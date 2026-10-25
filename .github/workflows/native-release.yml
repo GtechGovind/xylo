@@ -146,6 +146,16 @@ jobs:
         run: |
           cargo test --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}'
           cargo clippy --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
+      - name: Windows native resource admission tests
+        if: runner.os == 'Windows'
+        run: |
+          cargo test --locked -p workbench-resources --lib
+          cargo clippy --locked -p workbench-resources --lib --tests -- -D warnings
+      - name: Linux native terminal lifecycle tests
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --locked --manifest-path crates/runtime/validation/terminal/Cargo.toml -- --nocapture
+          cargo clippy --locked --manifest-path crates/runtime/validation/terminal/Cargo.toml --all-targets -- -D warnings
       # Exercise the platform compiler before the longer Rust build. Native
       # assets live under release/ and survive the later debug-only cleanup.
       - name: Build pinned native speech runtime

@@ -223,17 +223,153 @@ fn parse_output(
     Ok(())
 }
 
+/// Unix PTY master writes can remain blocked after the slave child exits.
+/// All clones share nonblocking mode; readiness waits also observe an owned
+/// shutdown socket, so closing a tab releases both I/O workers directly.
+#[cfg(unix)]
+#[derive(Clone)]
+struct UnixPtyIo {
+    master: Arc<std::os::fd::OwnedFd>,
+    shutdown: Arc<std::os::unix::net::UnixStream>,
+    stop: Arc<AtomicBool>,
+}
+#[cfg(unix)]
+impl UnixPtyIo {
+    fn prepare(
+        master: &dyn portable_pty::MasterPty,
+        stop: Arc<AtomicBool>,
+    ) -> Result<(Self, std::os::unix::net::UnixStream)> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let source = master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow!("Terminal master has no native descriptor"))?;
+        let duplicate = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // Retain an owned descriptor throughout real I/O. A worker closing the
+        // original master must not allow descriptor reuse during another poll.
+        let master = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                == -1
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let (incoming, outgoing) = std::os::unix::net::UnixStream::pair()?;
+        Ok((
+            Self {
+                master: Arc::new(master),
+                shutdown: Arc::new(incoming),
+                stop,
+            },
+            outgoing,
+        ))
+    }
+
+    fn wait(&self, events: libc::c_short) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: self.master.as_raw_fd(),
+                    events,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.shutdown.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let result = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    -1,
+                )
+            };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if self.stop.load(Ordering::Acquire) || descriptors[1].revents != 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            let ready = descriptors[0].revents;
+            if ready & libc::POLLNVAL != 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+            }
+            if events == libc::POLLOUT && ready & (libc::POLLHUP | libc::POLLERR) != 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            if ready & (events | libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    fn read(&self, reader: &mut dyn Read, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            match reader.read(bytes) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Err(error) = self.wait(libc::POLLIN) {
+                        if self.stop.load(Ordering::Acquire) {
+                            return Ok(0);
+                        }
+                        return Err(error);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn write_all(&self, writer: &mut dyn Write, mut bytes: &[u8]) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            if self.stop.load(Ordering::Acquire) {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            match writer.write(&bytes[..bytes.len().min(8192)]) {
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.wait(libc::POLLOUT)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        writer.flush()
+    }
+}
+
 struct Control {
     tx: mpsc::SyncSender<Command>,
     stop: Arc<AtomicBool>,
     frames: Arc<FrameSignal>,
     shutdown: mpsc::SyncSender<()>,
+    #[cfg(unix)]
+    io_shutdown: std::os::unix::net::UnixStream,
     #[cfg(all(test, unix))]
     lifecycle: Arc<LifecycleProbe>,
 }
 impl Drop for Control {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        #[cfg(unix)]
+        let _ = self.io_shutdown.shutdown(std::net::Shutdown::Write);
         // This channel is independent of the input writer, which may be
         // blocked inside a PTY write. Closing a tab never waits for child I/O.
         let _ = self.shutdown.try_send(());
@@ -310,6 +446,9 @@ impl TerminalSession {
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        let (io, io_shutdown) = UnixPtyIo::prepare(pair.master.as_ref(), stop.clone())?;
         let (tx, rx) = mpsc::sync_channel(64);
         // There are only two logical producers: final Control drop and reader
         // completion. Neither blocks, including if both signal simultaneously.
@@ -320,7 +459,6 @@ impl TerminalSession {
                 let _ = stopping.recv();
                 drop(child);
             })?;
-        let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let frames = Arc::new(FrameSignal::default());
         let control = Arc::new(Control {
@@ -328,6 +466,8 @@ impl TerminalSession {
             stop,
             frames: frames.clone(),
             shutdown: shutdown.clone(),
+            #[cfg(unix)]
+            io_shutdown,
             #[cfg(all(test, unix))]
             lifecycle: lifecycle.clone(),
         });
@@ -365,6 +505,8 @@ impl TerminalSession {
         let parser_frames = frames.clone();
         #[cfg(all(test, unix))]
         let parser_lifecycle = lifecycle.clone();
+        #[cfg(unix)]
+        let reader_io = io.clone();
         thread::Builder::new()
             .name("terminal-reader".into())
             .spawn(move || {
@@ -372,7 +514,11 @@ impl TerminalSession {
                     alacritty_terminal::vte::ansi::Processor::new();
                 let mut buffer = [0; 8192];
                 loop {
-                    match reader.read(&mut buffer) {
+                    #[cfg(unix)]
+                    let result = reader_io.read(reader.as_mut(), &mut buffer);
+                    #[cfg(not(unix))]
+                    let result = reader.read(&mut buffer);
+                    match result {
                         Ok(0) => break,
                         Ok(count) => {
                             if let Err(error) = parse_output(
@@ -416,6 +562,9 @@ impl TerminalSession {
                         Command::Write(bytes) => {
                             #[cfg(all(test, unix))]
                             lifecycle.writing.store(true, Ordering::Release);
+                            #[cfg(unix)]
+                            let result = io.write_all(writer.as_mut(), &bytes).map_err(Into::into);
+                            #[cfg(not(unix))]
                             let result = writer
                                 .write_all(&bytes)
                                 .and_then(|_| writer.flush())
@@ -516,6 +665,9 @@ impl TerminalSession {
                         }
                         Command::Stop => break,
                     };
+                    if worker_stop.load(Ordering::Acquire) {
+                        break;
+                    }
                     if let Err(error) = result {
                         state.lock().error = Some(error.to_string());
                         frames.request(true);

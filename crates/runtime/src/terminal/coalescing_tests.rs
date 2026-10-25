@@ -273,9 +273,10 @@ async fn closing_a_saturated_real_pty_reaps_the_child_and_releases_every_worker(
         }
     })
     .await
-    .expect("The real PTY writer must enter write_all");
-    // The write-in-progress hook plus a non-reading real PTY proves this is an
-    // in-flight OS write, not merely a queued command.
+    .expect("The real PTY writer must begin input delivery");
+    // The delivery hook plus a non-reading real PTY proves this input is
+    // backpressured by the native terminal, rather than merely queued. Unix
+    // delivery now waits for cancellable readiness instead of blocking write.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(lifecycle.writing.load(Ordering::Acquire));
     let mut queued = 0;
@@ -333,7 +334,7 @@ async fn closing_a_saturated_real_pty_reaps_the_child_and_releases_every_worker(
         }
     }
     eprintln!(
-        "Real PTY close regression passed: 2 MiB write blocked, 64 queued inputs, ignored SIGHUP escalated, owned child reaped, reader/control/frame workers released. Unix owned-child scope; no detached descendant or Windows qualification."
+        "Real PTY close regression passed: 2 MiB native input backpressured, 64 queued inputs, ignored SIGHUP escalated, owned child reaped, reader/control/frame workers released. Unix owned-child scope; no detached descendant or Windows qualification."
     );
 }
 

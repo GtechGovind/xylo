@@ -112,6 +112,12 @@ fn prepare_directory(directory: &Path, cancel: &CancellationToken) -> Result<Pat
     for part in directory.components() {
         checked(cancel)?;
         current.push(part);
+        // A drive prefix (C: or \\?\C:) is not a filesystem root yet.
+        // Inspect it only after RootDir is attached. UNC prefixes already
+        // denote absolute share roots and still receive the normal checks.
+        if matches!(part, Component::Prefix(_)) && !current.is_absolute() {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) => ensure!(
                 metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -473,26 +479,27 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn canonical_windows_directory_admission_creates_a_live_reservation() {
-        let (_temp, path) = directory();
-        let prefix = PathBuf::from(path.components().next().unwrap().as_os_str());
-        let prefix_probe = std::fs::symlink_metadata(&prefix)
-            .map(|metadata| (metadata.is_dir(), metadata.file_type().is_symlink()));
-        let cancel = CancellationToken::new();
-        let lease = try_acquire(&path, demand(), hardware(), &cancel)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "Admission for a canonical Windows directory failed: {error:#}; \
-                     prefix-only metadata probe for {prefix:?}: {prefix_probe:?}"
-                )
-            })
-            .expect("A deterministic available-memory budget must admit the reservation");
-        assert_eq!(lease.directory(), path.canonicalize().unwrap());
-        assert_eq!(
-            reap_and_sum(lease.directory(), &cancel).unwrap(),
-            (1, 1024 * MIB, 1.)
+        let (_temp, canonical) = directory();
+        let ordinary = PathBuf::from(
+            canonical
+                .to_str()
+                .unwrap()
+                .strip_prefix(r"\\?\")
+                .expect("The native canonical temp path must use a verbatim drive prefix"),
         );
-        drop(lease);
-        assert_eq!(reap_and_sum(&path, &cancel).unwrap(), (0, 0, 0.));
+        for path in [canonical.join("verbatim-雪"), ordinary.join("ordinary-雪")] {
+            let cancel = CancellationToken::new();
+            let lease = try_acquire(&path, demand(), hardware(), &cancel)
+                .unwrap_or_else(|error| panic!("Admission for {path:?} failed: {error:#}"))
+                .expect("A deterministic available-memory budget must admit the reservation");
+            assert_eq!(lease.directory(), path.canonicalize().unwrap());
+            assert_eq!(
+                reap_and_sum(lease.directory(), &cancel).unwrap(),
+                (1, 1024 * MIB, 1.)
+            );
+            drop(lease);
+            assert_eq!(reap_and_sum(&path, &cancel).unwrap(), (0, 0, 0.));
+        }
     }
 
     #[test]
