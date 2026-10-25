@@ -130,6 +130,11 @@ jobs:
         env:
           WORKBENCH_PACKAGER: ${{ github.workspace }}/.release-tools/bin/cargo-packager${{ runner.os == 'Windows' && '.exe' || '' }}
         run: python scripts/release.py --target '${{ matrix.target }}' --mode preview --preflight
+      - name: Windows actual LLVM and NSIS tool integration (synthetic executables)
+        if: runner.os == 'Windows'
+        env:
+          WORKBENCH_PACKAGER: ${{ github.workspace }}/.release-tools/bin/cargo-packager.exe
+        run: python scripts/release_windows_packaging_smoke.py --target '${{ matrix.target }}' --output 'target/windows-packaging-fixture/${{ matrix.target }}'
       - name: Formatting and release-script regressions
         run: |
           cargo fmt --all --check
@@ -195,6 +200,13 @@ jobs:
           else
             python scripts/release_smoke.py --target '${{ matrix.target }}' --output "$output"
           fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && runner.os == 'Windows'
+        with:
+          name: windows-packaging-fixture-${{ matrix.target }}
+          path: target/windows-packaging-fixture/
+          if-no-files-found: warn
+          retention-days: 14
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
