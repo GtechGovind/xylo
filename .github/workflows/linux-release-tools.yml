@@ -1,0 +1,73 @@
+name: Linux release tool integration
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/linux-release-tools.yml'
+      - 'scripts/release_linux_notices*.py'
+      - 'scripts/test_release_linux_notices.py'
+      - 'packaging/licenses/linux-infrastructure/**'
+  pull_request:
+    paths:
+      - '.github/workflows/linux-release-tools.yml'
+      - 'scripts/release_linux_notices*.py'
+      - 'scripts/test_release_linux_notices.py'
+      - 'packaging/licenses/linux-infrastructure/**'
+
+permissions:
+  contents: read
+
+jobs:
+  native-tools:
+    if: github.event.repository.private == false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.13'
+      - name: Native compiler and actual target libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils patchelf libxkbcommon-x11-dev
+      - name: Actual loader ownership and diversion evidence
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          sys.path.insert(0, 'scripts')
+          from release_windows import run_llvm
+          paths = sorted({*pathlib.Path('/lib').glob('ld-linux-*.so.*'), *pathlib.Path('/lib64').glob('ld-linux-*.so.*')})
+          if not 0 < len(paths) <= 16:
+              raise ValueError('Unexpected native loader inventory')
+          records = []
+          for path in paths:
+              resolved = path.resolve(strict=True)
+              aliases = {str(path), str(resolved)}
+              for value in list(aliases):
+                  if value.startswith('/usr/lib/') or value.startswith('/usr/lib64/'):
+                      aliases.add(value.removeprefix('/usr'))
+                  elif value.startswith('/lib/') or value.startswith('/lib64/'):
+                      aliases.add('/usr' + value)
+              queries = []
+              for alias in sorted(aliases):
+                  result = run_llvm(['env', 'LC_ALL=C', 'dpkg-query', '--search', alias], timeout=30, limit=64*1024)
+                  queries.append({'path': alias, 'exit': result.returncode, 'stdout': result.stdout[:8192], 'stderr': result.stderr[:1024]})
+              records.append({'input': str(path), 'resolved': str(resolved), 'queries': queries})
+          print(json.dumps({'scope':'actual native dpkg evidence, not inferred ownership', 'records': records}, indent=2))
+          PY
+      - name: Portable notice parser and integrity fixtures
+        run: python -m unittest discover -s scripts -p test_release_linux_notices.py -v
+      - name: Actual native compiler and notice collection integration
+        run: python scripts/release_linux_notices_smoke.py --target '${{ matrix.target }}'

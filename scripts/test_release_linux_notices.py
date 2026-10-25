@@ -128,7 +128,11 @@ class LinuxNoticeTests(unittest.TestCase):
         def search(args, **_options):
             calls.append(args[-1])
             return subprocess.CompletedProcess(args, 0 if args[-1] == "/lib/libfixture.so.1" else 1,
-                "libfixture1:amd64: /lib/libfixture.so.1\n" if args[-1] == "/lib/libfixture.so.1" else "", "")
+                ("diversion by libfixture1 from: /lib/libfixture.so.1\n"
+                 "diversion by libfixture1 to: /lib/libfixture.so.1.usr-is-merged\n"
+                 "local diversion from: /lib/libfixture.so.1\n"
+                 "local diversion to: /lib/libfixture.so.1.local\n"
+                 "libfixture1:amd64: /lib/libfixture.so.1\n") if args[-1] == "/lib/libfixture.so.1" else "", "")
         # The resolved name represents Linux dpkg state, even when these pure
         # parser fixtures execute on a native Windows release runner.
         with patch.object(Path, "resolve", return_value=PurePosixPath("/usr/lib/libfixture.so.1")), \
@@ -136,10 +140,17 @@ class LinuxNoticeTests(unittest.TestCase):
                 patch("release_linux_notices.command", return_value="libfixture1:amd64\t1.2-3\tfixture\t1.2-3\n"):
             self.assertEqual(package_owner(Path("/usr/lib/libfixture.so.1"))["version"], "1.2-3")
         self.assertIn("/lib/libfixture.so.1", calls)
-        for output in ("", "one: /lib/libfixture.so.1\ntwo: /lib/libfixture.so.1\n"):
+        for output in ("", "one: /lib/libfixture.so.1\ntwo: /lib/libfixture.so.1\n",
+                       "diversion by libc6 from: /lib/libfixture.so.1\ndiversion by libc6 to: /lib/libfixture.so.1.usr-is-merged\n"):
             with patch.object(Path, "resolve", return_value=PurePosixPath("/lib/libfixture.so.1")), \
                     patch("release_linux_notices.run_bounded", return_value=subprocess.CompletedProcess([], 0, output, "")):
                 with self.assertRaisesRegex(ValueError, "unknown or ambiguous"):
+                    package_owner(Path("/lib/libfixture.so.1"))
+        for code in (0, 1):
+            with patch.object(Path, "resolve", return_value=PurePosixPath("/lib/libfixture.so.1")), \
+                    patch("release_linux_notices.run_bounded", return_value=subprocess.CompletedProcess([], code,
+                          "arbitrary ownership annotation: /lib/libfixture.so.1\n", "")):
+                with self.assertRaisesRegex(ValueError, "[Uu]nexpected|Unrecognized"):
                     package_owner(Path("/lib/libfixture.so.1"))
 
     def test_installed_copyright_symlink_and_referenced_common_license_preserve_exact_bytes(self):

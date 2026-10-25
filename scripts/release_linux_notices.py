@@ -120,19 +120,31 @@ def package_owner(path: Path) -> dict:
             candidates.add(candidate.removeprefix("/usr"))
         elif candidate.startswith("/lib/") or candidate.startswith("/lib64/"):
             candidates.add("/usr" + candidate)
-    owners = set()
+    owners, evidence = set(), []
     for candidate in sorted(candidates):
         result = run_bounded(["env", "LC_ALL=C", "dpkg-query", "--search", candidate], timeout=30, limit=64 * 1024)
+        evidence.append({"path": candidate, "exit": result.returncode, "stdout": result.stdout[:2048], "stderr": result.stderr[:512]})
         if result.returncode == 1:
+            if result.stdout.strip():
+                raise ValueError("Unexpected dpkg owner output for an unmatched path: " + result.stdout[:2048])
             continue
         if result.returncode:
             raise ValueError("dpkg could not identify a native dependency owner")
         for line in result.stdout.splitlines():
-            owner, separator, owned = line.partition(": ")
-            if separator and owned == candidate:
-                owners.update(owner.split(", "))
+            # dpkg-query --search also emits "diversion by <pkg> from/to:"
+            # and "local diversion from/to:". Those are metadata, not owners.
+            # Mirror dpkg-shlibdeps' distinction; never infer authority from
+            # the package which registered a diversion.
+            if re.fullmatch(r"(?:diversion by [a-z0-9][a-z0-9+.-]* (?:from|to)|local diversion (?:from|to)): /.*", line):
+                continue
+            match = re.fullmatch(r"([a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)?(?:, [a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)?)*): (/.*)", line)
+            if match is None:
+                raise ValueError("Unrecognized dpkg owner output: " + line[:2048])
+            if match[2] == candidate:
+                owners.update(match[1].split(", "))
     if len(owners) != 1:
-        raise ValueError("Native dependency has an unknown or ambiguous installed package owner: " + str(path))
+        raise ValueError("Native dependency has an unknown or ambiguous installed package owner: " + str(path)[:512]
+                         + "; owners=" + repr(sorted(owners))[:1024] + "; queries=" + json.dumps(evidence)[:8192])
     owner = owners.pop()
     if not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)?", owner):
         raise ValueError("Invalid native dependency package name")
