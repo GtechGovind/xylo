@@ -6,6 +6,8 @@ extern crate gpui_kit as gpui;
 mod state;
 #[path = "../src/terminal_view.rs"]
 mod terminal_view;
+#[path = "../src/terminal_workspace.rs"]
+mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
 mod workbench {
@@ -145,7 +147,7 @@ mod workbench {
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| {
                     let terminal = cx.new(|cx| {
-                        crate::terminal_view::TerminalView::new(session, events, window, cx)
+                        crate::terminal_workspace::TerminalWorkspace::new(directory.path().to_path_buf(), session, events, window, cx)
                     });
                     let identity = terminal.entity_id();
                     view.terminal = Some(terminal);

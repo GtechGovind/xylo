@@ -2,6 +2,7 @@ extern crate gpui_kit as gpui;
 mod startup;
 mod state;
 mod terminal_view;
+mod terminal_workspace;
 mod tray;
 mod ui;
 mod workbench;

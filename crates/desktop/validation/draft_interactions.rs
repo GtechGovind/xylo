@@ -6,6 +6,8 @@ extern crate gpui_kit as gpui;
 mod state;
 #[path = "../src/terminal_view.rs"]
 mod terminal_view;
+#[path = "../src/terminal_workspace.rs"]
+mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
 mod workbench {
@@ -79,6 +81,85 @@ mod workbench {
                 DraftSave::Saved(snapshot) => snapshot,
                 _ => panic!("Unexpected conflict"),
             }
+        }
+        #[gpui_kit::test]
+        fn terminal_assistance_preserves_the_original_draft_and_requires_normal_send(
+            cx: &mut TestAppContext,
+        ) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(directory.path().join("profile")).unwrap();
+            let store = Store::open(&paths.database).unwrap();
+            let (window, view) = open(cx, HostClient::spawn_at(paths));
+            wait(cx, &view, "initial draft", |view, _| {
+                view.drafts
+                    .validation_revision(&DraftKey {
+                        session_id: view.session,
+                        workspace: view.workspace.clone(),
+                    })
+                    .is_some()
+            });
+            let old = cx.update(|cx| {
+                let view = view.read(cx);
+                DraftKey {
+                    session_id: view.session,
+                    workspace: view.workspace.clone(),
+                }
+            });
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.composer.update(cx, |input, cx| {
+                        input.set_value("Keep my existing unsent message", window, cx)
+                    });
+                    view.draft_changed(cx);
+                    view.terminal_assistance_chat(
+                        "Explain this selected terminal output".into(),
+                        window,
+                        cx,
+                    );
+                    assert_ne!(view.session, old.session_id);
+                    assert_eq!(
+                        view.composer.read(cx).value().as_ref(),
+                        "Explain this selected terminal output"
+                    );
+                    assert!(
+                        view.turns.is_empty(),
+                        "Opening assistance must not submit a turn or execute a tool"
+                    );
+                })
+            })
+            .unwrap();
+            let new = cx.update(|cx| {
+                let view = view.read(cx);
+                DraftKey {
+                    session_id: view.session,
+                    workspace: view.workspace.clone(),
+                }
+            });
+            wait(cx, &view, "both saved drafts", |view, _| {
+                view.drafts.validation_revision(&new).is_some()
+                    && !view.drafts.validation_dirty(&old)
+                    && !view.drafts.validation_dirty(&new)
+            });
+            assert_eq!(
+                store.draft(&old).unwrap().text,
+                "Keep my existing unsent message"
+            );
+            assert_eq!(
+                store.draft(&new).unwrap().text,
+                "Explain this selected terminal output"
+            );
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    let session = view.session;
+                    view.terminal_assistance_chat("   ".into(), window, cx);
+                    assert_eq!(
+                        view.session, session,
+                        "An empty question must not open another chat"
+                    );
+                })
+            })
+            .unwrap();
         }
         #[gpui_kit::test]
         fn restarted_database_drafts_restore_in_native_chat_picker_and_cross_chat_switches(

@@ -139,6 +139,36 @@ impl DraftUi {
     }
 }
 impl Workbench {
+    /// Open terminal assistance as an ordinary, editable saved draft. Preserve
+    /// the original chat (including attachments), and use the normal send,
+    /// provider, permission and cancellation flow when the user submits it.
+    pub(super) fn terminal_assistance_chat(
+        &mut self,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if prompt.trim().is_empty() || prompt.len() > MAX_DRAFT_BYTES {
+            return;
+        }
+        if !self.recovery_before_switch(cx) || !self.draft_before_switch(cx) {
+            return;
+        }
+        self.stash_history();
+        self.session = Uuid::new_v4();
+        self.recovery_scope_changed(cx);
+        self.messages.clear();
+        self.page = Page::Chat;
+        self.settings_open = false;
+        let key = self.current_draft_key();
+        self.activate_draft(key, window, cx);
+        self.composer.update(cx, |input, cx| {
+            input.set_value(prompt, window, cx);
+            input.focus(window, cx);
+        });
+        self.draft_changed(cx);
+        cx.notify();
+    }
     fn current_draft_key(&self) -> DraftKey {
         DraftKey {
             session_id: self.session,
@@ -866,11 +896,14 @@ impl Workbench {
             .flex()
             .items_center()
             .gap_2()
-            .px_4()
-            .py_1()
-            .child(subtitle(label))
+            .flex_wrap()
+            .justify_end()
+            .when(!label.is_empty(), |row| row.child(subtitle(label)))
             .child(
                 button("saved-drafts", "Saved drafts")
+                    .text_xs()
+                    .px_2()
+                    .min_h(px(28.))
                     .on_click(cx.listener(|view, _, _, cx| view.open_saved_drafts(cx))),
             );
         if entry.is_some_and(|entry| entry.conflict.is_some()) {

@@ -1,12 +1,20 @@
 # Modern native terminal
 
-Research reviewed on 2026-10-25. This document describes the next terminal milestone; the current preview has a working native terminal, with a basic interface. The modern session interface and AI actions below are planned work.
+Research reviewed on 2026-10-25. The native terminal now includes session tabs, two-pane splits, font zoom, on-demand search and an editable **Ask Xylo** handoff to a new chat. The remaining workflow and qualification work is listed below.
 
 ## Direction
 
 Keep the existing Rust `alacritty_terminal` core and `portable-pty` process layer while building an original GPUI terminal workspace. This preserves the native architecture and existing shell support. Compare alternative cores against the same workloads before making a performance claim or changing dependencies.
 
-The interface, shell integration and AI workflow need their own implementation. Adopting another terminal parser would still leave those layers to build.
+The interface, shell integration and AI workflow have separate responsibilities. Adopting another terminal parser would still leave those layers to build.
+
+## Implemented interface
+
+The terminal uses a compact session strip and toolbar. A selected tab identifies the active session; split panes have a neutral divider. The interface labels the folder in which each workspace was opened, without treating that label as live shell-directory metadata. Closing a live tab asks before stopping its shell.
+
+The renderer selects a concrete monospace font and uses the same metrics for text, cursor, selection and composition placement. Unicode clusters are anchored to their parser columns. A native macOS font/GPU regression reproduced a 163.60-point gap with the former generic font choice and measured zero gap for the corrected ASCII prompt. This does not qualify every font, IME or platform.
+
+**Ask Xylo** offers an editable excerpt from the explicit selection or visible viewport, capped at 12 KiB plus an omission marker. Continuing opens a separate saved chat while retaining the existing draft. The normal model, send, permissions and cancellation flow applies. Opening the assistance editor or continuing to chat does not submit a turn or write a generated command to the PTY.
 
 ## Native options reviewed
 
@@ -21,12 +29,12 @@ The interface, shell integration and AI workflow need their own implementation. 
 
 These are source and API findings, not measured speed rankings or completed Xylo integrations. Third-party license notices remain required for any adopted dependency.
 
-## Planned experience
+## Remaining experience
 
-- Session tabs, split panes, readable shell labels and working-directory context.
-- Theme-aware colors, spacing and typography, font zoom, focused search and useful exit states.
+- Live working-directory context and richer shell exit metadata.
+- Broader theme, font, accessibility and input qualification.
 - Searchable command history and command/output blocks when shell integration supplies real command boundaries, duration and exit status.
-- **Ask Xylo**, **Explain selection**, **Explain failure** and editable command proposals using the user's selected local or cloud model.
+- Command-aware **Explain failure** and editable command proposals using the user's selected local or cloud model.
 - Copy or insert a proposed command without submitting Enter. Agent execution continues through normal permissions, action records and cancellation.
 - Clickable file locations and links, with native selection, clipboard, Unicode and IME behavior.
 
@@ -38,9 +46,11 @@ Proposals stay in an editable command buffer. Insertion into a live terminal is 
 
 ## Performance work
 
-The current implementation builds a complete visible snapshot after each PTY read, then shapes all visible rows for rendering. Delivery through a coalescing channel does not eliminate that allocation work.
+The parser processes every byte independently of display scheduling. A dirty-state publisher coalesces viewport construction at a 16 ms cadence, waits without periodic polling when idle, and flushes the complete tail on EOF/error. Parser replies are enqueued after releasing the terminal lock, preserving replies under backpressure.
 
-The next implementation should parse every byte off the UI thread, publish only the latest dirty display state at a bounded frame cadence, and cache unchanged rows and text shaping. Terminal protocol replies and user input must remain responsive independently of repaint scheduling. Idle sessions should schedule no periodic rendering work.
+A local debug scheduling replay compared six alternating matched pairs with the same 2 MiB input, 8 KiB packets and 120 × 40 viewport. Median viewport constructions fell from 257 to 5; median accumulated construction time fell from 74.75 ms to 1.48 ms. Whole-burst p95 remained approximately 176 ms in both paths. These samples measure a synthetic parser/snapshot workload, not interactive latency, GPU frames, release performance or a comparison against another emulator.
+
+Cache unchanged rendered rows and qualify input-to-paint performance separately. Terminal protocol replies and user input must remain responsive independently of repaint scheduling.
 
 Keep bounded queues, scrollback, retained command metadata and snapshots. Store larger history on disk with paging. Closing a terminal must terminate and reap its shell without blocking the UI.
 

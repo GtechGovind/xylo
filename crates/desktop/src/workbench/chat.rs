@@ -434,103 +434,120 @@ impl Workbench {
                         .on_click(cx.listener(|view, _, _, cx| view.navigate(Page::Voice, cx))),
                 )
             })
-            .rounded(px(24.))
-            .bg(rgb(sidebar()))
             .child(
                 div()
-                    .rounded(px(24.))
+                    .id("image-drop-target")
+                    .w_full()
+                    .rounded(px(18.))
                     .bg(rgb(panel()))
                     .border_1()
                     .border_color(rgb(border()))
-                    .p_3()
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .gap_2()
+                    .p_3()
+                    .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
+                        view.attach_image_paths(paths.paths().to_vec(), AttachmentSource::Drop, cx)
+                    }))
                     .child(
-                        Textarea::new(&self.composer)
-                            .aria_label("Message")
-                            .appearance(false)
-                            .bordered(false)
-                            .disabled(self.draft_flush_pending()),
+                        div().min_h(px(56.)).px_1().py_1().child(
+                            Textarea::new(&self.composer)
+                                .aria_label("Message")
+                                .appearance(false)
+                                .bordered(false)
+                                .disabled(self.draft_flush_pending()),
+                        ),
                     )
+                    .when(
+                        !self.draft_attachments().is_empty() || self.attachments.importing(),
+                        |surface| surface.child(self.attachment_strip(cx)),
+                    )
+                    .when(!self.attachments.notice.is_empty(), |surface| {
+                        surface.child(subtitle(self.attachments.notice.clone()))
+                    })
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .justify_between()
+                            .gap_1()
+                            .h(px(32.))
                             .child(self.attachment_controls(cx))
+                            .child(div().flex_1().min_w_0())
                             .child(
-                                div()
+                                compact_selector("composer-model", model)
+                                    .max_w(px(180.))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.navigate(Page::Providers, cx)
+                                    })),
+                            )
+                            .child(
+                                compact_selector(
+                                    "permission-mode",
+                                    if self.settings.permissions == PermissionMode::ReadOnly {
+                                        "Read only"
+                                    } else {
+                                        "Ask before changes"
+                                    },
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.settings.permissions = if this.settings.permissions
+                                            == PermissionMode::ReadOnly
+                                        {
+                                            PermissionMode::AskForWrites
+                                        } else {
+                                            PermissionMode::ReadOnly
+                                        };
+                                        let settings = this.settings.clone();
+                                        this.host_call(cx, |host| host.save_settings(settings));
+                                    },
+                                )),
+                            )
+                            .when(self.running(), |row| {
+                                row.child(button("cancel-task", "Stop").text_xs().on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.engine_command(WorkerCommand::Cancel, cx)
+                                    }),
+                                ))
+                            })
+                            .child(self.speech_capture_button(cx))
+                            .child(
+                                gpui_kit::base::Button::new("send-prompt")
+                                    .accessibility_label("Send message")
+                                    .size(px(32.))
+                                    .rounded_full()
+                                    .flex_shrink_0()
                                     .flex()
                                     .items_center()
-                                    .gap_1()
-                                    .child(
-                                        button("composer-model", format!("{model}⌄"))
-                                            .text_xs()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.navigate(Page::Providers, cx)
-                                            })),
+                                    .justify_center()
+                                    .bg(rgb(accent()))
+                                    .text_color(rgb(0xffffff))
+                                    .cursor_pointer()
+                                    .disabled(
+                                        self.attachments.importing() || self.draft_flush_pending(),
                                     )
-                                    .child(
-                                        button(
-                                            "permission-mode",
-                                            if self.settings.permissions == PermissionMode::ReadOnly
-                                            {
-                                                "Read only⌄"
-                                            } else {
-                                                "Ask before changes⌄"
-                                            },
-                                        )
-                                        .text_xs()
-                                        .text_color(rgb(muted()))
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.settings.permissions =
-                                                    if this.settings.permissions
-                                                        == PermissionMode::ReadOnly
-                                                    {
-                                                        PermissionMode::AskForWrites
-                                                    } else {
-                                                        PermissionMode::ReadOnly
-                                                    };
-                                                let settings = this.settings.clone();
-                                                this.host_call(cx, |h| h.save_settings(settings));
-                                            }),
-                                        ),
-                                    )
-                                    .when(self.running(), |d| {
-                                        d.child(button("cancel-task", "Stop").on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.engine_command(WorkerCommand::Cancel, cx)
-                                            }),
-                                        ))
-                                    })
-                                    .child(self.speech_capture_button(cx))
-                                    .child(
-                                        primary("send-prompt", "↑")
-                                            .disabled(
-                                                self.attachments.importing()
-                                                    || self.draft_flush_pending(),
-                                            )
-                                            .min_w(px(32.))
-                                            .h(px(32.))
-                                            .rounded_full()
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.submit(window, cx)
-                                            })),
+                                    .child(icon(IconName::ArrowUp))
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.submit(window, cx)),
                                     ),
                             ),
                     ),
             )
-            .child(self.draft_status_footer(cx))
             .child(
-                button("composer-project", format!("▱  {project}  ›"))
-                    .justify_start()
-                    .text_xs()
-                    .text_color(rgb(muted()))
-                    .my_1()
-                    .mx_2()
-                    .on_click(cx.listener(|this, _, window, cx| this.pick_workspace(window, cx))),
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .px_1()
+                    .pt_1()
+                    .child(
+                        compact_selector("composer-project", project)
+                            .max_w(px(220.))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.pick_workspace(window, cx)),
+                            ),
+                    )
+                    .child(div().flex_1().min_w_0().child(self.draft_status_footer(cx))),
             )
             .into_any_element()
     }

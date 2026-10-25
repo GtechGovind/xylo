@@ -2,56 +2,137 @@ use super::*;
 
 impl Workbench {
     pub(super) fn files_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        use super::file_browser::{RowContent, TreeRow};
+        use gpui_kit::component::{Icon, IconName};
         let weak = cx.entity().downgrade();
-        let rows = uniform_list("file-list-rows", self.file_browser.entries.len(), move |range, _, cx| {
-            weak.update(cx, |view, cx| range.filter_map(|i| {
-                let entry = view.file_browser.entries.get(i)?.clone();
-                let path = entry.path;
-                let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
-                let label = if entry.is_dir { format!("▸ {name}") } else { name.into_owned() };
-                Some(button(("file", i), label).h(px(32.)).w_full().justify_start().text_xs()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if entry.is_dir {
-                            this.browse_directory(path.clone(), cx);
-                            return;
-                        }
-                        if path.extension().and_then(|extension|extension.to_str()).is_some_and(|extension|matches!(extension.to_ascii_lowercase().as_str(),"docx"|"xlsx")) {
-                            this.document_open(path.clone(),window,cx);
-                            return;
-                        }
-                        if this.editor_dirty {
-                            this.error = Some("Save the current editor changes before opening another file.".into());
-                            cx.notify();
-                            return;
-                        }
-                        this.request_editor_file(path.clone(), None, false, cx);
-                    })).into_any_element())
-            }).collect()).unwrap_or_default()
-        }).track_scroll(&self.file_scroll).flex_1().min_h_0();
-        let directory = self
-            .file_browser
-            .directory
-            .as_ref()
-            .or(self.workspace.as_ref());
-        let location = directory
-            .and_then(|path| {
-                self.workspace
-                    .as_ref()
-                    .and_then(|root| path.strip_prefix(root).ok())
-            })
-            .filter(|path| !path.as_os_str().is_empty())
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "Project folder".into());
-        let parent = directory
-            .and_then(|path| path.parent())
-            .filter(|path| {
-                self.workspace
-                    .as_ref()
-                    .is_some_and(|root| path.starts_with(root))
-            })
-            .map(Path::to_path_buf);
-        let next = self.file_browser.next.clone();
-        let loading = self.file_browser.loading();
+        let rows = uniform_list(
+            "file-list-rows",
+            self.file_browser.tree.rows.len(),
+            move |range, _, cx| {
+                weak.update(cx, |view, cx| {
+                    range
+                        .filter_map(|i| {
+                            let row: TreeRow = view.file_browser.tree.rows.get(i)?.clone();
+                            let name = row
+                                .path
+                                .file_name()
+                                .unwrap_or(row.path.as_os_str())
+                                .to_string_lossy()
+                                .into_owned();
+                            let is_selected =
+                                row.key.is_some() && row.key == view.file_browser.tree.selected;
+                            let padding = 6. + row.depth as f32 * 14.;
+                            let (label, detail, glyph, directory) = match &row.content {
+                                RowContent::Entry(entry) => {
+                                    let label = if entry.is_dir {
+                                        format!(
+                                            "{} folder {name}",
+                                            if row.expanded { "Collapse" } else { "Expand" }
+                                        )
+                                    } else {
+                                        format!("Open file {name}")
+                                    };
+                                    (
+                                        label,
+                                        name.clone(),
+                                        Some(if entry.is_dir {
+                                            IconName::Folder
+                                        } else {
+                                            IconName::FileText
+                                        }),
+                                        entry.is_dir,
+                                    )
+                                }
+                                RowContent::More => (
+                                    format!("Load more in {name}"),
+                                    "Load more…".into(),
+                                    None,
+                                    false,
+                                ),
+                                RowContent::Earlier => (
+                                    format!("Show earlier items in {name}"),
+                                    "Show earlier items…".into(),
+                                    None,
+                                    false,
+                                ),
+                                RowContent::Load => (
+                                    format!("Load folder {name}"),
+                                    "Load folder…".into(),
+                                    None,
+                                    false,
+                                ),
+                                RowContent::Loading => {
+                                    (String::new(), "Loading…".into(), None, false)
+                                }
+                                RowContent::Notice(message) => {
+                                    (String::new(), message.clone(), None, false)
+                                }
+                            };
+                            let Some(key) = row.key else {
+                                return Some(
+                                    div()
+                                        .h(px(30.))
+                                        .pl(px(padding + 16.))
+                                        .pr_2()
+                                        .flex()
+                                        .items_center()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_color(rgb(muted()))
+                                        .child(div().truncate().child(detail))
+                                        .into_any_element(),
+                                );
+                            };
+                            let mut button = gpui_kit::base::Button::new(("file", i))
+                                .accessibility_label(label)
+                                .h(px(30.))
+                                .w_full()
+                                .pl(px(padding))
+                                .pr_2()
+                                .flex()
+                                .items_center()
+                                .justify_start()
+                                .gap_1()
+                                .rounded_md()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(rgb(text()))
+                                .bg(rgb(if is_selected { selected() } else { sidebar() }))
+                                .hover(|style| style.bg(rgb(hover())))
+                                .child(
+                                    div()
+                                        .w(px(12.))
+                                        .flex_shrink_0()
+                                        .text_color(rgb(muted()))
+                                        .child(if directory {
+                                            if row.expanded { "⌄" } else { "›" }
+                                        } else {
+                                            ""
+                                        }),
+                                );
+                            if let Some(glyph) = glyph {
+                                button =
+                                    button.child(Icon::new(glyph).size(px(14.)).text_color(rgb(
+                                        if directory { 0xb18b43 } else { muted() },
+                                    )));
+                            }
+                            Some(
+                                button
+                                    .child(div().min_w_0().truncate().child(detail))
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        view.activate_tree_row(key.clone(), window, cx)
+                                    }))
+                                    .into_any_element(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+            },
+        )
+        .track_scroll(&self.file_scroll)
+        .flex_1()
+        .min_h_0();
         let list = div()
             .id("file-tree")
             .w(px(self.settings.ui.files_width))
@@ -63,68 +144,38 @@ impl Workbench {
             .flex()
             .flex_col()
             .gap_1()
-            .child(subtitle(format!(
-                "PROJECT FILES · {}",
-                self.file_browser.file_count
-            )))
+            .when_some(self.file_browser.focus.as_ref(), |panel, focus| {
+                panel.track_focus(focus)
+            })
+            .on_key_down(
+                cx.listener(|view, event, window, cx| view.tree_key_down(event, window, cx)),
+            )
             .child(
                 div()
                     .flex()
+                    .items_center()
+                    .justify_between()
                     .gap_1()
+                    .child(subtitle("PROJECT FILES").flex_1().min_w_0())
                     .child(
-                        button("files-up", "Up")
-                            .text_xs()
-                            .disabled(parent.is_none())
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                if let Some(parent) = &parent {
-                                    view.browse_directory(parent.clone(), cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        button("refresh-files", "Refresh files")
+                        button("refresh-files", "Refresh")
                             .text_xs()
                             .on_click(cx.listener(|view, _, _, cx| view.refresh_files(cx))),
                     ),
             )
-            .child(subtitle(location).min_w_0().truncate())
             .when(self.file_browser.indexing, |panel| {
                 panel.child(subtitle("Discovering project files…"))
             })
             .when(self.file_browser.watch_limited, |panel| {
-                panel.child(subtitle(
-                    "Automatic file updates are limited. Refresh files to check recent changes.",
-                ))
+                panel.child(subtitle("Refresh files to check recent changes."))
             })
-            .when(loading, |panel| panel.child(subtitle("Loading folder…")))
             .when(!self.file_browser.notice.is_empty(), |panel| {
                 panel.child(subtitle(self.file_browser.notice.clone()))
             })
-            .when(!loading && self.file_browser.entries.is_empty(), |panel| {
-                panel.child(subtitle("No files in this folder."))
+            .when(self.workspace.is_none(), |panel| {
+                panel.child(subtitle("Open a project to browse its files."))
             })
             .child(rows)
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(
-                        button("files-first", "First page")
-                            .text_xs()
-                            .disabled(loading || self.file_browser.after.is_none())
-                            .on_click(cx.listener(|view, _, _, cx| view.load_file_page(None, cx))),
-                    )
-                    .child(
-                        button("files-next", "Next page")
-                            .text_xs()
-                            .disabled(loading || next.is_none())
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                if let Some(next) = &next {
-                                    view.load_file_page(Some(next.clone()), cx);
-                                }
-                            })),
-                    ),
-            )
             .relative()
             .child(self.resize_edge(Panel::Files));
         let content = if let Some(path) = &self.editor_path {

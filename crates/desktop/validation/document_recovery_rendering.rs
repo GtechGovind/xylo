@@ -7,6 +7,8 @@ mod document_recovery_fixture;
 mod state;
 #[path = "../src/terminal_view.rs"]
 mod terminal_view;
+#[path = "../src/terminal_workspace.rs"]
+mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
 mod workbench {

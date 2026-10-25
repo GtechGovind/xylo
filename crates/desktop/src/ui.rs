@@ -88,6 +88,53 @@ fn button_base(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_kit::base::Button {
     button_base(id, label).hover(|d| d.bg(rgb(hover())))
 }
+/// Compact toolbar action with an accessible name independent of its glyph.
+pub fn icon_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    name: IconName,
+) -> gpui_kit::base::Button {
+    gpui_kit::base::Button::new(id)
+        .accessibility_label(label)
+        .size(px(28.))
+        .flex_shrink_0()
+        .rounded_md()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(rgb(muted()))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
+        .child(icon(name))
+}
+pub fn compact_selector(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+) -> gpui_kit::base::Button {
+    let label = label.into();
+    gpui_kit::base::Button::new(id)
+        .accessibility_label(label.clone())
+        .flex()
+        .items_center()
+        .gap_1()
+        .min_w_0()
+        .h(px(28.))
+        .px_2()
+        .rounded_md()
+        .text_xs()
+        .text_color(rgb(muted()))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(label),
+        )
+        .child(icon(IconName::ChevronDown).size(px(12.)))
+}
 pub fn primary(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_kit::base::Button {
     button_base(id, label)
         .bg(rgb(0x1d2129))

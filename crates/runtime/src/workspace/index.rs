@@ -133,6 +133,7 @@ pub(super) fn open_writer(database: &Path, root: &Path) -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS meta(id INTEGER PRIMARY KEY CHECK(id=1),root BLOB NOT NULL,revision INTEGER NOT NULL DEFAULT 0,epoch INTEGER NOT NULL DEFAULT 0,files INTEGER NOT NULL DEFAULT 0,dirs INTEGER NOT NULL DEFAULT 0,unreadable INTEGER NOT NULL DEFAULT 0,indexing INTEGER NOT NULL DEFAULT 1,watching INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS entries(path BLOB PRIMARY KEY,parent BLOB NOT NULL,kind INTEGER NOT NULL,bytes INTEGER NOT NULL,modified BLOB,seen INTEGER NOT NULL,seeded INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS entries_parent ON entries(parent,path);
+        CREATE INDEX IF NOT EXISTS entries_parent_kind ON entries(parent,kind,path);
         CREATE INDEX IF NOT EXISTS entries_kind ON entries(kind,path);
         CREATE INDEX IF NOT EXISTS entries_seen ON entries(seen,path);
         CREATE INDEX IF NOT EXISTS entries_frontier ON entries(seen,kind,seeded,path);
@@ -548,15 +549,54 @@ pub(super) fn files(
         .as_ref()
         .map(|cursor| paths::encode(&cursor.path))
         .unwrap_or_default();
+    // The revision and parent were checked inside this transaction. Resolve
+    // the cursor's kind through its primary key, preserving the public opaque
+    // cursor while giving directory and file pages a stable folders-first order.
+    let after_kind: i64 = if options.after.is_some() {
+        tx.query_row(
+            "SELECT kind FROM entries WHERE path=?1 AND parent=?2",
+            params![after, paths::encode(&directory)],
+            |row| row.get(0),
+        )
+        .optional()?
+        .context("The project changed; open this folder again")?
+    } else {
+        1
+    };
+    ensure!(
+        matches!(after_kind, 0 | 1),
+        "Project catalogue entry kind is invalid"
+    );
     let limit = options.limit.clamp(1, 500);
     let rows: Vec<(Vec<u8>, bool, u64)> = {
-        let mut query = tx.prepare("SELECT path,kind,bytes FROM entries WHERE parent=?1 AND path>?2 ORDER BY path LIMIT ?3")?;
-        query
-            .query_map(
-                params![paths::encode(&directory), after, limit + 1],
+        // At most two indexed seeks, retaining only limit+1 entries. Avoid an
+        // OFFSET or mixed-direction OR predicate which revisits earlier pages.
+        let mut rows = Vec::with_capacity(limit + 1);
+        let mut query = tx.prepare("SELECT path,kind,bytes FROM entries WHERE parent=?1 AND kind=?2 AND path>?3 ORDER BY path LIMIT ?4")?;
+        for kind in (0..=after_kind).rev() {
+            check(cancel, project)?;
+            let path = if kind == after_kind {
+                after.as_slice()
+            } else {
+                &[]
+            };
+            let page = query.query_map(
+                params![
+                    paths::encode(&directory),
+                    kind,
+                    path,
+                    limit + 1 - rows.len()
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?
-            .collect::<rusqlite::Result<_>>()?
+            )?;
+            for entry in page {
+                rows.push(entry?);
+            }
+            if rows.len() > limit {
+                break;
+            }
+        }
+        rows
     };
     let more = rows.len() > limit;
     let mut entries = Vec::with_capacity(limit.min(rows.len()));

@@ -6,6 +6,8 @@ extern crate gpui_kit as gpui;
 mod state;
 #[path = "../src/terminal_view.rs"]
 mod terminal_view;
+#[path = "../src/terminal_workspace.rs"]
+mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
 mod workbench {
@@ -99,11 +101,12 @@ mod workbench {
         }
 
         #[gpui_kit::test]
-        fn directory_pages_reach_every_file_and_navigation_preserves_unsaved_editor(
+        fn directory_pages_reach_every_file_and_expansion_preserves_unsaved_editor(
             cx: &mut TestAppContext,
         ) {
+            use super::file_browser::RowKey;
             let (_temporary, workspace, client, window, view) = host_fixture(cx);
-            let directory = workspace.join("a-folder");
+            let directory = workspace.join("z-folder");
             std::fs::create_dir(&directory).unwrap();
             let child = directory.join("child.txt");
             std::fs::write(&child, "Nested text").unwrap();
@@ -120,50 +123,83 @@ mod workbench {
             });
             let mut seen = std::collections::BTreeSet::new();
             loop {
-                let (paths, next, first) = cx.update(|cx| {
-                    let browser = &view.read(cx).file_browser;
+                let (paths, next) = cx.update(|cx| {
+                    let node = view
+                        .read(cx)
+                        .file_browser
+                        .tree
+                        .directories
+                        .get(&workspace)
+                        .unwrap();
                     (
-                        browser
-                            .entries
+                        node.entries
                             .iter()
                             .map(|entry| entry.path.clone())
                             .collect::<Vec<_>>(),
-                        browser.next.clone(),
-                        browser.entries.first().map(|entry| entry.path.clone()),
+                        node.next.as_ref().map(|cursor| cursor.path.clone()),
                     )
                 });
-                assert!(paths.len() <= 500);
-                for path in paths {
-                    assert!(seen.insert(path), "Page duplicated a path");
-                }
+                assert!(paths.len() <= 1000);
+                seen.extend(paths);
                 if next.is_none() {
                     break;
                 }
                 cx.update_window(window, |_, window, cx| {
                     view.update(cx, |view, cx| {
                         view.page = Page::Files;
+                        let row = view
+                            .file_browser
+                            .tree
+                            .rows
+                            .iter()
+                            .position(|row| {
+                                row.key.as_ref() == Some(&RowKey::More(workspace.clone()))
+                            })
+                            .unwrap();
+                        view.file_scroll
+                            .scroll_to_item(row, gpui_kit::ScrollStrategy::Top);
                         cx.notify();
                     });
                     window.render_frame(cx);
-                    window.click("files-next", cx);
+                    let row = view
+                        .read(cx)
+                        .file_browser
+                        .tree
+                        .rows
+                        .iter()
+                        .position(|row| row.key.as_ref() == Some(&RowKey::More(workspace.clone())))
+                        .unwrap();
+                    window.click(("file", row), cx);
                 })
                 .unwrap();
-                wait_for(cx, &view, "next directory page", |view, _| {
+                wait_for(cx, &view, "inline directory continuation", |view, _| {
                     !view.file_browser.loading()
-                        && view.file_browser.entries.first().map(|entry| &entry.path)
-                            != first.as_ref()
+                        && view
+                            .file_browser
+                            .tree
+                            .directories
+                            .get(&workspace)
+                            .unwrap()
+                            .next
+                            .as_ref()
+                            .map(|cursor| &cursor.path)
+                            != next.as_ref()
                 });
             }
-            assert_eq!(seen.len(), 1201, "All root entries remain reachable");
+            assert_eq!(
+                seen.len(),
+                1201,
+                "Every root path stays reachable across bounded windows"
+            );
             assert!(seen.contains(&directory));
             cx.update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                window.click("files-first", cx);
+                view.update(cx, |view, cx| {
+                    view.activate_tree_row(RowKey::Earlier(workspace.clone()), window, cx)
+                });
             })
             .unwrap();
-            wait_for(cx, &view, "first directory page", |view, _| {
+            wait_for(cx, &view, "earlier root entries", |view, _| {
                 !view.file_browser.loading()
-                    && view.file_browser.after.is_none()
                     && view
                         .file_browser
                         .entries
@@ -176,7 +212,7 @@ mod workbench {
                     view.request_editor_file(edit.clone(), None, false, cx)
                 })
             });
-            wait_for(cx, &view, "opened page fixture", |view, _| {
+            wait_for(cx, &view, "opened fixture", |view, _| {
                 view.editor_path.as_ref() == Some(&edit)
             });
             cx.update_window(window, |_, window, cx| {
@@ -185,28 +221,37 @@ mod workbench {
                         editor.set_value("Unsaved local edits", window, cx)
                     });
                     view.editor_dirty = true;
-                    cx.notify();
+                    view.activate_tree_row(RowKey::Entry(directory.clone()), window, cx);
                 });
-                window.render_frame(cx);
-                window.click(("file", 0usize), cx);
             })
             .unwrap();
-            wait_for(cx, &view, "nested directory page", |view, _| {
+            wait_for(cx, &view, "expanded nested directory", |view, _| {
                 !view.file_browser.loading()
-                    && view.file_browser.entries.len() == 1
-                    && view.file_browser.entries[0].path == child
+                    && view
+                        .file_browser
+                        .entries
+                        .iter()
+                        .any(|entry| entry.path == child)
             });
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| {
                     assert!(view.editor_dirty);
                     assert_eq!(view.editor.read(cx).value().as_ref(), "Unsaved local edits");
-                    view.browse_directory(workspace.clone(), cx);
-                    let stale = view.file_browser.validation_request().unwrap();
-                    view.browse_directory(directory.clone(), cx);
+                    // Collapse cancels only that subtree; late replies cannot
+                    // replace the root or clear the preserved editor proposal.
+                    view.toggle_tree_folder(directory.clone(), cx);
+                    view.toggle_tree_folder(directory.clone(), cx);
+                    view.load_file_page(None, cx);
+                    let stale = view
+                        .file_browser
+                        .validation_request_for(&workspace)
+                        .unwrap();
+                    view.reset_file_browser();
+                    view.load_file_page(None, cx);
                     view.event(
                         HostEvent::WorkspaceFiles {
                             request_id: stale,
-                            result: Err("Stale response must not replace the folder".into()),
+                            result: Err("Stale response must not replace the tree".into()),
                         },
                         window,
                         cx,
@@ -215,10 +260,8 @@ mod workbench {
                 });
             })
             .unwrap();
-            wait_for(cx, &view, "latest folder selection", |view, _| {
-                !view.file_browser.loading()
-                    && view.file_browser.entries.len() == 1
-                    && view.file_browser.entries[0].path == child
+            wait_for(cx, &view, "latest tree refresh", |view, _| {
+                !view.file_browser.loading() && !view.file_browser.entries.is_empty()
             });
             assert_eq!(std::fs::read_to_string(edit).unwrap(), "Original");
             client.shutdown().unwrap();

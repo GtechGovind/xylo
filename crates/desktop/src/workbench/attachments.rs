@@ -248,41 +248,30 @@ impl Workbench {
     /// Drop target and explicit user import actions; no images import on render.
     pub(super) fn attachment_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
-            .id("image-drop-target")
             .flex()
-            .flex_col()
-            .gap_2()
-            .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
-                view.attach_image_paths(paths.paths().to_vec(), AttachmentSource::Drop, cx)
-            }))
+            .items_center()
+            .gap_1()
             .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        button("attach-images", "Attach images")
-                            .disabled(self.attachments.importing())
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.attachment_picker(window, cx)
-                            })),
-                    )
-                    .child(
-                        button("paste-image-files", "Paste image")
-                            .disabled(self.attachments.importing())
-                            .on_click(
-                                cx.listener(|view, _, _, cx| view.attachment_paste_files(cx)),
-                            ),
-                    ),
+                icon_button(
+                    "attach-images",
+                    "Attach images",
+                    gpui_kit::component::IconName::Plus,
+                )
+                .disabled(self.attachments.importing())
+                .on_click(cx.listener(|view, _, window, cx| view.attachment_picker(window, cx))),
             )
-            .child(self.attachment_strip(cx))
-            .child(subtitle(
-                "Drop images here or choose Attach images. Up to four, 8 MiB each.",
-            ))
-            .when(!self.attachments.notice.is_empty(), |panel| {
-                panel.child(subtitle(self.attachments.notice.clone()))
-            })
+            .child(
+                icon_button(
+                    "paste-image-files",
+                    "Paste image",
+                    gpui_kit::component::IconName::Copy,
+                )
+                .disabled(self.attachments.importing())
+                .on_click(cx.listener(|view, _, _, cx| view.attachment_paste_files(cx))),
+            )
             .into_any_element()
     }
+
     pub(super) fn attachment_strip(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut strip = div().flex().flex_wrap().gap_2();
         for image in self.draft_attachments() {

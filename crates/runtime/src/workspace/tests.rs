@@ -628,3 +628,69 @@ fn unknown_cache_version_or_layout_fails_closed_without_mutation() {
         paths::FORMAT_VERSION
     );
 }
+
+#[test]
+fn folder_first_keyset_pages_cross_kind_boundary_without_skipping_or_reordering() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    for name in ["z-folder", "m-folder", "a-folder"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+    }
+    for name in ["0-file", "b-file", "z-file", "界-file"] {
+        std::fs::write(root.join(name), "fixture").unwrap();
+    }
+    let database = catalogue(&root, cache.path());
+    let stop = CancellationToken::new();
+    for size in [1, 2, 3, 4, 7, 500] {
+        let mut cursor = None;
+        let mut actual = Vec::new();
+        loop {
+            let page =
+                index::files(&database, &root, options(&root, cursor, size), &stop, &stop).unwrap();
+            assert!(page.entries.len() <= size);
+            actual.extend(page.entries.into_iter().map(|entry| {
+                (
+                    entry.is_dir,
+                    entry
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }));
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+            assert!(actual.len() < 20, "Cursor did not advance");
+        }
+        assert_eq!(
+            actual,
+            vec![
+                (true, "a-folder".into()),
+                (true, "m-folder".into()),
+                (true, "z-folder".into()),
+                (false, "0-file".into()),
+                (false, "b-file".into()),
+                (false, "z-file".into()),
+                (false, "界-file".into())
+            ]
+        );
+    }
+    let conn = index::open_reader(&database).unwrap();
+    let plans = conn.prepare("EXPLAIN QUERY PLAN SELECT path,kind,bytes FROM entries WHERE parent=?1 AND kind=?2 AND path>?3 ORDER BY path LIMIT ?4").unwrap()
+        .query_map(params![paths::encode(&root), 0, Vec::<u8>::new(), 501], |row| row.get::<_, String>(3)).unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.contains("entries_parent_kind")),
+        "{plans:?}"
+    );
+    assert!(
+        !plans.iter().any(|plan| plan.contains("TEMP B-TREE")),
+        "{plans:?}"
+    );
+}

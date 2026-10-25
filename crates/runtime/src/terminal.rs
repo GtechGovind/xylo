@@ -13,7 +13,7 @@ use alacritty_terminal::{
     },
 };
 use anyhow::{Result, anyhow};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
     io::{Read, Write},
@@ -24,6 +24,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::{Duration, Instant},
 };
 use tokio::sync::watch;
 
@@ -97,21 +98,25 @@ enum Command {
         start: bool,
     },
     Search(String, bool),
-    Title(String),
     Stop,
 }
-#[derive(Clone)]
-struct Listener(mpsc::SyncSender<Command>);
+#[derive(Default)]
+struct ParserEvents {
+    replies: Vec<String>,
+    title: Option<String>,
+}
+#[derive(Clone, Default)]
+struct Listener(Arc<Mutex<ParserEvents>>);
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
-        let command = match event {
-            Event::PtyWrite(text) => Some(Command::Write(text.into_bytes())),
-            Event::Title(title) => Some(Command::Title(title.chars().take(160).collect())),
-            Event::ResetTitle => Some(Command::Title("Terminal".into())),
-            _ => None,
-        };
-        if let Some(command) = command {
-            let _ = self.0.try_send(command);
+        // Parsing holds the terminal lock. Collect replies for this bounded
+        // input packet and enqueue them only after releasing that lock: a full
+        // writer queue must neither lose replies nor deadlock its consumer.
+        match event {
+            Event::PtyWrite(text) => self.0.lock().replies.push(text),
+            Event::Title(title) => self.0.lock().title = Some(title.chars().take(160).collect()),
+            Event::ResetTitle => self.0.lock().title = Some("Terminal".into()),
+            _ => {}
         }
     }
 }
@@ -122,16 +127,152 @@ struct State {
     exited: bool,
     error: Option<String>,
 }
+
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Default)]
+struct PendingFrame {
+    dirty: bool,
+    urgent: bool,
+    closing: bool,
+}
+
+/// Coalesces requests before constructing a viewport, rather than merely
+/// replacing already allocated frames in the watch channel. An idle session
+/// waits on the condition variable without a polling timer.
+#[derive(Default)]
+struct FrameSignal {
+    pending: Mutex<PendingFrame>,
+    changed: Condvar,
+}
+impl FrameSignal {
+    fn request(&self, urgent: bool) {
+        let mut pending = self.pending.lock();
+        let wake = !pending.dirty || urgent && !pending.urgent;
+        pending.dirty = true;
+        pending.urgent |= urgent;
+        if wake {
+            self.changed.notify_one();
+        }
+    }
+    fn close(&self) {
+        let mut pending = self.pending.lock();
+        pending.closing = true;
+        self.changed.notify_one();
+    }
+    fn publish(&self, interval: Duration, mut capture: impl FnMut()) {
+        let mut previous = None::<Instant>;
+        loop {
+            let mut pending = self.pending.lock();
+            loop {
+                if pending.closing && !pending.dirty {
+                    return;
+                }
+                if !pending.dirty {
+                    self.changed.wait(&mut pending);
+                    continue;
+                }
+                let remaining = previous.and_then(|time| interval.checked_sub(time.elapsed()));
+                if !pending.urgent
+                    && !pending.closing
+                    && let Some(remaining) = remaining
+                {
+                    self.changed.wait_for(&mut pending, remaining);
+                    continue;
+                }
+                pending.dirty = false;
+                pending.urgent = false;
+                break;
+            }
+            let closing = pending.closing;
+            // No signal lock is held while taking the terminal lock or while
+            // publishing. Producers can always mark the next frame dirty.
+            drop(pending);
+            capture();
+            previous = Some(Instant::now());
+            if closing {
+                return;
+            }
+        }
+    }
+}
+
+fn parse_output(
+    parser: &mut alacritty_terminal::vte::ansi::Processor,
+    state: &Mutex<State>,
+    listener: &Listener,
+    bytes: &[u8],
+    commands: &mpsc::SyncSender<Command>,
+    frames: &FrameSignal,
+) -> Result<()> {
+    let events = {
+        let mut state = state.lock();
+        parser.advance(&mut state.term, bytes);
+        let events = std::mem::take(&mut *listener.0.lock());
+        if let Some(title) = &events.title {
+            state.title.clone_from(title);
+        }
+        events
+    };
+    frames.request(false);
+    for reply in events.replies {
+        commands
+            .send(Command::Write(reply.into_bytes()))
+            .map_err(|_| anyhow!("Terminal writer stopped"))?;
+    }
+    Ok(())
+}
+
 struct Control {
     tx: mpsc::SyncSender<Command>,
     stop: Arc<AtomicBool>,
+    frames: Arc<FrameSignal>,
+    shutdown: mpsc::SyncSender<()>,
+    #[cfg(all(test, unix))]
+    lifecycle: Arc<LifecycleProbe>,
 }
 impl Drop for Control {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        // This channel is independent of the input writer, which may be
+        // blocked inside a PTY write. Closing a tab never waits for child I/O.
+        let _ = self.shutdown.try_send(());
         let _ = self.tx.try_send(Command::Stop);
+        self.frames.close();
     }
 }
+
+/// Owns termination and reaping even when startup fails before its supervisor
+/// thread is created. `spawn` is a background-only API; successful sessions move
+/// this guard onto the supervisor, never onto the UI thread.
+struct OwnedChild {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    #[cfg(all(test, unix))]
+    lifecycle: Arc<LifecycleProbe>,
+}
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            // Use the actual child, not clone_killer: the pinned Unix child
+            // implementation escalates an ignored SIGHUP before waiting.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        #[cfg(all(test, unix))]
+        self.lifecycle.reaped.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(all(test, unix))]
+#[derive(Default)]
+struct LifecycleProbe {
+    writing: AtomicBool,
+    reader_done: AtomicBool,
+    control_done: AtomicBool,
+    frames_done: AtomicBool,
+    reaped: AtomicBool,
+}
+
 #[derive(Clone)]
 pub struct TerminalSession {
     control: Arc<Control>,
@@ -154,14 +295,38 @@ impl TerminalSession {
         command.cwd(cwd);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        let mut child = pair.slave.spawn_command(command)?;
+        #[cfg(all(test, unix))]
+        let lifecycle = Arc::new(LifecycleProbe::default());
+        let child = OwnedChild {
+            child: pair.slave.spawn_command(command)?,
+            #[cfg(all(test, unix))]
+            lifecycle: lifecycle.clone(),
+        };
         drop(pair.slave);
-        let mut killer = child.clone_killer();
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
         let (tx, rx) = mpsc::sync_channel(64);
+        // There are only two logical producers: final Control drop and reader
+        // completion. Neither blocks, including if both signal simultaneously.
+        let (shutdown, stopping) = mpsc::sync_channel(2);
+        thread::Builder::new()
+            .name("terminal-supervisor".into())
+            .spawn(move || {
+                let _ = stopping.recv();
+                drop(child);
+            })?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
+        let frames = Arc::new(FrameSignal::default());
+        let control = Arc::new(Control {
+            tx: tx.clone(),
+            stop,
+            frames: frames.clone(),
+            shutdown: shutdown.clone(),
+            #[cfg(all(test, unix))]
+            lifecycle: lifecycle.clone(),
+        });
+        let listener = Listener::default();
         let state = Arc::new(Mutex::new(State {
             term: Term::new(
                 Config::default(),
@@ -169,7 +334,7 @@ impl TerminalSession {
                     columns: 80,
                     rows: 24,
                 },
-                Listener(tx.clone()),
+                listener.clone(),
             ),
             title: "Terminal".into(),
             search_status: String::new(),
@@ -177,8 +342,24 @@ impl TerminalSession {
             error: None,
         }));
         let (updates, receiver) = watch::channel(TerminalSnapshot::default());
+        let frame_state = state.clone();
+        let frame_signal = frames.clone();
+        #[cfg(all(test, unix))]
+        let frame_lifecycle = lifecycle.clone();
+        thread::Builder::new()
+            .name("terminal-frames".into())
+            .spawn(move || {
+                frame_signal.publish(FRAME_INTERVAL, || {
+                    let frame = snapshot(&frame_state.lock());
+                    updates.send_replace(frame);
+                });
+                #[cfg(all(test, unix))]
+                frame_lifecycle.frames_done.store(true, Ordering::Release);
+            })?;
         let parser_state = state.clone();
-        let parser_updates = updates.clone();
+        let parser_frames = frames.clone();
+        #[cfg(all(test, unix))]
+        let parser_lifecycle = lifecycle.clone();
         thread::Builder::new()
             .name("terminal-reader".into())
             .spawn(move || {
@@ -189,9 +370,17 @@ impl TerminalSession {
                     match reader.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(count) => {
-                            let mut state = parser_state.lock();
-                            parser.advance(&mut state.term, &buffer[..count]);
-                            parser_updates.send_replace(snapshot(&state));
+                            if let Err(error) = parse_output(
+                                &mut parser,
+                                &parser_state,
+                                &listener,
+                                &buffer[..count],
+                                &tx,
+                                &parser_frames,
+                            ) {
+                                parser_state.lock().error = Some(error.to_string());
+                                break;
+                            }
                         }
                         Err(error) => {
                             let mut state = parser_state.lock();
@@ -202,7 +391,13 @@ impl TerminalSession {
                 }
                 let mut state = parser_state.lock();
                 state.exited = true;
-                parser_updates.send_replace(snapshot(&state));
+                drop(state);
+                // EOF and errors must expose the complete tail immediately,
+                // including a burst which ended before its next display tick.
+                parser_frames.request(true);
+                let _ = shutdown.try_send(());
+                #[cfg(all(test, unix))]
+                parser_lifecycle.reader_done.store(true, Ordering::Release);
             })?;
         thread::Builder::new()
             .name("terminal-control".into())
@@ -211,11 +406,19 @@ impl TerminalSession {
                     if worker_stop.load(Ordering::Acquire) {
                         break;
                     }
+                    let visual_change = !matches!(&command, Command::Write(_));
                     let result: Result<()> = match command {
-                        Command::Write(bytes) => writer
-                            .write_all(&bytes)
-                            .and_then(|_| writer.flush())
-                            .map_err(Into::into),
+                        Command::Write(bytes) => {
+                            #[cfg(all(test, unix))]
+                            lifecycle.writing.store(true, Ordering::Release);
+                            let result = writer
+                                .write_all(&bytes)
+                                .and_then(|_| writer.flush())
+                                .map_err(Into::into);
+                            #[cfg(all(test, unix))]
+                            lifecycle.writing.store(false, Ordering::Release);
+                            result
+                        }
                         Command::Resize(columns, rows) => pair
                             .master
                             .resize(PtySize {
@@ -306,30 +509,22 @@ impl TerminalSession {
                             }
                             Ok(())
                         }
-                        Command::Title(title) => {
-                            state.lock().title = title;
-                            Ok(())
-                        }
-                        Command::Stop => {
-                            let _ = killer.kill();
-                            break;
-                        }
+                        Command::Stop => break,
                     };
-                    let mut state = state.lock();
                     if let Err(error) = result {
-                        state.error = Some(error.to_string());
+                        state.lock().error = Some(error.to_string());
+                        frames.request(true);
+                    } else if visual_change {
+                        frames.request(false);
                     }
-                    updates.send_replace(snapshot(&state));
                 }
-                let _ = killer.kill();
-                let _ = child.wait();
+                // Dropping the receiver releases a parser blocked while
+                // sending protocol replies into a saturated command queue.
+                drop(rx);
+                #[cfg(all(test, unix))]
+                lifecycle.control_done.store(true, Ordering::Release);
             })?;
-        Ok((
-            Self {
-                control: Arc::new(Control { tx, stop }),
-            },
-            receiver,
-        ))
+        Ok((Self { control }, receiver))
     }
     fn command(&self, command: Command) -> Result<()> {
         self.control
@@ -457,6 +652,12 @@ fn snapshot(s: &State) -> TerminalSnapshot {
     }
 }
 #[cfg(test)]
+#[path = "terminal/coalescing_tests.rs"]
+mod coalescing_tests;
+#[cfg(test)]
+#[path = "terminal/measurement.rs"]
+mod measurement;
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -472,7 +673,6 @@ mod tests {
     }
     #[test]
     fn parser_handles_colors_wide_characters_and_history() {
-        let (tx, _) = mpsc::sync_channel(8);
         let mut s = State {
             term: Term::new(
                 Config::default(),
@@ -480,7 +680,7 @@ mod tests {
                     columns: 10,
                     rows: 2,
                 },
-                Listener(tx),
+                Listener::default(),
             ),
             title: String::new(),
             search_status: String::new(),

@@ -386,15 +386,23 @@ impl Workbench {
         } else {
             "Record voice"
         };
-        button("record-voice-composer", label)
-            .on_click(cx.listener(move |view, _, _, cx| {
-                if active {
-                    view.speech_record_stop(cx);
-                } else {
-                    view.speech_record_start(cx);
-                }
-            }))
-            .into_any_element()
+        icon_button(
+            "record-voice-composer",
+            label,
+            if active {
+                gpui_kit::component::IconName::Square
+            } else {
+                gpui_kit::component::IconName::Mic
+            },
+        )
+        .on_click(cx.listener(move |view, _, _, cx| {
+            if active {
+                view.speech_record_stop(cx);
+            } else {
+                view.speech_record_start(cx);
+            }
+        }))
+        .into_any_element()
     }
     pub(super) fn speech_card(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut panel=card().child(div().font_weight(FontWeight::MEDIUM).child("Voice"))

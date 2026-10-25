@@ -78,7 +78,7 @@ mod tasks;
 mod workspace_pages;
 use crate::{
     state::{TurnState, message},
-    terminal_view::TerminalView,
+    terminal_workspace::{TerminalWorkspace, TerminalWorkspaceEvent},
     ui::*,
 };
 use gpui_kit::base::text::TextView;
@@ -226,7 +226,8 @@ pub struct Workbench {
     file_browser: FileBrowserUi,
     artifacts: Vec<PathBuf>,
     diff: String,
-    terminal: Option<Entity<TerminalView>>,
+    terminal: Option<Entity<TerminalWorkspace>>,
+    terminal_subscription: Option<Subscription>,
     terminal_visible: bool,
     terminal_starting: bool,
     provider_name: Entity<InputState>,
@@ -400,6 +401,7 @@ impl Workbench {
             artifacts: vec![],
             diff: String::new(),
             terminal: None,
+            terminal_subscription: None,
             terminal_visible: false,
             terminal_starting: false,
             provider_name: input("Provider name", window, cx),
@@ -1225,7 +1227,10 @@ impl Workbench {
         self.detach_editor_assist();
         self.editor_path = None;
         self.editor_dirty = false;
-        self.terminal = None;
+        self.terminal_subscription = None;
+        if let Some(terminal) = self.terminal.take() {
+            terminal.update(cx, |terminal, cx| terminal.close_all(cx));
+        }
         self.terminal_visible = false;
         self.terminal_starting = false;
         self.host_call(cx, |h| h.open_workspace(path.clone()));
@@ -1259,8 +1264,44 @@ impl Workbench {
                     this.terminal_starting = false;
                     match result {
                         Ok((session, events)) => {
-                            this.terminal =
-                                Some(cx.new(|cx| TerminalView::new(session, events, window, cx)))
+                            let terminal = cx.new(|cx| {
+                                TerminalWorkspace::new(
+                                    requested.clone(),
+                                    session,
+                                    events,
+                                    window,
+                                    cx,
+                                )
+                            });
+                            this.terminal_subscription = Some(cx.subscribe_in(
+                                &terminal,
+                                window,
+                                |this, source, event, window, cx| {
+                                    if this.terminal.as_ref().map(Entity::entity_id)
+                                        != Some(source.entity_id())
+                                    {
+                                        return;
+                                    }
+                                    match event {
+                                        TerminalWorkspaceEvent::Empty => {
+                                            this.terminal = None;
+                                            this.terminal_subscription = None;
+                                            this.terminal_visible = false;
+                                            this.persist_ui(cx);
+                                        }
+                                        TerminalWorkspaceEvent::AssistRequested { prompt } => {
+                                            this.terminal_assistance_chat(
+                                                prompt.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                    cx.notify();
+                                },
+                            ));
+                            terminal.update(cx, |terminal, cx| terminal.focus_active(window, cx));
+                            this.terminal = Some(terminal);
                         }
                         Err(error) => this.error = Some(error.to_string()),
                     }

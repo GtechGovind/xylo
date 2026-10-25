@@ -9,6 +9,8 @@ mod production_ui;
 mod state;
 #[path = "../src/terminal_view.rs"]
 mod terminal_view;
+#[path = "../src/terminal_workspace.rs"]
+mod terminal_workspace;
 mod ui {
     pub use super::production_ui::*;
     use gpui_kit::{TestSupportExt, prelude::*, *};
@@ -82,7 +84,7 @@ fn render() {
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(window.try_find_by_label("New Chat").is_some());
-        assert!(window.try_find_by_label("↑").is_some());
+        assert!(window.try_find_by_label("Send message").is_some());
     })
     .unwrap();
     let output = std::env::var_os("WORKBENCH_RENDER_DIR")
