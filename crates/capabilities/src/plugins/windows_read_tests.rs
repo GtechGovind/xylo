@@ -65,6 +65,40 @@ fn real_local_file_reads_support_unicode_and_canonical_workspace_roots() {
 }
 
 #[test]
+fn directory_authorities_and_regular_files_use_compatible_nt_open_modes() {
+    let fixture = Fixture::new();
+    let nested = fixture.config.workspace.join("authority-child");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("fact.txt"), "retained directory authority").unwrap();
+    let cancel = CancellationToken::new();
+    let authority = open_authority(
+        &drive_path(&fixture.config.workspace).unwrap(),
+        &cancel,
+        None,
+    )
+    .expect("Volume and ancestor directories must accept the directory NT open mode");
+    let directory = open_relative(authority.directory(), OsStr::new("authority-child"), true)
+        .expect("A relative directory must accept the directory NT open mode");
+    let mut file = open_relative(&directory, OsStr::new("fact.txt"), false)
+        .expect("A regular file must retain its separate NT open mode");
+    let mut content = String::new();
+    file.read_to_string(&mut content).unwrap();
+    assert_eq!(content, "retained directory authority");
+    assert!(
+        std::fs::rename(&nested, fixture.config.workspace.join("moved")).is_err(),
+        "The valid directory open mode must still deny ancestor replacement"
+    );
+    assert!(
+        std::fs::write(nested.join("fact.txt"), "replacement").is_err(),
+        "The valid file open mode must still deny concurrent writes"
+    );
+    drop(file);
+    drop(directory);
+    drop(authority);
+    std::fs::rename(&nested, fixture.config.workspace.join("moved")).unwrap();
+}
+
+#[test]
 fn namespace_stream_device_and_traversal_aliases_are_refused_before_io() {
     let workspace = drive_path(Path::new("C:\\work")).unwrap();
     for raw in [

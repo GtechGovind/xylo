@@ -120,13 +120,15 @@ fn native_open(parent: Option<&File>, name: &OsStr, directory: bool) -> Result<F
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_OPEN,
             FILE_OPEN_REPARSE_POINT
-                | FILE_OPEN_NO_RECALL
                 | FILE_SYNCHRONOUS_IO_NONALERT
                 | FILE_COMPLETE_IF_OPLOCKED
                 | if directory {
                     FILE_DIRECTORY_FILE
                 } else {
-                    FILE_NON_DIRECTORY_FILE
+                    // NO_RECALL is invalid with DIRECTORY_FILE. Directory
+                    // attributes still reject offline objects and reparse
+                    // points; regular files retain the no-recall request.
+                    FILE_NON_DIRECTORY_FILE | FILE_OPEN_NO_RECALL
                 },
             std::ptr::null(),
             0,

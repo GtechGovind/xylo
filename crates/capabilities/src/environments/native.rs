@@ -107,6 +107,7 @@ pub(super) async fn run_limit(
 ) -> Result<ProcessOutput> {
     process::run(spec(manager, record, args, timeout, limit)?, cancel).await
 }
+#[cfg(unix)]
 pub(super) async fn socket(
     manager: &Manager,
     id: Uuid,
@@ -119,14 +120,11 @@ pub(super) async fn socket(
         "{:x}",
         Sha256::digest(format!("{}:{installation}", manager.root.display()))
     );
-    #[cfg(unix)]
     let root = PathBuf::from("/tmp").join(format!(
         "workbench-{}-{}",
         unsafe { libc::geteuid() },
         &suffix[..12]
     ));
-    #[cfg(not(unix))]
-    let root = std::env::temp_dir().join(format!("workbench-{}", &suffix[..12]));
     storage::private_directory(&root)?;
     let path = root.join(format!("s-{}", id.simple()));
     ensure!(

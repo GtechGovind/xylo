@@ -151,13 +151,15 @@ fn native_open_mode(
                 FILE_OPEN
             },
             FILE_OPEN_REPARSE_POINT
-                | FILE_OPEN_NO_RECALL
                 | FILE_SYNCHRONOUS_IO_NONALERT
                 | FILE_COMPLETE_IF_OPLOCKED
                 | if directory {
+                    // NtCreateFile rejects FILE_OPEN_NO_RECALL with
+                    // FILE_DIRECTORY_FILE (STATUS_INVALID_PARAMETER).
+                    // Reparse/offline checks still apply to the opened handle.
                     FILE_DIRECTORY_FILE
                 } else {
-                    FILE_NON_DIRECTORY_FILE
+                    FILE_NON_DIRECTORY_FILE | FILE_OPEN_NO_RECALL
                 },
             std::ptr::null(),
             0,
@@ -469,6 +471,40 @@ pub(super) fn regular_pair(_file: &File) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn nested_directory_authority_keeps_ancestor_rename_fences() {
+        let temporary = tempfile::tempdir().unwrap();
+        let nested = temporary.path().join("ancestor/child");
+        std::fs::create_dir_all(&nested).unwrap();
+        let root = Authority::open(temporary.path()).unwrap();
+        let relative = root
+            .child("ancestor", false)
+            .unwrap()
+            .child("child", false)
+            .unwrap();
+        let absolute = Authority::open(&nested).unwrap();
+        assert!(relative.same(&absolute).unwrap());
+        assert!(absolute.child("..", false).is_err());
+        absolute
+            .file("captured.bin", true)
+            .unwrap()
+            .write_all(b"bounded output")
+            .unwrap();
+        let moved = temporary.path().join("moved");
+        assert!(std::fs::rename(temporary.path().join("ancestor"), &moved).is_err());
+        assert_eq!(
+            std::fs::read(nested.join("captured.bin")).unwrap(),
+            b"bounded output"
+        );
+        drop(absolute);
+        drop(relative);
+        std::fs::rename(temporary.path().join("ancestor"), &moved).unwrap();
+        assert_eq!(
+            std::fs::read(moved.join("child/captured.bin")).unwrap(),
+            b"bounded output"
+        );
+    }
 
     #[test]
     fn published_stream_can_be_verified_while_original_handle_is_live() {

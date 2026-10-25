@@ -1,0 +1,72 @@
+name: Windows filesystem regression checks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/capabilities/src/environments/capture_fs_windows.rs"
+      - "crates/capabilities/src/plugins/windows_read*.rs"
+      - "crates/capabilities/validation/windows-read/**"
+      - "crates/runtime/src/workspace/reader*.rs"
+      - "crates/runtime/validation/windows-workspace/**"
+      - ".github/workflows/windows-filesystem.yml"
+  pull_request:
+    paths:
+      - "crates/capabilities/src/environments/capture_fs_windows.rs"
+      - "crates/capabilities/src/plugins/windows_read*.rs"
+      - "crates/capabilities/validation/windows-read/**"
+      - "crates/runtime/src/workspace/reader*.rs"
+      - "crates/runtime/validation/windows-workspace/**"
+      - ".github/workflows/windows-filesystem.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-filesystem-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  authority:
+    if: github.event.repository.private == false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Pinned native Rust toolchain
+        run: |
+          rustup set default-host '${{ matrix.target }}'
+          rustup toolchain install 1.98.0 --profile minimal --component clippy
+          host=$(rustc --version --verbose | sed -n 's/^host: //p')
+          test "$host" = '${{ matrix.target }}'
+      # These import the production modules and execute their real NT handle
+      # operations without first compiling the desktop/browser/inference graph.
+      - name: Plugin and capture filesystem authority tests
+        run: cargo test --locked --manifest-path crates/capabilities/validation/windows-read/Cargo.toml --target '${{ matrix.target }}'
+      - name: Project filesystem reader tests
+        run: cargo test --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}'
+      - name: Strict platform-module Clippy
+        run: |
+          cargo clippy --locked --manifest-path crates/capabilities/validation/windows-read/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings

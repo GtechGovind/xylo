@@ -91,6 +91,7 @@ impl Client {
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().context("Start code intelligence")?;
+        #[cfg(unix)]
         let pid = child.id();
         let input = child
             .stdin

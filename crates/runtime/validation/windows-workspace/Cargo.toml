@@ -4,10 +4,16 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
-# Compile the actual platform file reader without a second GPUI/runtime graph.
+# Check and test the actual reader without a second GPUI/runtime graph.
 [workspace]
 
 [dependencies]
 anyhow = "=1.0.104"
 tokio-util = { version = "=0.7.20", features = ["rt"] }
 windows-sys = { version = "=0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_System_Ioctl", "Win32_System_SystemServices"] }

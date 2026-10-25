@@ -17,11 +17,14 @@ const OUTPUT_LIMIT: usize = 512 * 1024;
 
 /// A native command owns its descendants for its complete lifetime, including
 /// when the caller drops the execution future before cancellation completes.
-struct ProcessGroup(Option<u32>);
+struct ProcessGroup {
+    #[cfg(unix)]
+    pid: Option<u32>,
+}
 impl ProcessGroup {
     fn terminate(&self) {
         #[cfg(unix)]
-        if let Some(pid) = self.0 {
+        if let Some(pid) = self.pid {
             // SAFETY: a negative PID targets the process group created below;
             // it never targets the application's own process group.
             unsafe {
@@ -88,7 +91,10 @@ pub async fn run(
     let mut child = command
         .spawn()
         .with_context(|| format!("Start {program}"))?;
-    let group = ProcessGroup(child.id());
+    let group = ProcessGroup {
+        #[cfg(unix)]
+        pid: child.id(),
+    };
     let stdout = child.stdout.take().context("Missing stdout pipe")?;
     let stderr = child.stderr.take().context("Missing stderr pipe")?;
     let output = tokio::spawn(drain(stdout));
