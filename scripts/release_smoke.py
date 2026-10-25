@@ -24,6 +24,7 @@ sys.dont_write_bytecode = True
 from release_common import BINARIES, ROOT, TARGETS, digest, source_identity, workspace_version, write_json
 from release_metadata import checksums, validate_inventory
 from release_windows import validate_windows_imports
+from release_linux_notices import validate_linux_appimage, validate_linux_debian, validate_linux_report
 
 MAX_FRAME = 8 * 1024 * 1024
 
@@ -361,6 +362,24 @@ def smoke(output: Path, target: str) -> dict:
         if "windows" in target:
             validate_packaged_windows_imports(output, resources, target, records)
             passed.append("packaged_windows_crt_imports_validated")
+        if "linux" in target:
+            packaged_metadata = resources / "licenses/dependencies"
+            retained_metadata = output / "release-metadata"
+            images = list(output.glob("*.AppImage"))
+            if len(images) != 1:
+                raise ValueError("Expected one actual AppImage for Linux notice validation")
+            report = validate_linux_appimage(packaged_metadata, scratch / "squashfs-root", target, records, images[0])
+            if digest(packaged_metadata / "linux-native/inventory.json") != digest(retained_metadata / "linux-native/inventory.json"):
+                raise ValueError("Packaged Linux notice inventory differs from retained release metadata")
+            packages = list(output.glob("*.deb"))
+            if len(packages) != 1:
+                raise ValueError("Expected one actual Debian package for native notice validation")
+            report["debian"] = validate_linux_debian(retained_metadata, packages[0], target, scratch)
+            validate_linux_report(report, retained_metadata, target, records)
+            write_json(retained_metadata / "linux-native-validation.json", report, exclusive=True)
+            passed.append("packaged_linux_distro_native_notices_validated")
+            passed.append("packaged_linux_appimage_infrastructure_notices_validated")
+            passed.append("packaged_linux_debian_native_notices_validated")
         for name in BINARIES:
             version = subprocess.run([str(binaries / (name + suffix)), "--version"],
                                      capture_output=True, text=True, check=True, timeout=30).stdout
@@ -421,7 +440,7 @@ def smoke(output: Path, target: str) -> dict:
                  for path in sorted(output.iterdir()) if path.is_file() and path.name.endswith(extensions)]
     if len(artifacts) != len(extensions):
         raise ValueError("Missing or ambiguous native release artifacts")
-    return {"schema": 1, "target": target, "platform": TARGETS[target][0], "source": identity,
+    proof = {"schema": 1, "target": target, "platform": TARGETS[target][0], "source": identity,
             "cargo_lock_sha256": digest(ROOT / "Cargo.lock"), "checks": passed, "binaries": records,
             "artifacts": artifacts, "passed": True, "license_inventory_complete": True,
             "qualification": "native_package_smoke", "limitations": [
@@ -430,6 +449,9 @@ def smoke(output: Path, target: str) -> dict:
                 "Desktop profile creation and process liveness do not establish full Host initialization success.",
                 "Linux launches the extracted AppImage AppRun; FUSE mounting and Debian installation are not exercised.",
                 "No model weights, microphone recording, remote accounts or paid APIs are used."]}
+    if "linux" in target:
+        proof["linux_native_notices_report_sha256"] = digest(output / "release-metadata/linux-native-validation.json")
+    return proof
 
 
 def main():

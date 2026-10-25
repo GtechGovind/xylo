@@ -15,6 +15,7 @@ from release_preview import COMMON_CHECKS, create_draft, prepare, validate_resul
 from release_smoke import JsonProcess, binary_architecture
 from release import linux_dependencies
 from release_windows import PHASE
+from test_release_linux_notices import inventory_fixture
 
 COMMIT = "a" * 40
 
@@ -50,6 +51,9 @@ class PipelineTests(unittest.TestCase):
             if "linux" in target:
                 platform_checks.add("packaged_appimage_apprun_launch_alive_8s")
                 platform_checks.add("packaged_debian_control_validated")
+                platform_checks.add("packaged_linux_distro_native_notices_validated")
+                platform_checks.add("packaged_linux_appimage_infrastructure_notices_validated")
+                platform_checks.add("packaged_linux_debian_native_notices_validated")
             if "windows" in target:
                 platform_checks.add("packaged_windows_crt_imports_validated")
             proof = {"schema": 1, "target": target, "platform": platform, "source": source,
@@ -59,6 +63,10 @@ class PipelineTests(unittest.TestCase):
                                   for name in ["agent-workbench", "workbench-worker", "workbench-helper", "whisper-cli"]],
                      "artifacts": artifacts}
             write_json(folder / "qualification.json", proof)
+            if "linux" in target:
+                inventory_fixture(metadata, target, proof["binaries"])
+                proof["linux_native_notices_report_sha256"] = digest(metadata / "linux-native-validation.json")
+                write_json(folder / "qualification.json", proof)
             if "windows" in target:
                 # Offline report fixture, not an LLVM inspection or native run.
                 write_json(metadata / "windows-pe-imports.json", {
@@ -165,6 +173,29 @@ class PipelineTests(unittest.TestCase):
             write_json(path, proof)
             with self.assertRaisesRegex(ValueError, "incomplete"):
                 validate_results(root, COMMIT, lock)
+
+    def test_linux_native_notices_are_required_and_tied_to_copied_bytes_and_binaries(self):
+        for mutation in ("missing_check", "missing_report", "text", "report", "binary"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                lock = self.fixture(root)
+                folder = root / "x86_64-unknown-linux-gnu"
+                path = folder / "qualification.json"
+                proof = json.loads(path.read_text())
+                if mutation == "missing_check":
+                    proof["checks"].remove("packaged_linux_distro_native_notices_validated")
+                    write_json(path, proof)
+                elif mutation == "missing_report":
+                    (folder / "release-metadata/linux-native-validation.json").unlink()
+                elif mutation == "text":
+                    next((folder / "release-metadata/linux-native/texts").iterdir()).write_bytes(b"Tampered notice")
+                elif mutation == "report":
+                    (folder / "release-metadata/linux-native-validation.json").write_text("{}", encoding="utf-8", newline="\n")
+                else:
+                    proof["binaries"][0]["sha256"] = "c" * 64
+                    write_json(path, proof)
+                with self.assertRaises(ValueError):
+                    validate_results(root, COMMIT, lock)
 
     def test_windows_requires_import_proof_bound_to_installed_binaries(self):
         for mutation in ("missing_check", "missing_report", "different_binary", "forbidden_delay_import"):

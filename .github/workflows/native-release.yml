@@ -134,6 +134,9 @@ jobs:
         run: |
           cargo fmt --all --check
           python -m unittest discover -s scripts -p 'test_release*.py' -v
+      - name: Linux native dependency notice tool integration
+        if: runner.os == 'Linux'
+        run: python scripts/release_linux_notices_smoke.py --target '${{ matrix.target }}'
       # Run the actual platform authority modules before compiling the desktop
       # dependency graph. These fixtures still execute natively on each runner.
       - name: Windows file authority tests

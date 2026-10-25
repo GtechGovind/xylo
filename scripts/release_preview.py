@@ -20,6 +20,7 @@ sys.dont_write_bytecode = True
 from release_common import BINARIES, ROOT, TARGETS, digest, workspace_version, write_json
 from release_metadata import checksums, validate_inventory
 from release_windows import validate_windows_imports
+from release_linux_notices import read_json as read_linux_json, validate_linux_report
 
 COMMON_CHECKS = {"all_four_native_executable_machines", "packaged_license_inventory_complete", "native_asset_hashes",
                  "all_three_packaged_version_commands", "packaged_whisper_cli_help",
@@ -52,7 +53,8 @@ def validate_results(inputs: Path, commit: str, lock_sha256: str) -> list[tuple[
         checks = COMMON_CHECKS | ({"app_bundle_codesign_verified"} if "apple" in target else
                                   {"nsis_silent_install_executed", "packaged_windows_crt_imports_validated"} if "windows" in target else
                                   {"appimage_native_extraction_executed", "packaged_appimage_apprun_launch_alive_8s",
-                                   "packaged_debian_control_validated"})
+                                   "packaged_debian_control_validated", "packaged_linux_distro_native_notices_validated",
+                                   "packaged_linux_appimage_infrastructure_notices_validated", "packaged_linux_debian_native_notices_validated"})
         if (proof.get("schema") != 1 or proof.get("passed") is not True or proof.get("platform") != platform_id
                 or proof.get("qualification") != "native_package_smoke" or not checks.issubset(proof.get("checks", []))
                 or proof.get("license_inventory_complete") is not True
@@ -89,6 +91,11 @@ def validate_results(inputs: Path, commit: str, lock_sha256: str) -> list[tuple[
                 raise ValueError("Invalid native executable identity")
         if "windows" in target:
             validate_windows_imports(regular(metadata, "windows-pe-imports.json"), target, binaries)
+        if "linux" in target:
+            report_path = regular(metadata, "linux-native-validation.json")
+            if digest(report_path) != proof.get("linux_native_notices_report_sha256"):
+                raise ValueError("Linux native notice proof hash differs from its qualification")
+            validate_linux_report(read_linux_json(report_path), metadata, target, binaries)
         expected = {".dmg", ".app.tar.gz"} if "apple" in target else {".exe"} if "windows" in target else {".AppImage", ".deb"}
         seen = set()
         for artifact in proof.get("artifacts", []):
@@ -101,6 +108,14 @@ def validate_results(inputs: Path, commit: str, lock_sha256: str) -> list[tuple[
             seen.add(extension)
         if seen != expected:
             raise ValueError("Missing required native installer artifacts")
+        if "linux" in target:
+            notice_report = read_linux_json(metadata / "linux-native-validation.json")
+            image = notice_report["appimage"]
+            if image not in proof.get("artifacts", []):
+                raise ValueError("Linux notice proof belongs to a different AppImage artifact")
+            debian = {key: notice_report["debian"][key] for key in ("name", "sha256", "size_bytes")}
+            if debian not in proof.get("artifacts", []):
+                raise ValueError("Linux notice proof belongs to a different Debian artifact")
         found[target] = (root, proof)
     if set(found) != set(TARGETS):
         raise ValueError("All six native targets must pass before release preparation")

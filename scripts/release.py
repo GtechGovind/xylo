@@ -28,6 +28,7 @@ from release_common import (BINARIES, ROOT, TARGETS, build_env, digest, packager
 from release_manifest import validate_policy
 from release_metadata import checksums, generate, validate_inventory
 from release_windows import audit_windows_imports
+from release_linux_notices import collect_linux_notices, pinned_runtime
 
 
 def require(name: str) -> str:
@@ -285,6 +286,7 @@ def main() -> None:
     generate(args.target, notices, strict=strict)
     if "linux" in args.target:
         config["deb"]["depends"] = linux_dependencies(Path(config["binariesDir"]), native, config["deb"]["depends"])
+        collect_linux_notices(Path(config["binariesDir"]), native, notices, args.target)
     for file in (ROOT / "LICENSE", ROOT / "NOTICE"):
         shutil.copyfile(file, notices / file.name)
     config_path = output / "packager.resolved.json"
@@ -293,6 +295,8 @@ def main() -> None:
     package_env = os.environ.copy()
     package_env.pop("CARGO_PACKAGER_SIGN_PRIVATE_KEY", None)
     package_env.pop("CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD", None)
+    if "linux" in args.target:
+        package_env["LDAI_RUNTIME_FILE"] = str(pinned_runtime(notices, args.target, ROOT / "target/release-runtime-cache"))
     if production and "windows" in args.target:
         sign_windows(Path(config["binariesDir"]), native)
     if "windows" in args.target:
