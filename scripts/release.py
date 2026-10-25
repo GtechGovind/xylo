@@ -108,8 +108,11 @@ def sign_macos(bundle: Path, policy: dict) -> None:
 
 def configuration(target: str, output: Path, native: Path, notices: Path, *, production: bool) -> dict:
     config = json.loads((ROOT / "packager.json").read_text())
-    config.update(version=workspace_version(), binariesDir=str(ROOT / "target" / target / "release"),
-                  outDir=str(output), targetTriple=target)
+    # The pinned CLI's name autodetection changes directory to the config FILE
+    # when name is absent. Supply the stable Cargo identifier explicitly.
+    config.update(name="agent-workbench", version=workspace_version(),
+                  binariesDir=str(ROOT / "target" / target / "release"),
+                  outDir=str(output), targetTriple=target, licenseFile=str(ROOT / "LICENSE"))
     config["icons"] = [str(ROOT / "packaging/icons/app.png"), str(ROOT / "packaging/icons/app.ico"),
                        str(ROOT / "packaging/icons/app.icns")]
     for resource in config["resources"]:
@@ -135,6 +138,29 @@ def configuration(target: str, output: Path, native: Path, notices: Path, *, pro
                           "depends": ["libasound2t64", "libfontconfig1", "libxkbcommon-x11-0", "libvulkan1", "libssl3t64",
                                       "libpipewire-0.3-0", "libgbm1", "libwayland-client0", "libx11-xcb1"]}
     return config
+
+
+def preflight_configuration(executable: str, config: dict) -> None:
+    """Exercise the real pinned parser without selecting or packaging any app.
+
+    0.11.8 exits 1 with a specific no-selection diagnostic after successful
+    parsing. An I/O/serde failure (including its ENOTDIR name-autodetection bug)
+    is a different diagnostic and must never count as a successful preflight.
+    """
+    selector = "__xylo_config_preflight_no_package__"
+    if config.get("name") == selector:
+        raise ValueError("Configuration must not match the parser-only selector")
+    with tempfile.TemporaryDirectory(prefix="xylo-packager-config-") as directory:
+        path = Path(directory) / "packager.resolved.json"
+        write_json(path, config)
+        result = subprocess.run([executable, "--config", str(path), "--packages", selector],
+                                cwd=ROOT, text=True, capture_output=True, timeout=30)
+        diagnostic = (result.stdout + "\n" + result.stderr).strip()
+        expected = ("Couldn't detect a valid configuration file or all configurations are disabled! "
+                    "Nothing to do here.")
+        if result.returncode != 1 or diagnostic != "ERROR " + expected:
+            raise ValueError("Pinned packager configuration parsing failed; no app was packaged. "
+                             + diagnostic[:2048])
 
 
 def linux_dependencies(binaries: Path, native: Path, configured: list[str]) -> list[str]:
@@ -174,7 +200,9 @@ def main() -> None:
     parser.add_argument("--policy", type=Path, default=ROOT / "packaging/update-policy.json")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--native-assets", type=Path)
-    parser.add_argument("--plan", action="store_true", help="Write/print the plan without compiling or signing")
+    inspection = parser.add_mutually_exclusive_group()
+    inspection.add_argument("--plan", action="store_true", help="Print the plan without compiling or signing")
+    inspection.add_argument("--preflight", action="store_true", help="Parse config with the pinned CLI; do not compile or package")
     args = parser.parse_args()
     production = args.mode == "production"
     strict = args.mode != "development"
@@ -185,14 +213,14 @@ def main() -> None:
         if identity["dirty"] or not identity["commit"]:
             raise ValueError("Production requires a committed, clean source tree and a fresh locked build")
         policy = validate_policy(args.policy)
-        if not args.plan:
+        if not (args.plan or args.preflight):
             require("CARGO_PACKAGER_SIGN_PRIVATE_KEY")
     else:
         policy = json.loads(args.policy.read_text())
         if policy.get("enabled"):
             raise ValueError("Development/preview packages must embed a disabled update policy")
     output = (args.output or ROOT / "dist" / f"{workspace_version()}-{args.target}-{args.mode}").resolve()
-    if output.exists() and not args.plan:
+    if output.exists() and not (args.plan or args.preflight):
         raise ValueError("Use a fresh output directory; release outputs are immutable")
     native = (args.native_assets or ROOT / "target" / args.target / "release/native-assets").resolve()
     notices = output / "release-metadata"
@@ -202,6 +230,10 @@ def main() -> None:
             "update_policy_sha256": digest(args.policy)}
     if args.plan:
         print(json.dumps(plan, indent=2, sort_keys=True))
+        return
+    if args.preflight:
+        preflight_configuration(packager(), config)
+        print(f"Pinned packager parsed the resolved {args.target} configuration; no compilation or packaging was requested.")
         return
     expected_os = "Darwin" if "apple" in args.target else "Windows" if "windows" in args.target else "Linux"
     if platform.system() != expected_os:

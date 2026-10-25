@@ -11,9 +11,10 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-from release import archive_bundle, configuration, rehash_native_assets
+from release import archive_bundle, configuration, preflight_configuration, rehash_native_assets
 from release_common import ROOT, digest
 from release_manifest import allowed_url, validate_policy
 
@@ -77,6 +78,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(windows["windows"]["allowDowngrades"])
         self.assertEqual(windows["nsis"]["installMode"], "currentUser")
         for config in (mac, linux, windows):
+            self.assertEqual(config["name"], "agent-workbench")
+            self.assertEqual(Path(config["licenseFile"]), ROOT / "LICENSE")
+            self.assertTrue(Path(config["licenseFile"]).is_absolute())
             self.assertEqual(config["productName"], "Xylo")
             self.assertEqual(config["identifier"], "com.qurkos.xylo")
             self.assertEqual([binary["path"] for binary in config["binaries"]],
@@ -90,6 +94,33 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(info["CFBundleExecutable"], "agent-workbench")
         self.assertEqual(info["CFBundleIconFile"], "app.icns")
         self.assertIn(str(ROOT / "packaging/icons/app.icns"), mac["icons"])
+
+    def test_real_cli_preflight_accepts_only_its_deliberate_no_selection_diagnostic(self):
+        expected = "Couldn't detect a valid configuration file or all configurations are disabled! Nothing to do here."
+        config = configuration("aarch64-pc-windows-msvc", Path("/out"), Path("/native"), Path("/notices"), production=False)
+        observed = []
+
+        def command(args, **options):
+            self.assertEqual(args[0:2], ["pinned-cargo-packager", "--config"])
+            self.assertEqual(args[3:], ["--packages", "__xylo_config_preflight_no_package__"])
+            self.assertEqual(options["timeout"], 30)
+            path = Path(args[2])
+            parsed = json.loads(path.read_text())
+            self.assertEqual(parsed["name"], "agent-workbench")
+            self.assertEqual(parsed["licenseFile"], str(ROOT / "LICENSE"))
+            observed.append(path)
+            return type("Result", (), {"returncode": 1, "stdout": "", "stderr": "ERROR " + expected})()
+
+        with patch("release.subprocess.run", side_effect=command):
+            preflight_configuration("pinned-cargo-packager", config)
+        self.assertFalse(observed[0].exists(), "Parser fixture must be cleaned up")
+        for code, diagnostic in [(0, "ERROR " + expected), (2, "ERROR " + expected),
+                                 (1, "ERROR I/O Error: Not a directory"), (1, "ERROR Failed to parse config"),
+                                 (1, "ERROR another failure\nERROR " + expected), (1, "")]:
+            result = type("Result", (), {"returncode": code, "stdout": diagnostic, "stderr": ""})()
+            with self.subTest(code=code, diagnostic=diagnostic), patch("release.subprocess.run", return_value=result):
+                with self.assertRaisesRegex(ValueError, "parsing failed"):
+                    preflight_configuration("pinned-cargo-packager", config)
 
     def test_packaged_icon_formats_and_original_master_provenance(self):
         def png_dimensions(data):

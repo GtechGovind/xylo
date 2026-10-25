@@ -8,7 +8,22 @@ script_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 output=${1:-"$script_root/target/debug/native-assets/whisper-runtime"}
 case "$output" in /*) ;; *) output="$PWD/$output" ;; esac
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/workbench-native-assets.XXXXXX")
-trap 'rm -rf "$scratch"' EXIT
+build_completed=false
+cleanup() {
+  local result=$?
+  trap - EXIT
+  # Bash 3.2 can report status zero after a nounset expansion abort. A successful
+  # exit requires reaching the final manifest, not just a zero trap status.
+  if [[ "$result" -eq 0 && "$build_completed" != true ]]; then
+    printf '%s\n' 'Native component preparation stopped before completion' >&2
+    result=1
+  fi
+  if ! rm -rf "$scratch"; then
+    if [[ "$result" -eq 0 ]]; then result=1; fi
+  fi
+  exit "$result"
+}
+trap cleanup EXIT
 curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 --retry 2 \
   "https://codeload.github.com/ggml-org/whisper.cpp/tar.gz/$revision" -o "$scratch/source.tar.gz"
 actual=$(cmake -E sha256sum "$scratch/source.tar.gz")
@@ -20,12 +35,13 @@ source_dir="$scratch/whisper.cpp-$revision"
 # keeps build-time memory bounded; runtime inference uses adaptive resources.
 jobs=${NATIVE_BUILD_JOBS:-2}
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { printf '%s\n' 'NATIVE_BUILD_JOBS must be a positive integer' >&2; exit 1; }
-cmake_platform=()
+# Keep this array nonempty: Bash 3.2 treats an empty array as unset under -u.
+cmake_arguments=(-DCMAKE_BUILD_TYPE=Release)
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     case "${CARGO_BUILD_TARGET:-${PROCESSOR_ARCHITECTURE:-}}" in
-      aarch64-*|ARM64|arm64) cmake_platform=(-A ARM64) ;;
-      x86_64-*|AMD64|amd64) cmake_platform=(-A x64) ;;
+      aarch64-*|ARM64|arm64) cmake_arguments+=(-A ARM64) ;;
+      x86_64-*|AMD64|amd64) cmake_arguments+=(-A x64) ;;
       *) printf '%s\n' 'Set CARGO_BUILD_TARGET to the native Windows ARM64/x64 target' >&2; exit 1 ;;
     esac
     ;;
@@ -34,8 +50,7 @@ esac
 # static preview runtime intentionally keeps a portable SSE2 CPU baseline.
 # ARM NEON/Metal remain available. Multi-variant shared backend loading requires
 # separate loader/packaging qualification; no unmeasured acceleration claim.
-cmake -S "$source_dir" -B "$scratch/build" -DCMAKE_BUILD_TYPE=Release \
-  "${cmake_platform[@]}" \
+cmake -S "$source_dir" -B "$scratch/build" "${cmake_arguments[@]}" \
   -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_SERVER=OFF \
   -DWHISPER_CURL=OFF -DWHISPER_SDL2=OFF -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
   -DGGML_SSE42=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_BMI2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF \
@@ -68,3 +83,4 @@ done
 printf ']}\n' >> "$manifest"
 mv "$manifest" "$output/manifest.json"
 printf 'Verified native component prepared at %s\n' "$output"
+build_completed=true

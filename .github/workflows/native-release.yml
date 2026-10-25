@@ -126,6 +126,10 @@ jobs:
         with:
           path: .release-tools
           key: ${{ steps.packager-cache.outputs.cache-primary-key }}
+      - name: Parse resolved configuration with the actual pinned packager (no packaging)
+        env:
+          WORKBENCH_PACKAGER: ${{ github.workspace }}/.release-tools/bin/cargo-packager${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: python scripts/release.py --target '${{ matrix.target }}' --mode preview --preflight
       - name: Source and updater checks
         run: |
           cargo fmt --all --check
