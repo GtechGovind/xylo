@@ -17,7 +17,7 @@ import sys
 import zipfile
 
 sys.dont_write_bytecode = True
-from release_common import BINARIES, ROOT, TARGETS, digest, workspace_version, write_json
+from release_common import BINARIES, ROOT, TARGETS, capture_utf8, digest, workspace_version, write_json
 from release_metadata import checksums, validate_inventory
 from release_windows import validate_windows_imports
 from release_linux_notices import read_json as read_linux_json, validate_linux_report
@@ -45,7 +45,7 @@ def validate_results(inputs: Path, commit: str, lock_sha256: str) -> list[tuple[
         if len(found) >= len(TARGETS):
             raise ValueError("Duplicate or excessive native qualifications")
         root = path.parent
-        proof = json.loads(regular(root, "qualification.json").read_text())
+        proof = json.loads(regular(root, "qualification.json").read_text(encoding="utf-8"))
         target = proof.get("target")
         if target not in TARGETS or target in found:
             raise ValueError("Unknown/duplicate native qualification target")
@@ -61,8 +61,8 @@ def validate_results(inputs: Path, commit: str, lock_sha256: str) -> list[tuple[
                 or proof.get("cargo_lock_sha256") != lock_sha256
                 or proof.get("source", {}).get("commit") != commit or proof["source"].get("dirty") is not False):
             raise ValueError("Native qualification is incomplete or belongs to another source")
-        status = json.loads(regular(root, "release-status.json").read_text())
-        plan = json.loads(regular(root, "build-plan.json").read_text())
+        status = json.loads(regular(root, "release-status.json").read_text(encoding="utf-8"))
+        plan = json.loads(regular(root, "build-plan.json").read_text(encoding="utf-8"))
         if plan.get("source") != proof["source"] or plan.get("target") != target or plan.get("mode") != "preview":
             raise ValueError("Package plan does not match the qualified source/target")
         if (status.get("mode") != "preview" or status.get("license_inventory_complete") is not True
@@ -70,15 +70,15 @@ def validate_results(inputs: Path, commit: str, lock_sha256: str) -> list[tuple[
                 or status.get("os_signed") is not False):
             raise ValueError("Expected a complete unsigned preview with disabled updater")
         metadata = root / "release-metadata"
-        provenance = json.loads(regular(metadata, "build-provenance.json").read_text())
+        provenance = json.loads(regular(metadata, "build-provenance.json").read_text(encoding="utf-8"))
         if (provenance.get("commit") != commit or provenance.get("dirty") is not False
                 or provenance.get("target") != target or provenance.get("cargo_lock_sha256") != lock_sha256):
             raise ValueError("Dependency provenance differs from its qualified source")
         validate_inventory(metadata, strict=True)
-        inventory = json.loads(regular(metadata, "licenses.json").read_text())
+        inventory = json.loads(regular(metadata, "licenses.json").read_text(encoding="utf-8"))
         if not inventory.get("packages"):
             raise ValueError("Release inventory must cover actual delivered dependencies")
-        sbom = json.loads(regular(metadata, "sbom.cdx.json").read_text())
+        sbom = json.loads(regular(metadata, "sbom.cdx.json").read_text(encoding="utf-8"))
         if sbom.get("bomFormat") != "CycloneDX" or not sbom.get("components"):
             raise ValueError("Missing dependency SBOM")
         binaries = proof.get("binaries", [])
@@ -175,7 +175,7 @@ def prepare(inputs: Path, output: Path, commit: str, version: str) -> dict:
              "The current bundled ONNX runtime setup is unavailable on macOS Intel; full-text memory search remains available.\n\n"
              "Each platform has a metadata ZIP with complete dependency license texts, SBOM, source/SDK provenance and native smoke results. "
              f"Source commit: `{commit}`. Verify downloads with `SHA256SUMS`.\n")
-    (output / "RELEASE_NOTES.md").write_text(notes, encoding="utf-8")
+    (output / "RELEASE_NOTES.md").write_text(notes, encoding="utf-8", newline="\n")
     checksums(output)
     return manifest
 
@@ -183,8 +183,8 @@ def prepare(inputs: Path, output: Path, commit: str, version: str) -> dict:
 def create_draft(output: Path, manifest: dict, repository: str):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("Use an exact GitHub owner/repository")
-    result = subprocess.run(["gh", "repo", "view", repository, "--json", "visibility,nameWithOwner"],
-                            text=True, capture_output=True, check=True, timeout=60)
+    result = capture_utf8(["gh", "repo", "view", repository, "--json", "visibility,nameWithOwner"],
+                            check=True, timeout=60)
     identity = json.loads(result.stdout)
     if identity.get("visibility") != "PUBLIC" or identity.get("nameWithOwner", "").lower() != repository.lower():
         raise ValueError("This preview workflow only publishes artifacts for public repositories")
@@ -193,8 +193,8 @@ def create_draft(output: Path, manifest: dict, repository: str):
     if exists.returncode == 0:
         raise ValueError("Refusing to replace an existing release or draft")
     # An existing tag must already point at this exact commit; never move tags.
-    tag = subprocess.run(["gh", "api", f"repos/{repository}/git/matching-refs/tags/{manifest['tag']}"],
-                         text=True, capture_output=True, check=True, timeout=60)
+    tag = capture_utf8(["gh", "api", f"repos/{repository}/git/matching-refs/tags/{manifest['tag']}"],
+                         check=True, timeout=60)
     matches = [entry for entry in json.loads(tag.stdout) if entry.get("ref") == "refs/tags/" + manifest["tag"]]
     if matches:
         item = matches[0]["object"]

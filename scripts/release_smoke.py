@@ -21,7 +21,7 @@ import uuid
 import zipfile
 
 sys.dont_write_bytecode = True
-from release_common import BINARIES, ROOT, TARGETS, digest, source_identity, workspace_version, write_json
+from release_common import BINARIES, ROOT, TARGETS, capture_utf8, digest, source_identity, workspace_version, write_json
 from release_metadata import checksums, validate_inventory
 from release_windows import validate_windows_imports
 from release_linux_notices import validate_linux_appimage, validate_linux_debian, validate_linux_report
@@ -124,9 +124,9 @@ def validate_debian_control(output: Path, target: str, configuration: dict) -> N
         raise ValueError("Resolved package authors must supply a nonempty Debian Maintainer")
     expected = {"package": "xylo", "version": workspace_version(),
                 "architecture": architectures[target], "maintainer": ", ".join(authors)}
-    result = subprocess.run(["dpkg-deb", "--field", str(packages[0]),
+    result = capture_utf8(["dpkg-deb", "--field", str(packages[0]),
                              "Package", "Version", "Architecture", "Maintainer"],
-                            capture_output=True, text=True, encoding="utf-8", check=True, timeout=30)
+                            check=True, timeout=30)
     if len(result.stdout) > 64 * 1024:
         raise ValueError("Debian control fields exceed their inspection budget")
     # dpkg-deb emits RFC822 field names when multiple fields are requested.
@@ -309,8 +309,8 @@ def validate_packaged_windows_imports(output: Path, resources: Path, target: str
 
 def smoke(output: Path, target: str) -> dict:
     identity = source_identity()
-    plan = json.loads((output / "build-plan.json").read_text())
-    status = json.loads((output / "release-status.json").read_text())
+    plan = json.loads((output / "build-plan.json").read_text(encoding="utf-8"))
+    status = json.loads((output / "release-status.json").read_text(encoding="utf-8"))
     if identity["dirty"] or not identity["commit"] or plan["source"] != identity:
         raise ValueError("Smoke source differs from the clean package build")
     if plan["target"] != target or status["mode"] != "preview" or status["updater_feed_enabled"]:
@@ -344,7 +344,7 @@ def smoke(output: Path, target: str) -> dict:
             resources = inventories[0].parent.parent.parent
         validate_inventory(resources / "licenses/dependencies", strict=True)
         asset_root = (binaries.parent / "Resources/native-assets" if "apple" in target else binaries / "native-assets")
-        manifest = json.loads((asset_root / "whisper-runtime/manifest.json").read_text())
+        manifest = json.loads((asset_root / "whisper-runtime/manifest.json").read_text(encoding="utf-8"))
         for entry in manifest["files"]:
             relative = Path(entry["path"])
             if relative.is_absolute() or ".." in relative.parts:
@@ -381,8 +381,8 @@ def smoke(output: Path, target: str) -> dict:
             passed.append("packaged_linux_appimage_infrastructure_notices_validated")
             passed.append("packaged_linux_debian_native_notices_validated")
         for name in BINARIES:
-            version = subprocess.run([str(binaries / (name + suffix)), "--version"],
-                                     capture_output=True, text=True, check=True, timeout=30).stdout
+            version = capture_utf8([str(binaries / (name + suffix)), "--version"],
+                                     check=True, timeout=30).stdout
             if "Xylo" not in version:
                 raise ValueError("Packaged executable did not report its product version")
         passed.append("all_three_packaged_version_commands")

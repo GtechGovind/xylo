@@ -62,7 +62,7 @@ def generate(target: str, output: Path, *, strict: bool) -> None:
     packages = sorted((p for p in metadata["packages"] if p["id"] in included),
                       key=lambda p: (p["name"], p["version"], p["id"]))
     output.mkdir(parents=True, exist_ok=True)
-    lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
+    lock = tomllib.loads((ROOT / "Cargo.lock").read_text(encoding="utf-8"))
     checksums = {(p["name"], p["version"], p.get("source")): p.get("checksum")
                  for p in lock["package"]}
     supplements = LicenseSupplements(ROOT / "packaging/licenses")
@@ -140,7 +140,7 @@ def generate(target: str, output: Path, *, strict: bool) -> None:
 
 def validate_inventory(directory: Path, *, strict: bool = False) -> None:
     """Validate the actual copied bytes and retain honest unresolved coverage."""
-    inventory = json.loads(regular(directory, "licenses.json").read_text())
+    inventory = json.loads(regular(directory, "licenses.json").read_text(encoding="utf-8"))
     missing = []
     proofs = {}
     if "supplements" in inventory:
@@ -148,7 +148,7 @@ def validate_inventory(directory: Path, *, strict: bool = False) -> None:
         provenance_path = regular(directory, "license-supplements.json")
         if digest(provenance_path) != identity["provenance_sha256"]:
             raise ValueError("Packaged license provenance hash mismatch")
-        provenance = json.loads(provenance_path.read_text())
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         if provenance["catalogue_sha256"] != identity["catalogue_sha256"] or provenance["applied_packages"] != identity["applied_packages"] or len(provenance["packages"]) != identity["applied_packages"]:
             raise ValueError("Packaged license provenance catalogue/count mismatch")
         for entry in provenance["packages"]:
@@ -263,7 +263,7 @@ def checksums(directory: Path) -> None:
     # Exclude directories, temporary files, and this file itself.
     artifacts = sorted(path for path in directory.iterdir()
                        if path.is_file() and path.name != "SHA256SUMS")
-    (directory / "SHA256SUMS").write_text("".join(f"{digest(p)}  {p.name}\n" for p in artifacts))
+    (directory / "SHA256SUMS").write_text("".join(f"{digest(p)}  {p.name}\n" for p in artifacts), encoding="utf-8", newline="\n")
 
 
 if __name__ == "__main__":

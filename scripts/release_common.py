@@ -22,11 +22,28 @@ TARGETS = {
 }
 
 
+def capture_utf8(args: list[str | Path], **options) -> subprocess.CompletedProcess:
+    """Capture declared UTF-8 tool protocols, decoding after both pipes drain.
+
+    Windows text-mode subprocess readers decode on background threads. A decode
+    failure there can leave stdout unset instead of propagating the real error.
+    Binary pipes keep decoding strict and on this calling thread. Process
+    failures retain their original return code and captured bytes.
+    """
+    if {"text", "encoding", "errors", "universal_newlines"}.intersection(options):
+        raise ValueError("UTF-8 protocol capture requires binary subprocess pipes")
+    result = subprocess.run([str(arg) for arg in args], capture_output=True, **options)
+    result.stdout = result.stdout.decode("utf-8", errors="strict")
+    result.stderr = result.stderr.decode("utf-8", errors="strict")
+    return result
+
+
 def run(args: list[str | Path], *, env: dict | None = None, capture: bool = False) -> str:
     # Never print argv or environments: signing tools may receive identity data.
-    result = subprocess.run([str(arg) for arg in args], cwd=ROOT, env=env,
-                            text=True, check=True, capture_output=capture)
-    return result.stdout.strip() if capture else ""
+    if capture:
+        return capture_utf8(args, cwd=ROOT, env=env, check=True).stdout.strip()
+    subprocess.run([str(arg) for arg in args], cwd=ROOT, env=env, check=True)
+    return ""
 
 
 def digest(path: Path) -> str:
@@ -42,7 +59,7 @@ def write_json(path: Path, data: object, *, exclusive: bool = False) -> None:
 
 
 def workspace_version() -> str:
-    return tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+    return tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
 
 
 def source_identity() -> dict:

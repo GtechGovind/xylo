@@ -23,7 +23,7 @@ import tempfile
 import uuid
 
 sys.dont_write_bytecode = True
-from release_common import (BINARIES, ROOT, TARGETS, build_env, digest, packager,
+from release_common import (BINARIES, ROOT, TARGETS, build_env, capture_utf8, digest, packager,
                             run, source_identity, workspace_version, write_json)
 from release_manifest import validate_policy
 from release_metadata import checksums, generate, validate_inventory
@@ -61,7 +61,7 @@ def rehash_native_assets(root: Path) -> None:
     if not root.exists():
         return
     for path in sorted(root.glob("*/manifest.json")):
-        manifest = json.loads(path.read_text())
+        manifest = json.loads(path.read_text(encoding="utf-8"))
         for entry in manifest["files"]:
             relative = Path(entry["path"])
             if relative.is_absolute() or ".." in relative.parts:
@@ -111,7 +111,7 @@ def sign_macos(bundle: Path, policy: dict) -> None:
 
 
 def configuration(target: str, output: Path, native: Path, notices: Path, *, production: bool) -> dict:
-    config = json.loads((ROOT / "packager.json").read_text())
+    config = json.loads((ROOT / "packager.json").read_text(encoding="utf-8"))
     # The pinned CLI's name autodetection changes directory to the config FILE
     # when name is absent. Supply the stable Cargo identifier explicitly.
     config.update(name="agent-workbench", version=workspace_version(),
@@ -185,9 +185,9 @@ def preflight_configuration(executable: str, config: dict) -> None:
         # nested platform fields. No hooks, binaries, or resources on the sentinel.
         sentinel = {"name": selector, "formats": []}
         write_json(path, [config, sentinel])
-        result = subprocess.run([str(Path(executable).resolve()) if Path(executable).is_file() else executable,
+        result = capture_utf8([str(Path(executable).resolve()) if Path(executable).is_file() else executable,
                                  "--packages", selector],
-                                cwd=root, env=environment, text=True, capture_output=True, timeout=30)
+                                cwd=root, env=environment, timeout=30)
         diagnostic = (result.stdout + "\n" + result.stderr).strip()
         if sorted(root.iterdir()) != [path] or output_state() != before:
             raise ValueError("Pinned packager preflight changed output files; no installer is accepted")
@@ -201,11 +201,11 @@ def linux_dependencies(binaries: Path, native: Path, configured: list[str]) -> l
     with tempfile.TemporaryDirectory(prefix="xylo-shlibdeps-") as directory:
         work = Path(directory)
         (work / "debian").mkdir()
-        (work / "debian/control").write_text("Source: xylo\n\nPackage: xylo\nArchitecture: any\nDescription: Xylo native preview\n")
+        (work / "debian/control").write_text("Source: xylo\n\nPackage: xylo\nArchitecture: any\nDescription: Xylo native preview\n", encoding="utf-8", newline="\n")
         inputs = [binaries / name for name in BINARIES]
         inputs.append(native / "whisper-runtime/runtime/whisper-cli")
-        result = subprocess.run(["dpkg-shlibdeps", "-O", *["-e" + str(path.resolve()) for path in inputs]],
-                                cwd=work, text=True, capture_output=True, check=True, timeout=120)
+        result = capture_utf8(["dpkg-shlibdeps", "-O", *["-e" + str(path.resolve()) for path in inputs]],
+                                cwd=work, check=True, timeout=120)
         records = [line.removeprefix("shlibs:Depends=") for line in result.stdout.splitlines() if line.startswith("shlibs:Depends=")]
         if len(records) != 1 or not records[0].strip():
             raise ValueError("Could not determine Debian dependencies from the actual native executables")
@@ -253,7 +253,7 @@ def main() -> None:
         if not (args.plan or args.preflight):
             require("CARGO_PACKAGER_SIGN_PRIVATE_KEY")
     else:
-        policy = json.loads(args.policy.read_text())
+        policy = json.loads(args.policy.read_text(encoding="utf-8"))
         if policy.get("enabled"):
             raise ValueError("Development/preview packages must embed a disabled update policy")
     output = (args.output or ROOT / "dist" / f"{workspace_version()}-{args.target}-{args.mode}").resolve()

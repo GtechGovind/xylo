@@ -26,7 +26,7 @@ def allowed_url(url: str, policy: dict) -> None:
 
 
 def validate_policy(path: Path) -> dict:
-    policy = json.loads(path.read_text())
+    policy = json.loads(path.read_text(encoding="utf-8"))
     if not policy.get("enabled") or not policy.get("public_key"):
         raise ValueError("A real maintainer public key and enabled release policy are required")
     public_key = base64.b64decode(policy["public_key"], validate=True).decode()
@@ -47,7 +47,7 @@ def sign(path: Path, executable: str) -> str:
     env = os.environ.copy()
     env["RUST_LOG"] = "error"
     run([executable, "signer", "sign", path], env=env)
-    return signature.read_text().strip()
+    return signature.read_text(encoding="utf-8").strip()
 
 
 def create(policy_path: Path, artifacts: list[tuple[str, str, Path]], output: Path,
@@ -111,5 +111,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     created = create(args.policy.resolve(), [(p, f, Path(a).resolve()) for p, f, a in args.artifact],
                      args.output.resolve(), args.base_url, args.sequence,
-                     args.notes.read_text(), args.lifetime_hours)
+                     args.notes.read_text(encoding="utf-8"), args.lifetime_hours)
     print(f"Signed, verified immutable release: {created.name}. No files were published.")

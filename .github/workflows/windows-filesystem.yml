@@ -14,6 +14,8 @@ on:
       - "crates/resources/**"
       - "crates/services/src/learning/sanitize.rs"
       - "crates/notifications/**"
+      - "scripts/release*.py"
+      - "scripts/test_release*.py"
       - ".github/workflows/windows-filesystem.yml"
   pull_request:
     paths:
@@ -26,6 +28,8 @@ on:
       - "crates/resources/**"
       - "crates/services/src/learning/sanitize.rs"
       - "crates/notifications/**"
+      - "scripts/release*.py"
+      - "scripts/test_release*.py"
       - ".github/workflows/windows-filesystem.yml"
 
 permissions:
@@ -68,6 +72,8 @@ jobs:
           rustup toolchain install 1.98.0 --profile minimal --component clippy
           host=$(rustc --version --verbose | sed -n 's/^host: //p')
           test "$host" = '${{ matrix.target }}'
+      - name: UTF-8 release protocols and actual Cargo metadata
+        run: python -m unittest discover -s scripts -p test_release_common.py -v
       # These import the production modules and execute their real NT handle
       # operations without first compiling the desktop/browser/inference graph.
       - name: Plugin and capture filesystem authority tests

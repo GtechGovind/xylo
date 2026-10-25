@@ -253,7 +253,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(child.process.returncode, 0)
 
     def test_draft_creation_refuses_private_destination_before_any_write(self):
-        result = type("Result", (), {"stdout": json.dumps({"visibility": "PRIVATE", "nameWithOwner": "owner/repo"})})()
+        result = type("Result", (), {"stdout": json.dumps({"visibility": "PRIVATE", "nameWithOwner": "owner/repo"}).encode("utf-8"), "stderr": b""})()
         with patch("release_preview.subprocess.run", return_value=result) as command:
             with self.assertRaisesRegex(ValueError, "public"):
                 create_draft(Path("unused"), {"tag": "v0.1.0"}, "owner/repo")
@@ -261,7 +261,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(command.call_args.args[0][:3], ["gh", "repo", "view"])
 
     def test_debian_dependency_inventory_uses_all_four_real_executable_paths(self):
-        result = type("Result", (), {"stdout": "shlibs:Depends=libc6 (>= 2.38), libstdc++6 (>= 13)\n"})()
+        result = type("Result", (), {"stdout": b"shlibs:Depends=libc6 (>= 2.38), libstdc++6 (>= 13)\n", "stderr": b""})()
         with patch("release.subprocess.run", return_value=result) as command:
             dependencies = linux_dependencies(Path("/binaries"), Path("/native"), ["libvulkan1"])
             self.assertEqual(dependencies, ["libc6 (>= 2.38)", "libstdc++6 (>= 13)", "libvulkan1"])

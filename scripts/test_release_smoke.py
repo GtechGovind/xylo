@@ -250,11 +250,11 @@ class DebianControlTests(unittest.TestCase):
                 fields = (f"Package: xylo\nVersion: {workspace_version()}\nArchitecture: {architecture}\n"
                           f"Maintainer: {authors[0]},\n {authors[1]}\n")
                 with self.subTest(target=target), patch("release_smoke.subprocess.run") as run:
-                    run.return_value = subprocess.CompletedProcess([], 0, stdout=fields)
+                    run.return_value = subprocess.CompletedProcess([], 0, stdout=fields.encode("utf-8"), stderr=b"")
                     validate_debian_control(output, target, {"authors": authors})
                     run.assert_called_once_with(
                         ["dpkg-deb", "--field", str(package), "Package", "Version", "Architecture", "Maintainer"],
-                        capture_output=True, text=True, encoding="utf-8", check=True, timeout=30)
+                        capture_output=True, check=True, timeout=30)
 
     def test_empty_mismatched_missing_and_duplicate_fields_or_unusable_authors_are_refused(self):
         valid = f"Package: xylo\nVersion: {workspace_version()}\nArchitecture: amd64\nMaintainer: Test Author\n"
@@ -271,7 +271,7 @@ class DebianControlTests(unittest.TestCase):
             with patch("release_smoke.subprocess.run") as run:
                 for fields in invalid:
                     with self.subTest(fields=fields), self.assertRaises(ValueError):
-                        run.return_value = subprocess.CompletedProcess([], 0, stdout=fields)
+                        run.return_value = subprocess.CompletedProcess([], 0, stdout=fields.encode("utf-8"), stderr=b"")
                         validate_debian_control(output, "x86_64-unknown-linux-gnu", {"authors": ["Test Author"]})
                 run.reset_mock()
                 for authors in [None, [], "Author", [""], ["Author", 1], ["Author\nInjected"]]:

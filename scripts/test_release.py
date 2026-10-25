@@ -222,7 +222,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(parsed, [original, {"name": args[2], "formats": []}])
             self.assertNotEqual(parsed[0]["name"], parsed[1]["name"])
             observed.append(path)
-            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            return type("Result", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
 
         with patch("release.subprocess.run", side_effect=command):
             preflight_configuration("pinned-cargo-packager", config)
@@ -232,7 +232,7 @@ class ReleaseTests(unittest.TestCase):
         for code, diagnostic in [(1, "Nothing to do here"), (2, "invalid arguments"),
                                  (1, "ERROR I/O Error: Not a directory"), (1, "ERROR Failed to parse config"),
                                  (1, "ERROR failed to copy unbuilt executable"), (1, "")]:
-            result = type("Result", (), {"returncode": code, "stdout": diagnostic, "stderr": ""})()
+            result = type("Result", (), {"returncode": code, "stdout": diagnostic.encode("utf-8"), "stderr": b""})()
             with self.subTest(code=code, diagnostic=diagnostic), patch("release.subprocess.run", return_value=result):
                 with self.assertRaisesRegex(ValueError, "preflight failed"):
                     preflight_configuration("pinned-cargo-packager", config)
