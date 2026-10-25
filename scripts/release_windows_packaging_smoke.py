@@ -8,6 +8,7 @@ the application dependency graph is built. Its result never qualifies Xylo.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 
 sys.dont_write_bytecode = True
@@ -37,6 +39,51 @@ fn main() {
     }
 }
 '''
+
+
+def remove_fixture_directory(root: Path, *, timeout: float = 10) -> None:
+    """Retire only our temporary tree, awaiting bounded Windows file release.
+
+    NSIS has exited before this runs. Windows can still reject immediate
+    deletion of its uninstaller with sharing/access errors. Keep other errors
+    fatal, and retain the last OS cause if the owned tree stays inaccessible.
+    """
+    if (not root.name.startswith("xylo-windows-packaging-") or root.is_symlink()
+            or root.parent.resolve() != Path(tempfile.gettempdir()).resolve()):
+        raise ValueError("Refusing cleanup outside the owned packaging fixture directory")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            shutil.rmtree(root)
+            return
+        except FileNotFoundError:
+            if not root.exists():
+                return
+            raise
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in (5, 32, 33):
+                raise
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Owned Windows packaging fixture files stayed inaccessible after cleanup deadline") from error
+            time.sleep(0.1)
+
+
+@contextmanager
+def fixture_directory():
+    directory = Path(tempfile.mkdtemp(prefix="xylo-windows-packaging-"))
+    failure = None
+    try:
+        yield directory
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            remove_fixture_directory(directory)
+        except BaseException as error:
+            if failure is None:
+                raise
+            failure.add_note("Owned fixture cleanup also failed: " + repr(error))
 
 
 def run_tool(args: list[str | Path], log: Path, *, timeout: float,
@@ -149,8 +196,8 @@ def smoke(target: str, output: Path) -> dict:
               "packager": {"path": tool, "sha256": digest(Path(tool)), "version": "0.11.8"},
               "rustc": version, "source": source_identity(), "checks": []}
     write_json(output / "result.json", result)
-    with tempfile.TemporaryDirectory(prefix="xylo-windows-packaging-") as directory:
-        root = Path(directory) / "fixture inputs café"
+    with fixture_directory() as directory:
+        root = directory / "fixture inputs café"
         binaries, native, notices = root / "binaries", root / "native-assets", root / "notices"
         binaries.mkdir(parents=True)
         runtime = native / "whisper-runtime/runtime"
@@ -228,8 +275,9 @@ def smoke(target: str, output: Path) -> dict:
                 subprocess.run(command, executable=str(uninstaller), shell=False, check=True, timeout=60)
         result["checks"].append("fixture_uninstaller_executed")
         result["resources"] = expected_resources
-        result["passed"] = True
-        write_json(output / "result.json", result)
+    result["checks"].append("owned_fixture_directory_removed")
+    result["passed"] = True
+    write_json(output / "result.json", result)
     return result
 
 

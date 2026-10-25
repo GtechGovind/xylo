@@ -1,6 +1,7 @@
 """Portable guard tests; actual LLVM/NSIS execution belongs to native Windows CI."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -9,7 +10,7 @@ from unittest.mock import patch
 
 from release_common import BINARIES, digest
 from release_windows_packaging_smoke import (fixture_configuration, require_native_vm,
-                                             run_tool, verify_resources)
+                                             remove_fixture_directory, run_tool, verify_resources)
 
 
 class WindowsPackagingFixtureTests(unittest.TestCase):
@@ -78,6 +79,51 @@ class WindowsPackagingFixtureTests(unittest.TestCase):
                 run_tool([sys.executable, "-c", "import time; time.sleep(10)"],
                          root / "timeout.log", timeout=0.1)
             self.assertTrue((root / "timeout.log").is_file())
+
+    def test_owned_cleanup_retries_only_typed_transient_windows_access_failure(self):
+        root = Path(tempfile.mkdtemp(prefix="xylo-windows-packaging-"))
+        (root / "uninstall.exe").write_bytes(b"owned fixture bytes")
+        denied = PermissionError("Windows executable still held")
+        denied.winerror = 5
+        real_remove = shutil.rmtree
+        attempts = []
+
+        def attempt(path):
+            attempts.append(path)
+            if len(attempts) == 1:
+                raise denied
+            real_remove(path)
+
+        try:
+            with patch("release_windows_packaging_smoke.shutil.rmtree", side_effect=attempt), \
+                    patch("release_windows_packaging_smoke.time.sleep") as pause:
+                remove_fixture_directory(root)
+            self.assertEqual(attempts, [root, root])
+            pause.assert_called_once_with(0.1)
+            self.assertFalse(root.exists())
+        finally:
+            if root.exists():
+                real_remove(root)
+
+    def test_permanent_cleanup_failure_keeps_last_os_cause_and_other_errors_fail_immediately(self):
+        with tempfile.TemporaryDirectory(prefix="xylo-windows-packaging-") as directory:
+            root = Path(directory)
+            denied = PermissionError("Exact Windows sharing violation")
+            denied.winerror = 32
+            with patch("release_windows_packaging_smoke.shutil.rmtree", side_effect=denied) as remove, \
+                    patch("release_windows_packaging_smoke.time.sleep") as pause:
+                with self.assertRaises(TimeoutError) as caught:
+                    remove_fixture_directory(root, timeout=0)
+                self.assertIs(caught.exception.__cause__, denied)
+                remove.assert_called_once_with(root)
+                pause.assert_not_called()
+            other = PermissionError("Different unqualified filesystem failure")
+            with patch("release_windows_packaging_smoke.shutil.rmtree", side_effect=other), \
+                    patch("release_windows_packaging_smoke.time.sleep") as pause:
+                with self.assertRaises(PermissionError) as caught:
+                    remove_fixture_directory(root)
+                self.assertIs(caught.exception, other)
+                pause.assert_not_called()
 
 
 if __name__ == "__main__":
