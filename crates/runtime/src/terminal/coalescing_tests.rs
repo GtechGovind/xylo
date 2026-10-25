@@ -261,6 +261,11 @@ async fn closing_a_saturated_real_pty_reaps_the_child_and_releases_every_worker(
         .trim()
         .parse()
         .unwrap();
+    assert_eq!(
+        pid as u32,
+        lifecycle.owned_pid.load(Ordering::Acquire),
+        "The exec fixture must retain the supervisor-owned child identity"
+    );
     session.input(vec![b'x'; 2 * 1024 * 1024]).unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while !lifecycle.writing.load(Ordering::Acquire) {
@@ -295,7 +300,25 @@ async fn closing_a_saturated_real_pty_reaps_the_child_and_releases_every_worker(
         }
     })
     .await
-    .expect("Closing must reap the child and release blocked I/O and frame workers");
+    .unwrap_or_else(|error| {
+        // Signal zero is diagnostic evidence only; process termination above
+        // retains the Child object as its authority, never this numeric PID.
+        let pid_query = unsafe { libc::kill(pid, 0) };
+        let pid_error = (pid_query == -1)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        panic!(
+            "Closing must reap the child and release blocked I/O and frame workers: {error:?}; \
+             reaped={} reader_done={} control_done={} frames_done={} writing={} \
+             script_pid={pid} owned_child_pid={} kill_zero_result={pid_query} kill_zero_errno={pid_error:?}",
+            lifecycle.reaped.load(Ordering::Acquire),
+            lifecycle.reader_done.load(Ordering::Acquire),
+            lifecycle.control_done.load(Ordering::Acquire),
+            lifecycle.frames_done.load(Ordering::Acquire),
+            lifecycle.writing.load(Ordering::Acquire),
+            lifecycle.owned_pid.load(Ordering::Acquire),
+        );
+    });
     // This query is evidence only. Termination uses the retained Child object,
     // never a PID lookup as execution authority.
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);

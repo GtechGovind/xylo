@@ -109,7 +109,10 @@ pub(super) fn lock(
         };
         match result {
             Ok(()) => return Ok(Arc::new(file)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
                 ensure!(
                     wait && Instant::now() < deadline,
                     "Plugin is busy; stop its active run and retry this action"

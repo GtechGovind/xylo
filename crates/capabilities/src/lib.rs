@@ -499,7 +499,10 @@ mod tests {
                 .execute(name, &json!({}), CancellationToken::new())
                 .await
                 .unwrap_err();
-            assert!(error.to_string().contains("Unknown capability tool"));
+            assert!(
+                error.to_string().contains("Unknown capability tool"),
+                "Management control {name} was rejected at the wrong boundary: {error:#}"
+            );
         }
     }
 }

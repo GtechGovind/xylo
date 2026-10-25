@@ -357,12 +357,12 @@ async fn active_run_lease_blocks_revoke_update_and_remove() {
     )
     .unwrap();
     let args = json!({"operation_id":Uuid::new_v4(),"expected_revision":fixture.list().await.revision,"id":"fixture.echo","grants":[]});
+    let error = control(&fixture.config, "helper_plugin_set_grants", args.clone())
+        .await
+        .unwrap_err();
     assert!(
-        control(&fixture.config, "helper_plugin_set_grants", args.clone())
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("busy")
+        error.to_string().contains("busy"),
+        "An actual held run lease must report contention: {error:#}"
     );
     drop(loaded);
     control(&fixture.config, "helper_plugin_set_grants", args)

@@ -266,6 +266,7 @@ impl Drop for OwnedChild {
 #[cfg(all(test, unix))]
 #[derive(Default)]
 struct LifecycleProbe {
+    owned_pid: std::sync::atomic::AtomicU32,
     writing: AtomicBool,
     reader_done: AtomicBool,
     control_done: AtomicBool,
@@ -302,6 +303,10 @@ impl TerminalSession {
             #[cfg(all(test, unix))]
             lifecycle: lifecycle.clone(),
         };
+        #[cfg(all(test, unix))]
+        lifecycle
+            .owned_pid
+            .store(child.child.process_id().unwrap_or(0), Ordering::Release);
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
