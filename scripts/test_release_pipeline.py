@@ -173,7 +173,8 @@ class PipelineTests(unittest.TestCase):
             argv = command.call_args.args[0]
             self.assertEqual(argv[:2], ["dpkg-shlibdeps", "-O"])
             self.assertEqual(sum(arg.startswith("-e") for arg in argv), 4)
-            self.assertIn("-e/native/whisper-runtime/runtime/whisper-cli", argv)
+            expected = Path("/native") / "whisper-runtime/runtime/whisper-cli"
+            self.assertIn("-e" + str(expected.resolve()), argv)
 
 
 if __name__ == "__main__":

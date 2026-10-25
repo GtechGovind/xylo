@@ -5,6 +5,7 @@ import os
 import plistlib
 import sys
 import struct
+import stat
 import zlib
 from pathlib import Path
 import tarfile
@@ -44,7 +45,10 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(digest(root / "one.app.tar.gz"), digest(root / "two.app.tar.gz"))
             with tarfile.open(root / "one.app.tar.gz", "r:gz") as archive:
                 info = archive.getmember("Xylo.app/Contents/MacOS/agent-workbench")
-                self.assertEqual((info.uid, info.gid, info.mtime, info.mode), (0, 0, 1234, 0o755))
+                self.assertEqual((info.uid, info.gid, info.mtime), (0, 0, 1234))
+                self.assertEqual(info.mode, stat.S_IMODE(exe.stat().st_mode))
+                if os.name != "nt":
+                    self.assertEqual(info.mode, 0o755)
             with self.assertRaisesRegex(ValueError, "overwrite"):
                 archive_bundle(app, root / "one.app.tar.gz", 1234)
 

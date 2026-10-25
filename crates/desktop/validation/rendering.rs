@@ -204,8 +204,8 @@ fn assert_mark_pixels(image: &image::RgbaImage, bounds: gpui_kit::Bounds<gpui_ki
     )
     .unwrap()
     .into_rgba8();
-    for pixel in source.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
+    for pixel in source.pixels_mut() {
+        pixel.0.swap(0, 2);
     }
     assert_eq!(cached.as_bytes(0), Some(source.as_raw().as_slice()));
 }

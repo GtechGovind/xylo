@@ -20,8 +20,8 @@ pub fn brand_image() -> Arc<RenderImage> {
             .expect("committed Xylo sidebar PNG is valid")
             .into_rgba8();
             // GPUI's texture atlas consumes BGRA, matching its own PNG loader.
-            for pixel in pixels.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
+            for pixel in pixels.pixels_mut() {
+                pixel.0.swap(0, 2);
             }
             Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]))
         })
