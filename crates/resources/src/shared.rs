@@ -115,7 +115,11 @@ fn prepare_directory(directory: &Path, cancel: &CancellationToken) -> Result<Pat
         // A drive prefix (C: or \\?\C:) is not a filesystem root yet.
         // Inspect it only after RootDir is attached. UNC prefixes already
         // denote absolute share roots and still receive the normal checks.
-        if matches!(part, Component::Prefix(_)) && !current.is_absolute() {
+        // Rust treats a verbatim drive prefix as having an implicit root even
+        // without its separator; is_absolute() cannot decide this boundary.
+        if matches!(part, Component::Prefix(prefix) if matches!(
+            prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+        )) {
             continue;
         }
         match std::fs::symlink_metadata(&current) {
