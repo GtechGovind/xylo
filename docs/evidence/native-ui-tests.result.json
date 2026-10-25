@@ -1,0 +1,8 @@
+{
+  "stage": "native-tests",
+  "exit_code": 0,
+  "seconds": 69.61,
+  "log": "/tmp/workbench-recovery-final-native-tests.log",
+  "log_sha256": "8df5a0ce96a198992584c7ecb78c28bf87e6f395ed473e1682f78c5bd20a42f6",
+  "reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1"
+}

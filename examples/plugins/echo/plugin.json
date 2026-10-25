@@ -1,0 +1,16 @@
+{
+  "format": 1,
+  "id": "org.agentworkbench.echo",
+  "name": "Echo example",
+  "version": "1.0.0",
+  "entrypoint": "echo.wat",
+  "sha256": "d17673f776ba23ac082be1db4ce3aeb9e13be413421a9b3efebb942d4b5568ac",
+  "capabilities": [],
+  "budgets": {
+    "memory_mib": 8,
+    "fuel": 100000,
+    "timeout_seconds": 5,
+    "max_input_bytes": 8192,
+    "max_output_bytes": 8192
+  }
+}

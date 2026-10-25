@@ -1,0 +1,157 @@
+name: Six native preview qualifications
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+    paths:
+      - "Cargo.*"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "vendor/**"
+      - "packaging/**"
+      - "scripts/**"
+      - "sdk/**"
+      - ".github/workflows/native-release.yml"
+      - ".github/workflows/preview-release.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-qualification-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    # These exact standard runners are free on public repositories. Never route
+    # this heavyweight matrix to private/billable or larger runners implicitly.
+    if: github.event.repository.private == false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            jobs: "1"
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            jobs: "2"
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            jobs: "2"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            jobs: "2"
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            jobs: "2"
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            jobs: "2"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+      - name: Pinned Rust toolchain
+        run: |
+          # Do not let an emulated x64 bootstrap choose an x64 compiler on ARM.
+          rustup set default-host '${{ matrix.target }}'
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+          host=$(rustc --version --verbose | sed -n 's/^host: //p')
+          test "$host" = '${{ matrix.target }}'
+      - name: macOS native SDK and Metal compiler
+        if: runner.os == 'macOS'
+        run: |
+          xcodebuild -version
+          xcrun --show-sdk-version
+          xcrun --find metal
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          # Disposable hosted VM only; reclaim SDKs this native Rust build never uses.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev cmake ninja-build pkg-config \
+            libfontconfig-dev libwayland-dev libwebkit2gtk-4.1-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev libvulkan-dev \
+            vulkan-validationlayers libvulkan1 mesa-vulkan-drivers libfuse2t64 patchelf librsvg2-bin \
+            libpipewire-0.3-dev libspa-0.2-dev libgbm-dev xvfb xauth
+      - name: Windows native build architecture and shader compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $targetArch = if ('${{ matrix.target }}'.StartsWith('aarch64')) { 'ARM64' } else { 'x64' }
+          "CMAKE_GENERATOR_PLATFORM=$targetArch" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          $fxc = Get-ChildItem $sdkRoot -Directory | Sort-Object Name -Descending | ForEach-Object {
+            $native = Join-Path $_.FullName "$($targetArch.ToLower())\fxc.exe"
+            $emulated = Join-Path $_.FullName 'x64\fxc.exe'
+            if (Test-Path $native) { $native } elseif (Test-Path $emulated) { $emulated }
+          } | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$fxc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install pinned packaging tool (isolated build-tool directory)
+        run: cargo install cargo-packager --version 0.11.8 --locked --root .release-tools
+      - name: Source and updater checks
+        run: |
+          cargo fmt --all --check
+          python -m unittest discover -s scripts -p 'test_release*.py' -v
+          cargo build --locked --workspace --bins
+          cargo test --locked --workspace --lib
+          cargo test --locked -p agent-workbench --bin agent-workbench startup::tests
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Windows plugin file authority tests
+        if: runner.os == 'Windows'
+        run: |
+          cargo test --locked --manifest-path crates/capabilities/validation/windows-read/Cargo.toml --target '${{ matrix.target }}'
+          cargo clippy --locked --manifest-path crates/capabilities/validation/windows-read/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
+      - name: Windows workspace reader API checks
+        if: runner.os == 'Windows'
+        run: |
+          cargo check --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}' --all-targets
+          cargo clippy --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
+      - name: Rust plugin SDK and native component execution
+        run: bash scripts/test-plugin-sdk.sh
+      - name: Build pinned native speech runtime
+        run: bash scripts/native-assets-build.sh "target/${{ matrix.target }}/release/native-assets/whisper-runtime"
+      - name: Reclaim tested debug artifacts before optimized compilation
+        run: cargo clean --target '${{ matrix.target }}' --profile dev
+      - name: Build unsigned preview installers with complete license inventory
+        env:
+          WORKBENCH_PACKAGER: ${{ github.workspace }}/.release-tools/bin/cargo-packager${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: python scripts/release.py --target '${{ matrix.target }}' --mode preview
+      - name: Smoke actual native package in an isolated profile
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['version'])")
+          output="dist/$version-${{ matrix.target }}-preview"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            xvfb-run -a python scripts/release_smoke.py --target '${{ matrix.target }}' --output "$output"
+          else
+            python scripts/release_smoke.py --target '${{ matrix.target }}' --output "$output"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: native-preview-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 14
+
+# No signing secrets, production feed, tags or repository write permissions here.
+# The separate manual workflow may create an unpublished draft after all six pass.

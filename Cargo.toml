@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/runtime", "crates/resources", "crates/worker", "crates/desktop", "crates/services", "crates/capabilities", "crates/engine", "crates/scheduler", "crates/helper-client", "crates/helper", "crates/distribution", "crates/notifications"]
+default-members = ["crates/desktop", "crates/worker", "crates/helper"]
+exclude = ["vendor/hermes-ultra"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.98"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "io-std", "fs", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+workbench-core = { path = "crates/core" }
+workbench-runtime = { path = "crates/runtime" }
+workbench-resources = { path = "crates/resources" }
+workbench-services = { path = "crates/services" }
+workbench-capabilities = { path = "crates/capabilities" }
+workbench-engine = { path = "crates/engine" }
+workbench-scheduler = { path = "crates/scheduler" }
+workbench-helper-client = { path = "crates/helper-client" }
+workbench-distribution = { path = "crates/distribution" }
+workbench-notifications = { path = "crates/notifications" }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 16
+
+[profile.dev]
+debug = 1

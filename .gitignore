@@ -1,0 +1,11 @@
+target/
+/.idea/
+/dist/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+.env
+
+/.release-tools/
+__pycache__/

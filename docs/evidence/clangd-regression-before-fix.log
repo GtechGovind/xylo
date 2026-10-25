@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running interactions.rs (target/debug/deps/native_interactions-f74a78cc6fb680a5)
+
+running 1 test
+
+thread 'workbench::native_tests::native_editor_completion_uses_real_host_and_clangd' (850385) panicked at interactions.rs:732:17:
+real clangd diagnostics must decorate the editor
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test workbench::native_tests::native_editor_completion_uses_real_host_and_clangd ... FAILED
+
+failures:
+
+failures:
+    workbench::native_tests::native_editor_completion_uses_real_host_and_clangd
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.25s
+
+error: test failed, to rerun pass `--test native-interactions`

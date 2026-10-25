@@ -1,0 +1,50 @@
+[package]
+name = "workbench-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+workbench-core.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+sqlite-vec = "=0.1.7"
+fastembed = { version = "7.5", default-features = false, features = ["onnx", "ort-load-dynamic"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
+keyring-core = "1.0.1"
+rmcp = { version = "3.7", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "query", "form"] }
+futures-util = "0.3"
+base64 = "0.22"
+getrandom = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+url = "2"
+jsonwebtoken = "9.3.1"
+fs2 = "0.4"
+tempfile = "3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1.1"
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3"

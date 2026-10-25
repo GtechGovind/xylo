@@ -1,0 +1,21 @@
+{
+  "productName": "Xylo",
+  "version": "0.1.0",
+  "identifier": "com.qurkos.xylo",
+  "description": "Native workspace for AI conversations, coding and tools",
+  "licenseFile": "LICENSE",
+  "binariesDir": "target/release",
+  "outDir": "dist",
+  "binaries": [
+    { "path": "agent-workbench", "main": true },
+    { "path": "workbench-worker" },
+    { "path": "workbench-helper" }
+  ],
+  "resources": [
+    { "src": "LICENSE", "target": "licenses/LICENSE" },
+    { "src": "NOTICE", "target": "licenses/NOTICE" },
+    { "src": "vendor/hermes-ultra/LICENSE", "target": "licenses/Hermes-Ultra-LICENSE" },
+    { "src": "vendor/hermes-ultra/LICENSE-UPSTREAM", "target": "licenses/Hermes-upstream-LICENSE" },
+    { "src": "vendor/hermes-ultra/NOTICE", "target": "licenses/Hermes-NOTICE" }
+  ]
+}

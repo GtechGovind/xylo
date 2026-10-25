@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "source_fingerprint_sha256": "3c0d03abdf3daebbee00a9a898dded5c51d46d6e2f70b29b26a5ac3d9550356d",
+  "source_manifest": "docs/evidence/2026-10-25-lifecycle-source-manifest.json",
+  "plugin_execution_report": "docs/evidence/2026-10-25-release-plugin-execution.json",
+  "report_sha256": "d8628442bfe30d81c0b4833ed0e8a284b7a126022e565cc5eee0ed7dbcf87166",
+  "compiled_harness_source_sha256": "123355ca46d0813f36e7bf63a871698df8c382073fab5f55a1e566c74704ad38",
+  "compiled_workspace_cargo_lock_sha256": "768df7b4e181bf3cb2cfad211b5e8574a66fbb15ef3463e5a78aa0e97b88e9dd",
+  "binary": {
+    "path": "target/performance/release/examples/measure_plugins",
+    "bytes": 32273088,
+    "sha256": "12f8ab3c2b71397d52199a0ad6a1abb74b4c8bcf1ced8fe29f79d62210d8e266"
+  },
+  "timing_region": "CapabilityService::execute: shared cross-process resource admission, installed catalog/lease/package validation, cached Wasmtime component instantiation, fuel-bounded echo execution and JSON serialization; result decoding/assertions excluded",
+  "limitations": [
+    "Direct native API excludes helper startup/IPC, host admission, agent approvals and UI input/rendering.",
+    "Single tiny component with no host imports, tools, network or models; not a representative plugin or task-quality benchmark.",
+    "Installation validates/compiles the component and may populate its cache. First run is one post-install observation, not a cold-launch percentile.",
+    "No memory-use, concurrency, OS acceptance or Rust-versus-Python speedup is measured.",
+    "Hardware/load are point-in-time observations; ordinary system activity is uncontrolled."
+  ]
+}

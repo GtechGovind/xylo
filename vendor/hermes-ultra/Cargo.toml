@@ -1,0 +1,110 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hermes-core",
+    "crates/hermes-provider-runtime",
+    "crates/hermes-app-runtime",
+    "crates/hermes-tool-planning",
+    "crates/hermes-agent",
+    "crates/hermes-tools",
+    "crates/hermes-gateway",
+    "crates/hermes-cli-ui",
+    "crates/hermes-cli",
+    "crates/hermes-cron",
+    "crates/hermes-skills",
+    "crates/hermes-mcp",
+    "crates/hermes-environments",
+    "crates/hermes-config",
+    "crates/hermes-intelligence",
+    "crates/hermes-acp",
+    "crates/hermes-eval",
+    "crates/hermes-http",
+    "crates/hermes-auth",
+    "crates/hermes-telemetry",
+    "crates/hermes-parity-tests",
+    "crates/hermes-source-parity-tests",
+    "crates/hermes-protocol-parity-tests",
+]
+
+[workspace.package]
+version = "0.22.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sheawinkler/hermes-agent-ultra"
+
+[workspace.dependencies]
+# Internal crates
+hermes-core = { path = "crates/hermes-core" }
+hermes-provider-runtime = { path = "crates/hermes-provider-runtime" }
+hermes-app-runtime = { path = "crates/hermes-app-runtime" }
+hermes-tool-planning = { path = "crates/hermes-tool-planning" }
+hermes-agent = { path = "crates/hermes-agent" }
+hermes-tools = { path = "crates/hermes-tools" }
+hermes-gateway = { path = "crates/hermes-gateway" }
+hermes-cli-ui = { path = "crates/hermes-cli-ui" }
+hermes-cli = { path = "crates/hermes-cli" }
+hermes-cron = { path = "crates/hermes-cron" }
+hermes-skills = { path = "crates/hermes-skills" }
+hermes-mcp = { path = "crates/hermes-mcp" }
+hermes-environments = { path = "crates/hermes-environments" }
+hermes-config = { path = "crates/hermes-config" }
+hermes-intelligence = { path = "crates/hermes-intelligence" }
+hermes-acp = { path = "crates/hermes-acp" }
+hermes-eval = { path = "crates/hermes-eval" }
+hermes-http = { path = "crates/hermes-http" }
+hermes-auth = { path = "crates/hermes-auth" }
+hermes-telemetry = { path = "crates/hermes-telemetry" }
+hermes-parity-tests = { path = "crates/hermes-parity-tests" }
+hermes-source-parity-tests = { path = "crates/hermes-source-parity-tests" }
+hermes-protocol-parity-tests = { path = "crates/hermes-protocol-parity-tests" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# HTTP / networking
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
+tokio-tungstenite = "0.29"
+eventsource-stream = "0.2"
+
+# Error handling & logging
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI & TUI
+clap = { version = "4", features = ["derive"] }
+ratatui = { version = "0.30.1", default-features = false, features = ["all-widgets", "crossterm", "macros", "underline-color"] }
+crossterm = "0.29"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
+
+# Utils
+regex = "1"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+bytes = "1"
+url = "2"
+directories = "6"
+minijinja = "2"
+jsonwebtoken = "9"
+indexmap = { version = "2", features = ["serde"] }
+once_cell = "1"
+
+[patch.crates-io]
+matrix-pickle-derive = { path = "third_party/rustsec-patches/matrix-pickle-derive-0.2.2" }
+matrix-sdk-crypto = { path = "third_party/rustsec-patches/matrix-sdk-crypto-0.18.0" }
+tungstenite = { path = "third_party/rustsec-patches/tungstenite-0.29.0" }
+vodozemac = { path = "third_party/rustsec-patches/vodozemac-0.10.0" }

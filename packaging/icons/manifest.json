@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "master": {
+    "path": "packaging/branding/xylo-mark.png",
+    "sha256": "73c4e6ecf1745a5abe88b2f402254dfbadbc30efa9c0da171b565c0227157625",
+    "bytes": 473164,
+    "width": 1254,
+    "height": 1254
+  },
+  "conversion": {
+    "filter": "Lanczos3",
+    "codec": "image 0.25.10 PNG",
+    "app_background": "warm white",
+    "tray": "master alpha, monochrome template",
+    "master_changed": false
+  },
+  "outputs": [
+    {
+      "path": "app.png",
+      "format": "png",
+      "sizes": [
+        512
+      ],
+      "bytes": 105935,
+      "sha256": "6ce27769b5b3cc71c5b25ff84fd8a25cb4ffe48a0db75df2512207a2928813a7"
+    },
+    {
+      "path": "app.ico",
+      "format": "ico",
+      "sizes": [
+        256
+      ],
+      "bytes": 31840,
+      "sha256": "c45520ae7bbdbfb10219416819139e1efb3e7b48d6989e638dbeabff515562bb"
+    },
+    {
+      "path": "app.icns",
+      "format": "icns",
+      "sizes": [
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024
+      ],
+      "bytes": 504157,
+      "sha256": "de52cab385b93ffb744c730fc33c1150fc337b6b8d6ca99d89672d94d9d9ddeb"
+    },
+    {
+      "path": "sidebar.png",
+      "format": "png",
+      "sizes": [
+        64
+      ],
+      "bytes": 3447,
+      "sha256": "cbc0caaf50507647c4e59251a8013ce314ae42f5b9d19f7bb3afac8210599306"
+    },
+    {
+      "path": "tray.png",
+      "format": "png",
+      "sizes": [
+        24
+      ],
+      "bytes": 789,
+      "sha256": "ba789f6c471c92df2afb0a9ee904845c353f1db097d5f3e6480c97155153df68"
+    }
+  ]
+}

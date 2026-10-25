@@ -1,0 +1,15 @@
+{
+  "brand": "Xylo",
+  "application_id": "com.qurkos.xylo",
+  "asset": "xylo-mark.png",
+  "sha256": "73c4e6ecf1745a5abe88b2f402254dfbadbc30efa9c0da171b565c0227157625",
+  "generation": "Built-in image_gen tool; original artwork generated for this application",
+  "prompt": "Original standalone Xylo symbol: a compact abstract X formed from four smoothly curved ribbon arms flowing clockwise around a diamond-shaped negative space. Flat near-black ink, transparent background, balanced margins, legible at small sizes, no text, no mockup, distinct from ChatGPT and Claude marks.",
+  "notes": "Master artwork retains the generated RGBA bytes. Platform icons may use faithful size/format derivatives; no third-party logo artwork was copied.",
+  "presentation": {
+    "asset": "xylo-lockup.png",
+    "sha256": "5da912044848dc0ff174557fe35bffc73ccd6b97dcdc8c9abcf7805ad181978f",
+    "generation": "Built-in image_gen edit from the original mark",
+    "prompt": "Preserve the original Xylo mark silhouette; place it left of the exact Xylo wordmark in a refined modern sans serif on a plain warm-white background. Flat horizontal lockup, generous spacing, no other text or decoration."
+  }
+}

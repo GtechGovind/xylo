@@ -1,0 +1,13 @@
+{
+  "id": "org.agentworkbench.text-report",
+  "name": "Text report",
+  "version": "1.0.0",
+  "capabilities": ["read_workspace", "write_artifacts"],
+  "budgets": {
+    "memory_mib": 16,
+    "fuel": 20000000,
+    "timeout_seconds": 10,
+    "max_input_bytes": 16384,
+    "max_output_bytes": 65536
+  }
+}

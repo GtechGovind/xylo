@@ -1,0 +1,3 @@
+# Source fingerprints, publication proofs and release hashes must identify the
+# same bytes on macOS, Windows and Linux. Preserve checked-in line endings.
+* -text

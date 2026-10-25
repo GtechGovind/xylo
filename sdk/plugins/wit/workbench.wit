@@ -1,0 +1,21 @@
+package agent-workbench:plugin@1.0.0;
+
+/// Synchronous guest ABI. The native host performs asynchronous work behind
+/// these calls. Permissions come from the user's reviewed installation.
+world plugin {
+    /// Bounded UTF-8 file read under the selected workspace. Requires
+    /// read_workspace. Links and private application data are refused.
+    import read-text: func(path: string) -> result<string, string>;
+
+    /// Publish a new UTF-8 artifact without replacing an existing file.
+    /// Requires write_artifacts. The host returns the committed artifact path.
+    import write-text: func(name: string, text: string) -> result<string, string>;
+
+    /// Bounded HTTPS GET without application credentials, cookies or redirects.
+    /// Requires https:exact.lowercase.host for this URL's port-443 host.
+    import http-get: func(url: string) -> result<string, string>;
+
+    /// Input/output are UTF-8 text; JSON is an application convention, not
+    /// ambient authority. An error does not undo already committed artifacts.
+    export run: func(input: string) -> result<string, string>;
+}

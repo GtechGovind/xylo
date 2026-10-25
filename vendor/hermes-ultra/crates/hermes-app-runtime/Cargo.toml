@@ -1,0 +1,21 @@
+[package]
+name = "hermes-app-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Non-UI application runtime policy and agent configuration for Hermes"
+
+[dependencies]
+hermes-core = { workspace = true }
+hermes-config = { workspace = true }
+hermes-agent = { workspace = true }
+hermes-intelligence = { workspace = true }
+hermes-provider-runtime = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }

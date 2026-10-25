@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Build native installers locally. No upload, publication, or account setup.
+
+Production mode requires existing maintainer credentials and invokes native
+signing/notarization tools. Preview mode additionally requires clean committed
+source and complete license texts, while keeping OS trust and updates disabled.
+Development mode permits incomplete local inventories. --plan does not compile.
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+sys.dont_write_bytecode = True
+from release_common import (BINARIES, ROOT, TARGETS, build_env, digest, packager,
+                            run, source_identity, workspace_version, write_json)
+from release_manifest import validate_policy
+from release_metadata import checksums, generate, validate_inventory
+
+
+def require(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise ValueError(f"Required release configuration is missing: {name}")
+    return value
+
+
+def archive_bundle(bundle: Path, destination: Path, epoch: int) -> None:
+    """Stable paths/order/ownership/mtime; preserve actual signed file bytes."""
+    if destination.exists():
+        raise ValueError("Refusing to overwrite an update archive")
+    with destination.open("xb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for path in [bundle, *sorted(bundle.rglob("*"))]:
+                info = archive.gettarinfo(str(path), arcname=(Path(bundle.name) / path.relative_to(bundle)).as_posix())
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                info.mtime = epoch
+                if info.isfile():
+                    with path.open("rb") as stream:
+                        archive.addfile(info, stream)
+                else:
+                    archive.addfile(info)
+
+
+def rehash_native_assets(root: Path) -> None:
+    """Codesign changes native payload bytes; bind those FINAL bytes in manifests."""
+    if not root.exists():
+        return
+    for path in sorted(root.glob("*/manifest.json")):
+        manifest = json.loads(path.read_text())
+        for entry in manifest["files"]:
+            relative = Path(entry["path"])
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("Unsafe bundled native asset path")
+            file = path.parent / relative
+            if not file.is_file() or file.is_symlink():
+                raise ValueError("Bundled native asset must be a regular file")
+            entry.update(size_bytes=file.stat().st_size, sha256=digest(file))
+        write_json(path, manifest)
+
+
+def sign_macos(bundle: Path, policy: dict) -> None:
+    identity = require("WORKBENCH_MACOS_SIGNING_IDENTITY")
+    team = policy.get("macos_team_id", "")
+    if len(team) != 10 or not team.isalnum() or not team.isupper():
+        raise ValueError("Production policy must pin the Apple Team ID")
+    profile = require("WORKBENCH_NOTARY_KEYCHAIN_PROFILE")
+    # Sign actual Mach-O files first, then enclosing bundles. No --deep signing.
+    magic = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
+    files = sorted((p for p in bundle.rglob("*") if p.is_file() and not p.is_symlink()),
+                   key=lambda p: (-len(p.parts), str(p)))
+    for path in files:
+        with path.open("rb") as stream:
+            is_macho = stream.read(4) in magic
+        if is_macho:
+            command = ["codesign", "--force", "--timestamp", "--options", "runtime", "--sign", identity]
+            if path.name == "agent-workbench":
+                command += ["--entitlements", ROOT / "packaging/entitlements.plist"]
+            run([*command, path])
+    rehash_native_assets(bundle / "Contents/Resources/native-assets")
+    for framework in sorted(bundle.rglob("*.framework"), key=lambda p: -len(p.parts)):
+        run(["codesign", "--force", "--timestamp", "--options", "runtime", "--sign", identity, framework])
+    run(["codesign", "--force", "--timestamp", "--options", "runtime", "--sign", identity,
+         "--entitlements", ROOT / "packaging/entitlements.plist", bundle])
+    run(["codesign", "--verify", "--deep", "--strict", bundle])
+    # codesign emits details on stderr, so use the designated requirement directly.
+    run(["codesign", "--verify", "--strict", "-R", f'anchor apple generic and certificate leaf[subject.OU] = "{team}"', bundle])
+    notary_zip = bundle.parent / "notarization-upload.zip"
+    run(["ditto", "-c", "-k", "--keepParent", bundle, notary_zip])
+    try:
+        run(["xcrun", "notarytool", "submit", notary_zip, "--keychain-profile", profile, "--wait"])
+        run(["xcrun", "stapler", "staple", bundle])
+        run(["xcrun", "stapler", "validate", bundle])
+        run(["spctl", "--assess", "--type", "execute", bundle])
+    finally:
+        notary_zip.unlink(missing_ok=True)
+
+
+def configuration(target: str, output: Path, native: Path, notices: Path, *, production: bool) -> dict:
+    config = json.loads((ROOT / "packager.json").read_text())
+    config.update(version=workspace_version(), binariesDir=str(ROOT / "target" / target / "release"),
+                  outDir=str(output), targetTriple=target)
+    config["icons"] = [str(ROOT / "packaging/icons/app.png"), str(ROOT / "packaging/icons/app.ico"),
+                       str(ROOT / "packaging/icons/app.icns")]
+    for resource in config["resources"]:
+        resource["src"] = str(ROOT / resource["src"])
+    config["resources"].append({"src": str(notices), "target": "licenses/dependencies"})
+    if "apple" in target:
+        config["formats"] = ["app"]
+        config["macos"] = {"minimumSystemVersion": "15.0", "infoPlistPath": str(ROOT / "packaging/info.plist")}
+        config["resources"].append({"src": str(native), "target": "native-assets"})
+    elif "windows" in target:
+        config["formats"] = ["nsis"]
+        config["resources"].append({"src": str(native), "target": "native-assets"})
+        config["nsis"] = {"installMode": "currentUser"}
+        config["windows"] = {"digestAlgorithm": "sha256", "allowDowngrades": False}
+        if production:
+            config["windows"].update(certificateThumbprint=require("WORKBENCH_WINDOWS_CERTIFICATE_THUMBPRINT"),
+                                     timestampUrl=require("WORKBENCH_WINDOWS_TIMESTAMP_URL"), tsp=True)
+    else:
+        config["formats"] = ["appimage", "deb"]
+        # The native helper resolves adjacent assets; do not leave them in usr/lib.
+        config["appimage"] = {"files": {str(native): "usr/bin/native-assets"}}
+        config["deb"] = {"files": {str(native): "usr/bin/native-assets"},
+                          "depends": ["libasound2t64", "libfontconfig1", "libxkbcommon-x11-0", "libvulkan1", "libssl3t64",
+                                      "libpipewire-0.3-0", "libgbm1", "libwayland-client0", "libx11-xcb1"]}
+    return config
+
+
+def linux_dependencies(binaries: Path, native: Path, configured: list[str]) -> list[str]:
+    """Bind Debian requirements to this build's ELF linkage, plus dlopen backends."""
+    with tempfile.TemporaryDirectory(prefix="xylo-shlibdeps-") as directory:
+        work = Path(directory)
+        (work / "debian").mkdir()
+        (work / "debian/control").write_text("Source: xylo\n\nPackage: xylo\nArchitecture: any\nDescription: Xylo native preview\n")
+        inputs = [binaries / name for name in BINARIES]
+        inputs.append(native / "whisper-runtime/runtime/whisper-cli")
+        result = subprocess.run(["dpkg-shlibdeps", "-O", *["-e" + str(path.resolve()) for path in inputs]],
+                                cwd=work, text=True, capture_output=True, check=True, timeout=120)
+        records = [line.removeprefix("shlibs:Depends=") for line in result.stdout.splitlines() if line.startswith("shlibs:Depends=")]
+        if len(records) != 1 or not records[0].strip():
+            raise ValueError("Could not determine Debian dependencies from the actual native executables")
+        return sorted(set(configured) | {entry.strip() for entry in records[0].split(",") if entry.strip()})
+
+
+def sign_windows(binaries: Path, native: Path) -> None:
+    thumbprint = require("WORKBENCH_WINDOWS_CERTIFICATE_THUMBPRINT")
+    timestamp = require("WORKBENCH_WINDOWS_TIMESTAMP_URL")
+    if not timestamp.startswith("https://"):
+        raise ValueError("The Windows timestamp service must use HTTPS")
+    inputs = [binaries / f"{name}.exe" for name in BINARIES]
+    inputs += sorted(path for path in native.rglob("*") if path.suffix.lower() in (".exe", ".dll"))
+    for path in inputs:
+        run(["signtool", "sign", "/fd", "SHA256", "/sha1", thumbprint,
+             "/tr", timestamp, "/td", "SHA256", path])
+        run(["signtool", "verify", "/pa", "/all", path])
+    rehash_native_assets(native)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", choices=TARGETS, required=True)
+    parser.add_argument("--mode", choices=("development", "preview", "production"), default="development")
+    parser.add_argument("--policy", type=Path, default=ROOT / "packaging/update-policy.json")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--native-assets", type=Path)
+    parser.add_argument("--plan", action="store_true", help="Write/print the plan without compiling or signing")
+    args = parser.parse_args()
+    production = args.mode == "production"
+    strict = args.mode != "development"
+    identity = source_identity()
+    if strict and (identity["dirty"] or not identity["commit"]):
+        raise ValueError("Preview/production packaging requires committed, clean source")
+    if production:
+        if identity["dirty"] or not identity["commit"]:
+            raise ValueError("Production requires a committed, clean source tree and a fresh locked build")
+        policy = validate_policy(args.policy)
+        if not args.plan:
+            require("CARGO_PACKAGER_SIGN_PRIVATE_KEY")
+    else:
+        policy = json.loads(args.policy.read_text())
+        if policy.get("enabled"):
+            raise ValueError("Development/preview packages must embed a disabled update policy")
+    output = (args.output or ROOT / "dist" / f"{workspace_version()}-{args.target}-{args.mode}").resolve()
+    if output.exists() and not args.plan:
+        raise ValueError("Use a fresh output directory; release outputs are immutable")
+    native = (args.native_assets or ROOT / "target" / args.target / "release/native-assets").resolve()
+    notices = output / "release-metadata"
+    config = configuration(args.target, output, native, notices, production=production)
+    plan = {"target": args.target, "mode": args.mode, "publishable": False,
+            "source": identity, "packager": config, "policy_enabled": policy["enabled"],
+            "update_policy_sha256": digest(args.policy)}
+    if args.plan:
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return
+    expected_os = "Darwin" if "apple" in args.target else "Windows" if "windows" in args.target else "Linux"
+    if platform.system() != expected_os:
+        raise ValueError("Build/package on the target's own OS; cross-platform packaging is not qualified")
+    executable = packager()
+    if not (native / "whisper-runtime/manifest.json").is_file():
+        raise ValueError("Build the pinned native speech runtime into --native-assets before packaging")
+    output.mkdir(parents=True)
+    write_json(output / "build-plan.json", plan)
+    packages = [part for binary in BINARIES for part in ("-p", binary)]
+    run(["cargo", "build", "--locked", "--release", "--target", args.target, *packages],
+        env=build_env(identity["source_date_epoch"], args.policy))
+    generate(args.target, notices, strict=strict)
+    if "linux" in args.target:
+        config["deb"]["depends"] = linux_dependencies(Path(config["binariesDir"]), native, config["deb"]["depends"])
+    for file in (ROOT / "LICENSE", ROOT / "NOTICE"):
+        shutil.copyfile(file, notices / file.name)
+    config_path = output / "packager.resolved.json"
+    write_json(config_path, config)
+    # Package first; update signatures must cover final OS-signed/stapled bytes.
+    package_env = os.environ.copy()
+    package_env.pop("CARGO_PACKAGER_SIGN_PRIVATE_KEY", None)
+    package_env.pop("CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD", None)
+    if production and "windows" in args.target:
+        sign_windows(Path(config["binariesDir"]), native)
+    run([executable, "--config", config_path], env=package_env)
+    if "apple" in args.target:
+        bundles = list(output.glob("*.app"))
+        if len(bundles) != 1:
+            raise ValueError("Expected exactly one cargo-packager app bundle")
+        bundle = bundles[0]
+        if not (bundle / "Contents/Resources/native-assets/whisper-runtime/manifest.json").is_file():
+            raise ValueError("Invalid native resource bundle layout")
+        validate_inventory(bundle / "Contents/Resources/licenses/dependencies", strict=strict)
+        if production:
+            sign_macos(bundle, policy)
+        else:
+            run(["codesign", "--force", "--deep", "--sign", "-", bundle])
+            rehash_native_assets(bundle / "Contents/Resources/native-assets")
+            run(["codesign", "--force", "--sign", "-", bundle])
+        archive_bundle(bundle, output / f"Xylo-{workspace_version()}-{TARGETS[args.target][0]}.app.tar.gz",
+                       identity["source_date_epoch"])
+        # DMG is built AFTER stapling; rebuilding with packager could mutate .app.
+        dmg = output / f"Xylo-{workspace_version()}-{TARGETS[args.target][0]}.dmg"
+        run(["hdiutil", "create", "-volname", "Xylo", "-srcfolder", bundle,
+             "-format", "UDZO", "-ov", dmg])
+        if production:
+            run(["codesign", "--timestamp", "--sign", require("WORKBENCH_MACOS_SIGNING_IDENTITY"), dmg])
+            run(["xcrun", "notarytool", "submit", dmg, "--keychain-profile",
+                 require("WORKBENCH_NOTARY_KEYCHAIN_PROFILE"), "--wait"])
+            run(["xcrun", "stapler", "staple", dmg])
+            run(["xcrun", "stapler", "validate", dmg])
+    if production and "windows" in args.target:
+        for installer in output.glob("*.exe"):
+            run(["signtool", "verify", "/pa", "/all", installer])
+    validate_inventory(notices, strict=strict)
+    write_json(output / "release-status.json", {"mode": args.mode, "license_inventory_complete": strict,
+               "os_signed": production and expected_os in ("Darwin", "Windows"),
+               "updater_feed_enabled": policy["enabled"], "update_manifest_created": False,
+               "published": False, "clean_machine_qualified": False})
+    checksums(output)
+    print(f"Created {args.mode} installers in {output}. No files were published.")
+
+
+if __name__ == "__main__":
+    main()

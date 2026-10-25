@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "source_fingerprint_sha256": "ee65938c711bbc4fb08996a514a6d77f56ce21ae8b8510ba609cfa4d16dd1953",
+  "source_manifest": "docs/evidence/2026-10-25-document-validated-source-manifest.json",
+  "document_paging_report": "docs/evidence/2026-10-25-release-document-paging.json",
+  "report_sha256": "d66aa7fda827bf865ddf5442917070da2c93096f3dd96e7f29508b87c1902f08",
+  "compiled_harness_source_sha256": "f393a7a5d1e22503cc9a274b9d41c7bb4aa2de9895606dd3e6a7aecea6c1e0ba",
+  "compiled_workspace_cargo_lock_sha256": "49d5642a1576fe82528087fe5eb29852121b1247010ad1340da0c2317a2658e6",
+  "binary": {
+    "path": "target/performance/release/examples/measure_documents",
+    "bytes": 8637984,
+    "sha256": "1ea287c09aee3a75fb9126a96c07cc79699b5672687d42e92c8356cea4be48be"
+  },
+  "historical_initial_report": "docs/evidence/2026-10-25-release-document-paging-initial.json",
+  "historical_initial_source_manifest": "docs/evidence/2026-10-25-document-source-manifest.json",
+  "scope": "Direct native API, revision hash/native parse/JSON. Excludes helper IPC, host resource admission, UI, display/input and save-copy.",
+  "conditions": "No compiler active at measurement start; ordinary system/developer activity was uncontrolled. Raw hardware/load/sample/preparation fields are in the report."
+}

@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-10-25T01:11:12.122459+00:00",
+  "scope": "Build-time dependency license supplement verification, not legal/release acceptance",
+  "target": "aarch64-apple-darwin",
+  "baseline_missing_packages": 101,
+  "supplemented_packages": 66,
+  "remaining_missing_packages": 35,
+  "remaining_missing_texts": [
+    "block 0.1.6",
+    "block2 0.6.2",
+    "dispatch2 0.3.1",
+    "eventsource-stream 0.2.3",
+    "mac 0.1.1",
+    "malloc_buf 0.0.6",
+    "objc2 0.6.5",
+    "objc2-app-kit 0.3.2",
+    "objc2-audio-toolbox 0.3.2",
+    "objc2-av-foundation 0.3.2",
+    "objc2-avf-audio 0.3.2",
+    "objc2-cloud-kit 0.3.2",
+    "objc2-core-audio 0.3.2",
+    "objc2-core-audio-types 0.3.2",
+    "objc2-core-data 0.3.2",
+    "objc2-core-foundation 0.3.2",
+    "objc2-core-graphics 0.3.2",
+    "objc2-core-image 0.3.2",
+    "objc2-core-media 0.3.2",
+    "objc2-core-text 0.3.2",
+    "objc2-core-video 0.3.2",
+    "objc2-encode 4.1.0",
+    "objc2-foundation 0.3.2",
+    "objc2-image-io 0.3.2",
+    "objc2-io-surface 0.3.2",
+    "objc2-media-toolbox 0.3.2",
+    "objc2-metal 0.3.2",
+    "objc2-quartz-core 0.3.2",
+    "objc2-security 0.3.2",
+    "objc2-user-notifications 0.3.2",
+    "objc_exception 0.1.2",
+    "pathfinder_geometry 0.5.1",
+    "realfft 3.5.0",
+    "seahash 4.1.0",
+    "simd_helpers 0.1.0"
+  ],
+  "inventory_package_count": 834,
+  "checked_in_unique_text_files": 33,
+  "upstream_text_records": 47,
+  "catalogue_sha256": "77a01c303465a52433b85da41494ded35d8ab9ea2988d6e024526c23f74db928",
+  "inventory_sha256": "4b92546e87d7f3d77eaf9b9df9f55067751cd335353ca36c277def975040c5a9",
+  "provenance_sha256": "6895438691720c7f0e7f14248e11f861ce2c32a01e09f95cc4939a839f62726d",
+  "strict_validation": {
+    "exit_code": 1,
+    "expected_failure": true,
+    "reason": "35 genuine unresolved full-license gaps remain"
+  },
+  "python_release_tests": {
+    "passed": 19,
+    "command": "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_release*.py' -v",
+    "log": "docs/evidence/license-supplement-tests.log",
+    "exit_code": 0,
+    "log_sha256": "5fe64d47570b073dd04ec627d6bf94021a0e64c983acc3568bfd45c70de6fa2f"
+  },
+  "special_cases": {
+    "audio-core 0.2.1": "Publication dirty=true retained.24 source files and Cargo.toml.keep match pinned upstream; parsed Cargo.toml.orig differs only by removed dev-dependencies, checked offline.",
+    "sqlite-vec 0.1.7": "Exact tag0.1.7 commit plus matching Rust/main C source bindings; tagged VERSION and Cargo template reproduce published manifest. External SQLite header provenance is not independently qualified by this supplement."
+  },
+  "limitations": [
+    "26 newer objc2 packages have pinned licensing guidance but no full text; guidance is not substituted.",
+    "Eight exact-version upstream sources contain no full license; pathfinder_geometry0.5.1 source commit remains unavailable.",
+    "Technical full-text coverage does not select legal alternatives, approve a release, or audit separate native/model/bundled-source obligations.",
+    "Generation uses Cargo metadata only. No Cargo compilation/tests or runtime/UI source changes were needed."
+  ],
+  "implementation_files": [
+    "scripts/release.py (import and post-packager bundle validation only)",
+    "scripts/release_licenses.py",
+    "scripts/release_metadata.py",
+    "scripts/test_release_licenses.py",
+    "packaging/licenses/supplements.json",
+    "packaging/licenses/texts/",
+    "docs/license-supplements.md"
+  ],
+  "post_packager_validation": {
+    "platform": "macOS",
+    "resource_directory": "Contents/Resources/licenses/dependencies",
+    "phase": "After cargo-packager, before signing/archive",
+    "strict_production": true,
+    "fixture": "Actual .app resource-tree copy validates, then missing notice is rejected; no signing/notarization acceptance claimed"
+  }
+}

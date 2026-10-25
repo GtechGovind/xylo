@@ -1,0 +1,55 @@
+[package]
+name = "workbench-capabilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+workbench-core.workspace = true
+workbench-resources.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+chromiumoxide = { version = "0.9.1", default-features = false, features = ["bytes"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "image_025", "thread_safe"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+calamine = "0.37"
+rust_xlsxwriter = "0.101"
+docx-rs = "0.4.22"
+xcap = "0.9.8"
+enigo = "0.6.1"
+wasmtime = { version = "50", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "reexport-wasmparser", "runtime", "std", "wat"] }
+wat = "=1.262.0"
+workbench-scheduler = { path = "../scheduler" }
+fs2 = "0.4"
+url = "2"
+libc = "0.2"
+zip = { version = "6", default-features = false, features = ["deflate"] }
+quick-xml = "0.38"
+sha2 = "0.10"
+tempfile = "3"
+tar = "0.4"
+flate2 = "1"
+bzip2 = "0.6"
+cpal = "=0.18.2"
+rodio = { version = "=0.23.0", default-features = false, features = ["playback", "wav", "mp3", "mp4", "flac", "vorbis"] }
+hound = "3.5"
+rtrb = "0.3"
+rubato = "=1.0.1"
+audioadapter-buffers = "2.0"
+sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Ioctl", "Win32_System_SystemServices"] }

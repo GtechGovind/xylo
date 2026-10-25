@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-25T00:59:11.745163+00:00",
+  "status": "Uncontrolled release development baseline; full product performance acceptance remains open.",
+  "source_fingerprint_sha256": "d7363f8d5c026fbf7fb63fd3f75d1215bb0011d270f87560f2b26c6c2406f0ab",
+  "source_manifest": "docs/evidence/2026-10-25-release-benchmark-source-manifest.json",
+  "source_files": 1162,
+  "source_state": "Uncommitted workspace; unborn main. No commit or publication performed.",
+  "hardware": {
+    "os": "27.0.1",
+    "os_build": "26A434",
+    "architecture": "arm64",
+    "hardware": "Mac17,2",
+    "ram_bytes": 34359738368,
+    "cpu_threads": 10,
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "xcode": "Xcode 27.1\nBuild version 27A9275"
+  },
+  "locks": {
+    "Cargo.lock": "49d5642a1576fe82528087fe5eb29852121b1247010ad1340da0c2317a2658e6",
+    "crates/desktop/validation/Cargo.lock": "d160d07f586c9e5bf2206415c59aee9bb94de0574bf370814c2bbe12b70fc1ae"
+  },
+  "binaries": {
+    "agent-workbench": {
+      "path": "target/performance/release/agent-workbench",
+      "sha256": "105ba46bd12a6f1ff9fdb468f719e8aea64472e16e4b562066e89fb8b1972785",
+      "bytes": 54224608
+    },
+    "workbench-worker": {
+      "path": "target/performance/release/workbench-worker",
+      "sha256": "d631f0250bc3c81bacadf14cb0f9c43edb7fee36d43226b1a8f6cf76e96a5599",
+      "bytes": 58529952
+    },
+    "workbench-helper": {
+      "path": "target/performance/release/workbench-helper",
+      "sha256": "b26458219cd30b9484b29892d8c66ce765d5ec6ec4044aa954597faa715e26ff",
+      "bytes": 32778544
+    },
+    "examples/measure_overhead": {
+      "path": "target/performance/release/examples/measure_overhead",
+      "sha256": "5853c6fb408b5a84dd44f41d137f30fb88bbe2af956ce0e19c6464ac7a9af49b",
+      "bytes": 7230112
+    },
+    "native-performance": {
+      "path": "target/performance/release/native-performance",
+      "sha256": "08f262cc0cca682954a08fdb9e0554d6e287405c9819dbc25b9289a0a1dffe4c",
+      "bytes": 30660032
+    }
+  },
+  "reports": [
+    {
+      "path": "docs/evidence/2026-10-25-release-overhead.json",
+      "sha256": "09abc121a21d906eccfc37b43fa0bcd82ec5f33bbd17b5caf0a5900e8c6ac3f5",
+      "bytes": 13089,
+      "file_modified_at_utc": "2026-10-25T00:49:57.355919+00:00"
+    },
+    {
+      "path": "docs/evidence/2026-10-25-release-semantic-overhead.json",
+      "sha256": "a4dbb3860c63d89e6490992ef06ebacc011a6c532717f57dbe77274255e83b9c",
+      "bytes": 13245,
+      "file_modified_at_utc": "2026-10-25T00:51:42.907946+00:00"
+    },
+    {
+      "path": "docs/evidence/2026-10-25-release-100k-overhead.json",
+      "sha256": "d9475bd435c7ed7a21d1b6bf7cc0f947afddfb7cdebcc1acb12eff38c46be8e6",
+      "bytes": 12987,
+      "file_modified_at_utc": "2026-10-25T00:52:29.964733+00:00"
+    },
+    {
+      "path": "docs/evidence/2026-10-25-release-native-rendering.json",
+      "sha256": "6ba9e587ab6a8d4b875133af26c3c1d3bc2d7f14965f4c6058258bf90546cd03",
+      "bytes": 10014,
+      "file_modified_at_utc": "2026-10-25T00:52:32.360542+00:00"
+    }
+  ],
+  "build_logs": [
+    "docs/evidence/2026-10-25-before-cancel-fix-release-build.log",
+    "docs/evidence/release-build.log",
+    "docs/evidence/native-performance-build.log"
+  ],
+  "native_rendering_source_note": "The native benchmark depends on desktop/runtime/service sources. Those inputs are unchanged from fe6e74991801c189a18dca0126cc422edb586863d8a59f66bfc9f955d6adf7f1; the later engine-only cancellation correction and its engine/worker tests are outside this benchmark dependency graph. Current aggregate source is recorded above.",
+  "measurement_conditions": [
+    "macOS ARM64, 32 GiB, 10 logical CPU threads; no Cargo build active at the start of the timed runs.",
+    "IDE and normal system activity remained active. Headless reports contain measured system load. OS scheduling, binary verification and filesystem caches were not controlled.",
+    "Three headless runs use a local scripted provider, real native worker pipes and file-tool/journal work. Each run executes 80 file-tool turns and 20 active-stream cancellations.",
+    "Semantic corpus preparation is separate from query timing; timed query text varies to avoid query-embedding cache hits.",
+    "Native rendering uses production UI with real native text and offscreen Metal/WGPU, a deterministic test dispatcher and no connected host. Ten warm-ups precede 100 samples per scrolling/streaming metric.",
+    "Native report file modification time is recorded as filesystem evidence only. It is not a timestamp emitted by the measurement harness."
+  ],
+  "limitations": [
+    "No claim of speedup over Python, Colibri, an alternative engine or an earlier debug build.",
+    "No physical input/IME, actual OS window launch, display/vsync/frame drops or attributable application-plus-helper memory acceptance.",
+    "Native logical viewport is 1380 by 880; physical raster scale was not recorded. CPU submission and fresh GPU allocation/render/wait/readback metrics must not be combined by adding percentiles.",
+    "Native initialization has one observation. Its emitted p95 field is not a launch-percentile estimate.",
+    "The 100,000-record workload is lexical only. No 100,000-record semantic retrieval or LongMemEval quality result is claimed.",
+    "Worker memory is a point observation of that worker alone. UI, host, embedding model/runtime, browser, inference weights, KV cache and other helpers are excluded.",
+    "No live provider/model latency, sustained mixed-resource workload, 100-connector or cross-platform acceptance."
+  ],
+  "retained_regression_evidence": [
+    "docs/evidence/2026-10-25-cancellation-regression.log",
+    "docs/evidence/2026-10-25-before-cancel-fix-release-overhead.json",
+    "docs/evidence/2026-10-25-before-cancel-fix-source-manifest.json",
+    "docs/evidence/workspace-tests.log"
+  ]
+}

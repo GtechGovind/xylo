@@ -1,0 +1,17 @@
+[package]
+name = "workbench-windows-read-validation"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Intentionally independent: checking this actual production module must not
+# require building GPUI, browser, audio or Wasmtime for a second platform.
+[workspace]
+
+[dependencies]
+anyhow = "=1.0.104"
+tokio-util = { version = "=0.7.20", features = ["rt"] }
+windows-sys = { version = "=0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemServices"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"

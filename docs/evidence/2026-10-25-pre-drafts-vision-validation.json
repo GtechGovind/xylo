@@ -1,0 +1,110 @@
+{
+  "recorded_at": "2026-10-24T23:04:41.522317+00:00",
+  "platform": {
+    "os": "27.0.1",
+    "os_build": "26A434",
+    "architecture": "arm64",
+    "hardware": "Mac17,2",
+    "ram_bytes": 34359738368,
+    "cpu_threads": 10,
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "xcode": "Xcode 27.1\nBuild version 27A9275"
+  },
+  "source_state": "Uncommitted workspace; unborn main. No commit or publication performed.",
+  "source_fingerprint_sha256": "ae26ed37525b5c14b0373f8520a54bdc74ce236f8d4c0014ea76b1b551010790",
+  "workspace_tests": {
+    "command": "CARGO_INCREMENTAL=0 cargo test --locked --workspace",
+    "passed": 181,
+    "failed": 0,
+    "ignored": 4,
+    "evidence": "docs/evidence/workspace-tests.log"
+  },
+  "lint": {
+    "command": "CARGO_INCREMENTAL=0 cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings",
+    "status": "passed",
+    "evidence": "docs/evidence/clippy.log"
+  },
+  "format": {
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo fmt --manifest-path crates/desktop/validation/Cargo.toml --all -- --check"
+    ],
+    "status": "passed"
+  },
+  "native_ui": {
+    "command": "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=\"$PWD/target\" cargo test --locked --manifest-path crates/desktop/validation/Cargo.toml --test native-interactions --test workspace-interactions --test updater-interactions",
+    "passed": 45,
+    "failed": 0,
+    "ignored": 1,
+    "groups": {
+      "native-interactions": 18,
+      "workspace-interactions": 12,
+      "updater-interactions": 15
+    },
+    "note": "45 test executions across three executables; common unit cases are repeated. 21 distinct native UI flows plus 8 shared unit cases.",
+    "renderer": "Metal",
+    "screenshots": [
+      "docs/native-preview/home.png",
+      "docs/native-preview/settings.png"
+    ],
+    "real_host_clangd_completion_hover_diagnostics": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "real_clangd_route": "Correlated production request_editor_file/opened_file path; diagnostics awaited independently."
+  },
+  "speech": {
+    "selected_native_synthesis_to_whisper": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "evidence": "docs/evidence/speech-pipeline.log",
+    "microphone_and_speaker_devices": "Not opened; physical OS permission and audio acceptance pending."
+  },
+  "package": {
+    "type": "macOS development preview",
+    "signature": "local ad hoc; not notarized",
+    "components": {
+      "agent-workbench": {
+        "bytes": 200168176,
+        "sha256": "963d8fb8a927bc48a9fbce10e399e0e37d16aed771f755d8e273fea71f553c0b"
+      },
+      "workbench-worker": {
+        "bytes": 231652128,
+        "sha256": "d7f1929104afbd93318d7b5d0e000d819eb6b44f1e12b6d2616c41502a96d1bd"
+      },
+      "workbench-helper": {
+        "bytes": 169516880,
+        "sha256": "d239e2326bbe84b67fdd19872664277450d5c76fbcc7d91ceb2be192a022c6ed"
+      }
+    },
+    "codesign_deep_strict_verification": "passed",
+    "native_assets_location": "Contents/Resources/native-assets",
+    "bundle": "target/debug/Agent Workbench.app"
+  },
+  "distribution": {
+    "release_script_tests": 6,
+    "platform_inventory_components": 819,
+    "missing_upstream_license_texts": 101,
+    "production_update_policy": "disabled; no invented signing identity or release feed",
+    "actual_installers_and_live_signed_update": "not qualified"
+  },
+  "packaged_on_screen_checks": {
+    "status": "pending",
+    "reason": "Interactive desktop and physical input/device checks have not been performed for the current source."
+  },
+  "performance": {
+    "build": "debug",
+    "scope": "Earlier headless scripted-provider worker/storage/semantic reports; not rerun for this integration.",
+    "original_source_fingerprint_sha256": "5518306d97001a173c20d9470100baa5842da9153d831caaaba3fafd07a5e1bb",
+    "semantic_10000_memories_p95_ms": 82.677375,
+    "reports": [
+      "docs/evidence/2026-10-25-debug-overhead.json",
+      "docs/evidence/2026-10-25-debug-semantic-overhead.json"
+    ],
+    "release_gui_and_cross_platform_acceptance": "not established"
+  },
+  "full_product_acceptance": "Open items tracked in docs/completion-audit.md; this preview is not a complete release."
+}

@@ -1,0 +1,19 @@
+   Compiling hermes-core v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-core)
+   Compiling workbench-capabilities v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/capabilities)
+   Compiling hermes-auth v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-auth)
+   Compiling hermes-skills v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-skills)
+   Compiling hermes-intelligence v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-intelligence)
+   Compiling hermes-agent v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-agent)
+   Compiling workbench-engine v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.01s
+     Running unittests src/lib.rs (target/debug/deps/workbench_engine-6685242e66f50f5d)
+
+running 1 test
+plugin fixture setup completed at 15.236ms; hardware ResourceSnapshot { total_memory_bytes: 34359738368, available_memory_bytes: 2805104640, cpu_threads: 10, cpu_busy_percent: 34.890526 }
+plugin approval at 16.745292ms
+plugin checkpoint 17.369542ms: journal=Some("running"), local-hardware=ResourceSnapshot { total_memory_bytes: 34359738368, available_memory_bytes: 2804973568, cpu_threads: 10, cpu_busy_percent: 34.890526 }, shared=[], compile=not-created, artifact=false, run_finished=false
+plugin ToolFinished at 64.086417ms: success=false
+test tools::tests::actual_plugin_partial_write_keeps_structured_artifacts_in_journal_and_event ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out; finished in 0.07s
+

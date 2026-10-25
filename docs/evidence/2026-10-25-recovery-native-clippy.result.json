@@ -1,0 +1,8 @@
+{
+  "stage": "native-clippy",
+  "exit_code": 0,
+  "seconds": 7.61,
+  "log": "/tmp/workbench-recovery-final-native-clippy.log",
+  "log_sha256": "8d0b50edf2781bfefe375060683348aaf524ed10489740f1a83ca3b643ba7028",
+  "reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1"
+}

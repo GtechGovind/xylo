@@ -1,0 +1,22 @@
+{
+  "scope": "Actual production Host and Store; modern protocol-qualified interrupted partial file write. No model, account, external action, or physical desktop acceptance.",
+  "logical_size": [
+    1380,
+    880
+  ],
+  "pixel_size": [
+    2760,
+    1760
+  ],
+  "file": "recovery.png",
+  "sha256": "33762bcd5fa6dfbac551bcca07640acaa681db9eff18c0711e9ff8b39c98790c",
+  "compiled_sources_sha256": {
+    "Cargo.lock": "14719e847f0b2372429426018f541c00dc1251fa1b0302610eafc63540dd3c46",
+    "recovery.rs": "cc9a6235e3d8ba07b4b94ba1db6d911684688150d59e3f9f131afc5b04980a87",
+    "recovery_fixture.rs": "c227773db6067d459cc61d96d6ae5d5ced294ddf1b8398a0e8339b07086ce019",
+    "recovery_forms.rs": "9a102213d42e28e3053acbd9debad1cb0e6f81f17d3d22f77a36c419bbdaa8b8",
+    "recovery_rendering.rs": "60837e2e34c86a89e1c7629481824cad6f02f34919648af27ca5c83d71a16de3",
+    "recovery_view.rs": "8806c017a433d65fb580cdfbd35c1a8ec1c51b1897b37d3690c3c3dd2cd5a922",
+    "workbench.rs": "321823070cc64a238dcac2e960b91c5b82df172cb4d75b4fb80d64005f0dc957"
+  }
+}

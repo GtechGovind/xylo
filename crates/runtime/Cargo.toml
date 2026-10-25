@@ -1,0 +1,49 @@
+[package]
+name = "workbench-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+workbench-core.workspace = true
+workbench-resources.workspace = true
+workbench-services.workspace = true
+workbench-scheduler.workspace = true
+workbench-helper-client.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+directories = "6"
+portable-pty = "0.9"
+alacritty_terminal = "0.25.1"
+parking_lot = "0.12"
+async-channel = "2"
+fs2 = "0.4"
+sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+libc = "0.2"
+url = "2"
+sha2 = "0.10"
+notify = "=8.2.0"
+ignore = "0.4"
+grep-searcher = "=0.1.17"
+grep-regex = "=0.1.14"
+grep-matcher = "=0.1.9"
+workbench-distribution.workspace = true
+workbench-notifications.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[dev-dependencies]
+tempfile = "3"
+minisign = "=0.8.0"
+base64 = "0.22"
+semver = "1"

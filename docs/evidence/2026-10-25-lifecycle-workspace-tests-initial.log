@@ -1,0 +1,240 @@
+   Compiling workbench-core v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/core)
+   Compiling workbench-resources v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/resources)
+   Compiling hermes-core v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-core)
+   Compiling workbench-scheduler v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/scheduler)
+   Compiling workbench-services v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/services)
+   Compiling workbench-capabilities v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/capabilities)
+   Compiling hermes-auth v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-auth)
+   Compiling hermes-intelligence v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-intelligence)
+   Compiling hermes-skills v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-skills)
+   Compiling workbench-runtime v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/runtime)
+   Compiling hermes-agent v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-agent)
+   Compiling workbench-engine v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/engine)
+   Compiling workbench-helper v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/helper)
+   Compiling workbench-worker v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/worker)
+   Compiling agent-workbench v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.05s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 2`
+     Running unittests src/main.rs (target/debug/deps/agent_workbench-dd121b90cdc6615e)
+
+running 8 tests
+test terminal_view::tests::printable_keys_wait_for_native_ime ... ok
+test terminal_view::tests::terminal_control_keys_are_encoded ... ok
+test workbench::tests::truncation_is_unicode_safe ... ok
+test workbench::tests::language_uses_extension ... ok
+test workbench::tasks::tests::schedules_use_valid_utc_fields ... ok
+test state::tests::cancellation_preserves_partial_output ... ok
+test state::tests::approval_and_finish_share_one_tool_card ... ok
+test workbench::tests::file_scan_keeps_large_and_deep_projects_and_respects_ignores ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running unittests src/lib.rs (target/debug/deps/workbench_capabilities-b309f40242c60a08)
+
+running 80 tests
+test assets::tests::native_asset_locations_match_packaged_and_development_layouts ... ok
+test audio::convert::tests::converter_cancels_without_leaving_an_output ... ok
+test assets::archive::tests::archive_traversal_and_special_entries_are_rejected ... ok
+test audio::convert::tests::resampling_rejects_alias_energy_above_target_nyquist ... ok
+test audio::playback::tests::playback_decodes_and_mixes_without_opening_a_device ... ok
+test audio::tests::microphone_and_playback_require_user_action_before_touching_devices ... ok
+test browser::tests::managed_chromium_performs_real_cdp_workflow_on_loopback ... ignored, Requires an explicit local Chromium executable in WORKBENCH_CHROMIUM
+test browser::tests::navigation_rejects_executable_and_local_file_urls ... ok
+test audio::convert::tests::stereo_48khz_is_mixed_resampled_and_duration_preserved ... ok
+test documents::editing_tests::cancelled_staging_and_existing_output_are_never_partially_published ... ok
+test documents::editing_tests::docx_actual_package_edits_table_and_single_styled_run_preserving_links_styles_media_and_raw_entries ... ok
+test documents::editing_tests::abandoned_copy_receipts_reconcile_output_and_live_lease_prevents_false_recovery ... ok
+test documents::editing_tests::friendly_unicode_copy_filenames_are_portable_and_never_escape_or_clobber ... ok
+test documents::editing_tests::full_length_cell_remains_editable_through_focused_page_after_explicit_page_budget_error ... ok
+test documents::editing_tests::signed_office_and_ancestor_bound_content_are_explicitly_protected ... ok
+test documents::editing_tests::source_revision_is_checked_again_after_copy_materialization_before_publication ... ok
+test documents::editing_tests::status_before_receipt_observes_live_start_or_tombstones_id_so_delayed_save_cannot_publish ... ok
+test documents::editing_tests::text_bom_revision_conflict_atomic_no_clobber_and_idempotent_receipts ... ok
+test documents::editing_tests::typed_page_budget_is_rejected_without_truncation_and_admission_cancellation_is_bounded ... ok
+test documents::editing_tests::unsupported_docx_style_crossing_and_embedded_object_edits_fail_without_publishing ... ok
+test assets::activation::tests::language_server_activation_preserves_other_overrides ... ok
+test documents::tests::office_exports_round_trip_text_and_numbers_offline ... ok
+test documents::editing_tests::xlsx_paged_typed_cells_and_explicit_formula_edits_preserve_other_sheets_styles_and_precise_numbers ... ok
+test assets::tests::reviewed_catalog_is_pinned_and_models_require_an_explicit_selection ... ok
+test assets::download::tests::production_policy_refuses_http_even_for_loopback ... ok
+test assets::download::tests::hash_mismatch_never_promotes_unverified_bytes ... ok
+test assets::download::tests::interrupted_transfer_resumes_exact_range_then_reuses_verified_cache ... ok
+test documents::editing_tests::small_sheet_pages_ignore_an_unrelated_sheet_beyond_native_materialization_limit ... ok
+test assets::download::tests::cancellation_preserves_only_partial_bytes_for_explicit_resume ... ok
+test assets::download::tests::ignored_range_restarts_safely_and_wrong_range_is_rejected ... ok
+test environments::tests::missing_receipt_resolution_fences_a_real_delayed_admission_and_rejects_wrong_context ... ok
+test environments::tests::a_replaced_client_symlink_cannot_redirect_a_saved_profile ... ok
+test assets::tests::installation_is_durable_verified_and_rejects_changed_bytes_on_activation ... ok
+test environments::tests::pre_dispatch_cas_error_can_be_authoritatively_cancelled_without_losing_the_form ... ok
+test environments::tests::live_profile_lease_prevents_stale_recovery_and_cancellation_while_waiting_has_no_effect ... ok
+test environments::tests::profiles_are_durable_cas_bound_and_management_is_not_an_agent_tool ... ok
+test environments::tests::unused_execution_recovery_never_initializes_environment_storage ... ok
+test models::tests::helper_templates_preserve_argument_boundaries_and_fail_unknown_assets ... ok
+test environments::tests::unused_shutdown_does_not_initialize_storage_and_missing_management_is_explicit ... ok
+test models::tests::local_server_defaults_fit_available_hardware_and_preserve_overrides ... ok
+test models::tests::inference_request_lock_is_exclusive_and_cancellable ... ok
+test models::tests::unconfigured_server_does_not_start_or_claim_readiness ... ok
+test managed_endpoints::tests::ownership_is_normalized_and_cleanup_preserves_other_servers ... ok
+test environments::tests::execute_is_revision_pinned_bounded_and_success_is_reused_without_a_second_process ... ok
+test environments::tests::foreground_ssh_master_survives_connect_and_is_shared_but_only_owner_shutdown_stops_it ... ok
+test environments::tests::cancellation_preserves_unknown_after_restart_and_blocks_automatic_replay ... ok
+test plugins::tests::active_run_lease_blocks_revoke_update_and_remove ... ok
+test plugins::tests::cancellation_fuel_limits_and_ungranted_imports_fail_closed ... ok
+test plugins::tests::ancestor_swap_after_validation_reads_only_the_original_directory_handle ... ok
+test plugins::tests::artifact_write_is_no_clobber_and_returns_committed_artifact ... ok
+test environments::tests::outer_journal_recovery_requires_an_exact_terminal_receipt_and_never_dispatches ... ok
+test plugins::tests::cancelled_admitted_artifact_write_never_publishes_partial_output ... ok
+test plugins::tests::corrupt_packages_grant_escalation_and_symlink_entrypoints_are_rejected ... ok
+test plugins::tests::failed_update_preserves_installed_authority_and_reclaims_crash_orphans ... ok
+test plugins::tests::file_swap_after_directory_validation_cannot_read_app_private_text ... ok
+test plugins::tests::https_grants_are_exact_and_management_is_not_discovered_by_agents ... ok
+test plugins::tests::guest_error_results_obey_the_same_byte_budget_as_success_results ... ok
+test plugins::tests::hard_link_aliases_and_named_pipes_cannot_be_read_as_workspace_text ... ok
+test plugins::tests::explicit_update_permissions_enablement_and_removal ... ok
+test plugins::tests::installation_replay_does_not_require_original_selected_files ... ok
+test plugins::tests::installed_echo_survives_restart_and_original_package_removal ... ok
+test environments::tests::lost_create_ack_is_reconciled_by_owned_labels_without_repeating_create ... ok
+test plugins::tests::installed_reads_reject_private_data_and_workspace_escape ... ok
+test plugins::tests::management_is_idempotent_and_rejects_reused_operation_id ... ok
+test process::tests::relative_helpers_are_rejected ... ok
+test remote::tests::ssh_arguments_are_single_quoted ... ok
+test tests::configuration_does_not_claim_availability ... ok
+test plugins::tests::multiple_linear_memories_cannot_multiply_the_declared_budget ... ok
+test plugins::tests::substituted_management_symlink_is_rejected_before_creating_children ... ok
+test tests::output_names_cannot_escape_artifacts ... ok
+test process::tests::capture_is_bounded_and_timeout_terminates ... ok
+test tests::management_storage_cannot_overlap_the_artifact_root ... ok
+test tests::private_management_files_are_not_part_of_the_plugin_input_scope ... ok
+test plugins::tests::review_pin_hash_and_catalog_revision_are_enforced ... ok
+test environments::tests::managed_lifecycle_checks_labels_and_never_forces_or_removes_unrelated_resources ... ok
+test plugins::tests::repeated_guest_writes_cannot_exhaust_artifact_storage ... ok
+test plugins::tests::repeated_guest_writes_respect_the_aggregate_byte_budget ... ok
+test models::tests::root_activity_prevents_idle_eviction_and_shutdown_without_a_generation ... ok
+test environments::tests::terminal_archival_preserves_exact_results_beyond_the_active_receipt_limit ... ok
+test tests::ordinary_tools_cannot_dispatch_application_management_controls has been running for over 60 seconds
+test tests::ordinary_tools_cannot_dispatch_application_management_controls ... ok
+
+test result: ok. 79 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 77.05s
+
+     Running unittests src/lib.rs (target/debug/deps/workbench_core-3b6446560b7c5ac4)
+
+running 2 tests
+test tests::incompatible_protocol_is_rejected ... ok
+test tests::context_and_endpoint_are_validated ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/workbench_distribution-82a816e7f5563e67)
+
+running 9 tests
+test tests::macos_archive_layout_is_bounded_complete_and_rejects_symlink_escape ... ok
+test tests::stable_channel_rejects_prerelease_and_policy_rejects_missing_publisher ... ok
+test tests::authentic_manifest_and_artifact_require_both_signatures ... ok
+test tests::staged_bytes_are_verified_again_before_any_install_mutation ... ok
+test tests::wrong_platform_channel_format_origin_and_expired_releases_are_rejected ... ok
+test tests::macos_transaction_preserves_old_bundle_on_verification_failure_and_replaces_atomically ... ok
+test tests::rollback_floor_advances_only_after_install_or_running_version_reconciliation ... ok
+test tests::corrupted_journal_fails_closed_and_cancelled_check_never_requests_feed ... ok
+test tests::cancellation_interrupts_a_stalled_tls_handshake ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+     Running unittests src/bin/workbench-release-verify.rs (target/debug/deps/workbench_release_verify-f0300715adb77055)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/workbench_engine-317be7e8d4a5b78d)
+
+running 61 tests
+test engine::tests::product_mode_is_opt_in_and_statuses_do_not_expose_engine_contracts ... ok
+test engine::tests::dropped_engine_future_guard_persists_the_terminal_evidence_hook ... ok
+test engine::tests::lost_completed_event_replays_receipt_without_model_or_duplicate_history ... ok
+test engine::tests::child_registry_cannot_expose_delegation ... ok
+test engine::tests::interrupted_generation_requires_durable_context_and_retains_unknown_writes ... ok
+test provider_guard::cancellation_boundary_tests::cancelling_a_polled_open_stream_returns_typed_interruption_every_time ... ok
+test provider_guard::tests::cancelled_waiting_generation_never_enters_provider ... ok
+test engine::tests::resume_rebuilds_only_leading_policy_and_retains_later_system_and_native_messages ... ok
+test engine::tests::denied_pending_result_is_restored_as_error_without_redispatch ... ok
+test provider_guard::tests::custom_model_overflow_is_rejected_before_provider_call ... ok
+test provider_guard::tests::remote_provider_is_not_serialized_by_local_lock ... ok
+test engine::tests::engine_error_after_admission_queues_terminal_learning_evidence_without_model_dispatch ... ok
+test provider_guard::tests::streaming_lease_is_retained_until_drop_then_released ... ok
+test engine::tests::image_checkpoint_resume_preserves_refs_without_duplicate_or_inline_image_data ... ok
+test providers::tests::chatgpt_plan_requests_obey_public_responses_restrictions ... ok
+test engine::tests::resume_restores_success_using_original_turn_before_new_prompt ... ok
+test engine::tests::same_turn_retry_resumes_without_reinjecting_the_original_user_instruction ... ok
+test providers::tests::gemini_model_override_changes_native_url_and_chat_input_images_are_normalized ... ok
+test engine::tests::native_streaming_finalization_finishes_after_one_tool_and_natural_answer ... ok
+test providers::tests::provider_http_auth_error_does_not_echo_a_reflected_credential ... ok
+test providers::tests::gemini_native_stream_retains_tool_signature_for_the_next_turn ... ok
+test providers::tests::chat_and_azure_use_correct_paths_headers_images_schema_and_tool_fragments ... ok
+test providers::tests::anthropic_stream_preserves_interleaved_thinking_signature_and_compact_tool_indexes ... ok
+test providers::tests::sse_framing_preserves_utf8_across_every_byte_and_multiline_data ... ok
+test providers::tests::remote_image_urls_are_rejected_without_http_dispatch_and_selected_model_failure_is_explicit ... ok
+test providers::tests::vertex_uses_project_publisher_endpoint_bearer_and_native_schema ... ok
+test engine::tests::native_nonstream_finalization_finishes_after_one_tool_and_natural_answer ... ok
+test providers::tests::stream_without_terminal_and_late_responses_failure_are_errors ... ok
+test tools::builtin::tests::paths_cannot_escape_through_parent_or_symlink ... ok
+test providers::tests::responses_stream_uses_public_api_and_preserves_encrypted_history ... ok
+test providers::tests::bedrock_native_binary_stream_retains_signed_reasoning_tools_images_and_usage ... ok
+test providers::tests::managed_image_refs_rehydrate_into_actual_streamed_images_for_every_api_family ... ok
+test tools::environment_recovery_tests::engine_entry_recovers_failure_before_unresolved_gate_using_original_turn ... ok
+test tools::environment_recovery_tests::cancelled_native_write_stays_unknown_until_observed_failure_is_recorded ... ok
+test tools::environment_recovery_tests::known_native_failure_resolves_outer_unknown_without_dispatch ... ok
+test providers::tests::bedrock_signed_requests_use_selected_credentials_and_reject_truncated_or_corrupt_frames ... ok
+test tools::environment_recovery_tests::engine_entry_recovers_success_before_unresolved_gate_using_original_turn ... ok
+test tools::image_generation::tests::image_tool_read_only_denial_and_arbitrary_provider_override_never_dispatch ... ok
+test tools::environment_recovery_tests::lost_outer_ack_recovers_exact_success_and_cached_retry_without_dispatch ... ok
+test tools::environment_recovery_tests::malformed_fresh_environment_requests_have_no_journal_approval_or_dispatch ... ok
+test tools::tests::agent_dispatch_cannot_invoke_application_management_controls ... ok
+test tools::environment_recovery_tests::existing_uncertain_receipt_is_not_classified_as_a_fresh_preflight_rejection ... ok
+test tools::tests::children_cannot_delegate_directly_or_through_dispatch_alias ... ok
+test tools::environment_recovery_tests::pending_original_operation_lease_cancellation_remains_unknown_without_reexecution ... ok
+test tools::tests::bounded_presentations_preserve_status_refs_and_replay_without_overwrite ... ok
+test tools::tests::child_call_identity_does_not_reuse_sibling_result ... ok
+test tools::tests::denied_write_never_touches_the_file ... ok
+test tools::tests::keys_are_namespaced_and_unambiguous ... ok
+test tools::tests::execution_error_after_running_always_finishes_the_journal_state ... ok
+test tools::tests::installed_extension_and_environment_execution_obey_read_only_tasks ... ok
+test tools::tests::failed_observation_is_not_journaled_as_success ... ok
+test tools::tests::native_connector_write_classification_cannot_be_overridden_by_arguments ... ok
+test tools::tests::presentation_failure_does_not_erase_a_completed_result ... ok
+test tools::tests::uncertain_observation_is_retained_and_never_replayed_as_success ... ok
+test tools::tests::retrieved_verified_command_remains_advisory_and_cannot_bypass_read_only_policy ... ok
+test providers::tests::bedrock_requires_a_valid_unfiltered_terminal_reason_even_after_http_success ... ok
+test tools::environment_recovery_tests::engine_entry_keeps_absent_or_unrelated_unknown_actions_blocked_without_dispatch ... ok
+test tools::environment_recovery_tests::broker_preflight_rejections_are_failed_and_allow_actual_engine_to_continue ... ok
+test tools::image_generation::tests::image_tool_transport_loss_retains_uncertainty_and_blocks_action_replay ... ok
+test tools::image_generation::tests::approved_image_tool_uses_frozen_saved_provider_actual_output_and_durable_no_replay ... FAILED
+test tools::tests::actual_plugin_partial_write_keeps_structured_artifacts_in_journal_and_event ... FAILED
+
+failures:
+
+---- tools::image_generation::tests::approved_image_tool_uses_frozen_saved_provider_actual_output_and_durable_no_replay stdout ----
+
+thread 'tokio-rt-worker' (1553675) panicked at crates/engine/src/tools/image_generation/tests.rs:108:14:
+called `Result::unwrap()` on an `Err` value: Elapsed(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'tools::image_generation::tests::approved_image_tool_uses_frozen_saved_provider_actual_output_and_durable_no_replay' (1553674) panicked at crates/engine/src/tools/image_generation/tests.rs:153:41:
+called `Result::unwrap()` on an `Err` value: Generation transport failed after dispatch. The provider may have generated or charged for an image. Check it before retrying. Generation receipt: 8ae55d50-4ad9-4e16-8b6a-5a0f3743d591. Do not automatically generate another image.
+
+---- tools::tests::actual_plugin_partial_write_keeps_structured_artifacts_in_journal_and_event stdout ----
+
+thread 'tools::tests::actual_plugin_partial_write_keeps_structured_artifacts_in_journal_and_event' (1553710) panicked at crates/engine/src/tools/tests.rs:371:6:
+called `Result::unwrap()` on an `Err` value: Elapsed(())
+
+thread 'tokio-rt-worker' (1553724) panicked at /Users/govind/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.54.1/src/runtime/time/entry.rs:534:9:
+A Tokio 1.x context was found, but it is being shutdown.
+
+
+failures:
+    tools::image_generation::tests::approved_image_tool_uses_frozen_saved_provider_actual_output_and_durable_no_replay
+    tools::tests::actual_plugin_partial_write_keeps_structured_artifacts_in_journal_and_event
+
+test result: FAILED. 59 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.23s
+
+error: test failed, to rerun pass `-p workbench-engine --lib`

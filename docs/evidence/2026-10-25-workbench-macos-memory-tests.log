@@ -1,0 +1,24 @@
+   Compiling workbench-resources v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/resources)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.44s
+     Running unittests src/lib.rs (target/debug/deps/workbench_resources-7c00753e09c076e0)
+
+running 15 tests
+test macos_memory::tests::physical_free_and_inactive_are_counted_once ... ok
+test macos_memory::tests::native_estimate_retains_headroom_and_existing_reservations ... ok
+test macos_memory::tests::elevated_unknown_or_unavailable_pressure_never_broadens_admission ... ok
+test macos_memory::tests::native_estimate_is_clamped_without_arithmetic_overflow ... ok
+test macos_memory::tests::missing_or_invalid_native_counters_keep_bounded_fallback ... ok
+macOS VM comparison: total=34359738368, page_size=16384, free=114250, inactive=591440, purgeable=4657, speculative=8410, compressor=506822, pressure_raw=Some(1), pressure=Normal, sysinfo_fallback=3334635520, old_formula_same_counters=3334553600, native_free_plus_inactive=11562024960, selected=11562024960, fallback_used=false
+test tests::live_pressure_changes_admission_on_the_same_machine ... ok
+test tests::reservations_prevent_oversubscription_without_ram_tiers ... ok
+test macos_memory::tests::live_counter_comparison ... ok
+test shared::tests::traversal_unexpected_files_and_oversized_records_are_rejected ... ok
+test shared::tests::directory_and_metadata_symlinks_never_touch_the_outside_target ... ok
+test shared::tests::live_corrupt_metadata_fails_closed_but_dead_corrupt_record_is_reclaimed ... ok
+test shared::tests::cpu_and_available_memory_changes_control_admission_without_profiles ... ok
+test shared::tests::independent_handles_share_accounting_and_drop_is_reaped_by_os_liveness ... ok
+test shared::tests::cancelled_outer_future_retains_admission_until_blocking_work_really_finishes ... ok
+test shared::tests::queued_cancellation_leaves_no_live_reservation ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

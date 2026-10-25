@@ -1,0 +1,8 @@
+{
+  "stage": "windows-check",
+  "exit_code": 0,
+  "seconds": 0.4,
+  "log": "/tmp/workbench-recovery-final-windows-check.log",
+  "log_sha256": "8b6421cdc92cb0d7954281bc775ec46d3d655a0c8139d661a1da3b77f2bf82a8",
+  "reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1"
+}

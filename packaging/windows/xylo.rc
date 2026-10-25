@@ -1,0 +1,3 @@
+// GPUI loads icon group 1 from the main executable. The resource compiler finds
+// this committed icon through the absolute include directory in build.rs.
+1 ICON "app.ico"

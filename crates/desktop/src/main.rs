@@ -1,0 +1,151 @@
+extern crate gpui_kit as gpui;
+mod startup;
+mod state;
+mod terminal_view;
+mod tray;
+mod ui;
+mod workbench;
+use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::{prelude::*, *};
+use workbench_runtime::host::HostClient;
+actions!(workbench, [ShowWorkbench, QuitWorkbench]);
+struct ShellState {
+    window: AnyWindowHandle,
+    view: Entity<workbench::Workbench>,
+    _tray: Option<tray_icon::TrayIcon>,
+}
+impl Global for ShellState {}
+fn show(cx: &mut App) {
+    if let Some(state) = cx.try_global::<ShellState>() {
+        let window = state.window;
+        cx.activate(true);
+        let _ = cx.update_window(window, |_, window, _| window.activate_window());
+    }
+}
+fn quit(cx: &mut App) {
+    if let Some(state) = cx.try_global::<ShellState>() {
+        let view = state.view.clone();
+        let window = state.window;
+        let _ = cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| view.request_quit(window, cx))
+        });
+    } else {
+        cx.quit();
+    }
+}
+fn main() -> anyhow::Result<()> {
+    let data = match startup::Command::parse(std::env::args_os().skip(1))? {
+        startup::Command::Version => {
+            println!(
+                "{} {}",
+                workbench_core::APPLICATION_NAME,
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        startup::Command::Help => {
+            println!(
+                "Xylo {}\n\nUsage: agent-workbench [--data-dir ABSOLUTE_PATH | --version | --help]\n\nWithout options, Xylo opens the existing application profile.",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        startup::Command::Launch { data } => data,
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    let host = match data {
+        Some(data) => workbench_runtime::AppPaths::at(data).and_then(HostClient::spawn_at),
+        None => HostClient::spawn(),
+    };
+    let application = gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .with_quit_mode(QuitMode::Explicit);
+    application.on_reopen(show);
+    application.run(move |cx| {
+        gpui_kit::init(cx);
+        Theme::change(ThemeMode::Light, None, cx);
+        cx.set_window_appearance(Some(WindowAppearance::Light));
+        let tray = tray::create();
+        if let Err(error) = &tray {
+            tracing::warn!(%error,"Tray unavailable; close minimizes the window");
+        }
+        let (tray, events) = match tray {
+            Ok((tray, events)) => (Some(tray), Some(events)),
+            Err(_) => (None, None),
+        };
+        let has_tray = tray.is_some();
+        let (window, view) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(1380.), px(880.)),
+                    cx,
+                ))),
+                window_min_size: Some(size(px(1000.), px(680.))),
+                // This GPUI backend supports a per-window icon on X11. Other
+                // platforms use the corresponding packaged application icon.
+                #[cfg(target_os = "linux")]
+                icon: image::load_from_memory_with_format(
+                    include_bytes!("../../../packaging/icons/app.png"),
+                    image::ImageFormat::Png,
+                )
+                .map(|image| std::sync::Arc::new(image.into_rgba8()))
+                .ok(),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Xylo".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            cx,
+            move |window, cx| {
+                window.on_window_should_close(cx, move |window, cx| {
+                    if has_tray && cfg!(target_os = "macos") {
+                        cx.hide();
+                    } else {
+                        window.minimize_window();
+                    }
+                    false
+                });
+                cx.new(|cx| workbench::Workbench::new(host, window, cx))
+            },
+        )
+        .expect("open native window");
+        cx.set_global(ShellState {
+            window,
+            view,
+            _tray: tray,
+        });
+        cx.on_action(|_: &ShowWorkbench, cx| show(cx));
+        cx.on_action(|_: &QuitWorkbench, cx| quit(cx));
+        cx.bind_keys([KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-q"
+            } else {
+                "ctrl-q"
+            },
+            QuitWorkbench,
+            None,
+        )]);
+        cx.set_menus([Menu::new("Xylo").items([
+            MenuItem::action("Open Xylo", ShowWorkbench),
+            MenuItem::Separator,
+            MenuItem::action("Quit Xylo", QuitWorkbench),
+        ])]);
+        if let Some(events) = events {
+            cx.spawn(async move |cx| {
+                while let Ok(event) = events.recv().await {
+                    cx.update(|cx| match event {
+                        tray::Event::Show => show(cx),
+                        tray::Event::Quit => quit(cx),
+                    });
+                }
+            })
+            .detach();
+        }
+        cx.activate(true);
+    });
+    Ok(())
+}

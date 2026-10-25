@@ -1,0 +1,19 @@
+Xylo
+Copyright 2026 Xylo contributors
+
+Application-owned code is licensed under Apache License 2.0.
+
+This project includes Hermes Ultra Rust sources pinned to
+c002f8c4efe475c89c9f14d3995d44e6a5df5b27:
+https://github.com/sheawinkler/hermes-agent-ultra
+Its fork-contribution license and inherited upstream terms remain applicable.
+See vendor/hermes-ultra/LICENSE, LICENSE-UPSTREAM and UPSTREAM.md.
+
+The native interface references AionUi's workflow and default theme:
+https://github.com/iOfficeAI/AionUi
+Xylo uses its own name and does not include AionUi brand artwork.
+
+Other third-party dependencies retain their respective copyright and license
+notices. Cargo.lock identifies the Rust dependency versions used by this build.
+Native asset distributors must also include the notices for every supplied
+browser, inference binary, document library, speech engine and model weight.

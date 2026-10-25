@@ -1,0 +1,6 @@
+   Compiling workbench-native-validation v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop/validation)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.03s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running rendering.rs (target/debug/deps/native_rendering-43ed1f53449f97fb)
+Native production UI captures: /Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/docs/native-preview

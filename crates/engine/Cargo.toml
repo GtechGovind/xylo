@@ -1,0 +1,36 @@
+[package]
+name = "workbench-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+workbench-core.workspace = true
+workbench-runtime.workspace = true
+workbench-services.workspace = true
+workbench-capabilities.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+parking_lot = "0.12"
+futures-util = "0.3"
+async-stream = "0.3"
+fs2 = "0.4"
+tempfile = "3"
+tiktoken-rs = "0.12.1"
+url = "2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+base64 = "0.22"
+hermes-agent = { path = "../../vendor/hermes-ultra/crates/hermes-agent" }
+hermes-core = { path = "../../vendor/hermes-ultra/crates/hermes-core" }
+
+[dev-dependencies]
+sha2 = "0.10"
+workbench-services = { workspace = true, features = ["test-support"] }
+keyring-core = "1.0.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }

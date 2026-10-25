@@ -1,0 +1,8 @@
+{
+  "stage": "native-render",
+  "exit_code": 0,
+  "seconds": 15.82,
+  "log": "/tmp/workbench-recovery-final-native-render.log",
+  "log_sha256": "32bbe1afa93dd224a87ae25def6f80642698f8cc7cd93137ce0facbd97345573",
+  "reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1"
+}

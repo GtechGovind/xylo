@@ -1,0 +1,7 @@
+{"reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1", "started_at_unix": 1792902598.085506, "command": ["cargo", "clippy", "--locked", "--manifest-path", "crates/desktop/validation/Cargo.toml", "--all-targets", "--no-deps", "--", "-D", "warnings"]}
+    Checking workbench-services v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/services)
+    Checking workbench-runtime v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/runtime)
+    Checking workbench-native-validation v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop/validation)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.54s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

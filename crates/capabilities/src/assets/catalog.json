@@ -1,0 +1,1146 @@
+[
+  {
+    "id": "llama-runtime",
+    "name": "Local model runtime",
+    "kind": "llama",
+    "description": "Native llama.cpp. Metal on macOS; portable CPU package on other platforms. GPU-accelerated external servers remain supported.",
+    "revision": "d327bf1f0780f87b8c01b367b61853b0c291d7c4",
+    "project_url": "https://github.com/ggml-org/llama.cpp/releases/tag/b11869",
+    "license": {
+      "identifier": "MIT",
+      "url": "https://github.com/ggml-org/llama.cpp/blob/d327bf1f0780f87b8c01b367b61853b0c291d7c4/LICENSE",
+      "notice": "llama.cpp contributors; bundled third-party notices are retained."
+    },
+    "requires": [],
+    "variants": [
+      {
+        "platform": "macos-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11869/llama-b11869-bin-macos-arm64.tar.gz",
+            "sha256": "0a24eb567528ee3265f0fcf11d9ef5d83f9d8f5bd18be760895b853eae82508f",
+            "size_bytes": 16248800,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "llama-server",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "macos-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11869/llama-b11869-bin-macos-x64.tar.gz",
+            "sha256": "9edc538331e7216c0dce7fa95251c5b2b075eff341e0d14e60a8f544aaf8160e",
+            "size_bytes": 11987907,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "llama-server",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "linux-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11869/llama-b11869-bin-ubuntu-arm64.tar.gz",
+            "sha256": "dc10f7a9e7048984834d03d84b05ddc5086c5d6a2c120276f78e846e2a6ea5af",
+            "size_bytes": 18154923,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "llama-server",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "linux-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11869/llama-b11869-bin-ubuntu-x64.tar.gz",
+            "sha256": "529ebb30c8aafcfd7d2ae0606aef346a3f3209d0a49addf382070c0c78fa2a6e",
+            "size_bytes": 22438155,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "llama-server",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "windows-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11869/llama-b11869-bin-win-cpu-arm64.zip",
+            "sha256": "c4617eb6a6d996eca7ed71f72e1e3bdc798a78237e65932f7fd029dba3dcba56",
+            "size_bytes": 12801791,
+            "format": "zip",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "llama-server.exe",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "windows-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11869/llama-b11869-bin-win-cpu-x64.zip",
+            "sha256": "68bbb8f833d6b623386d50f958af8cf5d9f4b39897ba8ab79b9b294093304891",
+            "size_bytes": 24180442,
+            "format": "zip",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "llama-server.exe",
+            "executable": true
+          }
+        }
+      }
+    ],
+    "hidden": false
+  },
+  {
+    "id": "whisper-runtime",
+    "name": "Transcription runtime",
+    "kind": "whisper",
+    "description": "Native whisper.cpp. macOS packaging builds the pinned source with CMake and the native compiler; no Python/Node runtime.",
+    "revision": "d1be6fde11ac6e0407606b4e42fe72d34add8037",
+    "project_url": "https://github.com/ggml-org/whisper.cpp/releases/tag/b5454",
+    "license": {
+      "identifier": "MIT",
+      "url": "https://github.com/ggml-org/whisper.cpp/blob/d1be6fde11ac6e0407606b4e42fe72d34add8037/LICENSE",
+      "notice": "whisper.cpp contributors; source license is retained."
+    },
+    "requires": [],
+    "variants": [
+      {
+        "platform": "linux-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-ubuntu-arm64.tar.gz",
+            "sha256": "6b95ebfc60447df48e70ef00a73bdc3f41679ed2d01ef465827206a2ff325149",
+            "size_bytes": 4608377,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "whisper-cli",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "linux-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-ubuntu-x64.tar.gz",
+            "sha256": "a72becf15d7917f990f6313867a52638b82b7f9ef237fb0c980dac56a135781c",
+            "size_bytes": 10364195,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "whisper-cli",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "windows-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-win-cpu-arm64.zip",
+            "sha256": "28c37e7b598c3d9bbfef94f3bd67f2ee6f12b7c86f3da5edcf5e4308d615ff6d",
+            "size_bytes": 4371193,
+            "format": "zip",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "whisper-cli.exe",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "windows-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip",
+            "sha256": "6ba69e3482d7826214f90a6a9c84ca07782aec1e1d0c6a7c30c994fd5d816ccb",
+            "size_bytes": 8928640,
+            "format": "zip",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "whisper-cli.exe",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "macos-aarch64",
+        "files": [
+          {
+            "url": "https://codeload.github.com/ggml-org/whisper.cpp/tar.gz/d1be6fde11ac6e0407606b4e42fe72d34add8037",
+            "sha256": "645445da884df6dbd52b30f82d7be7c01d1767c938714e477e786b88d529e9f4",
+            "size_bytes": 9631456,
+            "format": "tar_gz",
+            "destination": "source"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "whisper-cli",
+            "executable": true
+          }
+        },
+        "source_build": true
+      },
+      {
+        "platform": "macos-x86_64",
+        "files": [
+          {
+            "url": "https://codeload.github.com/ggml-org/whisper.cpp/tar.gz/d1be6fde11ac6e0407606b4e42fe72d34add8037",
+            "sha256": "645445da884df6dbd52b30f82d7be7c01d1767c938714e477e786b88d529e9f4",
+            "size_bytes": 9631456,
+            "format": "tar_gz",
+            "destination": "source"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "whisper-cli",
+            "executable": true
+          }
+        },
+        "source_build": true
+      }
+    ],
+    "hidden": false
+  },
+  {
+    "id": "pdfium-runtime",
+    "name": "PDF previews and extraction",
+    "kind": "pdf",
+    "description": "Pinned non-V8 PDFium build by bblanchon/pdfium-binaries. This independent distribution is not affiliated with Google or Foxit.",
+    "revision": "chromium/8111",
+    "project_url": "https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium/8111",
+    "license": {
+      "identifier": "BSD-3-Clause AND third-party notices",
+      "url": "https://pdfium.googlesource.com/pdfium/+/refs/heads/main/LICENSE",
+      "notice": "PDFium authors and third-party notices; the complete archive LICENSE/licenses are retained."
+    },
+    "requires": [],
+    "variants": [
+      {
+        "platform": "macos-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8111/pdfium-mac-arm64.tgz",
+            "sha256": "46c674298c60123f1195c2a03c65ee08c4783c84874ce4f5b3a054abb3ecaf30",
+            "size_bytes": 3541773,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "libpdfium.dylib",
+            "executable": false
+          }
+        }
+      },
+      {
+        "platform": "macos-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8111/pdfium-mac-x64.tgz",
+            "sha256": "e7fece4693f65a7e47f84fa38099068d573d4dcbd46b1a3c8d2c26581c308466",
+            "size_bytes": 3749773,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "libpdfium.dylib",
+            "executable": false
+          }
+        }
+      },
+      {
+        "platform": "linux-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8111/pdfium-linux-arm64.tgz",
+            "sha256": "042de247138f96341534cccf24ed21c2550a7245b936bb4a60d2340120000f05",
+            "size_bytes": 3728828,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "libpdfium.so",
+            "executable": false
+          }
+        }
+      },
+      {
+        "platform": "linux-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8111/pdfium-linux-x64.tgz",
+            "sha256": "bdc60126399f39fe768566a18d4be055a7b3681bc9e248e8a6656b4f6cae0aa2",
+            "size_bytes": 3828739,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "libpdfium.so",
+            "executable": false
+          }
+        }
+      },
+      {
+        "platform": "windows-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8111/pdfium-win-arm64.tgz",
+            "sha256": "99ec8b76d5ac30602a8488da745397393ff6cddc824ef36f398146f6b4f76d4e",
+            "size_bytes": 3654396,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "pdfium.dll",
+            "executable": false
+          }
+        }
+      },
+      {
+        "platform": "windows-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8111/pdfium-win-x64.tgz",
+            "sha256": "3452d11031050ec65e57f180215b57b9e6d465e3fbedafa8a77ad90885c7d23e",
+            "size_bytes": 3905343,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "pdfium.dll",
+            "executable": false
+          }
+        }
+      }
+    ],
+    "hidden": false
+  },
+  {
+    "id": "onnx-runtime",
+    "name": "Embedding runtime",
+    "kind": "runtime",
+    "description": "Official Microsoft CPU ONNX Runtime. No compatible official Intel macOS archive is available in this pinned release.",
+    "revision": "v1.31.0",
+    "project_url": "https://github.com/microsoft/onnxruntime/releases/tag/v1.31.0",
+    "license": {
+      "identifier": "MIT",
+      "url": "https://github.com/microsoft/onnxruntime/blob/v1.31.0/LICENSE",
+      "notice": "Microsoft Corporation; bundled license/third-party notices are retained."
+    },
+    "requires": [],
+    "variants": [
+      {
+        "platform": "macos-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-osx-arm64-1.31.0.tgz",
+            "sha256": "1031b36dd3bdaa8d976a6130d9cf2a05e9be320b93ae804f8427b91dc3432afc",
+            "size_bytes": 36549009,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "libonnxruntime.dylib",
+            "executable": false
+          }
+        }
+      },
+      {
+        "platform": "linux-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-aarch64-1.31.0.tgz",
+            "sha256": "c5b8b3cca31f3d643a3b313b8f42e2d0f16a4fcefd02cda343d97bd5306afaab",
+            "size_bytes": 10331104,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "libonnxruntime.so",
+            "executable": false
+          }
+        }
+      },
+      {
+        "platform": "linux-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz",
+            "sha256": "cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57",
+            "size_bytes": 11408003,
+            "format": "tar_gz",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "libonnxruntime.so",
+            "executable": false
+          }
+        }
+      },
+      {
+        "platform": "windows-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-win-arm64-1.31.0.zip",
+            "sha256": "ef6206fa8d6975878d93a97035d280240ce5764c126a7430e5427e18923316d5",
+            "size_bytes": 85806468,
+            "format": "zip",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "onnxruntime.dll",
+            "executable": false
+          }
+        }
+      },
+      {
+        "platform": "windows-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-win-x64-1.31.0.zip",
+            "sha256": "3958d8a44984160692c1b4ffd0de3cb48f8c39f9d34bb31e433db06e30b82195",
+            "size_bytes": 82887349,
+            "format": "zip",
+            "destination": "runtime"
+          }
+        ],
+        "exports": {
+          "library": {
+            "basename": "onnxruntime.dll",
+            "executable": false
+          }
+        }
+      }
+    ],
+    "hidden": true
+  },
+  {
+    "id": "sherpa-runtime",
+    "name": "Speech synthesis runtime",
+    "kind": "runtime",
+    "description": "Official native sherpa-onnx text-to-speech executable and its runtime libraries.",
+    "revision": "v2.0.0",
+    "project_url": "https://github.com/k2-fsa/sherpa-onnx/releases/tag/v2.0.0",
+    "license": {
+      "identifier": "Apache-2.0",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/blob/v2.0.0/LICENSE",
+      "notice": "k2-fsa/sherpa-onnx contributors and retained third-party notices."
+    },
+    "requires": [],
+    "variants": [
+      {
+        "platform": "macos-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.0/sherpa-onnx-v2.0.0-osx-arm64-shared.tar.bz2",
+            "sha256": "ca352a87d313fb1cce311c7b5ddc2e48df3ff899fb2c43ce8076071f029d1d3f",
+            "size_bytes": 20225744,
+            "format": "tar_bz2",
+            "destination": "runtime"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v2.0.0/LICENSE",
+            "destination": "notices/sherpa-onnx-LICENSE",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+            "size_bytes": 11358,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "sherpa-onnx-offline-tts",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "macos-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.0/sherpa-onnx-v2.0.0-osx-universal2-shared.tar.bz2",
+            "sha256": "32bc7a4a463ba35e2447428439062f3b1794cdb929596dfb04ccde383126708f",
+            "size_bytes": 43458941,
+            "format": "tar_bz2",
+            "destination": "runtime"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v2.0.0/LICENSE",
+            "destination": "notices/sherpa-onnx-LICENSE",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+            "size_bytes": 11358,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "sherpa-onnx-offline-tts",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "linux-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.0/sherpa-onnx-v2.0.0-linux-aarch64-shared-cpu.tar.bz2",
+            "sha256": "0ee6e6a6de388f9db6f24c241ee6631c7509d47f3c8e5cd7b05259ff92f722b6",
+            "size_bytes": 27802045,
+            "format": "tar_bz2",
+            "destination": "runtime"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v2.0.0/LICENSE",
+            "destination": "notices/sherpa-onnx-LICENSE",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+            "size_bytes": 11358,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "sherpa-onnx-offline-tts",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "linux-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.0/sherpa-onnx-v2.0.0-linux-x64-shared.tar.bz2",
+            "sha256": "ee729caa387ede28fb62dd0c111e267da5ed436c9438ee502da9ee0a2e03ab7c",
+            "size_bytes": 27896866,
+            "format": "tar_bz2",
+            "destination": "runtime"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v2.0.0/LICENSE",
+            "destination": "notices/sherpa-onnx-LICENSE",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+            "size_bytes": 11358,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "sherpa-onnx-offline-tts",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "windows-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.0/sherpa-onnx-v2.0.0-win-arm64-shared-MT-Release.tar.bz2",
+            "sha256": "d2fc12f76d601e34b70ea9c79cb46bddb17b843bf0bda858421bf56704523382",
+            "size_bytes": 25570325,
+            "format": "tar_bz2",
+            "destination": "runtime"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v2.0.0/LICENSE",
+            "destination": "notices/sherpa-onnx-LICENSE",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+            "size_bytes": 11358,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "sherpa-onnx-offline-tts.exe",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "windows-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.0/sherpa-onnx-v2.0.0-win-x64-shared-MT-Release.tar.bz2",
+            "sha256": "a66a89c6f3401f3f26a6f53d39ea632900884cbd6a116155e2a85f434b6a7bda",
+            "size_bytes": 26570586,
+            "format": "tar_bz2",
+            "destination": "runtime"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v2.0.0/LICENSE",
+            "destination": "notices/sherpa-onnx-LICENSE",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+            "size_bytes": 11358,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "sherpa-onnx-offline-tts.exe",
+            "executable": true
+          }
+        }
+      }
+    ],
+    "hidden": true
+  },
+  {
+    "id": "qwen3-0.6b-q8",
+    "name": "Qwen3 0.6B \u00b7 Q8",
+    "kind": "model",
+    "description": "Explicit optional local generation model. Download size is shown; no model is selected automatically and quality is not a benchmark claim.",
+    "revision": "23749fefcc72300e3a2ad315e1317431b06b590a",
+    "project_url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF",
+    "license": {
+      "identifier": "Apache-2.0",
+      "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/23749fefcc72300e3a2ad315e1317431b06b590a/LICENSE",
+      "notice": "Qwen Team, Alibaba Cloud; original LICENSE and model card are retained."
+    },
+    "requires": [
+      "llama-runtime"
+    ],
+    "variants": [
+      {
+        "platform": "any",
+        "files": [
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/23749fefcc72300e3a2ad315e1317431b06b590a/Qwen3-0.6B-Q8_0.gguf",
+            "sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+            "size_bytes": 639446688,
+            "format": "raw",
+            "destination": "model.gguf"
+          },
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/23749fefcc72300e3a2ad315e1317431b06b590a/LICENSE",
+            "sha256": "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd",
+            "size_bytes": 11544,
+            "format": "raw",
+            "destination": "LICENSE"
+          },
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/23749fefcc72300e3a2ad315e1317431b06b590a/README.md",
+            "sha256": "44adabae2153c3a7bb741b86fbffd48736bc95118831935fdfc4d3cc1854f2f5",
+            "size_bytes": 6236,
+            "format": "raw",
+            "destination": "README.md"
+          }
+        ],
+        "exports": {
+          "model": {
+            "basename": "model.gguf",
+            "executable": false
+          }
+        }
+      }
+    ],
+    "hidden": false
+  },
+  {
+    "id": "qwen3-1.7b-q8",
+    "name": "Qwen3 1.7B \u00b7 Q8",
+    "kind": "model",
+    "description": "Explicit optional local generation model. Download size is shown; no model is selected automatically and quality is not a benchmark claim.",
+    "revision": "90862c4b9d2787eaed51d12237eafdfe7c5f6077",
+    "project_url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF",
+    "license": {
+      "identifier": "Apache-2.0",
+      "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/blob/90862c4b9d2787eaed51d12237eafdfe7c5f6077/LICENSE",
+      "notice": "Qwen Team, Alibaba Cloud; original LICENSE and model card are retained."
+    },
+    "requires": [
+      "llama-runtime"
+    ],
+    "variants": [
+      {
+        "platform": "any",
+        "files": [
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf",
+            "sha256": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+            "size_bytes": 1834426016,
+            "format": "raw",
+            "destination": "model.gguf"
+          },
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/LICENSE",
+            "sha256": "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd",
+            "size_bytes": 11544,
+            "format": "raw",
+            "destination": "LICENSE"
+          },
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/README.md",
+            "sha256": "60706b0c6aa38e0d1e73a7b21f98e50cad82ee1eaea636fd1f3a49617bccdb0d",
+            "size_bytes": 6235,
+            "format": "raw",
+            "destination": "README.md"
+          }
+        ],
+        "exports": {
+          "model": {
+            "basename": "model.gguf",
+            "executable": false
+          }
+        }
+      }
+    ],
+    "hidden": false
+  },
+  {
+    "id": "whisper-tiny-en",
+    "name": "Whisper Tiny English",
+    "kind": "whisper",
+    "description": "Explicit English speech recognition model (about 78MB). Includes the native transcription runtime dependency.",
+    "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+    "project_url": "https://huggingface.co/ggerganov/whisper.cpp",
+    "license": {
+      "identifier": "MIT",
+      "url": "https://raw.githubusercontent.com/openai/whisper/6e3be77e1a105e59086e3e21ff5f609fd6fa89a5/LICENSE",
+      "notice": "OpenAI Whisper weights, converted by whisper.cpp. Upstream license metadata is preserved."
+    },
+    "requires": [
+      "whisper-runtime"
+    ],
+    "variants": [
+      {
+        "platform": "any",
+        "files": [
+          {
+            "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en.bin",
+            "sha256": "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+            "size_bytes": 77704715,
+            "format": "raw",
+            "destination": "ggml-tiny.en.bin"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/openai/whisper/6e3be77e1a105e59086e3e21ff5f609fd6fa89a5/LICENSE",
+            "destination": "notices/Whisper-model-LICENSE",
+            "sha256": "b5d65a59060e68c4ff940e1eddfa6f94b2d68fdf58ed7f4dd57721c997e35e9d",
+            "size_bytes": 1063,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "model": {
+            "basename": "ggml-tiny.en.bin",
+            "executable": false
+          }
+        }
+      }
+    ],
+    "hidden": false
+  },
+  {
+    "id": "bge-small-en-v1.5",
+    "name": "Semantic memory \u00b7 BGE small English",
+    "kind": "embedding",
+    "description": "Explicit 384-dimensional English embedding model; CLS pooling and the pinned ONNX runtime are configured together.",
+    "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+    "project_url": "https://huggingface.co/BAAI/bge-small-en-v1.5",
+    "license": {
+      "identifier": "MIT",
+      "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/blob/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/README.md",
+      "notice": "Beijing Academy of Artificial Intelligence; publisher model card declares MIT and is retained."
+    },
+    "requires": [
+      "onnx-runtime"
+    ],
+    "variants": [
+      {
+        "platform": "any",
+        "files": [
+          {
+            "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/onnx/model.onnx",
+            "sha256": "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35",
+            "size_bytes": 133093490,
+            "format": "raw",
+            "destination": "model.onnx"
+          },
+          {
+            "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/config.json",
+            "sha256": "094f8e891b932f2000c92cfc663bac4c62069f5d8af5b5278c4306aef3084750",
+            "size_bytes": 743,
+            "format": "raw",
+            "destination": "config.json"
+          },
+          {
+            "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/special_tokens_map.json",
+            "sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+            "size_bytes": 125,
+            "format": "raw",
+            "destination": "special_tokens_map.json"
+          },
+          {
+            "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer.json",
+            "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+            "size_bytes": 711396,
+            "format": "raw",
+            "destination": "tokenizer.json"
+          },
+          {
+            "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer_config.json",
+            "sha256": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+            "size_bytes": 366,
+            "format": "raw",
+            "destination": "tokenizer_config.json"
+          },
+          {
+            "url": "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/README.md",
+            "sha256": "ddb964361a55c6e5dfca6361615854b260c9c960205d04c7520151aaa1d75837",
+            "size_bytes": 94783,
+            "format": "raw",
+            "destination": "README.md"
+          }
+        ],
+        "exports": {
+          "model": {
+            "basename": "model.onnx",
+            "executable": false
+          }
+        }
+      }
+    ],
+    "hidden": false
+  },
+  {
+    "id": "vits-ljs-int8",
+    "name": "English voice \u00b7 LJSpeech int8",
+    "kind": "voice",
+    "description": "Explicit single-speaker VITS voice, publisher ONNX export. Native sherpa runtime is included as a dependency.",
+    "revision": "7ac337c834f318e45a34037cb3371cc3929187ff",
+    "project_url": "https://huggingface.co/csukuangfj/vits-ljs",
+    "license": {
+      "identifier": "Apache-2.0 (publisher declaration); VITS MIT; LJSpeech public-domain recordings",
+      "url": "https://huggingface.co/csukuangfj/vits-ljs/blob/7ac337c834f318e45a34037cb3371cc3929187ff/README.md",
+      "notice": "Jaehyeon Kim/VITS and sherpa-onnx export contributors; the model card and provenance are retained. This voice is not an official identity."
+    },
+    "requires": [
+      "sherpa-runtime"
+    ],
+    "variants": [
+      {
+        "platform": "any",
+        "files": [
+          {
+            "url": "https://huggingface.co/csukuangfj/vits-ljs/resolve/7ac337c834f318e45a34037cb3371cc3929187ff/vits-ljs.int8.onnx",
+            "sha256": "b3aa88de0202a040d7d75bac9dbf1a59d81d60c7369046f32241afa7dec65cc1",
+            "size_bytes": 37423560,
+            "format": "raw",
+            "destination": "vits-ljs.int8.onnx"
+          },
+          {
+            "url": "https://huggingface.co/csukuangfj/vits-ljs/resolve/7ac337c834f318e45a34037cb3371cc3929187ff/lexicon.txt",
+            "sha256": "bdccfc6da71c45c48e2e0056fcf0aab760577c5f959f6c1b5eb3e3e916fd5a0e",
+            "size_bytes": 3708181,
+            "format": "raw",
+            "destination": "lexicon.txt"
+          },
+          {
+            "url": "https://huggingface.co/csukuangfj/vits-ljs/resolve/7ac337c834f318e45a34037cb3371cc3929187ff/tokens.txt",
+            "sha256": "5fee2c6b238d712287f2ecb08f34a8a8b413bcb7390862ef6fb6fd6f0f8d3a17",
+            "size_bytes": 1084,
+            "format": "raw",
+            "destination": "tokens.txt"
+          },
+          {
+            "url": "https://huggingface.co/csukuangfj/vits-ljs/resolve/7ac337c834f318e45a34037cb3371cc3929187ff/README.md",
+            "sha256": "26711a83b9cfccab716b482512ee95f53de9aaf68c3a3c4400c789ab52892a3c",
+            "size_bytes": 526,
+            "format": "raw",
+            "destination": "README.md"
+          }
+        ],
+        "exports": {
+          "model": {
+            "basename": "vits-ljs.int8.onnx",
+            "executable": false
+          },
+          "tokens": {
+            "basename": "tokens.txt",
+            "executable": false
+          },
+          "lexicon": {
+            "basename": "lexicon.txt",
+            "executable": false
+          }
+        }
+      }
+    ],
+    "hidden": false
+  },
+  {
+    "id": "rust-analyzer",
+    "name": "Rust language intelligence",
+    "kind": "language-server",
+    "description": "Official native rust-analyzer. Build scripts, procedural macros, and check-on-save remain disabled until explicitly enabled for the project.",
+    "revision": "5ec20d044dbf04895877a55921ddc0ae6e73e127",
+    "project_url": "https://github.com/rust-lang/rust-analyzer/releases/tag/2026-10-19",
+    "license": {
+      "identifier": "MIT OR Apache-2.0",
+      "url": "https://github.com/rust-lang/rust-analyzer/blob/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-MIT",
+      "notice": "The rust-analyzer contributors; both original license texts are retained."
+    },
+    "requires": [],
+    "hidden": false,
+    "variants": [
+      {
+        "platform": "macos-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-10-19/rust-analyzer-aarch64-apple-darwin.gz",
+            "size_bytes": 14071674,
+            "sha256": "eedad08a96f7bf92afd0890463787337d17591ea2e3df216033c6bc3ccc9d802",
+            "format": "gzip",
+            "destination": "runtime/rust-analyzer"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-MIT",
+            "destination": "notices/LICENSE-MIT",
+            "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+            "size_bytes": 1023,
+            "format": "raw"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-APACHE",
+            "destination": "notices/LICENSE-APACHE",
+            "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+            "size_bytes": 9723,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "rust-analyzer",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "macos-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-10-19/rust-analyzer-x86_64-apple-darwin.gz",
+            "size_bytes": 14805239,
+            "sha256": "bdfd46e82731a8d3502d852d28b6462c1f1c13eed0b3e76bbcf1ba839028249c",
+            "format": "gzip",
+            "destination": "runtime/rust-analyzer"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-MIT",
+            "destination": "notices/LICENSE-MIT",
+            "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+            "size_bytes": 1023,
+            "format": "raw"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-APACHE",
+            "destination": "notices/LICENSE-APACHE",
+            "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+            "size_bytes": 9723,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "rust-analyzer",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "linux-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-10-19/rust-analyzer-aarch64-unknown-linux-gnu.gz",
+            "size_bytes": 14480382,
+            "sha256": "d31ee384ab788b9abd8e7aa8e1322f23e6cd4310471d373e9a79ce4656e21896",
+            "format": "gzip",
+            "destination": "runtime/rust-analyzer"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-MIT",
+            "destination": "notices/LICENSE-MIT",
+            "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+            "size_bytes": 1023,
+            "format": "raw"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-APACHE",
+            "destination": "notices/LICENSE-APACHE",
+            "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+            "size_bytes": 9723,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "rust-analyzer",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "linux-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-10-19/rust-analyzer-x86_64-unknown-linux-gnu.gz",
+            "size_bytes": 15066130,
+            "sha256": "8fde1c9dae81459f98e99eedae3654846a9166abea686306c26e57773be558da",
+            "format": "gzip",
+            "destination": "runtime/rust-analyzer"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-MIT",
+            "destination": "notices/LICENSE-MIT",
+            "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+            "size_bytes": 1023,
+            "format": "raw"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-APACHE",
+            "destination": "notices/LICENSE-APACHE",
+            "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+            "size_bytes": 9723,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "rust-analyzer",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "windows-aarch64",
+        "files": [
+          {
+            "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-10-19/rust-analyzer-aarch64-pc-windows-msvc.zip",
+            "size_bytes": 15884787,
+            "sha256": "dc2b6c35e2be0bf13f4ae2a6c69adca5730c91d011bfac31371279a4e55bcb2b",
+            "format": "zip",
+            "destination": "runtime"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-MIT",
+            "destination": "notices/LICENSE-MIT",
+            "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+            "size_bytes": 1023,
+            "format": "raw"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-APACHE",
+            "destination": "notices/LICENSE-APACHE",
+            "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+            "size_bytes": 9723,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "rust-analyzer.exe",
+            "executable": true
+          }
+        }
+      },
+      {
+        "platform": "windows-x86_64",
+        "files": [
+          {
+            "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-10-19/rust-analyzer-x86_64-pc-windows-msvc.zip",
+            "size_bytes": 17750891,
+            "sha256": "7df6e1a2595d1906e8441cb83fd58170b47d32eb09bc52c1b2184538cfd49a71",
+            "format": "zip",
+            "destination": "runtime"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-MIT",
+            "destination": "notices/LICENSE-MIT",
+            "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+            "size_bytes": 1023,
+            "format": "raw"
+          },
+          {
+            "url": "https://raw.githubusercontent.com/rust-lang/rust-analyzer/5ec20d044dbf04895877a55921ddc0ae6e73e127/LICENSE-APACHE",
+            "destination": "notices/LICENSE-APACHE",
+            "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+            "size_bytes": 9723,
+            "format": "raw"
+          }
+        ],
+        "exports": {
+          "executable": {
+            "basename": "rust-analyzer.exe",
+            "executable": true
+          }
+        }
+      }
+    ]
+  }
+]

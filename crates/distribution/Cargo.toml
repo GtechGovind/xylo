@@ -1,0 +1,31 @@
+[package]
+name = "workbench-distribution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
+cargo-packager-updater = { version = "=0.2.3", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
+minisign-verify = "=0.2.4"
+base64 = "0.22"
+semver = { version = "1", features = ["serde"] }
+sha2 = "0.10"
+url = { version = "2", features = ["serde"] }
+fs2 = "0.4"
+tempfile = "3"
+flate2 = "1"
+tar = "0.4"
+walkdir = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+minisign = "=0.8.0"

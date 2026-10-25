@@ -1,0 +1,78 @@
+   Compiling hermes-core v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-core)
+   Compiling hermes-auth v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-auth)
+   Compiling hermes-skills v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-skills)
+   Compiling hermes-intelligence v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-intelligence)
+   Compiling hermes-agent v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-agent)
+   Compiling workbench-engine v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.22s
+     Running unittests src/lib.rs (target/debug/deps/workbench_engine-6685242e66f50f5d)
+
+running 61 tests
+test engine::tests::product_mode_is_opt_in_and_statuses_do_not_expose_engine_contracts ... ok
+test engine::tests::lost_completed_event_replays_receipt_without_model_or_duplicate_history ... ok
+test engine::tests::dropped_engine_future_guard_persists_the_terminal_evidence_hook ... ok
+test engine::tests::interrupted_generation_requires_durable_context_and_retains_unknown_writes ... ok
+test provider_guard::cancellation_boundary_tests::cancelling_a_polled_open_stream_returns_typed_interruption_every_time ... ok
+test engine::tests::resume_rebuilds_only_leading_policy_and_retains_later_system_and_native_messages ... ok
+test engine::tests::denied_pending_result_is_restored_as_error_without_redispatch ... ok
+test engine::tests::child_registry_cannot_expose_delegation ... ok
+test provider_guard::tests::cancelled_waiting_generation_never_enters_provider ... ok
+test provider_guard::tests::remote_provider_is_not_serialized_by_local_lock ... ok
+test provider_guard::tests::custom_model_overflow_is_rejected_before_provider_call ... ok
+test provider_guard::tests::streaming_lease_is_retained_until_drop_then_released ... ok
+test providers::tests::anthropic_stream_preserves_interleaved_thinking_signature_and_compact_tool_indexes ... ok
+test providers::tests::chat_and_azure_use_correct_paths_headers_images_schema_and_tool_fragments ... ok
+test providers::tests::chatgpt_plan_requests_obey_public_responses_restrictions ... ok
+test engine::tests::engine_error_after_admission_queues_terminal_learning_evidence_without_model_dispatch ... ok
+test providers::tests::gemini_model_override_changes_native_url_and_chat_input_images_are_normalized ... ok
+test providers::tests::gemini_native_stream_retains_tool_signature_for_the_next_turn ... ok
+test providers::tests::provider_http_auth_error_does_not_echo_a_reflected_credential ... ok
+test providers::tests::remote_image_urls_are_rejected_without_http_dispatch_and_selected_model_failure_is_explicit ... ok
+test engine::tests::resume_restores_success_using_original_turn_before_new_prompt ... ok
+test engine::tests::native_nonstream_finalization_finishes_after_one_tool_and_natural_answer ... ok
+test providers::tests::sse_framing_preserves_utf8_across_every_byte_and_multiline_data ... ok
+test providers::tests::responses_stream_uses_public_api_and_preserves_encrypted_history ... ok
+test engine::tests::same_turn_retry_resumes_without_reinjecting_the_original_user_instruction ... ok
+test engine::tests::native_streaming_finalization_finishes_after_one_tool_and_natural_answer ... ok
+test engine::tests::image_checkpoint_resume_preserves_refs_without_duplicate_or_inline_image_data ... ok
+test tools::builtin::tests::paths_cannot_escape_through_parent_or_symlink ... ok
+test providers::tests::vertex_uses_project_publisher_endpoint_bearer_and_native_schema ... ok
+test providers::tests::stream_without_terminal_and_late_responses_failure_are_errors ... ok
+test providers::tests::bedrock_native_binary_stream_retains_signed_reasoning_tools_images_and_usage ... ok
+test providers::tests::managed_image_refs_rehydrate_into_actual_streamed_images_for_every_api_family ... ok
+test tools::environment_recovery_tests::cancelled_native_write_stays_unknown_until_observed_failure_is_recorded ... ok
+test tools::environment_recovery_tests::engine_entry_recovers_failure_before_unresolved_gate_using_original_turn ... ok
+test providers::tests::bedrock_signed_requests_use_selected_credentials_and_reject_truncated_or_corrupt_frames ... ok
+test tools::environment_recovery_tests::known_native_failure_resolves_outer_unknown_without_dispatch ... ok
+test tools::environment_recovery_tests::engine_entry_keeps_absent_or_unrelated_unknown_actions_blocked_without_dispatch ... ok
+test tools::environment_recovery_tests::existing_uncertain_receipt_is_not_classified_as_a_fresh_preflight_rejection ... ok
+test tools::image_generation::tests::approved_image_tool_uses_frozen_saved_provider_actual_output_and_durable_no_replay ... ok
+plugin fixture setup completed at 24.948292ms; hardware ResourceSnapshot { total_memory_bytes: 34359738368, available_memory_bytes: 2822455296, cpu_threads: 10, cpu_busy_percent: 34.863163 }
+plugin approval at 28.639667ms
+test tools::environment_recovery_tests::engine_entry_recovers_success_before_unresolved_gate_using_original_turn ... ok
+plugin checkpoint 32.350042ms: journal=Some("running"), local-hardware=ResourceSnapshot { total_memory_bytes: 34359738368, available_memory_bytes: 2822455296, cpu_threads: 10, cpu_busy_percent: 34.863163 }, shared=[], compile=not-created, artifact=false, run_finished=false
+test tools::image_generation::tests::image_tool_transport_loss_retains_uncertainty_and_blocks_action_replay ... ok
+test tools::tests::agent_dispatch_cannot_invoke_application_management_controls ... ok
+test tools::tests::children_cannot_delegate_directly_or_through_dispatch_alias ... ok
+test tools::tests::child_call_identity_does_not_reuse_sibling_result ... ok
+plugin ToolFinished at 64.215209ms: success=false
+test tools::tests::actual_plugin_partial_write_keeps_structured_artifacts_in_journal_and_event ... ok
+test tools::tests::denied_write_never_touches_the_file ... ok
+test tools::tests::execution_error_after_running_always_finishes_the_journal_state ... ok
+test tools::tests::keys_are_namespaced_and_unambiguous ... ok
+test tools::tests::failed_observation_is_not_journaled_as_success ... ok
+test tools::tests::bounded_presentations_preserve_status_refs_and_replay_without_overwrite ... ok
+test tools::tests::installed_extension_and_environment_execution_obey_read_only_tasks ... ok
+test tools::tests::native_connector_write_classification_cannot_be_overridden_by_arguments ... ok
+test tools::tests::presentation_failure_does_not_erase_a_completed_result ... ok
+test tools::tests::uncertain_observation_is_retained_and_never_replayed_as_success ... ok
+test tools::image_generation::tests::image_tool_read_only_denial_and_arbitrary_provider_override_never_dispatch ... ok
+test tools::tests::retrieved_verified_command_remains_advisory_and_cannot_bypass_read_only_policy ... ok
+test tools::environment_recovery_tests::malformed_fresh_environment_requests_have_no_journal_approval_or_dispatch ... ok
+test tools::environment_recovery_tests::lost_outer_ack_recovers_exact_success_and_cached_retry_without_dispatch ... ok
+test providers::tests::bedrock_requires_a_valid_unfiltered_terminal_reason_even_after_http_success ... ok
+test tools::environment_recovery_tests::pending_original_operation_lease_cancellation_remains_unknown_without_reexecution ... ok
+test tools::environment_recovery_tests::broker_preflight_rejections_are_failed_and_allow_actual_engine_to_continue ... ok
+
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.99s
+

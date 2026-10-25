@@ -1,0 +1,8 @@
+{
+  "stage": "workspace-tests",
+  "exit_code": 0,
+  "seconds": 93.85,
+  "log": "/tmp/workbench-recovery-final-workspace-tests.log",
+  "log_sha256": "9a0d3547d33b40cc2a72096d37cb5912bca90e8db7c0c378b8078ef63972c68d",
+  "reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1"
+}
