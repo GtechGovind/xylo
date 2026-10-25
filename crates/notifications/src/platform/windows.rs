@@ -105,25 +105,25 @@ impl actor::Backend for Backend {
                 Ok(())
             },
         ))?;
-        if let Some(position) = self.toasts.iter().position(|(tag, _)| tag == &notice.tag) {
-            if let Some((_, old)) = self.toasts.remove(position) {
-                let _ = notifier.Hide(&old);
-            }
+        if let Some(position) = self.toasts.iter().position(|(tag, _)| tag == &notice.tag)
+            && let Some((_, old)) = self.toasts.remove(position)
+        {
+            let _ = notifier.Hide(&old);
         }
-        if self.toasts.len() >= 64 {
-            if let Some((_, old)) = self.toasts.pop_front() {
-                let _ = notifier.Hide(&old);
-            }
+        if self.toasts.len() >= 64
+            && let Some((_, old)) = self.toasts.pop_front()
+        {
+            let _ = notifier.Hide(&old);
         }
         notifier.Show(&toast)?;
         self.toasts.push_back((notice.tag, toast));
         Ok(())
     }
     fn dismiss(&mut self, tag: &str) -> Result<()> {
-        if let Some(index) = self.toasts.iter().position(|(known, _)| known == tag) {
-            if let Some((_, toast)) = self.toasts.remove(index) {
-                self.notifier()?.Hide(&toast)?;
-            }
+        if let Some(index) = self.toasts.iter().position(|(known, _)| known == tag)
+            && let Some((_, toast)) = self.toasts.remove(index)
+        {
+            self.notifier()?.Hide(&toast)?;
         }
         ToastNotificationManager::History()?.RemoveGroupedTagWithId(
             &tag.into(),

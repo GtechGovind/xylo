@@ -151,6 +151,11 @@ jobs:
         run: |
           cargo test --locked -p workbench-resources --lib
           cargo clippy --locked -p workbench-resources --lib --tests -- -D warnings
+      - name: Windows native notification checks
+        if: runner.os == 'Windows'
+        run: |
+          cargo test --locked -p workbench-notifications --lib
+          cargo clippy --locked -p workbench-notifications --all-targets -- -D warnings
       - name: Linux native terminal lifecycle tests
         if: runner.os == 'Linux'
         run: |
