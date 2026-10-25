@@ -14,6 +14,7 @@ from release_common import ROOT, TARGETS, digest, workspace_version, write_json
 from release_preview import COMMON_CHECKS, create_draft, prepare, validate_results
 from release_smoke import JsonProcess, binary_architecture
 from release import linux_dependencies
+from release_windows import PHASE
 
 COMMIT = "a" * 40
 
@@ -45,13 +46,29 @@ class PipelineTests(unittest.TestCase):
                 artifacts.append({"name": file.name, "size_bytes": file.stat().st_size, "sha256": digest(file)})
             architecture = "aarch64" if target.startswith("aarch64") else "x86_64"
             package_check = "app_bundle_codesign_verified" if "apple" in target else "nsis_silent_install_executed" if "windows" in target else "appimage_native_extraction_executed"
+            platform_checks = {package_check}
+            if "linux" in target:
+                platform_checks.add("packaged_appimage_apprun_launch_alive_8s")
+                platform_checks.add("packaged_debian_control_validated")
+            if "windows" in target:
+                platform_checks.add("packaged_windows_crt_imports_validated")
             proof = {"schema": 1, "target": target, "platform": platform, "source": source,
-                     "cargo_lock_sha256": lock, "checks": sorted(COMMON_CHECKS | {package_check}),
+                     "cargo_lock_sha256": lock, "checks": sorted(COMMON_CHECKS | platform_checks),
                      "passed": True, "qualification": "native_package_smoke", "license_inventory_complete": True,
                      "binaries": [{"name": name, "architecture": architecture, "sha256": "b" * 64, "size_bytes": 1}
                                   for name in ["agent-workbench", "workbench-worker", "workbench-helper", "whisper-cli"]],
                      "artifacts": artifacts}
             write_json(folder / "qualification.json", proof)
+            if "windows" in target:
+                # Offline report fixture, not an LLVM inspection or native run.
+                write_json(metadata / "windows-pe-imports.json", {
+                    "schema": 1, "target": target, "phase": PHASE, "passed": True,
+                    "tool": {"sha256": "d" * 64, "version": "LLVM offline fixture"},
+                    "binaries": [{**item,
+                                  "format": "COFF-ARM64" if architecture == "aarch64" else "COFF-x86-64",
+                                  "imports": ["KERNEL32.dll"], "delay_imports": [],
+                                  "report_sha256": "e" * 64, "forbidden_runtime_imports": []}
+                                 for item in proof["binaries"]]})
         return lock
 
     def test_all_six_source_bound_targets_prepare_unique_assets_and_complete_metadata(self):
@@ -122,6 +139,53 @@ class PipelineTests(unittest.TestCase):
                     proof = json.loads(path.read_text())
                     proof["binaries"][0]["architecture"] = "unsupported"
                     write_json(path, proof)
+                with self.assertRaises(ValueError):
+                    validate_results(root, COMMIT, lock)
+
+    def test_linux_direct_binary_launch_cannot_replace_actual_apprun_qualification(self):
+        for target in ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                self.fixture(root / "inputs")
+                path = root / "inputs" / target / "qualification.json"
+                proof = json.loads(path.read_text())
+                proof["checks"].remove("packaged_appimage_apprun_launch_alive_8s")
+                write_json(path, proof)
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    prepare(root / "inputs", root / "prepared", COMMIT, workspace_version())
+                self.assertFalse((root / "prepared").exists())
+
+    def test_linux_packages_require_debian_control_inspection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            lock = self.fixture(root)
+            path = root / "aarch64-unknown-linux-gnu/qualification.json"
+            proof = json.loads(path.read_text())
+            proof["checks"].remove("packaged_debian_control_validated")
+            write_json(path, proof)
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                validate_results(root, COMMIT, lock)
+
+    def test_windows_requires_import_proof_bound_to_installed_binaries(self):
+        for mutation in ("missing_check", "missing_report", "different_binary", "forbidden_delay_import"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                lock = self.fixture(root)
+                folder = root / "aarch64-pc-windows-msvc"
+                path = folder / "release-metadata/windows-pe-imports.json"
+                if mutation == "missing_check":
+                    proof = json.loads((folder / "qualification.json").read_text())
+                    proof["checks"].remove("packaged_windows_crt_imports_validated")
+                    write_json(folder / "qualification.json", proof)
+                elif mutation == "missing_report":
+                    path.unlink()
+                else:
+                    report = json.loads(path.read_text())
+                    if mutation == "different_binary":
+                        report["binaries"][0]["sha256"] = "f" * 64
+                    else:
+                        report["binaries"][0]["delay_imports"] = ["VCRUNTIME140.dll"]
+                    write_json(path, report)
                 with self.assertRaises(ValueError):
                     validate_results(root, COMMIT, lock)
 

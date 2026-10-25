@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "identifier": "com.qurkos.xylo",
   "description": "Native workspace for AI conversations, coding and tools",
+  "authors": ["Govind Yadav <gtech.govind2000@gmail.com>"],
   "licenseFile": "LICENSE",
   "binariesDir": "target/release",
   "outDir": "dist",

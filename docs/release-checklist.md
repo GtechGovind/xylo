@@ -9,7 +9,7 @@ This is the signed production release gate, not a statement that distribution is
 - [ ] Real maintainer update public key, application identity/channel, HTTPS origins/feed and expiry policy are embedded. The checked-in disabled policy is not a production setup.
 - [ ] Native runtime payload provenance matches catalog/import rules on this OS; signing did not invalidate asset hashes.
 - [ ] macOS nested/outer Developer ID signing, correct Team ID, audio entitlement, notarization and stapling pass. Validate the extracted updater `.app`, not only the prearchive app.
-- [ ] Windows all three executables, native DLLs and NSIS installer have valid timestamped Authenticode signatures. Per-user installer blocks downgrade.
+- [ ] Windows all three executables, native DLLs, NSIS installer and embedded uninstaller have valid timestamped Authenticode signatures. The embedded-uninstaller signing policy is currently outstanding. Per-user installer blocks downgrade; the final import report matches installed executable hashes.
 - [ ] Linux package dependencies and bundled dynamic libraries are reviewed; a real Vulkan driver/window session is available. AppImage is executable; Debian packages use package-manager updates.
 - [ ] Final updater artifact and immutable manifest signatures verify with the exact embedded key. A newer sequence has not reused older metadata bytes. Checksums match downloaded bytes.
 - [ ] First install, launch, uninstall and reinstall pass in a **clean user/VM without Rust, Python, Node or build tools**, for each intended platform/architecture.

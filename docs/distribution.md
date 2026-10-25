@@ -8,7 +8,7 @@ The checked-in update policy is deliberately disabled. No maintainer private key
 
 Use a clean checkout on the target OS, with the pinned Rust **1.98.0** toolchain and checked-in `Cargo.lock`. macOS has a 15.0 package baseline; Windows uses Windows 10+ with MSVC/Windows SDK; the Linux installer baseline is Ubuntu 24.04 with a working Vulkan driver and graphical Wayland/X11 session. See [GPUI Kit's native requirements](https://gpui-kit.com/docs/installation/) and [cargo-packager formats](https://docs.crabnebula.dev/packager/).
 
-Install CMake, a C/C++ compiler, platform SDKs, Python 3.11+, and the packaging tool. On macOS, full Xcode with the Metal toolchain is required for GPUI shaders. On Ubuntu install the development headers listed in `.github/workflows/native-release.yml`, including ALSA and pkg-config for native audio. Windows needs Visual Studio 2022's Desktop development with C++ workload and NSIS; run from a developer shell with CMake, Git Bash, and the Windows SDK available.
+Install CMake, a C/C++ compiler, platform SDKs, Python 3.11+, and the packaging tool. On macOS, full Xcode with the Metal toolchain is required for GPUI shaders. On Ubuntu install the development headers listed in `.github/workflows/native-release.yml`, including ALSA and pkg-config for native audio. Windows needs Visual Studio's Desktop development with C++ workload, LLVM and NSIS; run from a developer shell with CMake, Git Bash, and the Windows SDK available. ARM64 speech builds require the ClangCL toolset.
 
 ```sh
 rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
@@ -40,7 +40,15 @@ On Windows, append `.exe` to the converter path. The driver does not build the c
 
 Native runtime assets are mapped to `Contents/Resources/native-assets` on macOS, adjacent `native-assets` on Windows, and `usr/bin/native-assets` beside the helper in Linux packages. Do not move macOS assets into `Contents/MacOS`. The asset manifest binds the final native runtime bytes. macOS signing therefore signs nested binaries first, regenerates their bundled asset digests, then signs the outer app. Windows signs native binaries before bundling and regenerates affected asset digests. Cross-platform bundle import remains subject to the capability subsystem's pinned-source checks; a package build alone does not prove native speech works.
 
-Production mode requires a clean committed source tree, fresh build, enabled maintainer policy, complete dependency license-text review, and existing signing configuration. It invokes native signing/notarization and never creates accounts or publishes releases. Required configuration:
+Windows release builds request `+crt-static`; the native speech build selects the static MSVC runtime and disables OpenMP. An LLVM `llvm-readobj --coff-imports` audit inspects normal and delayed imports of all four final executable inputs before packaging. `WORKBENCH_LLVM_READOBJ` may select an installed tool; otherwise the script searches PATH and the standard LLVM installation directory. The retained report records tool/input hashes and rejects unstaged VC runtime, C++ runtime and OpenMP DLL imports. Native smoke binds that report to the installed executables. It does not qualify dynamically loaded model or speech packages.
+
+The pinned Linux packager scans top-level executables for dependencies. An additional Whisper dependency seed lets that scan cover the nested speech executable while preserving its original manifest-bound bytes. Linux smoke exercises the extracted `AppRun` entry point and inspects Debian control metadata; it does not install the Debian package or test FUSE mounting.
+
+Production mode requires a clean committed source tree, fresh build, enabled maintainer policy, complete dependency license-text review, and existing signing configuration. It invokes native signing/notarization and never creates accounts or publishes releases.
+
+Windows signing is application-owned: sign inputs, inspect their imports, build the installer without implicit packager re-signing, then sign and verify the finished installer. The embedded NSIS uninstaller currently remains unsigned; its signing policy and actual production installation/uninstallation acceptance are outstanding. This does not change the unsigned preview policy.
+
+Required configuration:
 
 | Platform | Existing maintainer configuration |
 | --- | --- |

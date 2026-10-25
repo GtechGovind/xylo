@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tomllib
 
@@ -62,17 +63,38 @@ def packager() -> str:
     return executable
 
 
-def build_env(epoch: int, policy: Path) -> dict:
+def build_env(epoch: int, policy: Path, target: str | None = None) -> dict:
     env = os.environ.copy()
     env.pop("CARGO_PACKAGER_SIGN_PRIVATE_KEY", None)
     env.pop("CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD", None)
     env["SOURCE_DATE_EPOCH"] = str(epoch)
     env["WORKBENCH_UPDATE_POLICY"] = str(policy.resolve())
     env["CARGO_INCREMENTAL"] = "0"
-    # Avoid workspace paths in release debug strings. Do not override user flags.
-    flags = env.get("CARGO_ENCODED_RUSTFLAGS", "")
+    # Match Cargo's environment precedence. RUSTFLAGS uses whitespace splitting,
+    # not shell quoting; encoded arguments retain spaces/backslashes verbatim.
+    if "CARGO_ENCODED_RUSTFLAGS" in env:
+        flags = env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f") if env["CARGO_ENCODED_RUSTFLAGS"] else []
+    elif "RUSTFLAGS" in env:
+        flags = env["RUSTFLAGS"].split()
+    else:
+        target_flags = env.get("CARGO_TARGET_" + target.upper().replace("-", "_") + "_RUSTFLAGS", "") if target else ""
+        flags = target_flags.split()
+    if target and target.endswith("-pc-windows-msvc"):
+        # Do not silently override an explicitly requested dynamic CRT. The
+        # post-build PE import gate checks the actual native linker result too.
+        for index, flag in enumerate(flags):
+            codegen = flags[index + 1] if flag == "-C" and index + 1 < len(flags) else flag.removeprefix("-C")
+            if codegen.startswith("target-feature=") and "-crt-static" in codegen.split("=", 1)[1].split(","):
+                raise ValueError("Windows release builds require a static CRT; remove the -crt-static override")
+        text = " ".join(flags).lower()
+        dynamic = r"(?:^|[\s=])[-/]mdd?(?:\s|$)|[-/]defaultlib:(?:msvcrt|msvcprt|vcruntime|msvcp|concrt)|[-/]nodefaultlib:libcmtd?(?:\.lib)?(?:\s|$)"
+        if re.search(dynamic, text):
+            raise ValueError("Windows release flags explicitly select or require a dynamic CRT")
     remap = f"--remap-path-prefix={ROOT}=/workbench"
-    env["CARGO_ENCODED_RUSTFLAGS"] = flags + ("\x1f" if flags else "") + remap
+    flags.append(remap)
+    if target and target.endswith("-pc-windows-msvc"):
+        flags.append("-Ctarget-feature=+crt-static")
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
     if os.name != "nt":
         env["TZ"] = "UTC"
     return env

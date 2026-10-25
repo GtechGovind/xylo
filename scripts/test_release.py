@@ -3,7 +3,12 @@
 import json
 import os
 import copy
+import contextlib
+import io
 import plistlib
+import shlex
+import shutil
+import subprocess
 import sys
 import struct
 import stat
@@ -15,7 +20,7 @@ import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-from release import archive_bundle, configuration, preflight_configuration, rehash_native_assets
+from release import archive_bundle, configuration, main, preflight_configuration, rehash_native_assets, sign_windows_files
 from release_common import ROOT, TARGETS, digest
 from release_manifest import allowed_url, validate_policy
 
@@ -68,6 +73,75 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(item["sha256"], digest(binary))
             self.assertEqual(item["size_bytes"], binary.stat().st_size)
 
+    def test_windows_production_signing_precedes_import_audit_and_cannot_implicitly_resign_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            output, native, policy = root / "output", root / "native", root / "policy.json"
+            (native / "whisper-runtime").mkdir(parents=True)
+            (native / "whisper-runtime/manifest.json").write_bytes(b"{}\n")
+            policy.write_text('{"enabled":true}', encoding="utf-8", newline="\n")
+            events = []
+            target = "aarch64-pc-windows-msvc"
+
+            def command(args, **options):
+                if args[0] == "cargo":
+                    self.assertEqual(args[1:5], ["build", "--locked", "--release", "--target"])
+                    self.assertEqual(args[5], target)
+                    self.assertIn("-Ctarget-feature=+crt-static", options["env"]["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"))
+                    events.append("build")
+                else:
+                    self.assertEqual(args[:2], ["pinned-packager", "--config"])
+                    resolved = json.loads(Path(args[2]).read_text())
+                    self.assertNotIn("certificateThumbprint", resolved["windows"])
+                    self.assertNotIn("signCommand", resolved["windows"])
+                    self.assertNotIn("CARGO_PACKAGER_SIGN_PRIVATE_KEY", options["env"])
+                    events.append("package")
+                    (output / "Xylo-setup.exe").write_bytes(b"Controlled finished installer fixture")
+
+            def generate_metadata(_target, path, **_options):
+                path.mkdir(parents=True)
+
+            def audit(binaries, assets, report, actual_target):
+                self.assertEqual(events[-1], "sign_inputs")
+                self.assertEqual(assets, native)
+                self.assertEqual(actual_target, target)
+                self.assertEqual(report, output / "release-metadata/windows-pe-imports.json")
+                events.append("audit")
+
+            def sign_finished(paths):
+                self.assertEqual(paths, [output / "Xylo-setup.exe"])
+                self.assertTrue(paths[0].is_file())
+                self.assertEqual(events[-1], "package")
+                events.append("sign_installer")
+
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, {"CARGO_ENCODED_RUSTFLAGS": "",
+                    "CARGO_PACKAGER_SIGN_PRIVATE_KEY": "test-only-key", "WORKBENCH_WINDOWS_CERTIFICATE_THUMBPRINT": "test-only-thumbprint",
+                    "WORKBENCH_WINDOWS_TIMESTAMP_URL": "https://timestamp.example.test"}))
+                stack.enter_context(patch("sys.argv", ["release.py", "--target", target, "--mode", "production",
+                    "--output", str(output), "--native-assets", str(native), "--policy", str(policy)]))
+                stack.enter_context(patch("release.source_identity", return_value={"commit": "a" * 40, "dirty": False, "source_date_epoch": 123}))
+                stack.enter_context(patch("release.validate_policy", return_value={"enabled": True}))
+                stack.enter_context(patch("release.platform.system", return_value="Windows"))
+                stack.enter_context(patch("release.packager", return_value="pinned-packager"))
+                stack.enter_context(patch("release.run", side_effect=command))
+                stack.enter_context(patch("release.generate", side_effect=generate_metadata))
+                stack.enter_context(patch("release.sign_windows", side_effect=lambda *_args: events.append("sign_inputs")))
+                stack.enter_context(patch("release.audit_windows_imports", side_effect=audit))
+                stack.enter_context(patch("release.sign_windows_files", side_effect=sign_finished))
+                stack.enter_context(patch("release.validate_inventory"))
+                stack.enter_context(patch("release.checksums"))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                main()
+            self.assertEqual(events, ["build", "sign_inputs", "audit", "package", "sign_installer"])
+            self.assertTrue(json.loads((output / "release-status.json").read_text())["os_signed"])
+            with patch.dict(os.environ, {"WORKBENCH_WINDOWS_CERTIFICATE_THUMBPRINT": "test-only-thumbprint",
+                                         "WORKBENCH_WINDOWS_TIMESTAMP_URL": "https://timestamp.example.test"}), patch("release.run") as signer:
+                sign_windows_files([output / "Xylo-setup.exe"])
+                self.assertEqual(signer.call_args_list[0].args[0], ["signtool", "sign", "/fd", "SHA256", "/sha1",
+                    "test-only-thumbprint", "/tr", "https://timestamp.example.test", "/td", "SHA256", output / "Xylo-setup.exe"])
+                self.assertEqual(signer.call_args_list[1].args[0], ["signtool", "verify", "/pa", "/all", output / "Xylo-setup.exe"])
+
     def test_native_resource_layouts_and_no_windows_downgrade(self):
         out, native, notices = Path("/out"), Path("/native"), Path("/notices")
         mac = configuration("aarch64-apple-darwin", out, native, notices, production=False)
@@ -84,6 +158,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertTrue(Path(config["licenseFile"]).is_absolute())
             self.assertEqual(config["productName"], "Xylo")
             self.assertEqual(config["identifier"], "com.qurkos.xylo")
+            self.assertEqual(config["authors"], ["Govind Yadav <gtech.govind2000@gmail.com>"])
             self.assertEqual([binary["path"] for binary in config["binaries"]],
                              ["agent-workbench", "workbench-worker", "workbench-helper"])
         preview = (ROOT / "scripts/preview-macos.sh").read_text()
@@ -95,6 +170,38 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(info["CFBundleExecutable"], "agent-workbench")
         self.assertEqual(info["CFBundleIconFile"], "app.icns")
         self.assertIn(str(ROOT / "packaging/icons/app.icns"), mac["icons"])
+
+    def test_appimage_whisper_seed_quotes_the_pinned_copy_command_without_changing_nested_asset(self):
+        bash = "/bin/bash" if sys.platform == "darwin" else shutil.which("bash")
+        if os.name == "nt":
+            git_bash = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"
+            if git_bash.is_file():
+                bash = str(git_bash)
+        if not bash:
+            self.skipTest("A native Bash is required to exercise the pinned AppImage shell template")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            native = root / "native ' assets $(touch leaked) `touch leaked-too`"
+            source = native / "whisper-runtime/runtime/whisper-cli"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"unchanged nested ELF fixture\0\n")
+            manifest = native / "whisper-runtime/manifest.json"
+            manifest.write_bytes(b'{"fixture":"unchanged manifest"}\n')
+            before = (source.read_bytes(), manifest.read_bytes())
+            (root / "usr/bin").mkdir(parents=True)
+            config = configuration("x86_64-unknown-linux-gnu", root / "out", native, root / "notices", production=False)
+            self.assertEqual(config["appimage"]["files"], {str(native): "usr/bin/native-assets"})
+            self.assertEqual(len(config["appimage"]["bins"]), 1)
+            seed = config["appimage"]["bins"][0]
+            self.assertEqual(shlex.split(seed), [source.as_posix()])
+            # This is the actual pinned template fragment, including its lack
+            # of quoting. Only the prequoted configuration entry is inserted.
+            subprocess.run([bash, "-c", f"cp {seed} usr/bin"], cwd=root,
+                           check=True, capture_output=True, text=True, timeout=10)
+            self.assertEqual((root / "usr/bin/whisper-cli").read_bytes(), before[0])
+            self.assertEqual((source.read_bytes(), manifest.read_bytes()), before)
+            self.assertFalse((root / "leaked").exists())
+            self.assertFalse((root / "leaked-too").exists())
 
     def test_preflight_selects_only_inert_sibling_and_rejects_errors_or_output_changes(self):
         temporary = tempfile.TemporaryDirectory()

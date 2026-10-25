@@ -15,7 +15,7 @@ GitHub documents these as [standard public runners](https://docs.github.com/en/a
 
 ## Native qualification
 
-`.github/workflows/native-release.yml` runs on a pull request, manually, or as a reusable workflow. Each native job installs pinned Rust/native headers, runs release-script regressions, builds the three debug executables, runs workspace library tests and strict Clippy, and validates the Rust plugin SDK. Windows executes its plugin file-authority fixtures on Windows; the isolated workspace-reader harness remains an API/Clippy check.
+`.github/workflows/native-release.yml` runs on a pull request, manually, or as a reusable workflow. Each native job installs pinned Rust/native headers, runs release-script regressions, builds the three debug executables, runs workspace library tests and strict Clippy, and validates the Rust plugin SDK. Windows executes the production plugin, capture-storage and project-reader filesystem fixtures before compiling the desktop graph. The smaller `windows-filesystem.yml` workflow runs those fixtures on both native architectures for relevant pushes and pull requests; it does not qualify the whole application.
 
 Jobs build pinned whisper.cpp without model weights, discard the tested debug graph to conserve hosted disk, then compile the optimized application. Build-time debug symbols and concurrency are bounded; the checked-in optimized profile retains thin LTO, symbol stripping and its code-generation settings. macOS ARM64 uses one build job on its 7 GB runner. Linux reclaims unused mobile/.NET/Haskell SDKs only inside the disposable hosted VM. Standard-runner memory/disk limits can still cause a qualification failure; targets are never silently omitted.
 
@@ -26,11 +26,13 @@ Jobs build pinned whisper.cpp without model weights, discard the tested debug gr
 - Verify packaged dependency texts and native asset hashes; inspect all three application executables and whisper's actual PE, ELF or Mach-O architecture.
 - Execute all three packaged `--version` commands and whisper's help command.
 - Run a per-user NSIS install on Windows; extract the native AppImage on Linux; verify the ad hoc macOS app signature.
+- On Windows, bind the retained and packaged normal/delayed DLL import reports to all four installed executable hashes and reject unstaged VC/OpenMP runtimes.
+- On Linux, inspect the actual Debian control fields, including maintainer and architecture, and launch the extracted AppImage through its `AppRun` entry point.
 - Run correlated helper status and an actual DOCX export, inspect the resulting ZIP, and shut down cleanly.
 - Observe the worker's `Ready` event and clean stdin shutdown.
 - Launch the desktop with an explicit temporary `--data-dir`, observe profile creation and eight seconds of process liveness, then terminate only that process tree. Linux uses Xvfb/software Vulkan.
 
-This proves package/process behavior. Profile creation and liveness do not establish full Host initialization, visual layout, accessibility, GPU performance, microphone permissions, real accounts or provider behavior. Debian installation is not exercised. No live providers, remote accounts, microphone recording or model downloads occur. Native UI/Host fixtures recorded elsewhere remain separate evidence.
+This proves package/process behavior. Profile creation and liveness do not establish full Host initialization, visual layout, accessibility, GPU performance, microphone permissions, real accounts or provider behavior. AppImage FUSE mounting and Debian installation are not exercised. No live providers, remote accounts, microphone recording or model downloads occur. Native UI/Host fixtures recorded elsewhere remain separate evidence.
 
 The static x64 whisper executable uses an explicit portable SSE2 CPU baseline. Upstream's `GGML_NATIVE=OFF` alone still enables AVX-family defaults, which are disabled here to avoid an undocumented CPU requirement. ARM NEON/Metal remain native. Multi-variant shared backends need separate trusted-loader/packaging qualification; optimized x64 speech performance is unqualified. This policy does not change Rust release optimization or external inference providers.
 

@@ -21,8 +21,9 @@ import uuid
 import zipfile
 
 sys.dont_write_bytecode = True
-from release_common import BINARIES, ROOT, TARGETS, digest, source_identity, write_json
+from release_common import BINARIES, ROOT, TARGETS, digest, source_identity, workspace_version, write_json
 from release_metadata import checksums, validate_inventory
+from release_windows import validate_windows_imports
 
 MAX_FRAME = 8 * 1024 * 1024
 
@@ -82,6 +83,70 @@ def confined_artifact(artifact: Path, root: Path) -> Path:
     if not resolved_artifact.parent.samefile(expected_parent):
         raise ValueError("Packaged helper artifact is outside its physical artifact directory")
     return resolved_artifact
+
+
+def nsis_command_line(installer: PurePath, destination: PurePath) -> str:
+    """Format NSIS's special trailing /D argument without argv auto-quoting.
+
+    NSIS consumes the entire unquoted command-line tail as its destination,
+    including spaces. Python's normal Windows argv conversion would quote that
+    tail. This string goes straight to CreateProcess, never through a shell.
+    """
+    values = [os.fspath(installer), os.fspath(destination)]
+    for value in values:
+        if '"' in value or any(ord(character) < 32 for character in value):
+            raise ValueError("NSIS paths must not contain quotes or control characters")
+    executable, directory = [windows_namespace(PureWindowsPath(value)) for value in values]
+    return subprocess.list2cmdline([str(executable), "/S"]) + " /D=" + str(directory)
+
+
+def install_nsis(installer: PurePath, destination: PurePath) -> None:
+    if os.name != "nt":
+        raise ValueError("NSIS installer smoke must run on Windows")
+    command = nsis_command_line(installer, destination)
+    executable = str(windows_namespace(PureWindowsPath(installer)))
+    subprocess.run(command, executable=executable, shell=False, check=True, timeout=180)
+
+
+def validate_debian_control(output: Path, target: str, configuration: dict) -> None:
+    """Inspect the built Debian control record without installing the package."""
+    architectures = {"aarch64-unknown-linux-gnu": "arm64", "x86_64-unknown-linux-gnu": "amd64"}
+    if target not in architectures:
+        raise ValueError("Debian control inspection requires a supported Linux target")
+    packages = list(output.glob("*.deb"))
+    if len(packages) != 1 or packages[0].is_symlink() or not packages[0].is_file():
+        raise ValueError("Expected exactly one regular Debian package")
+    authors = configuration.get("authors")
+    if (not isinstance(authors, list) or not authors
+            or any(not isinstance(author, str) or not author.strip()
+                   or any(ord(character) < 32 for character in author) for author in authors)):
+        raise ValueError("Resolved package authors must supply a nonempty Debian Maintainer")
+    expected = {"package": "xylo", "version": workspace_version(),
+                "architecture": architectures[target], "maintainer": ", ".join(authors)}
+    result = subprocess.run(["dpkg-deb", "--field", str(packages[0]),
+                             "Package", "Version", "Architecture", "Maintainer"],
+                            capture_output=True, text=True, encoding="utf-8", check=True, timeout=30)
+    if len(result.stdout) > 64 * 1024:
+        raise ValueError("Debian control fields exceed their inspection budget")
+    # dpkg-deb emits RFC822 field names when multiple fields are requested.
+    # Unfold continuations, but reject duplicates/missing fields rather than
+    # accidentally accepting the last value from a malformed control record.
+    fields, current = {}, None
+    for line in result.stdout.splitlines():
+        if line.startswith((" ", "\t")):
+            if current is None:
+                raise ValueError("Malformed Debian control continuation")
+            fields[current] += " " + line.strip()
+            continue
+        match = re.fullmatch(r"([A-Za-z][A-Za-z0-9-]*):[ \t]*(.*)", line)
+        if match is None:
+            raise ValueError("Malformed Debian control field")
+        current = match[1].lower()
+        if current in fields or current not in expected:
+            raise ValueError("Unexpected or duplicate Debian control field")
+        fields[current] = match[2].strip()
+    if fields != expected:
+        raise ValueError("Packaged Debian control fields differ from the resolved release configuration")
 
 
 def binary_architecture(path: Path) -> str:
@@ -203,8 +268,7 @@ def packaged_root(output: Path, target: str, scratch: Path) -> tuple[Path, str]:
         if len(installers) != 1:
             raise ValueError("Expected exactly one NSIS installer")
         install = scratch / "installed"
-        # NSIS requires /D last, and its entire unquoted value in one argv entry.
-        subprocess.run([str(installers[0]), "/S", f"/D={install}"], check=True, timeout=180)
+        install_nsis(installers[0], install)
         return install, "nsis_silent_install_executed"
     images = list(output.glob("*.AppImage"))
     if len(images) != 1:
@@ -214,6 +278,32 @@ def packaged_root(output: Path, target: str, scratch: Path) -> tuple[Path, str]:
         subprocess.run([str(images[0]), "--appimage-extract"], cwd=scratch,
                        stdout=log, stderr=subprocess.STDOUT, check=True, timeout=180)
     return scratch / "squashfs-root/usr/bin", "appimage_native_extraction_executed"
+
+
+def launch_desktop(binaries: Path, target: str, scratch: Path, data: Path, log):
+    """Launch the real platform entry point with an isolated native profile."""
+    environment = None
+    if "linux" in target:
+        appdir = scratch / "squashfs-root"
+        launcher = appdir / "AppRun"
+        if (appdir.is_symlink() or not appdir.is_dir() or launcher.is_symlink()
+                or not stat.S_ISREG(launcher.stat().st_mode) or not os.access(launcher, os.X_OK)):
+            raise ValueError("Extracted AppImage AppRun must be a regular executable")
+        environment = os.environ.copy()
+        environment["APPDIR"] = str(appdir.resolve(strict=True))
+    else:
+        launcher = binaries / ("agent-workbench.exe" if "windows" in target else "agent-workbench")
+    return subprocess.Popen([str(launcher), "--data-dir", str(data)], env=environment,
+                            stdout=log, stderr=subprocess.STDOUT, start_new_session=os.name != "nt")
+
+
+def validate_packaged_windows_imports(output: Path, resources: Path, target: str, records: list[dict]) -> None:
+    packaged = resources / "licenses/dependencies/windows-pe-imports.json"
+    retained = output / "release-metadata/windows-pe-imports.json"
+    validate_windows_imports(packaged, target, records)
+    validate_windows_imports(retained, target, records)
+    if digest(packaged) != digest(retained):
+        raise ValueError("Packaged Windows import proof differs from the retained release metadata")
 
 
 def smoke(output: Path, target: str) -> dict:
@@ -239,6 +329,9 @@ def smoke(output: Path, target: str) -> dict:
         scratch = Path(directory).resolve()
         binaries, package_check = packaged_root(output, target, scratch)
         passed.append(package_check)
+        if "linux" in target:
+            validate_debian_control(output, target, plan["packager"])
+            passed.append("packaged_debian_control_validated")
         suffix = ".exe" if "windows" in target else ""
         resources = binaries.parent / "Resources" if "apple" in target else binaries
         if "linux" in target:
@@ -265,6 +358,9 @@ def smoke(output: Path, target: str) -> dict:
             records.append({"name": name, "sha256": digest(path), "size_bytes": path.stat().st_size,
                             "architecture": architecture})
         passed.extend(["all_four_native_executable_machines", "packaged_license_inventory_complete", "native_asset_hashes"])
+        if "windows" in target:
+            validate_packaged_windows_imports(output, resources, target, records)
+            passed.append("packaged_windows_crt_imports_validated")
         for name in BINARIES:
             version = subprocess.run([str(binaries / (name + suffix)), "--version"],
                                      capture_output=True, text=True, check=True, timeout=30).stdout
@@ -305,8 +401,7 @@ def smoke(output: Path, target: str) -> dict:
         passed.append("packaged_worker_ready_and_clean_stdin_shutdown")
         with (log_root / "desktop.log").open("wb") as log:
             data = scratch / "desktop-data"
-            process = subprocess.Popen([str(binaries / ("agent-workbench" + suffix)), "--data-dir", str(data)],
-                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=os.name != "nt")
+            process = launch_desktop(binaries, target, scratch, data, log)
             try:
                 deadline = time.monotonic() + 45
                 while not (data / "workbench.db").is_file():
@@ -319,6 +414,8 @@ def smoke(output: Path, target: str) -> dict:
             finally:
                 terminate(process)
         passed.append("packaged_desktop_isolated_profile_launch_alive_8s")
+        if "linux" in target:
+            passed.append("packaged_appimage_apprun_launch_alive_8s")
     extensions = (".dmg", ".app.tar.gz") if "apple" in target else (".exe",) if "windows" in target else (".AppImage", ".deb")
     artifacts = [{"name": path.name, "sha256": digest(path), "size_bytes": path.stat().st_size}
                  for path in sorted(output.iterdir()) if path.is_file() and path.name.endswith(extensions)]
@@ -331,7 +428,7 @@ def smoke(output: Path, target: str) -> dict:
                 "Unsigned preview: macOS uses ad hoc signing; Windows has no Authenticode certificate.",
                 "Launch/process/protocol smoke is not visual, accessibility, device, account or live-provider acceptance.",
                 "Desktop profile creation and process liveness do not establish full Host initialization success.",
-                "Linux AppImage is extracted and launched; Debian installation is not exercised.",
+                "Linux launches the extracted AppImage AppRun; FUSE mounting and Debian installation are not exercised.",
                 "No model weights, microphone recording, remote accounts or paid APIs are used."]}
 
 

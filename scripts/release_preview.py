@@ -19,6 +19,7 @@ import zipfile
 sys.dont_write_bytecode = True
 from release_common import BINARIES, ROOT, TARGETS, digest, workspace_version, write_json
 from release_metadata import checksums, validate_inventory
+from release_windows import validate_windows_imports
 
 COMMON_CHECKS = {"all_four_native_executable_machines", "packaged_license_inventory_complete", "native_asset_hashes",
                  "all_three_packaged_version_commands", "packaged_whisper_cli_help",
@@ -49,7 +50,9 @@ def validate_results(inputs: Path, commit: str, lock_sha256: str) -> list[tuple[
             raise ValueError("Unknown/duplicate native qualification target")
         platform_id = TARGETS[target][0]
         checks = COMMON_CHECKS | ({"app_bundle_codesign_verified"} if "apple" in target else
-                                  {"nsis_silent_install_executed"} if "windows" in target else {"appimage_native_extraction_executed"})
+                                  {"nsis_silent_install_executed", "packaged_windows_crt_imports_validated"} if "windows" in target else
+                                  {"appimage_native_extraction_executed", "packaged_appimage_apprun_launch_alive_8s",
+                                   "packaged_debian_control_validated"})
         if (proof.get("schema") != 1 or proof.get("passed") is not True or proof.get("platform") != platform_id
                 or proof.get("qualification") != "native_package_smoke" or not checks.issubset(proof.get("checks", []))
                 or proof.get("license_inventory_complete") is not True
@@ -84,6 +87,8 @@ def validate_results(inputs: Path, commit: str, lock_sha256: str) -> list[tuple[
             if (item.get("architecture") != architecture or not re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", ""))
                     or not isinstance(item.get("size_bytes"), int) or item["size_bytes"] < 1):
                 raise ValueError("Invalid native executable identity")
+        if "windows" in target:
+            validate_windows_imports(regular(metadata, "windows-pe-imports.json"), target, binaries)
         expected = {".dmg", ".app.tar.gz"} if "apple" in target else {".exe"} if "windows" in target else {".AppImage", ".deb"}
         seen = set()
         for artifact in proof.get("artifacts", []):
@@ -149,7 +154,7 @@ def prepare(inputs: Path, output: Path, commit: str, version: str) -> dict:
              "worker/helper protocol, document export and isolated desktop launch smoke checks before this draft is created. "
              "These checks do not establish full visual, accessibility, microphone, GPU, live-account or provider acceptance. "
              "Desktop profile creation and liveness do not establish full Host initialization success. "
-             "Linux tests launch an extracted AppImage; Debian installation is not exercised.\n\n"
+             "Linux tests launch the extracted AppImage through AppRun; FUSE mounting and Debian installation are not exercised.\n\n"
              "Model weights are not included. Choose/install compatible models explicitly in the app. "
              "The portable x64 speech runtime currently favors a baseline CPU build over AVX optimization; speech performance is unqualified. "
              "The current bundled ONNX runtime setup is unavailable on macOS Intel; full-text memory search remains available.\n\n"

@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from release_common import (BINARIES, ROOT, TARGETS, build_env, digest, packager
                             run, source_identity, workspace_version, write_json)
 from release_manifest import validate_policy
 from release_metadata import checksums, generate, validate_inventory
+from release_windows import audit_windows_imports
 
 
 def require(name: str) -> str:
@@ -129,12 +131,21 @@ def configuration(target: str, output: Path, native: Path, notices: Path, *, pro
         config["nsis"] = {"installMode": "currentUser"}
         config["windows"] = {"digestAlgorithm": "sha256", "allowDowngrades": False}
         if production:
-            config["windows"].update(certificateThumbprint=require("WORKBENCH_WINDOWS_CERTIFICATE_THUMBPRINT"),
-                                     timestampUrl=require("WORKBENCH_WINDOWS_TIMESTAMP_URL"), tsp=True)
+            # Signing is owned below: packager otherwise signs the main PE
+            # again after the import audit, invalidating its final input hash.
+            require("WORKBENCH_WINDOWS_CERTIFICATE_THUMBPRINT")
+            require("WORKBENCH_WINDOWS_TIMESTAMP_URL")
     else:
         config["formats"] = ["appimage", "deb"]
         # The native helper resolves adjacent assets; do not leave them in usr/lib.
-        config["appimage"] = {"files": {str(native): "usr/bin/native-assets"}}
+        config["appimage"] = {
+            "files": {str(native): "usr/bin/native-assets"},
+            # 0.11.8 renders bins directly into `cp <entry> usr/bin` without
+            # shell quoting. A separate top-level dependency seed lets
+            # linuxdeploy scan Whisper while preserving the nested asset bytes
+            # and manifest. Quote once here for that exact pinned template.
+            "bins": [shlex.quote((native / "whisper-runtime/runtime/whisper-cli").as_posix())],
+        }
         config["deb"] = {"files": {str(native): "usr/bin/native-assets"},
                           "depends": ["libasound2t64", "libfontconfig1", "libxkbcommon-x11-0", "libvulkan1", "libssl3t64",
                                       "libpipewire-0.3-0", "libgbm1", "libwayland-client0", "libx11-xcb1"]}
@@ -200,17 +211,21 @@ def linux_dependencies(binaries: Path, native: Path, configured: list[str]) -> l
         return sorted(set(configured) | {entry.strip() for entry in records[0].split(",") if entry.strip()})
 
 
-def sign_windows(binaries: Path, native: Path) -> None:
+def sign_windows_files(inputs: list[Path]) -> None:
     thumbprint = require("WORKBENCH_WINDOWS_CERTIFICATE_THUMBPRINT")
     timestamp = require("WORKBENCH_WINDOWS_TIMESTAMP_URL")
     if not timestamp.startswith("https://"):
         raise ValueError("The Windows timestamp service must use HTTPS")
-    inputs = [binaries / f"{name}.exe" for name in BINARIES]
-    inputs += sorted(path for path in native.rglob("*") if path.suffix.lower() in (".exe", ".dll"))
     for path in inputs:
         run(["signtool", "sign", "/fd", "SHA256", "/sha1", thumbprint,
              "/tr", timestamp, "/td", "SHA256", path])
         run(["signtool", "verify", "/pa", "/all", path])
+
+
+def sign_windows(binaries: Path, native: Path) -> None:
+    inputs = [binaries / f"{name}.exe" for name in BINARIES]
+    inputs += sorted(path for path in native.rglob("*") if path.suffix.lower() in (".exe", ".dll"))
+    sign_windows_files(inputs)
     rehash_native_assets(native)
 
 
@@ -266,7 +281,7 @@ def main() -> None:
     write_json(output / "build-plan.json", plan)
     packages = [part for binary in BINARIES for part in ("-p", binary)]
     run(["cargo", "build", "--locked", "--release", "--target", args.target, *packages],
-        env=build_env(identity["source_date_epoch"], args.policy))
+        env=build_env(identity["source_date_epoch"], args.policy, args.target))
     generate(args.target, notices, strict=strict)
     if "linux" in args.target:
         config["deb"]["depends"] = linux_dependencies(Path(config["binariesDir"]), native, config["deb"]["depends"])
@@ -280,6 +295,11 @@ def main() -> None:
     package_env.pop("CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD", None)
     if production and "windows" in args.target:
         sign_windows(Path(config["binariesDir"]), native)
+    if "windows" in args.target:
+        # Inspect the final inputs, including any Authenticode changes, before
+        # NSIS copies them into the installer. The proof ships with the notices.
+        audit_windows_imports(Path(config["binariesDir"]), native,
+                              notices / "windows-pe-imports.json", args.target)
     run([executable, "--config", config_path], env=package_env)
     if "apple" in args.target:
         bundles = list(output.glob("*.app"))
@@ -308,8 +328,10 @@ def main() -> None:
             run(["xcrun", "stapler", "staple", dmg])
             run(["xcrun", "stapler", "validate", dmg])
     if production and "windows" in args.target:
-        for installer in output.glob("*.exe"):
-            run(["signtool", "verify", "/pa", "/all", installer])
+        installers = list(output.glob("*.exe"))
+        if len(installers) != 1 or installers[0].is_symlink() or not installers[0].is_file():
+            raise ValueError("Expected exactly one finished NSIS installer for signing")
+        sign_windows_files(installers)
     validate_inventory(notices, strict=strict)
     write_json(output / "release-status.json", {"mode": args.mode, "license_inventory_complete": strict,
                "os_signed": production and expected_os in ("Darwin", "Windows"),

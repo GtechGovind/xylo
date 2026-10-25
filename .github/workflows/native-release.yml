@@ -134,26 +134,30 @@ jobs:
         run: |
           cargo fmt --all --check
           python -m unittest discover -s scripts -p 'test_release*.py' -v
-      # Exercise the platform compiler before the longer Rust build. Native
-      # assets live under release/ and survive the later debug-only cleanup.
-      - name: Build pinned native speech runtime
-        run: bash scripts/native-assets-build.sh "target/${{ matrix.target }}/release/native-assets/whisper-runtime"
-      - name: Source and updater checks
-        run: |
-          cargo build --locked --workspace --bins
-          cargo test --locked --workspace --lib
-          cargo test --locked -p agent-workbench --bin agent-workbench startup::tests
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Windows plugin file authority tests
+      # Run the actual platform authority modules before compiling the desktop
+      # dependency graph. These fixtures still execute natively on each runner.
+      - name: Windows file authority tests
         if: runner.os == 'Windows'
         run: |
           cargo test --locked --manifest-path crates/capabilities/validation/windows-read/Cargo.toml --target '${{ matrix.target }}'
           cargo clippy --locked --manifest-path crates/capabilities/validation/windows-read/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
-      - name: Windows workspace reader API checks
+      - name: Windows workspace reader tests
         if: runner.os == 'Windows'
         run: |
-          cargo check --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}' --all-targets
+          cargo test --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}'
           cargo clippy --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
+      # Exercise the platform compiler before the longer Rust build. Native
+      # assets live under release/ and survive the later debug-only cleanup.
+      - name: Build pinned native speech runtime
+        run: bash scripts/native-assets-build.sh "target/${{ matrix.target }}/release/native-assets/whisper-runtime"
+      - name: Build all native application binaries
+        run: cargo build --locked --workspace --bins
+      - name: Workspace library tests
+        run: cargo test --locked --workspace --lib
+      - name: Desktop startup and updater tests
+        run: cargo test --locked -p agent-workbench --bin agent-workbench startup::tests
+      - name: Strict workspace Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Rust plugin SDK and native component execution
         run: bash scripts/test-plugin-sdk.sh
       - name: Reclaim tested debug artifacts before optimized compilation
