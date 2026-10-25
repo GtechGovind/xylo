@@ -85,10 +85,16 @@ pub(super) fn stripe(id: Uuid) -> String {
 fn try_lock(file: File) -> Result<Option<Arc<File>>> {
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(Arc::new(file))),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            Ok(None)
+        }
         Err(e) => Err(e.into()),
     }
 }
+
 impl Store {
     /// Held before durable intent creation through real execution and result
     /// persistence. Async native code must retain this file in its task context.
@@ -164,5 +170,23 @@ impl Store {
             conn.query_row("SELECT json_extract(a.intent,'$.name'),coalesce(p.version,0) FROM actions a LEFT JOIN action_execution_protocol p ON p.action_id=a.id WHERE a.id=?1 AND a.session_id=?2", params![id.to_string(),session.to_string()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))).optional()?.context("This action is unavailable in the selected chat")
         })?;
         Ok(self.action_review_status_metadata(id, &name, protocol))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn independent_execution_handles_report_contention_until_the_owner_drops() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("execution.lock");
+        let owner = try_lock(open(&path).unwrap()).unwrap().unwrap();
+        assert!(
+            try_lock(open(&path).unwrap()).unwrap().is_none(),
+            "A second handle must classify the live OS lock as contention"
+        );
+        drop(owner);
+        assert!(try_lock(open(&path).unwrap()).unwrap().is_some());
     }
 }
