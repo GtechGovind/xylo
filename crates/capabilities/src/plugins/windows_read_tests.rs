@@ -185,19 +185,47 @@ fn final_file_swap_after_directory_validation_cannot_return_private_bytes() {
     let secret = fixture.private().join("private.txt");
     std::fs::write(&fact, "authorized file").unwrap();
     std::fs::write(&secret, "private profile secret").unwrap();
-    let error = open_with_before(
+    let mut callback_ran = false;
+    let mut original_removed = false;
+    let mut private_link_created = false;
+    let result = open_with_before(
         &fixture.config,
         "fact.txt",
         &CancellationToken::new(),
         || {
-            std::fs::remove_file(&fact)?;
-            std::fs::hard_link(&secret, &fact)?;
+            callback_ran = true;
+            std::fs::remove_file(&fact)
+                .context("Swap fixture could not remove the original file")?;
+            original_removed = true;
+            std::fs::hard_link(&secret, &fact)
+                .context("Swap fixture could not create the private hard link")?;
+            private_link_created = true;
+            ensure!(
+                std::fs::read(&fact).context("Swap fixture could not verify the replacement")?
+                    == b"private profile secret",
+                "Swap fixture did not replace the original with the private file"
+            );
             Ok(())
         },
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("without links"));
-    assert!(!error.to_string().contains("private profile secret"));
+    );
+    let diagnostic = result.as_ref().err().map_or_else(
+        || "unexpected successful file open".to_owned(),
+        |error| format!("{error:#}"),
+    );
+    assert!(
+        callback_ran,
+        "Directory validation failed before the swap callback: {diagnostic}"
+    );
+    assert!(
+        original_removed && private_link_created,
+        "Private swap was not completed (removed={original_removed}, linked={private_link_created}): {diagnostic}"
+    );
+    let error = result.expect_err("A private-file swap must never return a readable handle");
+    assert!(
+        error.to_string().contains("without links"),
+        "Final open failed at a different protection boundary: {error:#}"
+    );
+    assert!(!diagnostic.contains("private profile secret"));
 }
 
 #[test]

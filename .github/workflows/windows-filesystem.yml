@@ -65,8 +65,10 @@ jobs:
       - name: Plugin and capture filesystem authority tests
         run: cargo test --locked --manifest-path crates/capabilities/validation/windows-read/Cargo.toml --target '${{ matrix.target }}'
       - name: Project filesystem reader tests
+        if: ${{ !cancelled() }}
         run: cargo test --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}'
       - name: Strict platform-module Clippy
+        if: ${{ !cancelled() }}
         run: |
           cargo clippy --locked --manifest-path crates/capabilities/validation/windows-read/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
           cargo clippy --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
