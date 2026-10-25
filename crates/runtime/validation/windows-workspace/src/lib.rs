@@ -18,6 +18,12 @@ mod index {
 #[path = "../../../src/workspace/reader.rs"]
 mod reader;
 
+// Run the actual codec's platform-specific tests and lint its Windows branch
+// before compiling the desktop/runtime dependency graph.
+#[cfg(test)]
+#[path = "../../../src/workspace/paths.rs"]
+mod native_paths;
+
 #[cfg(windows)]
 pub fn open_project_file(
     root: &std::path::Path,

@@ -1,0 +1,67 @@
+name: Windows lint patch audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-lint-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    if: github.event.repository.private == false
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Pinned native Rust toolchain
+        run: |
+          rustup set default-host x86_64-pc-windows-msvc
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+          test "$(rustc --version --verbose | sed -n 's/^host: //p')" = x86_64-pc-windows-msvc
+      - name: Native Windows shader compiler
+        shell: pwsh
+        run: |
+          "CMAKE_GENERATOR_PLATFORM=x64" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          $fxc = Get-ChildItem $sdkRoot -Directory | Sort-Object Name -Descending | ForEach-Object {
+            Join-Path $_.FullName 'x64\fxc.exe'
+          } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required' }
+          "GPUI_FXC_PATH=$fxc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      # Diagnostic only: suggestions are applied to this disposable checkout,
+      # never pushed or used to produce a qualified release artifact. Review
+      # the patch, commit accepted changes, then run the unmodified-source gates.
+      - name: Collect machine-applicable fixes across the native workspace
+        run: cargo clippy --locked --fix --allow-dirty --workspace --all-targets -- -D warnings
+      - name: Verify resulting workspace without suppressions
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Preserve source identity and review patch
+        if: always()
+        run: |
+          mkdir -p lint-audit
+          git rev-parse HEAD > lint-audit/source.txt
+          git diff --binary > lint-audit/windows-lint.patch
+          git status --short > lint-audit/status.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: windows-lint-audit
+          path: lint-audit/
+          if-no-files-found: error
+          retention-days: 7
