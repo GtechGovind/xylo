@@ -4,7 +4,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import tempfile
 import tarfile
@@ -110,6 +110,15 @@ class LinuxNoticeTests(unittest.TestCase):
             path.write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
             with patch("release_linux_notices.command", return_value=" 0x000000000000000e (SONAME) Library soname: [libfixture.so.1]\n    Build ID: " + "1" * 40 + "\n"):
                 self.assertEqual(elf_identity(path), LIB_ID)
+            # GNU binutils 2.42 print_note(do_wide) prints a TAB rather than a
+            # newline before print_gnu_note appends its Build ID field.
+            wide = " 0x000000000000000e (SONAME) Library soname: [libfixture.so.1]\n  GNU 0x00000014\tNT_GNU_BUILD_ID (unique build ID bitstring)\t    Build ID: " + "1" * 40 + "\n"
+            with patch("release_linux_notices.command", return_value=wide):
+                self.assertEqual(elf_identity(path), LIB_ID)
+            for invalid in (wide + "Build ID: " + "2" * 40 + "\n", wide.replace("1" * 40, "1" * 129), wide.replace("1" * 40, "1" * 40 + "not-hex")):
+                with patch("release_linux_notices.command", return_value=invalid):
+                    with self.assertRaisesRegex(ValueError, "readelf output"):
+                        elf_identity(path)
             with patch("release_linux_notices.command", return_value="No build ID"):
                 with self.assertRaisesRegex(ValueError, "missing/ambiguous"):
                     elf_identity(path)
@@ -120,13 +129,15 @@ class LinuxNoticeTests(unittest.TestCase):
             calls.append(args[-1])
             return subprocess.CompletedProcess(args, 0 if args[-1] == "/lib/libfixture.so.1" else 1,
                 "libfixture1:amd64: /lib/libfixture.so.1\n" if args[-1] == "/lib/libfixture.so.1" else "", "")
-        with patch.object(Path, "resolve", return_value=Path("/usr/lib/libfixture.so.1")), \
+        # The resolved name represents Linux dpkg state, even when these pure
+        # parser fixtures execute on a native Windows release runner.
+        with patch.object(Path, "resolve", return_value=PurePosixPath("/usr/lib/libfixture.so.1")), \
                 patch("release_linux_notices.run_bounded", side_effect=search), \
                 patch("release_linux_notices.command", return_value="libfixture1:amd64\t1.2-3\tfixture\t1.2-3\n"):
             self.assertEqual(package_owner(Path("/usr/lib/libfixture.so.1"))["version"], "1.2-3")
         self.assertIn("/lib/libfixture.so.1", calls)
         for output in ("", "one: /lib/libfixture.so.1\ntwo: /lib/libfixture.so.1\n"):
-            with patch.object(Path, "resolve", return_value=Path("/lib/libfixture.so.1")), \
+            with patch.object(Path, "resolve", return_value=PurePosixPath("/lib/libfixture.so.1")), \
                     patch("release_linux_notices.run_bounded", return_value=subprocess.CompletedProcess([], 0, output, "")):
                 with self.assertRaisesRegex(ValueError, "unknown or ambiguous"):
                     package_owner(Path("/lib/libfixture.so.1"))
@@ -176,9 +187,16 @@ class LinuxNoticeTests(unittest.TestCase):
             copyright_file.write_bytes(b"Exact copyright fixture")
             def identity(path):
                 return identities.get(path.name, LIB_ID)
+            def native_dependencies(output):
+                # The tool reports Linux names even when the local byte
+                # fixture is held in a Windows temporary directory. Exercise
+                # the strict parser, then explicitly map its synthetic name.
+                self.assertEqual(dependency_paths(output), [Path("/usr/lib/libfixture.so.1")])
+                return [library]
             owner = {"package": "libfixture1:amd64", "version": "1.2-3", "source_package": "fixture", "source_version": "1.2-3"}
             with patch("release_linux_notices.elf_identity", side_effect=identity), \
-                    patch("release_linux_notices.command", return_value=f"libfixture.so.1 => {library} (0x00000001)\n"), \
+                    patch("release_linux_notices.command", return_value="libfixture.so.1 => /usr/lib/libfixture.so.1 (0x00000001)\n"), \
+                    patch("release_linux_notices.dependency_paths", side_effect=native_dependencies), \
                     patch("release_linux_notices.package_owner", return_value=owner), \
                     patch("release_linux_notices.collect_infrastructure", side_effect=infrastructure_fixture), \
                     patch("release_linux_notices.notice_inputs", return_value=[("installed_package_copyright", copyright_file, copyright_file.read_bytes())]):

@@ -75,10 +75,14 @@ def elf_identity(path: Path) -> dict:
         raise ValueError("Linux notice inspection requires a 64-bit little-endian ELF")
     machine = int.from_bytes(header[18:20], "little")
     text = command(["readelf", "--wide", "--dynamic", "--notes", str(path)])
-    builds = re.findall(r"^\s*Build ID: ([0-9a-fA-F]{8,128})\s*$", text, re.M)
+    # GNU binutils 2.42 print_note() emits the note owner/type followed by a
+    # TAB in --wide mode; print_gnu_note() then appends Build ID on that row.
+    # LLVM and non-wide GNU output put the same field on its own line.
+    builds = re.findall(r"(?<![A-Za-z0-9_])Build ID:[ \t]+([0-9a-fA-F]{8,128})(?=\s|$)", text)
     sonames = re.findall(r"\(SONAME\)\s+Library soname: \[([^\]\n]{1,255})\]", text)
     if len(builds) != 1 or len(sonames) > 1:
-        raise ValueError("ELF dependency has a missing/ambiguous GNU build ID or SONAME")
+        raise ValueError("ELF dependency has a missing/ambiguous GNU build ID or SONAME: "
+                         + str(path)[:512] + f" (build_ids={len(builds)}, sonames={len(sonames)}). readelf output: " + text[:4096])
     return {"machine": machine, "build_id": builds[0].lower(), "soname": sonames[0] if sonames else None}
 
 
