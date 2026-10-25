@@ -165,14 +165,16 @@ jobs:
       # assets live under release/ and survive the later debug-only cleanup.
       - name: Build pinned native speech runtime
         run: bash scripts/native-assets-build.sh "target/${{ matrix.target }}/release/native-assets/whisper-runtime"
+      # Type-check every platform path before paying for full native codegen.
+      # Keep warnings fatal; later execution tests still exercise these targets.
+      - name: Strict workspace Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Build all native application binaries
         run: cargo build --locked --workspace --bins
       - name: Workspace library tests
         run: cargo test --locked --workspace --lib
       - name: Desktop startup and updater tests
         run: cargo test --locked -p agent-workbench --bin agent-workbench startup::tests
-      - name: Strict workspace Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Rust plugin SDK and native component execution
         run: bash scripts/test-plugin-sdk.sh
       - name: Reclaim tested debug artifacts before optimized compilation
