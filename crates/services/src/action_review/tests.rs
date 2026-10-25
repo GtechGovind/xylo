@@ -238,16 +238,30 @@ fn actual_os_lease_blocks_resolution_and_legacy_or_native_ownership_stays_unqual
             .is_err()
     );
     drop(active);
-    assert!(
-        !f.store
-            .action_review(f.scope.clone(), id)
-            .unwrap()
-            .action
-            .busy
-    );
-    f.store
-        .resolve_action(request, &CancellationToken::new())
-        .unwrap();
+    // A concurrent fork may briefly own this CLOEXEC descriptor until exec.
+    // Observe actual kernel quiescence by acquiring the resolution guard,
+    // rather than assuming parent drop made a liveness snapshot authoritative.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match f
+            .store
+            .resolve_action(request.clone(), &CancellationToken::new())
+        {
+            Ok(_) => break,
+            Err(error) if error.downcast_ref::<leases::LiveAction>().is_some() => {
+                assert_eq!(
+                    f.store.action(id).unwrap().unwrap().state,
+                    "outcome_unknown"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Execution lease still has a live OS owner: {error:#}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => panic!("Guarded resolution failed after owner drop: {error:#}"),
+        }
+    }
     for (name, protocol) in [
         ("file_write", None),
         ("run_command", Some(false)),
