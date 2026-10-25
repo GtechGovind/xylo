@@ -1,0 +1,129 @@
+   Compiling workbench-capabilities v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/capabilities)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.88s
+     Running unittests src/lib.rs (target/debug/deps/workbench_capabilities-2de5338549cfdc32)
+
+running 100 tests
+test assets::tests::native_asset_locations_match_packaged_and_development_layouts ... ok
+test assets::download::tests::production_policy_refuses_http_even_for_loopback ... ok
+test assets::archive::tests::archive_traversal_and_special_entries_are_rejected ... ok
+test audio::convert::tests::converter_cancels_without_leaving_an_output ... ok
+test audio::convert::tests::resampling_rejects_alias_energy_above_target_nyquist ... ok
+test assets::download::tests::hash_mismatch_never_promotes_unverified_bytes ... ok
+test browser::tests::managed_chromium_performs_real_cdp_workflow_on_loopback ... ignored, Requires an explicit local Chromium executable in WORKBENCH_CHROMIUM
+test audio::tests::microphone_and_playback_require_user_action_before_touching_devices ... ok
+test assets::tests::reviewed_catalog_is_pinned_and_models_require_an_explicit_selection ... ok
+test browser::tests::navigation_rejects_executable_and_local_file_urls ... ok
+test audio::playback::tests::playback_decodes_and_mixes_without_opening_a_device ... ok
+test assets::download::tests::interrupted_transfer_resumes_exact_range_then_reuses_verified_cache ... ok
+test assets::download::tests::cancellation_preserves_only_partial_bytes_for_explicit_resume ... ok
+test assets::download::tests::ignored_range_restarts_safely_and_wrong_range_is_rejected ... ok
+test documents::editing_tests::cancelled_staging_and_existing_output_are_never_partially_published ... ok
+test assets::activation::tests::language_server_activation_preserves_other_overrides ... ok
+test documents::editing_tests::source_revision_is_checked_again_after_copy_materialization_before_publication ... ok
+test audio::convert::tests::stereo_48khz_is_mixed_resampled_and_duration_preserved ... ok
+test documents::editing_tests::status_before_receipt_observes_live_start_or_tombstones_id_so_delayed_save_cannot_publish ... ok
+test documents::editing_tests::friendly_unicode_copy_filenames_are_portable_and_never_escape_or_clobber ... ok
+test documents::editing_tests::full_length_cell_remains_editable_through_focused_page_after_explicit_page_budget_error ... ok
+test documents::editing_tests::typed_page_budget_is_rejected_without_truncation_and_admission_cancellation_is_bounded ... ok
+test documents::editing_tests::signed_office_and_ancestor_bound_content_are_explicitly_protected ... ok
+test documents::editing_tests::docx_actual_package_edits_table_and_single_styled_run_preserving_links_styles_media_and_raw_entries ... ok
+test environments::capture::pipes::tests::actual_write_error_takes_precedence_over_command_timeout ... ok
+test environments::capture::pipes::tests::explicit_read_error_takes_precedence_over_command_cancellation ... ok
+test environments::capture::pipes::tests::observed_eof_is_exact_and_complete_without_command_interruption ... ok
+test documents::editing_tests::abandoned_copy_receipts_reconcile_output_and_live_lease_prevents_false_recovery ... ok
+test environments::capture::pipes::tests::unexpected_reader_join_error_is_a_read_error ... ok
+test assets::tests::installation_is_durable_verified_and_rejects_changed_bytes_on_activation ... ok
+test documents::editing_tests::unsupported_docx_style_crossing_and_embedded_object_edits_fail_without_publishing ... ok
+test documents::editing_tests::text_bom_revision_conflict_atomic_no_clobber_and_idempotent_receipts ... ok
+test environments::capture::pipes::tests::held_open_pipe_preserves_known_end_cause_and_inexact_prefix ... ok
+test environments::capture::tests::detached_blocking_output_work_retains_real_operation_and_profile_leases ... ok
+test documents::tests::office_exports_round_trip_text_and_numbers_offline ... ok
+test documents::editing_tests::small_sheet_pages_ignore_an_unrelated_sheet_beyond_native_materialization_limit ... ok
+test documents::editing_tests::xlsx_paged_typed_cells_and_explicit_formula_edits_preserve_other_sheets_styles_and_precise_numbers ... ok
+test environments::capture::tests::exact_link_publication_crash_is_recovered_but_unknown_aliases_are_refused ... ok
+test environments::capture::tests::storage_quota_refuses_new_reservation_without_evicting_previous_bytes ... ok
+test environments::capture::tests::binary_streams_are_complete_and_separate_from_bounded_lossy_previews ... ok
+test environments::capture::tests::failed_command_retains_complete_output_without_claiming_rollback ... ok
+test environments::capture::tests::symlink_hardlink_and_renamed_authorities_never_escape_artifact_storage ... ok
+test environments::capture::tests::missing_outer_receipt_recovers_retained_prefix_without_replaying ... ok
+test environments::capture::tests::unrelated_destination_and_hash_tampering_never_authorize_publication ... ok
+test environments::capture::tests::later_stream_or_manifest_tampering_is_detected_without_overwriting_evidence ... ok
+test environments::capture::pipes::tests::retained_byte_limit_takes_precedence_over_command_cancellation ... ok
+test environments::tests::a_replaced_client_symlink_cannot_redirect_a_saved_profile ... ok
+test environments::capture::tests::every_pre_intent_setup_crash_remains_discoverable_and_reconciles ... ok
+test environments::tests::live_profile_lease_prevents_stale_recovery_and_cancellation_while_waiting_has_no_effect ... ok
+test environments::capture::tests::cancellation_and_timeout_retain_prefixes_with_unknown_effects ... ok
+test environments::tests::missing_receipt_resolution_fences_a_real_delayed_admission_and_rejects_wrong_context ... ok
+test environments::tests::lost_create_ack_is_reconciled_by_owned_labels_without_repeating_create ... ok
+test environments::tests::dropped_caller_cancels_local_client_and_retains_output_until_explicit_recovery ... ok
+test environments::tests::unused_execution_recovery_never_initializes_environment_storage ... ok
+test environments::tests::foreground_ssh_master_survives_connect_and_is_shared_but_only_owner_shutdown_stops_it ... ok
+test environments::tests::unused_shutdown_does_not_initialize_storage_and_missing_management_is_explicit ... ok
+test models::tests::helper_templates_preserve_argument_boundaries_and_fail_unknown_assets ... ok
+test models::tests::inference_request_lock_is_exclusive_and_cancellable ... ok
+test models::tests::local_server_defaults_fit_available_hardware_and_preserve_overrides ... ok
+test environments::tests::profiles_are_durable_cas_bound_and_management_is_not_an_agent_tool ... ok
+test models::tests::unconfigured_server_does_not_start_or_claim_readiness ... ok
+test environments::tests::pre_dispatch_cas_error_can_be_authoritatively_cancelled_without_losing_the_form ... ok
+test managed_endpoints::tests::ownership_is_normalized_and_cleanup_preserves_other_servers ... ok
+test plugins::tests::active_run_lease_blocks_revoke_update_and_remove ... ok
+test plugins::tests::ancestor_swap_after_validation_reads_only_the_original_directory_handle ... ok
+test plugins::tests::artifact_write_is_no_clobber_and_returns_committed_artifact ... ok
+test environments::tests::execute_is_revision_pinned_bounded_and_success_is_reused_without_a_second_process ... ok
+test plugins::tests::cancellation_fuel_limits_and_ungranted_imports_fail_closed ... ok
+test plugins::tests::cancelled_admitted_artifact_write_never_publishes_partial_output ... ok
+test environments::tests::cancellation_preserves_unknown_after_restart_and_blocks_automatic_replay ... ok
+test environments::tests::managed_lifecycle_checks_labels_and_never_forces_or_removes_unrelated_resources ... ok
+test plugins::tests::corrupt_packages_grant_escalation_and_symlink_entrypoints_are_rejected ... ok
+test plugins::tests::https_grants_are_exact_and_management_is_not_discovered_by_agents ... ok
+test plugins::tests::failed_update_preserves_installed_authority_and_reclaims_crash_orphans ... ok
+test plugins::tests::file_swap_after_directory_validation_cannot_read_app_private_text ... ok
+test plugins::tests::guest_error_results_obey_the_same_byte_budget_as_success_results ... ok
+test plugins::tests::explicit_update_permissions_enablement_and_removal ... ok
+test plugins::tests::hard_link_aliases_and_named_pipes_cannot_be_read_as_workspace_text ... ok
+test plugins::tests::installation_replay_does_not_require_original_selected_files ... ok
+test plugins::tests::installed_echo_survives_restart_and_original_package_removal ... ok
+test environments::capture::tests::stream_ceiling_still_drains_and_reports_the_exact_observed_total ... ok
+test plugins::tests::management_is_idempotent_and_rejects_reused_operation_id ... ok
+test plugins::tests::multiple_linear_memories_cannot_multiply_the_declared_budget ... ok
+test process::tests::relative_helpers_are_rejected ... ok
+test remote::tests::ssh_arguments_are_single_quoted ... ok
+test plugins::tests::installed_reads_reject_private_data_and_workspace_escape ... ok
+test tests::configuration_does_not_claim_availability ... ok
+test plugins::tests::substituted_management_symlink_is_rejected_before_creating_children ... ok
+test tests::output_names_cannot_escape_artifacts ... ok
+test process::tests::capture_is_bounded_and_timeout_terminates ... ok
+test tests::management_storage_cannot_overlap_the_artifact_root ... ok
+test tests::saved_environments_replace_legacy_remote_discovery ... ok
+test tests::ordinary_tools_cannot_dispatch_application_management_controls ... ok
+test tests::private_management_files_are_not_part_of_the_plugin_input_scope ... ok
+test plugins::tests::review_pin_hash_and_catalog_revision_are_enforced ... ok
+test environments::tests::outer_journal_recovery_requires_an_exact_terminal_receipt_and_never_dispatches ... ok
+test plugins::tests::repeated_guest_writes_cannot_exhaust_artifact_storage ... ok
+test plugins::tests::repeated_guest_writes_respect_the_aggregate_byte_budget ... ok
+test models::tests::root_activity_prevents_idle_eviction_and_shutdown_without_a_generation ... ok
+test environments::tests::terminal_archival_preserves_exact_results_beyond_the_active_receipt_limit ... ok
+
+test result: ok. 99 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 51.62s
+
+     Running unittests src/lib.rs (target/debug/deps/workbench_notifications-b3dd170e9ac7c535)
+
+running 15 tests
+test platform::linux::tests::reused_daemon_id_replaces_old_route_and_active_routes_stay_bounded ... ok
+test tests::disabled_default_is_lazy_and_cannot_prompt_or_post ... ok
+test tests::explicit_test_cancellation_uses_same_late_retraction_guarantee ... ok
+test tests::persistence_failure_cannot_optimistically_enable_delivery ... ok
+test tests::enabling_does_not_ask_permission_or_post_and_observation_cannot_grant ... ok
+test tests::dropped_waiter_cancels_and_retracts_late_native_acceptance ... ok
+test tests::restarted_history_and_future_clock_skew_are_not_reannounced ... ok
+test tests::cancellation_retracts_approval_and_blocks_late_completion_and_activation ... ok
+test tests::native_activation_is_validated_and_consumed_once_after_restart ... ok
+test tests::disabling_never_waits_for_native_post_and_enable_cannot_revive_it ... ok
+test tests::duplicate_terminal_events_are_durable_and_first_terminal_wins ... ok
+test tests::categories_and_foreground_policy_are_independent ... ok
+test tests::denial_unavailable_and_unsupported_never_imply_delivery ... ok
+test tests::simultaneous_repeated_events_make_only_one_native_attempt ... ok
+test tests::journal_is_bounded_and_contains_no_freeform_content ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.49s
+

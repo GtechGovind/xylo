@@ -1,0 +1,59 @@
+{
+  "scope": "Focused local validation of native portability and capture changes. These results do not replace the source-bound d0bf complete milestone or native OS qualification. Input hashes were recorded after checks, not in pre-run gate headers.",
+  "changes": [
+    "Windows Disconnect returns a local plan when no Unix SSH master exists.",
+    "macOS-only notification wait helper and Unix-only fixture helpers have explicit platform guards.",
+    "Capture preserves a known cancellation/timeout cause when its bounded reader drain stops before EOF; byte exactness and completeness remain independent.",
+    "Unexpected reader task failure is recorded as ReadError, while the writer and its leases remain owned through completion."
+  ],
+  "source_inputs_sha256": {
+    "crates/capabilities/src/environments/operations.rs": "5e342f85b6590edfc551b54d31ce61684cbda0e3e1321907ad0bce7b969fe95f",
+    "crates/capabilities/src/environments/tests.rs": "00106a949410c44a7fb1c715bdaa59bb7a1098e4d9189171dc6250d60d985311",
+    "crates/capabilities/src/environments/capture_pipes.rs": "c4f9b621716966de0c0a4f68c3c678af7f68133b2e6f8338d28cedb440568558",
+    "crates/notifications/src/platform/actor.rs": "a15cd0e1f0dd51a4e84df43b9285d905f4672d557761c32045ced00b1a24f349"
+  },
+  "logs": {
+    "library-tests": {
+      "path": "docs/evidence/2026-10-25-native-portability-and-capture/library-tests.log",
+      "sha256": "99f1daff4d6deaaf33f172ce5ee3de3331e26900d8f06f1ace8768598d8872c7"
+    },
+    "capture-tests": {
+      "path": "docs/evidence/2026-10-25-native-portability-and-capture/capture-tests.log",
+      "sha256": "bab042e10deb1ed63942446f55f1d29aa884fdab2c9ae76809502b3ed3b6930c"
+    },
+    "clippy": {
+      "path": "docs/evidence/2026-10-25-native-portability-and-capture/clippy.log",
+      "sha256": "767394372d18bf74a08087ed62b9a5d910f795fc6de29d9f77c680ed25de94bc"
+    }
+  },
+  "native_ci_before_fix": {
+    "commit": "4363e3c819797185be9aad276ae6ff239f4e351a",
+    "run": "https://github.com/GtechGovind/xylo/actions/runs/40184927362",
+    "observations": [
+      "Windows x64 and ARM64 compile failed at the missing non-Unix Disconnect result.",
+      "macOS ARM64 capture cancellation fixture expected Cancelled and observed Interrupted.",
+      "The exact reader completion cause in that CI sample was not instrumented; the generic classification path is reproduced deterministically using a held-open pipe."
+    ]
+  },
+  "local_tests": {
+    "capabilities": {
+      "passed": 99,
+      "failed": 0,
+      "ignored": 1
+    },
+    "notifications": {
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0
+    },
+    "focused_capture": {
+      "passed": 18,
+      "failed": 0,
+      "scope": "Subset of capabilities, not additional unique executions in the library total."
+    }
+  },
+  "lint": "capabilities all-target strict Clippy passed after capture changes; notifications strict Clippy passed after its platform guard.",
+  "production_drain_timeout_seconds": 2,
+  "initial_development_lint": "Test-module placement first failed Clippy. Its raw log was overwritten during development and is unavailable; it has not been reconstructed. The archived Clippy log is the final successful run.",
+  "remaining": "Native Windows/Linux/macOS release qualification of the eventual clean commit remains pending; modern terminal UI and AI remain planned work."
+}

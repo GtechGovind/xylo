@@ -34,6 +34,8 @@ Shell metadata comes from session-local integration, such as [OSC 7 and command 
 
 AI actions use a bounded, inspectable excerpt selected by the user. Opening a terminal or typing a command does not invoke a model or upload its scrollback automatically. Terminal output remains untrusted input; it cannot grant permissions or authorize commands.
 
+Proposals stay in an editable command buffer. Insertion into a live terminal is limited to a validated single line at a known shell prompt; multiline content and control characters stay in the editor for explicit review. Alternate-screen applications keep normal terminal input.
+
 ## Performance work
 
 The current implementation builds a complete visible snapshot after each PTY read, then shapes all visible rows for rendering. Delivery through a coalescing channel does not eliminate that allocation work.

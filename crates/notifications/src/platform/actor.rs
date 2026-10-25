@@ -108,6 +108,7 @@ impl Adapter for Native {
         tokio::select! {_ = cancel.cancelled()=>anyhow::bail!("Notification action cancelled"),result=result=>result.context("Notification service stopped")?}
     }
 }
+#[cfg(target_os = "macos")]
 pub(super) fn wait<T>(
     receiver: std::sync::mpsc::Receiver<T>,
     cancel: &CancellationToken,

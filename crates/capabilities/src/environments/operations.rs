@@ -340,10 +340,9 @@ async fn prepare(
             next.connected = false;
             #[cfg(unix)]
             if matches!(record.profile.target, EnvironmentTarget::Ssh { .. }) {
-                Ok(Plan::Ssh(next, false))
-            } else {
-                Ok(Plan::Local(next, false))
+                return Ok(Plan::Ssh(next, false));
             }
+            Ok(Plan::Local(next, false))
         }
         EnvironmentAction::Create => {
             let (image, command) = managed(record)?;

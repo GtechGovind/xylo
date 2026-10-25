@@ -1,6 +1,8 @@
 use super::*;
+#[cfg(unix)]
 use std::fs;
 
+#[cfg(unix)]
 struct Fixture {
     root: tempfile::TempDir,
     config: CapabilityConfig,
@@ -113,11 +115,13 @@ fn profile(fixture: &Fixture, managed: bool) -> EnvironmentProfile {
         },
     }
 }
+#[cfg(unix)]
 async fn management(config: &CapabilityConfig, name: &str, args: Value) -> Value {
     execute_management(config, name, &args, CancellationToken::new())
         .await
         .unwrap()
 }
+#[cfg(unix)]
 async fn save_profile(fixture: &Fixture, profile: &EnvironmentProfile) -> EnvironmentRecord {
     let receipt: EnvironmentReceipt = serde_json::from_value(
         management(
@@ -131,6 +135,7 @@ async fn save_profile(fixture: &Fixture, profile: &EnvironmentProfile) -> Enviro
     assert_eq!(receipt.state, EnvironmentOperationState::Succeeded);
     receipt.environment.unwrap()
 }
+#[cfg(unix)]
 async fn action_request(
     fixture: &Fixture,
     record: &EnvironmentRecord,
