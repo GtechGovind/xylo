@@ -231,11 +231,25 @@ esac
     }
 
     fn assert_retained_artifacts(&self, observation: &Value, complete: bool) {
-        use sha2::{Digest, Sha256};
         let receipt = receipt(observation);
-        let output = receipt.output.as_ref().unwrap();
+        let paths = self.assert_retained_receipt(&receipt, complete);
+        assert_eq!(
+            observation["artifacts"],
+            serde_json::to_value(paths).unwrap()
+        );
+    }
+
+    fn assert_retained_receipt(
+        &self,
+        receipt: &EnvironmentReceipt,
+        complete: bool,
+    ) -> Vec<PathBuf> {
+        use sha2::{Digest, Sha256};
+        let output = receipt.output.as_ref().unwrap_or_else(|| {
+            panic!("Finalized receipt must retain its captured output: {receipt:?}")
+        });
         assert_eq!(output.artifacts.len(), 2);
-        let paths: Vec<_> = output
+        output
             .artifacts
             .iter()
             .map(|artifact| {
@@ -245,11 +259,33 @@ esac
                 assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&bytes)));
                 artifact.path.clone()
             })
-            .collect();
-        assert_eq!(
-            observation["artifacts"],
-            serde_json::to_value(paths).unwrap()
-        );
+            .collect()
+    }
+
+    async fn retained_receipt(&self, operation_id: Uuid) -> EnvironmentReceipt {
+        let mut last = None;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // This is an observation of the exact saved operation. It must
+                // never execute the original command or a native status probe.
+                let current = management(
+                    &self.config,
+                    "helper_environment_operation",
+                    json!({"operation_id":operation_id,"environment_id":self.environment.profile.id,"action":"execute"}),
+                )
+                .await;
+                assert_eq!(current.operation_id, operation_id);
+                assert_eq!(current.environment_id, self.environment.profile.id);
+                assert_eq!(current.action, workbench_core::EnvironmentAction::Execute);
+                if current.output.is_some() {
+                    return current;
+                }
+                last = Some(current);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Retained native output did not finish; last saved receipt: {last:?}"))
     }
 
     fn assert_recovery_event(&mut self, id: Uuid, expected: &Value, success: bool) {
@@ -373,18 +409,53 @@ async fn cancelled_native_write_stays_unknown_until_observed_failure_is_recorded
         })
         .await
         .expect("Fixture must reach the actual native dispatch before cancellation");
+        // Hold the fixture's real publication lease after dispatch. This makes
+        // the bounded acknowledgement precede finalization deterministically,
+        // just as concurrent disk work can do, without replacing any I/O.
+        let publication = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                fixture
+                    .root
+                    .join("native-management/environments/captures/storage.lock"),
+            )
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&publication).unwrap();
         cancel.cancel();
+        publication
     };
-    let (observation, _) = tokio::join!(execution, interrupt);
+    let (observation, publication) = tokio::join!(execution, interrupt);
     let unknown = serde_json::to_value(observation.unwrap()).unwrap();
     assert_eq!(
         receipt(&unknown).state,
         EnvironmentOperationState::OutcomeUnknown
     );
-    fixture.assert_retained_artifacts(&unknown, false);
+    // The cancellation acknowledgement is bounded to two seconds while the
+    // retained task still owns its writer, leases and durable output. Under
+    // concurrent fsync load this response can precede output finalization.
+    assert!(receipt(&unknown).output.is_none());
+    assert_eq!(unknown["artifacts"], json!([]));
     fixture.lose_acknowledgement(id);
     let argv = fixture.argv();
 
+    assert!(fixture.retry(call_id, &arguments).await.is_err());
+    assert_eq!(
+        fixture.broker.store.action(id).unwrap().unwrap().state,
+        "outcome_unknown"
+    );
+    assert!(fixture.events.try_recv().is_err());
+    fixture.assert_single_execution(&argv);
+
+    drop(publication);
+    let saved = fixture
+        .retained_receipt(serde_json::from_value(arguments["operation_id"].clone()).unwrap())
+        .await;
+    assert_eq!(saved.state, EnvironmentOperationState::OutcomeUnknown);
+    let output = saved.output.as_ref().unwrap();
+    assert_eq!(output.stdout, "captured prefix");
+    assert_eq!(output.stderr, "captured diagnostic");
+    fixture.assert_retained_receipt(&saved, false);
     assert!(fixture.retry(call_id, &arguments).await.is_err());
     assert_eq!(
         fixture.broker.store.action(id).unwrap().unwrap().state,
