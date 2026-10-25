@@ -1,0 +1,8 @@
+{
+  "stage": "clippy",
+  "exit_code": 0,
+  "seconds": 7.23,
+  "log": "/tmp/workbench-recovery-final-clippy.log",
+  "log_sha256": "b53ba4391c33826b5be23766da0b7df98cfac9ef1685022ec3ed1f87de1be8db",
+  "reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1"
+}

@@ -1,0 +1,58 @@
+{
+  "source_fingerprint_sha256": "273afe5f8f8cc32a29680ab6f87d8a81d702ade63e88954de710d084fc074f8f",
+  "scope": "Platform identity and portability inputs. Focused logs have no pre-run source header; this snapshot identifies the reviewed final contents. Original d0bf full gates retain their own source. Native release CI must validate the eventual clean commit.",
+  "changes": [
+    "Register Windows process identity before opening windows; match Linux launcher basename.",
+    "Qualify the external Windows crate in notifications.",
+    "Keep directory permission mutation on Unix and import File only for Unix or tests.",
+    "Cache only the pinned native packaging tool; verify version before reuse."
+  ],
+  "passed": [
+    "workspace formatting",
+    "strict workspace all-target Clippy on macOS ARM64",
+    "2 startup tests",
+    "7 resource tests",
+    "4 memory-record tests",
+    "macOS preview build, plist and ad hoc signature verification",
+    "actionlint for both release workflows"
+  ],
+  "not_passed_or_not_run": [
+    "Initial memory test compile exposed the test-only File import; the corrected focused run is separate.",
+    "Windows cross-check stopped at bundled SQLite C compilation because this Mac lacks Windows SDK headers; notification Rust code was not reached.",
+    "Native release qualification for the eventual commit is pending."
+  ],
+  "logs": {
+    "format": {
+      "path": "docs/evidence/2026-10-25-xylo-platform-fixes/format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "clippy": {
+      "path": "docs/evidence/2026-10-25-xylo-platform-fixes/clippy.log",
+      "sha256": "9fda10338e819cc5eb943db80d79e32d0f580e8187e85be649f583527b4e865e"
+    },
+    "startup": {
+      "path": "docs/evidence/2026-10-25-xylo-platform-fixes/startup.log",
+      "sha256": "a16502aac880ec452cb5e9055142396b191445e6f3df453de58b9014a2c6abef"
+    },
+    "preview-build": {
+      "path": "docs/evidence/2026-10-25-xylo-platform-fixes/preview-build.log",
+      "sha256": "7f5fe9fc84d91915f57dd61907f1dd9bcc9736a2ec323af2175d2dfcecc4fbca"
+    },
+    "resource-tests": {
+      "path": "docs/evidence/2026-10-25-xylo-platform-fixes/resource-tests.log",
+      "sha256": "1386c9ce380d276862f1961930c32bb1fe64ce6fd91654a4a255ff26cfb6a3e6"
+    },
+    "memory-tests": {
+      "path": "docs/evidence/2026-10-25-xylo-platform-fixes/memory-tests.log",
+      "sha256": "8852a9698c4ae99e7d8ea88d461c5a961d1aa372f406ab406770b633fa84397c"
+    },
+    "memory-tests-first": {
+      "path": "docs/evidence/2026-10-25-xylo-platform-fixes/memory-tests-first.log",
+      "sha256": "0342463fb21518b3f28cbf78d36ab3bcdb7294b96076d3996a2495500538a015"
+    },
+    "windows-cross-check": {
+      "path": "docs/evidence/2026-10-25-xylo-platform-fixes/windows-cross-check.log",
+      "sha256": "01761083c7bb91f50f7cb5d9c9d8622d22f9c879b304462ee76ca1989e60d3c2"
+    }
+  }
+}

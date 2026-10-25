@@ -1,0 +1,16 @@
+{"reviewed_source_fingerprint_sha256": "3c0d03abdf3daebbee00a9a898dded5c51d46d6e2f70b29b26a5ac3d9550356d", "started_at_unix": 1792898611.806436, "command": ["cargo", "build", "--locked", "--release", "-p", "agent-workbench", "-p", "workbench-worker", "-p", "workbench-helper", "-p", "workbench-capabilities", "--bins", "--example", "measure_plugins"]}
+   Compiling hermes-core v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-core)
+   Compiling workbench-resources v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/resources)
+   Compiling workbench-capabilities v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/capabilities)
+   Compiling workbench-runtime v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/runtime)
+   Compiling hermes-auth v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-auth)
+   Compiling hermes-intelligence v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-intelligence)
+   Compiling hermes-skills v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-skills)
+   Compiling hermes-agent v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-agent)
+   Compiling workbench-engine v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/engine)
+   Compiling workbench-helper v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/helper)
+   Compiling agent-workbench v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop)
+   Compiling workbench-worker v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/worker)
+    Finished `release` profile [optimized] target(s) in 4m 51s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

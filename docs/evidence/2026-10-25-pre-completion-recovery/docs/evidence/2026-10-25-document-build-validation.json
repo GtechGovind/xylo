@@ -1,0 +1,223 @@
+{
+  "recorded_at": "2026-10-25T01:47:41.416889+00:00",
+  "platform": {
+    "os": "27.0.1",
+    "os_build": "26A434",
+    "architecture": "arm64",
+    "hardware": "Mac17,2",
+    "ram_bytes": 34359738368,
+    "cpu_threads": 10,
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "xcode": "Xcode 27.1\nBuild version 27A9275"
+  },
+  "source_state": "Uncommitted workspace; unborn main. No commit or publication performed.",
+  "source_fingerprint_sha256": "ee65938c711bbc4fb08996a514a6d77f56ce21ae8b8510ba609cfa4d16dd1953",
+  "workspace_tests": {
+    "command": "CARGO_INCREMENTAL=0 cargo test --locked --workspace",
+    "passed": 294,
+    "failed": 0,
+    "ignored": 4,
+    "evidence": "docs/evidence/2026-10-25-document-workspace-tests.log"
+  },
+  "lint": {
+    "command": "CARGO_INCREMENTAL=0 cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings",
+    "status": "passed",
+    "evidence": "docs/evidence/2026-10-25-document-clippy.log"
+  },
+  "format": {
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo fmt --manifest-path crates/desktop/validation/Cargo.toml --all -- --check"
+    ],
+    "status": "passed"
+  },
+  "native_ui": {
+    "command": "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=\"$PWD/target\" cargo test --locked --manifest-path crates/desktop/validation/Cargo.toml --test draft-interactions --test image-generation-interactions --test memory-interactions --test native-interactions --test notification-interactions --test updater-interactions --test vision-interactions --test workspace-interactions --test document-interactions",
+    "passed": 121,
+    "failed": 0,
+    "ignored": 1,
+    "groups": {
+      "draft-interactions": 16,
+      "image-generation-interactions": 10,
+      "memory-interactions": 13,
+      "native-interactions": 18,
+      "notification-interactions": 14,
+      "updater-interactions": 15,
+      "vision-interactions": 10,
+      "workspace-interactions": 12,
+      "document-interactions": 13
+    },
+    "note": "121 test executions across nine executables: 49 distinct native UI flows plus eight common unit cases repeated per executable. Native text/GPU offscreen captures also regenerated. Physical presentation, IME and accessibility acceptance remain open.",
+    "renderer": "Metal",
+    "screenshots": [
+      "docs/native-preview/home.png",
+      "docs/native-preview/settings.png"
+    ],
+    "real_host_clangd_completion_hover_diagnostics": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "real_clangd_route": "Correlated production request_editor_file/opened_file path; diagnostics awaited independently.",
+    "real_clangd_and_speech_component_reuse": "Prior explicit clangd and selected local speech checks are retained as historical component evidence; their LSP/speech service and fixture sources are unchanged. They were not rerun for this document integration. Current full native fixtures are reported separately."
+  },
+  "speech": {
+    "selected_native_synthesis_to_whisper": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "evidence": "docs/evidence/speech-pipeline.log",
+    "microphone_and_speaker_devices": "Not opened; physical OS permission and audio acceptance pending."
+  },
+  "package": {
+    "type": "macOS development preview",
+    "signature": "local ad hoc; not notarized",
+    "components": {
+      "agent-workbench": {
+        "bytes": 219953488,
+        "sha256": "0dfc56ef4e0aa032f44bff7166745e0c6296d57738ff313d17c0d484808f99d8"
+      },
+      "workbench-worker": {
+        "bytes": 245819760,
+        "sha256": "8f510a0c9019394f77cdc2111e6443d27352c7b7517c153c19473c69ed76d131"
+      },
+      "workbench-helper": {
+        "bytes": 172500000,
+        "sha256": "86325fa9edb66fedb2c08132a94a1efd84d2768f91db63a0ad53d2d97d99098d"
+      }
+    },
+    "codesign_deep_strict_verification": "passed",
+    "native_assets_location": "Contents/Resources/native-assets",
+    "bundle": "target/debug/Agent Workbench.app",
+    "bundled_asset_manifest_entries_verified": 2,
+    "dependency_inventory": "Contents/Resources/licenses/dependencies/licenses.json"
+  },
+  "distribution": {
+    "release_script_tests": 19,
+    "platform_inventory_components": 834,
+    "missing_upstream_license_texts": 35,
+    "production_update_policy": "disabled; no invented signing identity or release feed",
+    "actual_installers_and_live_signed_update": "not qualified",
+    "available_license_texts": "docs/evidence/licenses plus hashed provenance in license-supplements.json; 35 exact-version gaps remain",
+    "verified_supplemented_packages": 66,
+    "macos_bundle_dependency_notice_integrity": "validated after copy in the actual development bundle"
+  },
+  "packaged_on_screen_checks": {
+    "status": "pending",
+    "reason": "Interactive desktop and physical input/device checks have not been performed for the current source."
+  },
+  "performance": {
+    "build": "release component workloads; full product performance not qualified",
+    "scope": "Historical scripted worker/storage and native offscreen reports remain identified by their original source/binary hashes. Current document paging has a separately identified optimized direct-API workload.",
+    "semantic_10000_memories_p95_ms": 27.192209,
+    "lexical_100000_memories_p95_ms": 113.738042,
+    "native_rendering_binary": {
+      "path": "target/performance/release/native-performance",
+      "sha256": "08f262cc0cca682954a08fdb9e0554d6e287405c9819dbc25b9289a0a1dffe4c",
+      "bytes": 30660032
+    },
+    "reports": [
+      "docs/evidence/2026-10-25-release-overhead.json",
+      "docs/evidence/2026-10-25-release-semantic-overhead.json",
+      "docs/evidence/2026-10-25-release-100k-overhead.json",
+      "docs/evidence/2026-10-25-release-native-rendering.json"
+    ],
+    "manifest": "docs/evidence/2026-10-25-release-benchmark-manifest.json",
+    "historical_debug_reports": [
+      "docs/evidence/2026-10-25-debug-overhead.json",
+      "docs/evidence/2026-10-25-debug-semantic-overhead.json"
+    ],
+    "release_gui_and_cross_platform_acceptance": "not established",
+    "historical_source_fingerprint_sha256": "d7363f8d5c026fbf7fb63fd3f75d1215bb0011d270f87560f2b26c6c2406f0ab",
+    "documents": {
+      "source_fingerprint_sha256": "ee65938c711bbc4fb08996a514a6d77f56ce21ae8b8510ba609cfa4d16dd1953",
+      "report": "docs/evidence/2026-10-25-release-document-paging.json",
+      "manifest": "docs/evidence/2026-10-25-document-benchmark-manifest.json",
+      "small_sheet_p95_ms": 1.659542,
+      "large_sheet_p95_ms": 38.556582999999996,
+      "samples_per_sheet": 40,
+      "scope": "Direct native API, revision hash/native parse/JSON. Excludes helper IPC, host resource admission, UI, display/input and save-copy."
+    }
+  },
+  "full_product_acceptance": "Development preview. Conservative document edit/copy flows are implemented and tested; full Office layout/object fidelity, missing-original recovery affordances, extension/environment lifecycle, native OS/account acceptance, full-app performance/quality evaluation, unresolved license texts and publisher signing remain tracked in docs/completion-audit.md.",
+  "capability_fixtures": {
+    "images": {
+      "native_import_cases": 7,
+      "streamed_api_families": 7,
+      "real_worker_restart_cases": 1,
+      "note": "Included in workspace totals. Managed image references survive worker restart; durable records contain no inline image bytes. No live vision account used."
+    },
+    "drafts": {
+      "service_cases": 8,
+      "runtime_and_host_cases": 7,
+      "note": "Included in workspace totals; native draft executable contains 4 UI flows plus 8 shared cases."
+    },
+    "notifications": {
+      "service_cases": 15,
+      "native_ui_flows": 6,
+      "note": "Included in totals. Native adapter compilation and fake-policy tests; no OS notification or permission dialog triggered. Linux Rust adapter type-checked under test on macOS; Windows still unqualified."
+    },
+    "facts": {
+      "service_cases": 20,
+      "native_ui_flows": 5,
+      "note": "Version lineage, scoped confirmed deletion and vector rollback, in-flight SQL cancellation, form migration, exact-input crash recovery and cross-project save receipts."
+    },
+    "image_generation": {
+      "services": 13,
+      "approved_agent_tool": 3,
+      "native_ui_flows": 2,
+      "note": "Includes durable recent jobs, actual local HTTP/output/artifacts, uncertainty, single-thread responsiveness and retained job ownership after abort. No paid account used."
+    },
+    "steering": {
+      "services": 6,
+      "real_worker": 3,
+      "native_ui_flows": 4,
+      "note": "Actual process interruption and three resumptions under default 8192 context; Applied commits checkpoint/history/draft clear, newer edits and writer conflicts preserved. Host integration cases included in workspace totals."
+    },
+    "model_stream_cancellation": {
+      "engine_cases": 2,
+      "real_worker_cases": 1,
+      "active_stream_iterations_per_worker_case": 64,
+      "note": "Typed interruption is cancellation only with own cancelled token, successful cleanup and a valid retained checkpoint. Missing/malformed checkpoints, cleanup/provider faults remain errors; unknown writes stay unresolved."
+    },
+    "documents": {
+      "backend_cases": 14,
+      "draft_store_cases": 6,
+      "host_draft_cases": 2,
+      "native_ui_flows": 5,
+      "note": "Real temporary Office packages and actual Host/helper UI; typed values/formulas, unrelated ZIP preservation, source conflicts, friendly names, staged no-clobber saves, delayed-before-receipt cancellation tombstones, copy recovery, continued typing during DB acknowledgements, project/Quit boundaries and dense Unicode fallback. No Office engine, physical input or account used."
+    }
+  },
+  "release_build": {
+    "profile": "release",
+    "source_fingerprint_sha256": "ee65938c711bbc4fb08996a514a6d77f56ce21ae8b8510ba609cfa4d16dd1953",
+    "target_directory": "target/performance",
+    "evidence": "docs/evidence/2026-10-25-document-release-recheck.log",
+    "initial_build_evidence": "docs/evidence/2026-10-25-document-release-build.log",
+    "artifacts": {
+      "agent-workbench": {
+        "path": "target/performance/release/agent-workbench",
+        "bytes": 55352752,
+        "sha256": "e446e2551f25d438f82ba1f135f27004930b18f4820530d17aed6ad94dbe3890"
+      },
+      "workbench-worker": {
+        "path": "target/performance/release/workbench-worker",
+        "bytes": 59130384,
+        "sha256": "6373287e75002fea451486db4a458054694f74d0b0852c31255d4b677cb6301a"
+      },
+      "workbench-helper": {
+        "path": "target/performance/release/workbench-helper",
+        "bytes": 33329632,
+        "sha256": "b868555049d43ba4c3f8e44eb4940ab49edaacb16cafb536e1553d7efec7e7a8"
+      }
+    },
+    "note": "All three optimized native binaries built/rechecked after final source changes. These are development binaries; no signed/notarized production installer or full-app performance acceptance is claimed."
+  },
+  "validation_limitations": {
+    "first_integration_run": "Two pre-existing local image HTTP fixtures exceeded their 5-second listener deadline while optimized linking was active; failure retained in docs/evidence/2026-10-25-document-integration-first-workspace-tests.log. The unchanged application code passed 294 tests after linking ended. This is not proof of the timeout cause or stressed live-provider acceptance.",
+    "initial_lint": "Strict all-target Clippy found an example-only manual-is-multiple-of assertion. Replaced it with the standard integer method, rebuilt/re-measured the harness and reran all gates. Initial lint evidence is retained.",
+    "native_os": "Physical on-screen/input/device/account and Windows/Linux acceptance remain unqualified."
+  },
+  "historical_evidence_note": "Snapshot of the earlier ee65938c document milestone. Raw logs use archived dated paths where available; binaries and bundle paths may now contain later builds. Original artifact hashes identify what was tested, not current file contents."
+}

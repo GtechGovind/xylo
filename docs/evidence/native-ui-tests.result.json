@@ -1,8 +1,10 @@
 {
   "stage": "native-tests",
   "exit_code": 0,
-  "seconds": 69.61,
-  "log": "/tmp/workbench-recovery-final-native-tests.log",
-  "log_sha256": "8df5a0ce96a198992584c7ecb78c28bf87e6f395ed473e1682f78c5bd20a42f6",
-  "reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1"
+  "seconds": 85.75,
+  "log": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/native-tests.log",
+  "log_sha256": "68c01fd74ee235bc7f37476ac72c54fbcad65668a11c90b63ed6cbe2a9538eba",
+  "reviewed_source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d",
+  "source_verified_after": true,
+  "runner_failure": null
 }

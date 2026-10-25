@@ -1,13 +1,13 @@
 {
   "build_host": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
   "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
-  "cargo_lock_sha256": "d4f48270a11e35a715fe3dd6a4868858470756860832bf8aaadfffb15b5d403b",
-  "commit": null,
-  "dirty": true,
+  "cargo_lock_sha256": "d83fe873f5ad0de0c7c21a2f1feaa56abfea8e2057bd8f7262caa9e2be71b827",
+  "commit": "0b1a4092466a712708efe42d52deca342702f33d",
+  "dirty": false,
   "packager_version": "0.11.8",
   "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8",
   "sdk_version": "27.0",
-  "source_date_epoch": 0,
+  "source_date_epoch": 1792922416,
   "target": "aarch64-apple-darwin",
   "xcode_version": "Xcode 27.1\nBuild version 27A9275"
 }

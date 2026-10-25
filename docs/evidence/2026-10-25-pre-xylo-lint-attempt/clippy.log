@@ -1,0 +1,32 @@
+{"reviewed_source_fingerprint_sha256": "afaf0c68703cc9d0a1a496eab07f0f1c87e2c5a81e205f89c7180cb48d5408b4", "started_at_unix": 1792922026.124971, "command": ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--no-deps", "--", "-D", "warnings"], "environment": {"CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": "/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target", "CARGO_BUILD_JOBS": "4", "CARGO_TERM_COLOR": "never", "WORKBENCH_RENDER_DIR": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/afaf0c68703cc9d0-1792921760203577000/captures"}, "recorder_sources_sha256": {"completion_validation_common.py": "a763cde845213a4f5764c6fd76b243e13a342c9f3d51896814c7e3625fc40412", "run-completion-gates.py": "0683cbf1427124c6f231e7c94a58944b8a8c58182ff6467b62fddeb7eed805ba", "record-completion-validation.py": "f35ebdc2f64a67cefa4d1535b257beee82f948b18ac5038fda3a89bce0b331d3", "record-recovery-validation.py": "629a312661ee6a6d3621129c7cc46b4532399280276b87f3ec6194bb5165ec7f"}}
+    Checking workbench-core v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/core)
+    Checking workbench-resources v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/resources)
+    Checking workbench-helper-client v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/helper-client)
+   Compiling workbench-distribution v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/distribution)
+    Checking workbench-notifications v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/notifications)
+   Compiling hermes-core v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-core)
+    Checking workbench-scheduler v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/scheduler)
+    Checking workbench-capabilities v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/capabilities)
+    Checking workbench-services v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/services)
+    Checking hermes-intelligence v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-intelligence)
+    Checking hermes-skills v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-skills)
+    Checking hermes-auth v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-auth)
+   Compiling agent-workbench v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop)
+    Checking hermes-agent v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-agent)
+    Checking workbench-runtime v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/runtime)
+    Checking workbench-helper v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/helper)
+    Checking workbench-engine v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/engine)
+    Checking workbench-worker v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/worker)
+error: using `chunks_exact_mut` with a constant chunk size
+  --> crates/desktop/src/ui.rs:23:33
+   |
+23 |             for pixel in pixels.chunks_exact_mut(4) {
+   |                                 ^^^^^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks_mut::<4>().0`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#chunks_exact_to_as_chunks
+   = note: `-D clippy::chunks-exact-to-as-chunks` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::chunks_exact_to_as_chunks)]`
+
+error: could not compile `agent-workbench` (bin "agent-workbench") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `agent-workbench` (bin "agent-workbench" test) due to 1 previous error

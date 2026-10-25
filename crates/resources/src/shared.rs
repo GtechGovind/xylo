@@ -118,12 +118,14 @@ fn prepare_directory(directory: &Path, cancel: &CancellationToken) -> Result<Pat
                 "Native admission directory cannot use symbolic links or non-directory parents"
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut builder = std::fs::DirBuilder::new();
+                let builder = std::fs::DirBuilder::new();
                 #[cfg(unix)]
-                {
+                let builder = {
                     use std::os::unix::fs::DirBuilderExt;
+                    let mut builder = builder;
                     builder.mode(0o700);
-                }
+                    builder
+                };
                 match builder.create(&current) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

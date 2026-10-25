@@ -1,0 +1,10 @@
+{
+  "stage": "native-tests",
+  "exit_code": 0,
+  "seconds": 84.93,
+  "log": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/a8b7ebb51c7d1875-1792908658894859000/native-tests.log",
+  "log_sha256": "4743efd8ee3dc38f235c781f89f90225045b9f022fa2409ad3cdb1e6d1b9597b",
+  "reviewed_source_fingerprint_sha256": "a8b7ebb51c7d1875aa4dd4484fb107454fea737f03be56fd1861c6b345b03650",
+  "source_verified_after": true,
+  "runner_failure": null
+}

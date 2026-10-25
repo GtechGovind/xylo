@@ -1,0 +1,10 @@
+{
+  "stage": "native-render",
+  "exit_code": 130,
+  "seconds": 10.34,
+  "log": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/a8b7ebb51c7d1875-1792908658894859000/native-render.log",
+  "log_sha256": "99b148942e9bb4d286b2df8053d4c95d08bc55f132fbfbb54cc2b5eb22756dcc",
+  "reviewed_source_fingerprint_sha256": "a8b7ebb51c7d1875aa4dd4484fb107454fea737f03be56fd1861c6b345b03650",
+  "source_verified_after": false,
+  "runner_failure": "Interrupted by operator; this gate is not successful"
+}

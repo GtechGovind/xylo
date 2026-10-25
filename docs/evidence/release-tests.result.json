@@ -1,8 +1,10 @@
 {
   "stage": "release-tests",
   "exit_code": 0,
-  "seconds": 0.22,
-  "log": "/tmp/workbench-recovery-final-release-tests.log",
-  "log_sha256": "7a1290127c8e1861f8d2ff852845e1883571540e2e106d547650d1d6fcefc4f9",
-  "reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1"
+  "seconds": 4.63,
+  "log": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/release-tests.log",
+  "log_sha256": "fa5ff4b1e20e79710ae36a580fb49b58c3a2ce0501dfc6a9f81f456220215bc4",
+  "reviewed_source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d",
+  "source_verified_after": true,
+  "runner_failure": null
 }

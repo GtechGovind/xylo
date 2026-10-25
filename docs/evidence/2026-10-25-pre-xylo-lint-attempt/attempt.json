@@ -1,0 +1,372 @@
+{
+  "schema_version": 1,
+  "classification": "historical_incomplete_attempt",
+  "failure_kind": "strict_lint_failure",
+  "source_fingerprint_sha256": "afaf0c68703cc9d0a1a496eab07f0f1c87e2c5a81e205f89c7180cb48d5408b4",
+  "original_run": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/afaf0c68703cc9d0-1792921760203577000",
+  "source_manifest": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/source-manifest.json",
+  "source_manifest_sha256": "946a49d64a469401a7e3d92e5af5e0196142f62784fa99ad0a20b721fdb8b355",
+  "run_index": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/run.json",
+  "run_index_sha256": "21fd956ae46072030238b5ec65e9eebf3c7521e18d241446ac5cedbbdf6aed01",
+  "archived_recorder_sources_sha256": {
+    "completion_validation_common.py": "a763cde845213a4f5764c6fd76b243e13a342c9f3d51896814c7e3625fc40412",
+    "run-completion-gates.py": "0683cbf1427124c6f231e7c94a58944b8a8c58182ff6467b62fddeb7eed805ba",
+    "record-completion-validation.py": "f35ebdc2f64a67cefa4d1535b257beee82f948b18ac5038fda3a89bce0b331d3",
+    "record-recovery-validation.py": "629a312661ee6a6d3621129c7cc46b4532399280276b87f3ec6194bb5165ec7f"
+  },
+  "stages": [
+    {
+      "name": "format",
+      "status": "completed_for_historical_source_only",
+      "exit_code": 0,
+      "seconds": 1.7,
+      "source_verified_after": true,
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "log": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/format.log",
+      "log_sha256": "6c7bde0931ff5b2dec12ace46d9bd5c8335f44029e06226bb1adfdf91970d0d6",
+      "proof": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/format.result.json",
+      "proof_sha256": "8c760bdf4ec71af6d3cdb5add6b8e45d3e1a3a4f350a2f626cf94388c6321717"
+    },
+    {
+      "name": "native-format",
+      "status": "completed_for_historical_source_only",
+      "exit_code": 0,
+      "seconds": 2.32,
+      "source_verified_after": true,
+      "command": [
+        "cargo",
+        "fmt",
+        "--manifest-path",
+        "crates/desktop/validation/Cargo.toml",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "log": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/native-format.log",
+      "log_sha256": "d00f6f65dad704eeb0bc092e5b810d203696d5bbb7e233a2ad7237fbc4e62652",
+      "proof": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/native-format.result.json",
+      "proof_sha256": "e35b7b79d5ea1ed70ac442186cc5a41d1f73baecf8207b688ff4839628313f5f"
+    },
+    {
+      "name": "windows-format",
+      "status": "completed_for_historical_source_only",
+      "exit_code": 0,
+      "seconds": 0.13,
+      "source_verified_after": true,
+      "command": [
+        "cargo",
+        "fmt",
+        "--manifest-path",
+        "crates/capabilities/validation/windows-read/Cargo.toml",
+        "--",
+        "--check"
+      ],
+      "log": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/windows-format.log",
+      "log_sha256": "07473c98ae441d1ab4feef7a2f7aa30acbd6ff755520a60609befb188f27c06e",
+      "proof": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/windows-format.result.json",
+      "proof_sha256": "2e78154ef6191c8b9d7ab6ad794c19ed55e04de3f1bf52a2b74eeb9cd0de3139"
+    },
+    {
+      "name": "windows-workspace-format",
+      "status": "completed_for_historical_source_only",
+      "exit_code": 0,
+      "seconds": 0.13,
+      "source_verified_after": true,
+      "command": [
+        "cargo",
+        "fmt",
+        "--manifest-path",
+        "crates/runtime/validation/windows-workspace/Cargo.toml",
+        "--",
+        "--check"
+      ],
+      "log": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/windows-workspace-format.log",
+      "log_sha256": "52618382b973fa907e7e15b7eefa31ef6a0d86bb282f26ce062f1c237812d56d",
+      "proof": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/windows-workspace-format.result.json",
+      "proof_sha256": "47795bc1a530f0f8972ffc339d453d6e7358dc806162e134a631d96e88088613"
+    },
+    {
+      "name": "sdk-format",
+      "status": "completed_for_historical_source_only",
+      "exit_code": 0,
+      "seconds": 1.72,
+      "source_verified_after": true,
+      "command": [
+        "cargo",
+        "fmt",
+        "--manifest-path",
+        "sdk/plugins/Cargo.toml",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "log": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/sdk-format.log",
+      "log_sha256": "bea9c0a658fc7b879f3cf4a0890eb51a4e0aacbabbb53d4191b5129d4e84c992",
+      "proof": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/sdk-format.result.json",
+      "proof_sha256": "8780d4d292c2b89c91c79cbbb71096ce89b14426eaeaf80631a05300294df720"
+    },
+    {
+      "name": "preview-build",
+      "status": "completed_for_historical_source_only",
+      "exit_code": 0,
+      "seconds": 23.41,
+      "source_verified_after": true,
+      "command": [
+        "bash",
+        "scripts/preview-macos.sh"
+      ],
+      "log": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/preview-build.log",
+      "log_sha256": "fdc2861663b05274944fcc13ca4b5e1b134b9244e1779e5112c6a87915c74371",
+      "proof": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/preview-build.result.json",
+      "proof_sha256": "43fb8e1d5e6abcefbb790ad3dcb0163dce5178e43305f28f8249a6a30cb20dae"
+    },
+    {
+      "name": "workspace-tests",
+      "status": "completed_for_historical_source_only",
+      "exit_code": 0,
+      "seconds": 130.02,
+      "source_verified_after": true,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--workspace"
+      ],
+      "log": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/workspace-tests.log",
+      "log_sha256": "fe572d64ba43ef0b7d7d9bbd0c45efb48c87076be52f40b8f08d9489be6343f3",
+      "proof": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/workspace-tests.result.json",
+      "proof_sha256": "cea59bf9fa991ee8d3d83e66ad8a7473aba3d7547a86bd8d4ab664ee14bbb62e"
+    },
+    {
+      "name": "native-tests",
+      "status": "completed_for_historical_source_only",
+      "exit_code": 0,
+      "seconds": 83.54,
+      "source_verified_after": true,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "crates/desktop/validation/Cargo.toml",
+        "--test",
+        "native-interactions",
+        "--test",
+        "workspace-interactions",
+        "--test",
+        "updater-interactions",
+        "--test",
+        "draft-interactions",
+        "--test",
+        "vision-interactions",
+        "--test",
+        "notification-interactions",
+        "--test",
+        "memory-interactions",
+        "--test",
+        "image-generation-interactions",
+        "--test",
+        "document-interactions",
+        "--test",
+        "management-interactions",
+        "--test",
+        "recovery-interactions",
+        "--test",
+        "document-recovery-interactions"
+      ],
+      "log": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/native-tests.log",
+      "log_sha256": "b55f044fb6946e728bd47b781493c6354ef2b716cb7ee9994f73c9f4f4097e6d",
+      "proof": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/native-tests.result.json",
+      "proof_sha256": "a39ad48e14cf82c9028c6a1e791e7663732b00f202a1ddfc2a327ecdc7df45b4"
+    },
+    {
+      "name": "native-render",
+      "status": "completed_for_historical_source_only",
+      "exit_code": 0,
+      "seconds": 22.24,
+      "source_verified_after": true,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "crates/desktop/validation/Cargo.toml",
+        "--test",
+        "native-rendering",
+        "--test",
+        "recovery-rendering",
+        "--test",
+        "document-recovery-rendering"
+      ],
+      "log": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/native-render.log",
+      "log_sha256": "2b94e7e5f1361602f985125f9620ca10c3f22c7955d76c17f1f06615ec316621",
+      "proof": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/native-render.result.json",
+      "proof_sha256": "c26a1435f634f1dab2702ca78ea711d8d2bcf372cd960fe559d5a9a1344f4578"
+    },
+    {
+      "name": "clippy",
+      "status": "failed_strict_lint_for_historical_source_only",
+      "exit_code": 101,
+      "seconds": 13.46,
+      "source_verified_after": true,
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "log": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/clippy.log",
+      "log_sha256": "802b14aeed34648bf0541fc7b5f038483a7f452c9cd807f7964429cb3da1b6be",
+      "proof": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/clippy.result.json",
+      "proof_sha256": "174c302ff93231e5d66ada5cf69b373d2bceff46b1b68e53fa420018058befb8"
+    }
+  ],
+  "completed_stage_count": 9,
+  "failed_stage": "clippy",
+  "failed_exit_code": 101,
+  "planned_but_not_started": [
+    "native-clippy",
+    "windows-check",
+    "windows-clippy",
+    "windows-workspace-check",
+    "windows-workspace-clippy",
+    "release-tests",
+    "sdk-script"
+  ],
+  "files": {
+    "captures/document-recovery.json": {
+      "sha256": "29b39e80bc61ddd95848fbf563ba9ec65ac35e6c7fd782fd357217661835390c",
+      "bytes": 1560
+    },
+    "captures/document-recovery.png": {
+      "sha256": "ffae6c1f3e663d1612678e9ea800d854c368ca26539294506dbb0f9160be0d29",
+      "bytes": 404925
+    },
+    "captures/environments.png": {
+      "sha256": "61a97ac2fade2be38b75fefcc5993746e060872bd391228738d7f7054dab2cee",
+      "bytes": 378487
+    },
+    "captures/home.png": {
+      "sha256": "abf54dc29ea2d3fcc180638a0d9ea83eaaaff3f4493afb86c7a6a35b02bee149",
+      "bytes": 378454
+    },
+    "captures/plugins.png": {
+      "sha256": "e2be374164dade0729023076559d60fe05be70ac2062cf3fbf8b8fa2af471471",
+      "bytes": 240327
+    },
+    "captures/recovery.json": {
+      "sha256": "7634e255cc373e6c6ecbffee2245b05e2610961dbba9167d9bfaeae0bfa10e2b",
+      "bytes": 1040
+    },
+    "captures/recovery.png": {
+      "sha256": "3fde76bf151170135bf2a2985339da89032705c52991ca280ef1ad58c77f64d5",
+      "bytes": 412949
+    },
+    "captures/settings.png": {
+      "sha256": "961786deeb3240f0e1b42c01fead6198dac3ad6277ab283cc95b9df9e319810a",
+      "bytes": 364234
+    },
+    "clippy.log": {
+      "sha256": "802b14aeed34648bf0541fc7b5f038483a7f452c9cd807f7964429cb3da1b6be",
+      "bytes": 4241
+    },
+    "clippy.result.json": {
+      "sha256": "174c302ff93231e5d66ada5cf69b373d2bceff46b1b68e53fa420018058befb8",
+      "bytes": 441
+    },
+    "format.log": {
+      "sha256": "6c7bde0931ff5b2dec12ace46d9bd5c8335f44029e06226bb1adfdf91970d0d6",
+      "bytes": 966
+    },
+    "format.result.json": {
+      "sha256": "8c760bdf4ec71af6d3cdb5add6b8e45d3e1a3a4f350a2f626cf94388c6321717",
+      "bytes": 437
+    },
+    "native-format.log": {
+      "sha256": "d00f6f65dad704eeb0bc092e5b810d203696d5bbb7e233a2ad7237fbc4e62652",
+      "bytes": 1025
+    },
+    "native-format.result.json": {
+      "sha256": "e35b7b79d5ea1ed70ac442186cc5a41d1f73baecf8207b688ff4839628313f5f",
+      "bytes": 452
+    },
+    "native-render.log": {
+      "sha256": "2b94e7e5f1361602f985125f9620ca10c3f22c7955d76c17f1f06615ec316621",
+      "bytes": 2580
+    },
+    "native-render.result.json": {
+      "sha256": "c26a1435f634f1dab2702ca78ea711d8d2bcf372cd960fe559d5a9a1344f4578",
+      "bytes": 453
+    },
+    "native-tests.log": {
+      "sha256": "b55f044fb6946e728bd47b781493c6354ef2b716cb7ee9994f73c9f4f4097e6d",
+      "bytes": 18107
+    },
+    "native-tests.result.json": {
+      "sha256": "a39ad48e14cf82c9028c6a1e791e7663732b00f202a1ddfc2a327ecdc7df45b4",
+      "bytes": 451
+    },
+    "preview-build.log": {
+      "sha256": "fdc2861663b05274944fcc13ca4b5e1b134b9244e1779e5112c6a87915c74371",
+      "bytes": 4042
+    },
+    "preview-build.result.json": {
+      "sha256": "43fb8e1d5e6abcefbb790ad3dcb0163dce5178e43305f28f8249a6a30cb20dae",
+      "bytes": 453
+    },
+    "run.json": {
+      "sha256": "21fd956ae46072030238b5ec65e9eebf3c7521e18d241446ac5cedbbdf6aed01",
+      "bytes": 1687
+    },
+    "sdk-format.log": {
+      "sha256": "bea9c0a658fc7b879f3cf4a0890eb51a4e0aacbabbb53d4191b5129d4e84c992",
+      "bytes": 1012
+    },
+    "sdk-format.result.json": {
+      "sha256": "8780d4d292c2b89c91c79cbbb71096ce89b14426eaeaf80631a05300294df720",
+      "bytes": 446
+    },
+    "source-manifest.json": {
+      "sha256": "946a49d64a469401a7e3d92e5af5e0196142f62784fa99ad0a20b721fdb8b355",
+      "bytes": 234885
+    },
+    "windows-format.log": {
+      "sha256": "07473c98ae441d1ab4feef7a2f7aa30acbd6ff755520a60609befb188f27c06e",
+      "bytes": 1034
+    },
+    "windows-format.result.json": {
+      "sha256": "2e78154ef6191c8b9d7ab6ad794c19ed55e04de3f1bf52a2b74eeb9cd0de3139",
+      "bytes": 454
+    },
+    "windows-workspace-format.log": {
+      "sha256": "52618382b973fa907e7e15b7eefa31ef6a0d86bb282f26ce062f1c237812d56d",
+      "bytes": 1035
+    },
+    "windows-workspace-format.result.json": {
+      "sha256": "47795bc1a530f0f8972ffc339d453d6e7358dc806162e134a631d96e88088613",
+      "bytes": 474
+    },
+    "workspace-tests.log": {
+      "sha256": "fe572d64ba43ef0b7d7d9bbd0c45efb48c87076be52f40b8f08d9489be6343f3",
+      "bytes": 53629
+    },
+    "workspace-tests.result.json": {
+      "sha256": "cea59bf9fa991ee8d3d83e66ad8a7473aba3d7547a86bd8d4ab664ee14bbb62e",
+      "bytes": 458
+    }
+  },
+  "reason": "This source-bound attempt stopped at strict Clippy: the new logo conversion used chunks_exact_mut(4), triggering chunks_exact_to_as_chunks. The first nine stages, including workspace tests, native tests and native rendering, completed for this old source. The tenth stage returned exit code 101 with source_verified_after=true. This was a lint failure, not an operator interruption or a recorded functional-test assertion failure.",
+  "counts_scope": "Historical source only. No completed stage, test count, duration or capture is reused as acceptance or performance evidence for the next source.",
+  "evidence_scope": "Exact original source map, run index, ten log/proof pairs and eight capture files. Producer headers are validated against that archived run index, never relabelled with successor hashes."
+}

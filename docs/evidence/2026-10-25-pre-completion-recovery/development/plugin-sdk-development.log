@@ -1,0 +1,116 @@
+info: component rust-std for target wasm32-unknown-unknown is up to date
+   Compiling workbench-core v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/core)
+   Compiling workbench-plugin-pack v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/sdk/plugins/packager)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.94s
+     Running unittests src/main.rs (target/debug/deps/workbench_plugin_pack-c981e4b1037eee76)
+
+running 2 tests
+test tests::bounded_inputs_and_create_new_never_replace_existing_bytes ... ok
+test tests::invalid_module_creates_no_package_and_preserves_source ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/workbench_plugin_sdk-11f5f40d397c928a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/workbench_text_report-d137670bff5df818)
+
+running 3 tests
+test tests::large_text_is_refused_before_any_publication ... ok
+test tests::denied_read_and_malformed_input_publish_nothing ... ok
+test tests::unicode_counts_and_artifact_are_consistent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests workbench_plugin_sdk
+
+running 1 test
+test guest/src/lib.rs - bindings::__export_plugin_impl (line 14) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.71s; merged doctests compilation took 0.39s
+   Doc-tests workbench_text_report
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling serde_core v1.0.229
+    Checking libc v0.2.191
+   Compiling anyhow v1.0.104
+    Checking foldhash v0.2.0
+    Checking bitflags v2.13.2
+    Checking errno v0.3.14
+    Checking hashbrown v0.17.1
+    Checking memchr v2.8.3
+   Compiling prettyplease v0.2.37
+    Checking serde v1.0.229
+    Checking indexmap v2.14.2
+   Compiling serde_json v1.0.154
+   Compiling wasmparser v0.247.0
+    Checking typenum v1.20.1
+    Checking semver v1.0.28
+    Checking getrandom v0.4.3
+    Checking generic-array v0.14.7
+    Checking wasmparser v0.261.0
+    Checking signal-hook-registry v1.4.8
+    Checking socket2 v0.6.5
+    Checking mio v1.2.4
+    Checking leb128fmt v0.1.0
+    Checking slab v0.4.12
+    Checking tokio v1.54.1
+    Checking futures-util v0.3.34
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking log v0.4.34
+    Checking unicode-ident v1.0.27
+    Checking id-arena v2.3.0
+   Compiling wasm-encoder v0.247.0
+   Compiling wit-parser v0.247.0
+    Checking wasm-encoder v0.261.0
+   Compiling wasm-metadata v0.247.0
+    Checking wasm-metadata v0.261.0
+    Checking tokio-util v0.7.20
+    Checking wit-parser v0.261.0
+    Checking uuid v1.29.0
+   Compiling wit-component v0.247.0
+   Compiling wit-bindgen-core v0.57.1
+    Checking digest v0.10.7
+    Checking cpufeatures v0.2.17
+    Checking workbench-core v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/core)
+    Checking sha2 v0.10.9
+    Checking wit-component v0.261.0
+   Compiling wit-bindgen-rust v0.57.1
+    Checking rustix v1.1.5
+    Checking once_cell v1.21.4
+    Checking workbench-plugin-pack v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/sdk/plugins/packager)
+    Checking tempfile v3.27.0
+   Compiling wit-bindgen-rust-macro v0.57.1
+    Checking wit-bindgen v0.57.1
+    Checking workbench-plugin-sdk v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/sdk/plugins/guest)
+    Checking workbench-text-report v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/sdk/plugins/examples/text-report)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.17s
+   Compiling workbench-plugin-sdk v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/sdk/plugins/guest)
+   Compiling workbench-text-report v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/sdk/plugins/examples/text-report)
+    Finished `release` profile [optimized] target(s) in 0.34s
+   Compiling bitflags v2.13.2
+   Compiling wasmparser v0.261.0
+   Compiling wasm-encoder v0.261.0
+   Compiling wit-parser v0.261.0
+   Compiling wasm-metadata v0.261.0
+   Compiling wit-component v0.261.0
+   Compiling workbench-plugin-pack v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/sdk/plugins/packager)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.65s
+     Running `target/debug/workbench-plugin-pack /Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target/wasm32-unknown-unknown/release/workbench_text_report.wasm /Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/sdk/plugins/examples/text-report/package.json /Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target/plugin-sdk-validation.w4fINK/text-report`
+Package created. Review plugin.json and install it through Workbench Settings → Plugins.
+   Compiling workbench-core v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/core)
+   Compiling workbench-resources v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/resources)
+   Compiling workbench-scheduler v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/scheduler)
+   Compiling workbench-capabilities v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/capabilities)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.00s
+     Running `target/debug/examples/validate_plugin_sdk /Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target/plugin-sdk-validation.w4fINK/text-report/plugin.json`
+Error: Output already exists; choose a new name

@@ -1,9 +1,11 @@
-{"reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1", "started_at_unix": 1792902574.8356988, "command": ["cargo", "test", "--locked", "--manifest-path", "crates/desktop/validation/Cargo.toml", "--test", "native-rendering", "--test", "recovery-rendering"]}
+{"reviewed_source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d", "started_at_unix": 1792922678.103659, "command": ["cargo", "test", "--locked", "--manifest-path", "crates/desktop/validation/Cargo.toml", "--test", "native-rendering", "--test", "recovery-rendering", "--test", "document-recovery-rendering"], "environment": {"CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": "/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target", "CARGO_BUILD_JOBS": "4", "CARGO_TERM_COLOR": "never", "WORKBENCH_RENDER_DIR": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/captures"}, "recorder_sources_sha256": {"completion_validation_common.py": "a763cde845213a4f5764c6fd76b243e13a342c9f3d51896814c7e3625fc40412", "run-completion-gates.py": "0683cbf1427124c6f231e7c94a58944b8a8c58182ff6467b62fddeb7eed805ba", "record-completion-validation.py": "f35ebdc2f64a67cefa4d1535b257beee82f948b18ac5038fda3a89bce0b331d3", "record-recovery-validation.py": "629a312661ee6a6d3621129c7cc46b4532399280276b87f3ec6194bb5165ec7f"}}
    Compiling workbench-native-validation v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop/validation)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.62s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.47s
 warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
 note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
-     Running rendering.rs (target/debug/deps/native_rendering-90659e318c4cd2e2)
-Native layout captures: /Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/docs/native-preview (Plugins/Environments are controlled no-Host loading/setup snapshots; loaded states require the Host/helper fixtures)
-     Running recovery_rendering.rs (target/debug/deps/recovery_rendering-4f02f67bf11d6e5d)
-Native recovery layout capture: /Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/docs/native-preview/recovery.png (actual Host/Store interrupted-write fixture, offscreen only)
+     Running document_recovery_rendering.rs (target/debug/deps/document_recovery_rendering-41305eefe682386b)
+Native missing-original document layout capture: /Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/captures/document-recovery.png (actual Host/Store/helper missing-original fixture, offscreen only)
+     Running rendering.rs (target/debug/deps/native_rendering-47316ab59ecb6f63)
+Native layout captures: /Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/captures (Plugins/Environments are controlled no-Host loading/setup snapshots; loaded states require the Host/helper fixtures)
+     Running recovery_rendering.rs (target/debug/deps/recovery_rendering-c23aa2bfa84585fa)
+Native recovery layout capture: /Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/captures/recovery.png (actual Host/Store interrupted-write fixture, offscreen only)

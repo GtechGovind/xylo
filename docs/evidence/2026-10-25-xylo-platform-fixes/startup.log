@@ -1,0 +1,12 @@
+   Compiling agent-workbench v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.87s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 2`
+     Running unittests src/main.rs (target/debug/deps/agent_workbench-7e20985c9f1f33d8)
+
+running 2 tests
+test startup::tests::normal_launch_uses_profile_discovery_and_information_commands_do_not_launch ... ok
+test startup::tests::explicit_profiles_require_one_absolute_path_without_creating_it ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+

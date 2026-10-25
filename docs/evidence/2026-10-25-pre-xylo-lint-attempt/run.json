@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "reviewed_source_fingerprint_sha256": "afaf0c68703cc9d0a1a496eab07f0f1c87e2c5a81e205f89c7180cb48d5408b4",
+  "archive": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-history/497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1/archive.json",
+  "archive_sha256": "c8d66531943f2bb5fcf8ee322141f1ac12deb7f75ce1a1219e49172e5d435258",
+  "environment": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_TARGET_DIR": "/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target",
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_TERM_COLOR": "never",
+    "WORKBENCH_RENDER_DIR": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/afaf0c68703cc9d0-1792921760203577000/captures"
+  },
+  "recorder_sources_sha256": {
+    "completion_validation_common.py": "a763cde845213a4f5764c6fd76b243e13a342c9f3d51896814c7e3625fc40412",
+    "run-completion-gates.py": "0683cbf1427124c6f231e7c94a58944b8a8c58182ff6467b62fddeb7eed805ba",
+    "record-completion-validation.py": "f35ebdc2f64a67cefa4d1535b257beee82f948b18ac5038fda3a89bce0b331d3",
+    "record-recovery-validation.py": "629a312661ee6a6d3621129c7cc46b4532399280276b87f3ec6194bb5165ec7f"
+  },
+  "stages": [
+    "format",
+    "native-format",
+    "windows-format",
+    "windows-workspace-format",
+    "sdk-format",
+    "preview-build",
+    "workspace-tests",
+    "native-tests",
+    "native-render",
+    "clippy",
+    "native-clippy",
+    "windows-check",
+    "windows-clippy",
+    "windows-workspace-check",
+    "windows-workspace-clippy",
+    "release-tests",
+    "sdk-script"
+  ],
+  "note": "Local gates only. No current optimized application build or performance measurement."
+}

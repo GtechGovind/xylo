@@ -106,8 +106,26 @@ jobs:
           } | Select-Object -First 1
           if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
           "GPUI_FXC_PATH=$fxc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Restore pinned native packaging tool
+        id: packager-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: .release-tools
+          key: packager-v1-${{ matrix.os }}-${{ matrix.target }}-rust1.98.0-0.11.8
       - name: Install pinned packaging tool (isolated build-tool directory)
+        if: steps.packager-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-packager --version 0.11.8 --locked --root .release-tools
+      - name: Verify packaging tool version before reuse
+        env:
+          PYTHONPATH: scripts
+          WORKBENCH_PACKAGER: ${{ github.workspace }}/.release-tools/bin/cargo-packager${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: python -c "from release_common import packager; print(packager())"
+      - name: Save verified native packaging tool
+        if: steps.packager-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: .release-tools
+          key: ${{ steps.packager-cache.outputs.cache-primary-key }}
       - name: Source and updater checks
         run: |
           cargo fmt --all --check

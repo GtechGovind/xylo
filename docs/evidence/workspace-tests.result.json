@@ -1,8 +1,10 @@
 {
   "stage": "workspace-tests",
   "exit_code": 0,
-  "seconds": 93.85,
-  "log": "/tmp/workbench-recovery-final-workspace-tests.log",
-  "log_sha256": "9a0d3547d33b40cc2a72096d37cb5912bca90e8db7c0c378b8078ef63972c68d",
-  "reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1"
+  "seconds": 102.35,
+  "log": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/workspace-tests.log",
+  "log_sha256": "7f90884e21e48e8bffdbe6abd8a88a38e60471d763028ec6ea16195a68a86ef6",
+  "reviewed_source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d",
+  "source_verified_after": true,
+  "runner_failure": null
 }

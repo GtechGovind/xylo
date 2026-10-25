@@ -1,0 +1,10 @@
+{
+  "stage": "format",
+  "exit_code": 0,
+  "seconds": 1.67,
+  "log": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/format.log",
+  "log_sha256": "db9eb5a96552dfa7c7e80279e89871dfa3712d85e2e9c8ebc239de8928713290",
+  "reviewed_source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d",
+  "source_verified_after": true,
+  "runner_failure": null
+}

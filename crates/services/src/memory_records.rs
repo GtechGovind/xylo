@@ -4,8 +4,9 @@ use crate::Store;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+#[cfg(any(unix, test))]
+use std::fs::File;
 use std::{
-    fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
 };

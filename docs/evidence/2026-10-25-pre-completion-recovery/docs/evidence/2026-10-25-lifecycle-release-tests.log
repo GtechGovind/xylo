@@ -1,0 +1,6 @@
+{"reviewed_source_fingerprint_sha256": "3c0d03abdf3daebbee00a9a898dded5c51d46d6e2f70b29b26a5ac3d9550356d", "started_at_unix": 1792898566.645727, "command": ["python3", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_release*.py"]}
+...................
+----------------------------------------------------------------------
+Ran 19 tests in 0.162s
+
+OK

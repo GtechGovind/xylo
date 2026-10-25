@@ -1,0 +1,10 @@
+{
+  "stage": "windows-clippy",
+  "exit_code": 0,
+  "seconds": 0.22,
+  "log": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/windows-clippy.log",
+  "log_sha256": "01e145b4c19f6c70273d8eb96be8da92ff7ec017b3c9ef5d31ea619f38079ce2",
+  "reviewed_source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d",
+  "source_verified_after": true,
+  "runner_failure": null
+}

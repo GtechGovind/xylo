@@ -1,0 +1,8 @@
+{
+  "stage": "release-tests",
+  "exit_code": 0,
+  "seconds": 0.22,
+  "log": "/tmp/workbench-recovery-final-release-tests.log",
+  "log_sha256": "7a1290127c8e1861f8d2ff852845e1883571540e2e106d547650d1d6fcefc4f9",
+  "reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1"
+}

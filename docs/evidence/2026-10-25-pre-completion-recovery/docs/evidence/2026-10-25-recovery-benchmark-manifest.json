@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1",
+  "source_manifest": "docs/evidence/2026-10-25-recovery-source-manifest.json",
+  "report": "docs/evidence/2026-10-25-recovery-release-overhead.json",
+  "report_sha256": "68a9bb50b98e3b851292a5c4ce83a43a2e84a2d4daf2873b047565c08a6a0812",
+  "compiled_harness_source_sha256": "6ca7c105e298b1b3b1b9db99e18fe93d64f98a1fd480f147af32fce99f881bdc",
+  "compiled_workspace_cargo_lock_sha256": "d4f48270a11e35a715fe3dd6a4868858470756860832bf8aaadfffb15b5d403b",
+  "release_gate": {
+    "log": "docs/evidence/2026-10-25-recovery-release-build.log",
+    "proof": "docs/evidence/2026-10-25-recovery-release-build.result.json",
+    "log_sha256": "d1da794d538158fda2febbcb3ed1edc81798a92a19ef61cab8da2e97b0cef94a"
+  },
+  "harness": {
+    "path": "target/performance/release/examples/measure_overhead",
+    "bytes": 7129488,
+    "sha256": "1d71f178bbd408caf6e71a5781a4cd3d16b64b37a78a80f2828d587c369e49b6"
+  },
+  "worker": {
+    "path": "target/performance/release/workbench-worker",
+    "bytes": 60095632,
+    "sha256": "b828496c1af0892c603e6c6c01e3dfccad65a756f13ade3df43b557c9d49aaa4"
+  },
+  "scope": "Current optimized headless worker/storage fixture; excludes host routing, GUI, live models and services.",
+  "limitations": [
+    "Headless worker and storage measurements exclude the native GUI and application host routing.",
+    "RSS and macOS physical footprint are point-in-time samples of the worker alone; neither proves full app plus worker attributable RAM.",
+    "Worker ready time is not application launch-to-usable time.",
+    "Tool time includes native file read, journal and JSONL delivery; it is not isolated dispatch overhead.",
+    "No live model quality, network latency, browser, generation-model weights or KV-cache measurement is claimed."
+  ]
+}

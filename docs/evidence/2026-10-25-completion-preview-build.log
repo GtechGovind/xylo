@@ -1,0 +1,17 @@
+{"reviewed_source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d", "started_at_unix": 1792922470.10191, "command": ["bash", "scripts/preview-macos.sh"], "environment": {"CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": "/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target", "CARGO_BUILD_JOBS": "4", "CARGO_TERM_COLOR": "never", "WORKBENCH_RENDER_DIR": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/captures"}, "recorder_sources_sha256": {"completion_validation_common.py": "a763cde845213a4f5764c6fd76b243e13a342c9f3d51896814c7e3625fc40412", "run-completion-gates.py": "0683cbf1427124c6f231e7c94a58944b8a8c58182ff6467b62fddeb7eed805ba", "record-completion-validation.py": "f35ebdc2f64a67cefa4d1535b257beee82f948b18ac5038fda3a89bce0b331d3", "record-recovery-validation.py": "629a312661ee6a6d3621129c7cc46b4532399280276b87f3ec6194bb5165ec7f"}}
+   Compiling hermes-core v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-core)
+   Compiling agent-workbench v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop)
+   Compiling hermes-intelligence v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-intelligence)
+   Compiling hermes-skills v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-skills)
+   Compiling hermes-auth v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-auth)
+   Compiling hermes-agent v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-agent)
+   Compiling workbench-engine v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/engine)
+   Compiling workbench-worker v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/worker)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.71s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 2`
+/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target/debug/Xylo.app/Contents/Info.plist: OK
+/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target/debug/Xylo.app/Contents/MacOS/workbench-worker: replacing existing signature
+/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target/debug/Xylo.app/Contents/MacOS/workbench-helper: replacing existing signature
+/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target/debug/Xylo.app: replacing existing signature
+Built: /Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target/debug/Xylo.app

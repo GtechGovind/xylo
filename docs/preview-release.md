@@ -36,6 +36,8 @@ The static x64 whisper executable uses an explicit portable SSE2 CPU baseline. U
 
 ## Draft workflow
 
+The native jobs cache only the installed, pinned packaging tool, using separate keys for each runner, target architecture and Rust version. Its version is checked before use. Application builds, tests and package qualification still run for the exact candidate commit.
+
 `.github/workflows/preview-release.yml` is manual only. It checks the exact workspace version, calls all six native jobs, downloads that run's artifacts and invokes the release gate. To prepare the same files locally without any GitHub write:
 
 ```sh

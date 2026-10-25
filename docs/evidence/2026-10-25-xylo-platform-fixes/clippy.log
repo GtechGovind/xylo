@@ -1,0 +1,16 @@
+    Checking workbench-resources v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/resources)
+    Checking workbench-services v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/services)
+   Compiling hermes-core v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-core)
+    Checking workbench-capabilities v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/capabilities)
+    Checking hermes-skills v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-skills)
+    Checking hermes-intelligence v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-intelligence)
+    Checking workbench-runtime v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/runtime)
+    Checking hermes-auth v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-auth)
+    Checking hermes-agent v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-agent)
+    Checking workbench-helper v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/helper)
+    Checking agent-workbench v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop)
+    Checking workbench-engine v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/engine)
+    Checking workbench-worker v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/worker)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.20s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

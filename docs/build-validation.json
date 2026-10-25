@@ -1,5 +1,5 @@
 {
-  "recorded_at": "2026-10-25T04:41:49.443511+00:00",
+  "recorded_at": "2026-10-25T10:18:30.271151+00:00",
   "platform": {
     "os": "27.0.1",
     "os_build": "26A434",
@@ -10,22 +10,22 @@
     "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
     "xcode": "Xcode 27.1\nBuild version 27A9275"
   },
-  "source_state": "Uncommitted workspace; unborn main. No commit or publication performed.",
-  "source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1",
+  "source_state": "Local Git HEAD 0b1a4092466a712708efe42d52deca342702f33d (main); clean worktree before documentation publication. Frozen source inputs verified; remote publication/parity was not checked by this postprocessor.",
+  "source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d",
   "workspace_tests": {
-    "command": "cargo test --locked --workspace",
-    "passed": 393,
+    "passed": 447,
     "failed": 0,
     "ignored": 5,
+    "command": "cargo test --locked --workspace",
     "evidence": "docs/evidence/workspace-tests.log",
     "executable_groups": {
       "agent_workbench": {
-        "passed": 8,
+        "passed": 9,
         "failed": 0,
         "ignored": 0
       },
       "workbench_capabilities": {
-        "passed": 79,
+        "passed": 93,
         "failed": 0,
         "ignored": 1
       },
@@ -45,7 +45,7 @@
         "ignored": 0
       },
       "workbench_engine": {
-        "passed": 65,
+        "passed": 68,
         "failed": 0,
         "ignored": 0
       },
@@ -85,7 +85,7 @@
         "ignored": 0
       },
       "workbench_runtime": {
-        "passed": 43,
+        "passed": 65,
         "failed": 0,
         "ignored": 1
       },
@@ -95,7 +95,7 @@
         "ignored": 0
       },
       "workbench_services": {
-        "passed": 138,
+        "passed": 152,
         "failed": 0,
         "ignored": 1
       },
@@ -133,99 +133,71 @@
   },
   "lint": {
     "status": "passed",
-    "command": "cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings",
     "evidence": "docs/evidence/clippy.log"
   },
   "format": {
     "status": "passed",
-    "commands": [
-      "cargo fmt --all -- --check",
-      "cargo fmt --manifest-path crates/desktop/validation/Cargo.toml --all -- --check",
-      "cargo fmt --manifest-path crates/capabilities/validation/windows-read/Cargo.toml -- --check"
-    ],
-    "source_bound_results": [
-      "docs/evidence/2026-10-25-recovery-format.result.json",
-      "docs/evidence/2026-10-25-recovery-native-format.result.json",
-      "docs/evidence/2026-10-25-recovery-windows-format.result.json"
+    "stages": [
+      "format",
+      "native-format",
+      "windows-format",
+      "windows-workspace-format",
+      "sdk-format"
     ]
   },
   "native_ui": {
-    "command": "cargo test --locked --manifest-path crates/desktop/validation/Cargo.toml --test native-interactions --test workspace-interactions --test updater-interactions --test draft-interactions --test vision-interactions --test notification-interactions --test memory-interactions --test image-generation-interactions --test document-interactions --test management-interactions --test recovery-interactions",
-    "passed": 153,
+    "passed": 158,
     "failed": 0,
     "ignored": 1,
     "groups": {
-      "native-interactions": 18,
-      "workspace-interactions": 12,
-      "updater-interactions": 15,
-      "draft-interactions": 16,
-      "vision-interactions": 10,
-      "notification-interactions": 14,
-      "memory-interactions": 13,
-      "image-generation-interactions": 10,
-      "document-interactions": 13,
-      "management-interactions": 15,
-      "recovery-interactions": 17
+      "native-interactions": 17,
+      "workspace-interactions": 14,
+      "updater-interactions": 14,
+      "draft-interactions": 15,
+      "vision-interactions": 9,
+      "notification-interactions": 13,
+      "memory-interactions": 12,
+      "image-generation-interactions": 9,
+      "document-interactions": 12,
+      "management-interactions": 14,
+      "recovery-interactions": 16,
+      "document-recovery-interactions": 13
     },
-    "note": "153 executions in 11 executables: 65 distinct flows plus 8 shared cases per executable. Counts come from named successful tests and executable summaries. Five actual offscreen GPU captures; recovery uses actual Host/Store. No physical display/input, accessibility, IME or device acceptance is established.",
-    "renderer": "Metal",
-    "screenshots": [
-      "docs/native-preview/home.png",
-      "docs/native-preview/settings.png",
-      "docs/native-preview/plugins.png",
-      "docs/native-preview/environments.png",
-      "docs/native-preview/recovery.png"
-    ],
-    "real_clangd_route": "Correlated production request_editor_file/opened_file path; diagnostics awaited independently.",
-    "real_clangd_and_speech_component_reuse": "Earlier selected clangd/speech component runs remain historical evidence with their original logs. Current full native fixtures are separate; physical services/devices were not exercised by this milestone.",
-    "historical_real_host_clangd_completion_hover_diagnostics": {
-      "passed": 1,
-      "failed": 0,
-      "ignored": 0,
-      "scope": "Historical explicit component run; ignored in the current default native suite and not rerun for this milestone.",
-      "evidence": "docs/evidence/native-clangd.log"
-    },
-    "executable_count": 11,
-    "distinct_flows": 65,
-    "shared_cases_per_executable": 8,
+    "executable_count": 12,
+    "distinct_flows": 74,
+    "shared_cases_per_executable": 7,
     "shared_test_names": [
       "state::tests::approval_and_finish_share_one_tool_card",
       "state::tests::cancellation_preserves_partial_output",
       "terminal_view::tests::printable_keys_wait_for_native_ime",
       "terminal_view::tests::terminal_control_keys_are_encoded",
       "workbench::tasks::tests::schedules_use_valid_utc_fields",
-      "workbench::tests::file_scan_keeps_large_and_deep_projects_and_respects_ignores",
       "workbench::tests::language_uses_extension",
       "workbench::tests::truncation_is_unicode_safe"
     ],
     "ignored_test_names": [
       "workbench::native_tests::native_editor_completion_uses_real_host_and_clangd"
     ],
+    "command": "cargo test --locked --manifest-path crates/desktop/validation/Cargo.toml --test native-interactions --test workspace-interactions --test updater-interactions --test draft-interactions --test vision-interactions --test notification-interactions --test memory-interactions --test image-generation-interactions --test document-interactions --test management-interactions --test recovery-interactions --test document-recovery-interactions",
     "evidence": "docs/evidence/native-ui-tests.log",
+    "screenshots": [
+      "docs/native-preview/document-recovery.png",
+      "docs/native-preview/environments.png",
+      "docs/native-preview/home.png",
+      "docs/native-preview/plugins.png",
+      "docs/native-preview/recovery.png",
+      "docs/native-preview/settings.png"
+    ],
     "capture_evidence": [
       {
-        "path": "docs/native-preview/home.png",
+        "path": "docs/native-preview/document-recovery.png",
         "pixel_size": [
           2760,
           1760
         ],
-        "sha256": "d6df3a4a5b6a3e9796f56520cace150ea28e36b29c739958568dd22df0353b6b"
-      },
-      {
-        "path": "docs/native-preview/settings.png",
-        "pixel_size": [
-          2760,
-          1760
-        ],
-        "sha256": "4bf6a06ffa7d050b6bf2d356f324dd24dba52cbbebfd6c6dc9f4184a223f5940"
-      },
-      {
-        "path": "docs/native-preview/plugins.png",
-        "pixel_size": [
-          2760,
-          1760
-        ],
-        "sha256": "dae53741cc6349cbd8e81d66be95f7b9670a84f08c3984849ee186c5d7f9e4dd"
+        "sha256": "ffae6c1f3e663d1612678e9ea800d854c368ca26539294506dbb0f9160be0d29",
+        "metadata": "docs/native-preview/document-recovery.json",
+        "metadata_sha256": "29b39e80bc61ddd95848fbf563ba9ec65ac35e6c7fd782fd357217661835390c"
       },
       {
         "path": "docs/native-preview/environments.png",
@@ -233,7 +205,23 @@
           2760,
           1760
         ],
-        "sha256": "5f8065c45e5323ab24851218996f2ccaf0aa9e6c4abc1810d46feb667a2fc5da"
+        "sha256": "61a97ac2fade2be38b75fefcc5993746e060872bd391228738d7f7054dab2cee"
+      },
+      {
+        "path": "docs/native-preview/home.png",
+        "pixel_size": [
+          2760,
+          1760
+        ],
+        "sha256": "abf54dc29ea2d3fcc180638a0d9ea83eaaaff3f4493afb86c7a6a35b02bee149"
+      },
+      {
+        "path": "docs/native-preview/plugins.png",
+        "pixel_size": [
+          2760,
+          1760
+        ],
+        "sha256": "e2be374164dade0729023076559d60fe05be70ac2062cf3fbf8b8fa2af471471"
       },
       {
         "path": "docs/native-preview/recovery.png",
@@ -241,10 +229,22 @@
           2760,
           1760
         ],
-        "sha256": "33762bcd5fa6dfbac551bcca07640acaa681db9eff18c0711e9ff8b39c98790c"
+        "sha256": "3fde76bf151170135bf2a2985339da89032705c52991ca280ef1ad58c77f64d5",
+        "metadata": "docs/native-preview/recovery.json",
+        "metadata_sha256": "7634e255cc373e6c6ecbffee2245b05e2610961dbba9167d9bfaeae0bfa10e2b"
+      },
+      {
+        "path": "docs/native-preview/settings.png",
+        "pixel_size": [
+          2760,
+          1760
+        ],
+        "sha256": "961786deeb3240f0e1b42c01fead6198dac3ad6277ab283cc95b9df9e319810a"
       }
     ],
-    "recovery_capture_metadata": "docs/native-preview/recovery.json"
+    "recovery_capture_metadata": "docs/native-preview/recovery.json",
+    "document_recovery_capture_metadata": "docs/native-preview/document-recovery.json",
+    "note": "Counts derive from named current gate logs; shared cases are counted per executable. Captures are offscreen GPU fixtures, not physical OS input/device/accessibility acceptance."
   },
   "speech": {
     "selected_native_synthesis_to_whisper": {
@@ -262,42 +262,42 @@
     "signature": "local ad hoc; not notarized",
     "components": {
       "agent-workbench": {
-        "path": "target/debug/Agent Workbench.app/Contents/MacOS/agent-workbench",
-        "bytes": 225334896,
-        "sha256": "b5861c81ef6e770ced739839f7fa7cca42593a4efc3313b16fc939b7cc95479e"
+        "path": "target/debug/Xylo.app/Contents/MacOS/agent-workbench",
+        "bytes": 227694368,
+        "sha256": "64d7b22fdf09a5c35c9610f7d84ff006b7d9bc08f0ecce2dab22367d1028a570"
       },
       "workbench-worker": {
-        "path": "target/debug/Agent Workbench.app/Contents/MacOS/workbench-worker",
-        "bytes": 249769600,
-        "sha256": "34ac3b459e424fcd91adf36acebd2ffca2fa56ea91c15c70afce8b8e240545c8"
+        "path": "target/debug/Xylo.app/Contents/MacOS/workbench-worker",
+        "bytes": 252150272,
+        "sha256": "a42298aa8337d450201840a6b0fe0c57f4829cd539f573b477cd158e75d734d4"
       },
       "workbench-helper": {
-        "path": "target/debug/Agent Workbench.app/Contents/MacOS/workbench-helper",
-        "bytes": 177536864,
-        "sha256": "bc70d809449eafae7ecf059de7c071db498bebbbd17eb71e684634265f2956c7"
+        "path": "target/debug/Xylo.app/Contents/MacOS/workbench-helper",
+        "bytes": 179725808,
+        "sha256": "1e10b7845f3eae9c9e4d11cbfe7986b9893cde3eee06c35826a25e889a99e0d5"
       }
     },
     "codesign_deep_strict_verification": "passed",
     "native_assets_location": "Contents/Resources/native-assets",
-    "bundle": "target/debug/Agent Workbench.app",
+    "bundle": "target/debug/Xylo.app",
     "bundled_asset_manifest_entries_verified": 2,
     "dependency_inventory": "Contents/Resources/licenses/dependencies/licenses.json",
-    "source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1",
+    "source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d",
     "debug_artifacts": {
       "agent-workbench": {
         "path": "target/debug/agent-workbench",
-        "bytes": 226652512,
-        "sha256": "4b74c863455c8f3bf06e390e12cae73de89ad88b58fce123a97fb1739d50a65c"
+        "bytes": 229025792,
+        "sha256": "b4898a0bbeadc63cb32058c5d6aa43badbe79996f762a3960620764f5d23188c"
       },
       "workbench-worker": {
         "path": "target/debug/workbench-worker",
-        "bytes": 251175392,
-        "sha256": "4def5f5debc266beaff99d32c6573df23f68c53f8cb0c034f569424e1c8d5292"
+        "bytes": 253723808,
+        "sha256": "e13627b87be2b3338e1d355ac815d340116406d428e0a009948ea376db6159e3"
       },
       "workbench-helper": {
         "path": "target/debug/workbench-helper",
-        "bytes": 178601712,
-        "sha256": "66e66ccbad7675ceb97e805802d00dc4dcd4f689f243ac6834bcb4af2a1fd8ad"
+        "bytes": 180819616,
+        "sha256": "2e83fb6d7276d0f1fd70e43b03ec561f650b8996cfe845dea012b1962421b343"
       }
     },
     "native_asset_packages": 1,
@@ -305,27 +305,90 @@
       {
         "package": "whisper-runtime",
         "path": "runtime/whisper-cli",
-        "bytes": 7986496,
-        "sha256": "b7593a65188f493dce37711e34040d9bf37d4783ac6b4f3c68c2426ade49be51"
+        "sha256": "b7593a65188f493dce37711e34040d9bf37d4783ac6b4f3c68c2426ade49be51",
+        "bytes": 7986496
       },
       {
         "package": "whisper-runtime",
         "path": "notices/whisper-LICENSE",
-        "bytes": 1078,
-        "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+        "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+        "bytes": 1078
       }
-    ]
+    ],
+    "bundle_identifier": "com.qurkos.xylo.preview",
+    "bundle_display_name": "Xylo"
   },
   "distribution": {
-    "release_script_tests": 19,
+    "release_script_tests": 38,
     "platform_inventory_components": 835,
-    "missing_upstream_license_texts": 35,
+    "missing_upstream_license_texts": 0,
     "production_update_policy": "disabled; no invented signing identity or release feed",
     "actual_installers_and_live_signed_update": "not qualified",
-    "available_license_texts": "docs/evidence/licenses with hashed provenance; 35 recorded exact-version text gaps remain",
-    "verified_supplemented_packages": 66,
+    "available_license_texts": "docs/evidence/licenses with schema-2 hashed upstream/canonical provenance; 0 recorded exact-version full-text gaps; canonical standards are distinct from package upstream license files",
+    "verified_supplemented_packages": 101,
     "macos_bundle_dependency_notice_integrity": "validated after copy in the actual development bundle",
-    "inventory_source_cargo_lock_sha256": "d4f48270a11e35a715fe3dd6a4868858470756860832bf8aaadfffb15b5d403b"
+    "inventory_source_cargo_lock_sha256": "d83fe873f5ad0de0c7c21a2f1feaa56abfea8e2057bd8f7262caa9e2be71b827",
+    "release_script_inventory": {
+      "count": 38,
+      "files": {
+        "scripts/test_release.py": {
+          "sha256": "a2f99ee4d9e2ecba14f9c089d6473313b5bd805b7869cb15bb26674c9c765f6b",
+          "tests": [
+            "test_release.ReleaseTests.test_disabled_default_cannot_publish_a_signed_feed",
+            "test_release.ReleaseTests.test_untrusted_and_credential_bearing_urls_are_rejected",
+            "test_release.ReleaseTests.test_bundle_archive_is_reproducible_and_immutable",
+            "test_release.ReleaseTests.test_signed_native_payload_manifest_binds_final_bytes",
+            "test_release.ReleaseTests.test_native_resource_layouts_and_no_windows_downgrade",
+            "test_release.ReleaseTests.test_packaged_icon_formats_and_original_master_provenance"
+          ]
+        },
+        "scripts/test_release_licenses.py": {
+          "sha256": "19121e833c03d323af0457364f43193994a2e78d517e86a676ba22adf1b5644e",
+          "tests": [
+            "test_release_licenses.SupplementTests.test_actual_copied_license_and_proof_validate_without_network",
+            "test_release_licenses.SupplementTests.test_actual_bundle_resource_copy_retains_verified_supplements",
+            "test_release_licenses.SupplementTests.test_changed_lock_source_repository_or_expression_cannot_reuse_supplement",
+            "test_release_licenses.SupplementTests.test_version_update_requires_a_new_explicit_mapping",
+            "test_release_licenses.SupplementTests.test_archive_or_text_tampering_is_not_accepted",
+            "test_release_licenses.SupplementTests.test_guidance_cannot_be_relabelled_as_full_license",
+            "test_release_licenses.SupplementTests.test_dirty_vcs_or_metadata_change_requires_new_verified_proof",
+            "test_release_licenses.SupplementTests.test_dirty_publication_accepts_only_the_recorded_dev_dependency_transform",
+            "test_release_licenses.SupplementTests.test_and_license_obligations_are_never_silently_satisfied_by_one_text",
+            "test_release_licenses.SupplementTests.test_version_tag_source_binding_must_match_exact_archive_bytes",
+            "test_release_licenses.SupplementTests.test_paths_symlinks_and_wrong_upstream_ownership_are_rejected",
+            "test_release_licenses.SupplementTests.test_packaged_bytes_and_provenance_are_checked_after_copy",
+            "test_release_licenses.SupplementTests.test_packaged_notice_set_must_include_non_license_upstream_notices",
+            "test_release_licenses.SupplementTests.test_checked_in_catalogue_contains_only_exact_pins_and_full_text_coverage",
+            "test_release_licenses.CanonicalSupplementTests.test_canonical_actual_copy_preserves_grant_attribution_and_source_distinction",
+            "test_release_licenses.CanonicalSupplementTests.test_canonical_wrong_authority_commit_or_standard_bytes_are_rejected",
+            "test_release_licenses.CanonicalSupplementTests.test_altered_grant_or_ambiguous_author_attribution_is_rejected",
+            "test_release_licenses.CanonicalSupplementTests.test_canonical_choice_requires_explicit_or_grant_and_prefers_apache",
+            "test_release_licenses.CanonicalSupplementTests.test_missing_or_cross_package_publication_notices_are_rejected",
+            "test_release_licenses.CanonicalSupplementTests.test_new_copyright_notice_in_exact_archive_cannot_be_silently_omitted",
+            "test_release_licenses.CanonicalSupplementTests.test_conflicting_original_publication_grant_remains_unresolved",
+            "test_release_licenses.CanonicalSupplementTests.test_packaged_canonical_class_and_grant_are_rechecked_after_copy",
+            "test_release_licenses.CanonicalSupplementTests.test_packaged_grant_alteration_cannot_hide_behind_updated_provenance_digest",
+            "test_release_licenses.CanonicalSupplementTests.test_copied_proof_cannot_be_orphaned_or_inventory_package_duplicated"
+          ]
+        },
+        "scripts/test_release_pipeline.py": {
+          "sha256": "d0b008bbde557e2ea683816f6c2e5f0a5fa34080789a33ae5d71a22cb3325528",
+          "tests": [
+            "test_release_pipeline.PipelineTests.test_all_six_source_bound_targets_prepare_unique_assets_and_complete_metadata",
+            "test_release_pipeline.PipelineTests.test_missing_target_and_wrong_commit_fail_before_output_mutation",
+            "test_release_pipeline.PipelineTests.test_tampered_payload_license_and_incomplete_smoke_fail_closed",
+            "test_release_pipeline.PipelineTests.test_missing_license_and_wrong_architecture_are_not_publishable_previews",
+            "test_release_pipeline.PipelineTests.test_native_machine_headers_are_parsed_not_inferred_from_names",
+            "test_release_pipeline.PipelineTests.test_correlated_jsonl_smoke_uses_actual_bounded_child_and_clean_shutdown",
+            "test_release_pipeline.PipelineTests.test_draft_creation_refuses_private_destination_before_any_write",
+            "test_release_pipeline.PipelineTests.test_debian_dependency_inventory_uses_all_four_real_executable_paths"
+          ]
+        }
+      }
+    },
+    "notice_provenance_schema": 2,
+    "notice_catalogue_sha256": "5e59742a615fcca8c226976bef05717fe5abd30d93d920519eb73de906d723d3",
+    "notice_validation": "strict copied-byte/grant/required-notice validation; not legal approval"
   },
   "packaged_on_screen_checks": {
     "status": "pending",
@@ -333,7 +396,7 @@
   },
   "performance": {
     "build": "release component workloads; full product performance not qualified",
-    "scope": "Earlier plugin/document/semantic/rendering reports remain historical and unchanged. A separately identified current optimized worker/storage baseline is added; no full-app or speedup claim.",
+    "scope": "All inherited performance reports retain their original sources/binaries. No current optimized build, new benchmark, Rust-versus-Python speedup or full-app performance acceptance is claimed. Any later live-GUI observations are separate exploratory evidence and do not relabel these historical measurements.",
     "semantic_10000_memories_p95_ms": 27.192209,
     "lexical_100000_memories_p95_ms": 113.738042,
     "native_rendering_binary": {
@@ -452,15 +515,17 @@
         "Tool time includes native file read, journal and JSONL delivery; it is not isolated dispatch overhead.",
         "No live model quality, network latency, browser, generation-model weights or KV-cache measurement is claimed."
       ]
-    }
+    },
+    "current_source_measurements": "No controlled or optimized benchmark in this milestone; developer GUI observations are separately scoped"
   },
-  "full_product_acceptance": "Development preview. Current frozen local gates, recovery flows, bundle integrity and optimized component baseline are recorded here. Native/external uncertain-action lifetime qualification, Windows/Linux OS execution, physical UI/input/audio/accessibility, live providers/connectors, full Office fidelity, representative extensions, full-app performance/quality, unresolved license texts and publisher signing remain open. Colibri remains deferred.",
+  "full_product_acceptance": "Development preview. Current source-bound local gates, debug bundle integrity and standalone SDK checks are recorded. Live OS/account/device behavior, full-app performance/quality, native/model/SDK redistribution obligations and publisher signing remain separate; consult docs/completion-audit.md. Colibri remains deferred.",
   "capability_fixtures": {
-    "scope": "Current counts below are parsed from the frozen workspace/native gate logs. Earlier detailed component counts are retained only in historical_validation.report.",
+    "scope": "Current namespace counts from actual current workspace logs; prior detailed counts remain in historical_validation.report.",
     "workspace_namespaces": {
       "agent_workbench": {
         "terminal_view": 2,
-        "workbench": 4,
+        "startup": 2,
+        "workbench": 3,
         "state": 2
       },
       "workbench_capabilities": {
@@ -468,13 +533,13 @@
         "audio": 5,
         "browser": 1,
         "documents": 14,
-        "environments": 14,
+        "environments": 27,
         "models": 5,
         "managed_endpoints": 1,
         "plugins": 21,
         "process": 2,
         "remote": 1,
-        "tests": 5
+        "tests": 6
       },
       "workbench_core": {
         "tests": 2
@@ -487,7 +552,7 @@
         "engine": 13,
         "provider_guard": 5,
         "providers": 15,
-        "tools": 32
+        "tools": 35
       },
       "workbench_helper": {
         "server": 2
@@ -513,13 +578,14 @@
         "shared": 7
       },
       "workbench_runtime": {
-        "host": 26,
+        "branding_compatibility_tests": 1,
         "drafts": 1,
+        "host": 27,
         "lsp": 4,
         "terminal": 4,
         "process": 2,
         "updates": 4,
-        "workspace": 2
+        "workspace": 22
       },
       "workbench_scheduler": {
         "tests": 4
@@ -527,8 +593,8 @@
       "workbench_services": {
         "action_review": 11,
         "attachments": 7,
-        "connectors": 15,
-        "document_drafts": 6,
+        "connectors": 19,
+        "document_drafts": 16,
         "drafts": 8,
         "image_generation": 13,
         "history_search": 4,
@@ -560,42 +626,12 @@
         "denied_write_never_changes_the_workspace": 1,
         "real_worker_streams_executes_and_checkpoints": 1
       }
-    },
-    "recovery": {
-      "services_cases": 11,
-      "native_ui_flows": 9,
-      "scope": "Actual temporary Store/Host/worker fixtures, immutable audit, original observations/artifacts, cross-process local action leases and durable review-form correlation. Controlled fixtures do not prove external action completion."
     }
   },
   "release_build": {
-    "profile": "release",
-    "source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1",
-    "target_directory": "target/performance",
-    "evidence": "docs/evidence/release-build.log",
-    "proof": "docs/evidence/2026-10-25-recovery-release-build.result.json",
-    "artifacts": {
-      "agent-workbench": {
-        "path": "target/performance/release/agent-workbench",
-        "bytes": 56596960,
-        "sha256": "854f0b42e4159e8cb7a6c6c9bd9726cc239051a678a51863ee749dccdac0a66b"
-      },
-      "workbench-worker": {
-        "path": "target/performance/release/workbench-worker",
-        "bytes": 60095632,
-        "sha256": "b828496c1af0892c603e6c6c01e3dfccad65a756f13ade3df43b557c9d49aaa4"
-      },
-      "workbench-helper": {
-        "path": "target/performance/release/workbench-helper",
-        "bytes": 34726240,
-        "sha256": "988f401377dab3d4ca8fff4593d27a8e7fd4189b486031e4aec4278232610782"
-      }
-    },
-    "measure_overhead": {
-      "path": "target/performance/release/examples/measure_overhead",
-      "bytes": 7129488,
-      "sha256": "1d71f178bbd408caf6e71a5781a4cd3d16b64b37a78a80f2828d587c369e49b6"
-    },
-    "note": "All three optimized binaries and measure_overhead covered by the frozen-source Cargo gate. Cache reuse is permitted by Cargo; binary hashes are recorded. Development artifacts, not publisher-signed distribution acceptance."
+    "status": "not_run_for_this_source",
+    "source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d",
+    "note": "Only current debug siblings/bundle were rebuilt and checked. Prior optimized artifacts remain historical."
   },
   "validation_limitations": {
     "first_integration_run": "Two pre-existing local image HTTP fixtures exceeded their 5-second listener deadline while optimized linking was active; failure retained in docs/evidence/2026-10-25-document-integration-first-workspace-tests.log. The unchanged application code passed 294 tests after linking ended. This is not proof of the timeout cause or stressed live-provider acceptance.",
@@ -640,100 +676,161 @@
       "correction": "Canonical admission validation had rewritten TurnRequest.workspace spelling (/var versus /private/var) while the durable DraftSubmission retained its exact scope. The confirmed correction removes that mutation and retains comparison-only canonical validation.",
       "accepted_final_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1",
       "scope": "Superseded failed attempt, retained without modifying its source/log/proof bytes. Its executed or failed cases do not contribute to accepted final counts; only successful gates for the later frozen source qualify the final report."
-    }
+    },
+    "pre_cache_format_attempt": {
+      "source_fingerprint_sha256": "a8b7ebb51c7d1875aa4dd4484fb107454fea737f03be56fd1861c6b345b03650",
+      "record": "docs/evidence/2026-10-25-pre-cache-format-attempt/attempt.json",
+      "run_index_sha256": "4e4dade58d3321605c3ea065565ac66432d79a2e9b5fa4c3e59966336112d6d8",
+      "source_manifest_sha256": "d42194d601164d6e739aa8784a9b5a2739f1f673483d379d68f92076eec114df",
+      "completed_stage_count": 8,
+      "interrupted_stage": "native-render",
+      "interrupted_exit_code": 130,
+      "scope": "All results belong only to this historical source. No stage, partial native-render output or historical test count contributes to current accepted totals.",
+      "reason": "The operator deliberately interrupted native rendering after live-profile inspection discovered a legacy project-cache format incompatibility requiring a versioned cache fix. Native tests had already completed before SIGINT arrived. This is an incomplete historical attempt, not a recorded production-test assertion failure."
+    },
+    "prior_strict_lint_attempt": {
+      "source_fingerprint_sha256": "afaf0c68703cc9d0a1a496eab07f0f1c87e2c5a81e205f89c7180cb48d5408b4",
+      "record": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/attempt.json",
+      "failure_kind": "strict_lint_failure",
+      "run_index_sha256": "21fd956ae46072030238b5ec65e9eebf3c7521e18d241446ac5cedbbdf6aed01",
+      "source_manifest_sha256": "946a49d64a469401a7e3d92e5af5e0196142f62784fa99ad0a20b721fdb8b355",
+      "completed_stage_count": 9,
+      "failed_stage": "clippy",
+      "failed_exit_code": 101,
+      "scope": "Historical source only. No completed stage, test count, duration or capture is reused as acceptance or performance evidence for the next source.",
+      "reason": "This source-bound attempt stopped at strict Clippy: the new logo conversion used chunks_exact_mut(4), triggering chunks_exact_to_as_chunks. The first nine stages, including workspace tests, native tests and native rendering, completed for this old source. The tenth stage returned exit code 101 with source_verified_after=true. This was a lint failure, not an operator interruption or a recorded functional-test assertion failure."
+    },
+    "initial_sdk_development_run": {
+      "path": "development/plugin-sdk-development.log",
+      "source_fingerprint_sha256": null,
+      "exit_code": null,
+      "observed_error": "Output already exists; choose a new name",
+      "scope": "Unbound development attempt, not a frozen gate or accepted/failed current test count.",
+      "evidence": "docs/evidence/2026-10-25-pre-completion-recovery/development/plugin-sdk-development.log",
+      "sha256": "6f72f7e42f62795d287dae7c053fef51dc2eedb5ab13f88b9f886537dace78ea"
+    },
+    "current_scope": "Local frozen-source gates and controlled fixtures only. Initial 12e3/SDK development failures, the pre-cache operator stop and the prior strict-lint attempt remain separate historical evidence, never included in current passed/failed totals."
   },
-  "source_manifest": "docs/evidence/2026-10-25-recovery-source-manifest.json",
+  "source_manifest": "docs/evidence/2026-10-25-completion-source-manifest.json",
   "historical_validation": {
-    "source_fingerprint_sha256": "3c0d03abdf3daebbee00a9a898dded5c51d46d6e2f70b29b26a5ac3d9550356d",
-    "report": "docs/evidence/2026-10-25-lifecycle-build-validation.json",
-    "archive_manifest": "docs/evidence/2026-10-25-lifecycle-archive.json",
-    "note": "Lifecycle component counts and all older plugin/document/semantic/rendering benchmarks remain historical, with their original source and binary identities."
+    "source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1",
+    "report": "docs/evidence/2026-10-25-pre-completion-recovery/docs/build-validation.json",
+    "archive_manifest": "docs/evidence/2026-10-25-pre-completion-recovery/archive.json",
+    "archive_manifest_sha256": "c8d66531943f2bb5fcf8ee322141f1ac12deb7f75ce1a1219e49172e5d435258",
+    "scope": "Exact prior report/log/capture/notice bytes. Embedded 3c/497a/plugin/document/semantic/worker measurement identities are historical and unchanged."
   },
   "gate_proofs": {
     "format": {
-      "log": "docs/evidence/2026-10-25-recovery-format.log",
-      "proof": "docs/evidence/2026-10-25-recovery-format.result.json",
-      "log_sha256": "8e484f73c7babfbf3a998b26f4271fae389e07e824762ea9a8078ba9cae2b083",
-      "seconds": 1.53
+      "log": "docs/evidence/2026-10-25-completion-format.log",
+      "proof": "docs/evidence/2026-10-25-completion-format.result.json",
+      "log_sha256": "db9eb5a96552dfa7c7e80279e89871dfa3712d85e2e9c8ebc239de8928713290",
+      "seconds": 1.67
     },
     "native-format": {
-      "log": "docs/evidence/2026-10-25-recovery-native-format.log",
-      "proof": "docs/evidence/2026-10-25-recovery-native-format.result.json",
-      "log_sha256": "b9bcabda3f7bb010dbed3c97007df18ab8d60f8d6dd1aff979456d540af56c10",
-      "seconds": 2.01
+      "log": "docs/evidence/2026-10-25-completion-native-format.log",
+      "proof": "docs/evidence/2026-10-25-completion-native-format.result.json",
+      "log_sha256": "fb8faf0f4308ff78948b0f8fd9e237320bad0489973dcb5d2a50a16a4af8cc27",
+      "seconds": 2.23
     },
     "windows-format": {
-      "log": "docs/evidence/2026-10-25-recovery-windows-format.log",
-      "proof": "docs/evidence/2026-10-25-recovery-windows-format.result.json",
-      "log_sha256": "e07acaf90403c2854ded2f2547486a243a09840c78d234edfd62d5e04b19066e",
-      "seconds": 0.06
+      "log": "docs/evidence/2026-10-25-completion-windows-format.log",
+      "proof": "docs/evidence/2026-10-25-completion-windows-format.result.json",
+      "log_sha256": "07adcc6cb6954dcaeb0cd725117f59b8d39a831431c26613e3e050744e6921c8",
+      "seconds": 0.13
+    },
+    "windows-workspace-format": {
+      "log": "docs/evidence/2026-10-25-completion-windows-workspace-format.log",
+      "proof": "docs/evidence/2026-10-25-completion-windows-workspace-format.result.json",
+      "log_sha256": "1cfe14f58ddd28da0780f552e072d7eca7095fb0bff03e5f4c0fce543c3b20f8",
+      "seconds": 0.13
+    },
+    "sdk-format": {
+      "log": "docs/evidence/2026-10-25-completion-sdk-format.log",
+      "proof": "docs/evidence/2026-10-25-completion-sdk-format.result.json",
+      "log_sha256": "ff749bad2d60ed5d4230e34d48354af2a4faac394938615ff158d0e31e12b330",
+      "seconds": 1.68
     },
     "preview-build": {
-      "log": "docs/evidence/2026-10-25-recovery-preview-build.log",
-      "proof": "docs/evidence/2026-10-25-recovery-preview-build.result.json",
-      "log_sha256": "e488518d609c96f6c1436e47a991e8eacabed33dcf2fbfee331807b1c2d38c18",
-      "seconds": 14.59
+      "log": "docs/evidence/2026-10-25-completion-preview-build.log",
+      "proof": "docs/evidence/2026-10-25-completion-preview-build.result.json",
+      "log_sha256": "69583aa9767efc13cea4f38172126cdd383016e0c33f3834b1d276f8bf15e6d1",
+      "seconds": 19.69
     },
     "workspace-tests": {
-      "log": "docs/evidence/2026-10-25-recovery-workspace-tests.log",
-      "proof": "docs/evidence/2026-10-25-recovery-workspace-tests.result.json",
-      "log_sha256": "9a0d3547d33b40cc2a72096d37cb5912bca90e8db7c0c378b8078ef63972c68d",
-      "seconds": 93.85
+      "log": "docs/evidence/2026-10-25-completion-workspace-tests.log",
+      "proof": "docs/evidence/2026-10-25-completion-workspace-tests.result.json",
+      "log_sha256": "7f90884e21e48e8bffdbe6abd8a88a38e60471d763028ec6ea16195a68a86ef6",
+      "seconds": 102.35
     },
     "native-tests": {
-      "log": "docs/evidence/2026-10-25-recovery-native-ui-tests.log",
-      "proof": "docs/evidence/2026-10-25-recovery-native-ui-tests.result.json",
-      "log_sha256": "8df5a0ce96a198992584c7ecb78c28bf87e6f395ed473e1682f78c5bd20a42f6",
-      "seconds": 69.61
+      "log": "docs/evidence/2026-10-25-completion-native-ui-tests.log",
+      "proof": "docs/evidence/2026-10-25-completion-native-ui-tests.result.json",
+      "log_sha256": "68c01fd74ee235bc7f37476ac72c54fbcad65668a11c90b63ed6cbe2a9538eba",
+      "seconds": 85.75
     },
     "native-render": {
-      "log": "docs/evidence/2026-10-25-recovery-native-render.log",
-      "proof": "docs/evidence/2026-10-25-recovery-native-render.result.json",
-      "log_sha256": "32bbe1afa93dd224a87ae25def6f80642698f8cc7cd93137ce0facbd97345573",
-      "seconds": 15.82
+      "log": "docs/evidence/2026-10-25-completion-native-render.log",
+      "proof": "docs/evidence/2026-10-25-completion-native-render.result.json",
+      "log_sha256": "e3ec662c9cd6f8c517c9c9f781ac2bc38f5108f656e8feab1a7b5f21e80df915",
+      "seconds": 24.18
     },
     "clippy": {
-      "log": "docs/evidence/2026-10-25-recovery-clippy.log",
-      "proof": "docs/evidence/2026-10-25-recovery-clippy.result.json",
-      "log_sha256": "b53ba4391c33826b5be23766da0b7df98cfac9ef1685022ec3ed1f87de1be8db",
-      "seconds": 7.23
+      "log": "docs/evidence/2026-10-25-completion-clippy.log",
+      "proof": "docs/evidence/2026-10-25-completion-clippy.result.json",
+      "log_sha256": "7b4249ff71677ca0bd67368e52a8d044bca5761773acabf80a5be9c8589f2eb3",
+      "seconds": 7.51
     },
     "native-clippy": {
-      "log": "docs/evidence/2026-10-25-recovery-native-clippy.log",
-      "proof": "docs/evidence/2026-10-25-recovery-native-clippy.result.json",
-      "log_sha256": "8d0b50edf2781bfefe375060683348aaf524ed10489740f1a83ca3b643ba7028",
-      "seconds": 7.61
+      "log": "docs/evidence/2026-10-25-completion-native-clippy.log",
+      "proof": "docs/evidence/2026-10-25-completion-native-clippy.result.json",
+      "log_sha256": "990fe160d480dd380da372fa4dea1caadd6a6ec18014dfc387b558bdb5251794",
+      "seconds": 0.54
     },
     "windows-check": {
-      "log": "docs/evidence/2026-10-25-recovery-windows-check.log",
-      "proof": "docs/evidence/2026-10-25-recovery-windows-check.result.json",
-      "log_sha256": "8b6421cdc92cb0d7954281bc775ec46d3d655a0c8139d661a1da3b77f2bf82a8",
-      "seconds": 0.4
+      "log": "docs/evidence/2026-10-25-completion-windows-check.log",
+      "proof": "docs/evidence/2026-10-25-completion-windows-check.result.json",
+      "log_sha256": "2d17a6cb7de96e0af3b7f6a7b23144b8f381e14ebacb7c2bc6873f1cf3365833",
+      "seconds": 0.6
     },
     "windows-clippy": {
-      "log": "docs/evidence/2026-10-25-recovery-windows-clippy.log",
-      "proof": "docs/evidence/2026-10-25-recovery-windows-clippy.result.json",
-      "log_sha256": "aef44cdacb052c9c4579b4145f026f9d3f3442ed2964fa3cbd994ce215a2ebcf",
-      "seconds": 0.31
-    },
-    "release-tests": {
-      "log": "docs/evidence/2026-10-25-recovery-release-tests.log",
-      "proof": "docs/evidence/2026-10-25-recovery-release-tests.result.json",
-      "log_sha256": "7a1290127c8e1861f8d2ff852845e1883571540e2e106d547650d1d6fcefc4f9",
+      "log": "docs/evidence/2026-10-25-completion-windows-clippy.log",
+      "proof": "docs/evidence/2026-10-25-completion-windows-clippy.result.json",
+      "log_sha256": "01e145b4c19f6c70273d8eb96be8da92ff7ec017b3c9ef5d31ea619f38079ce2",
       "seconds": 0.22
     },
-    "release-build": {
-      "log": "docs/evidence/2026-10-25-recovery-release-build.log",
-      "proof": "docs/evidence/2026-10-25-recovery-release-build.result.json",
-      "log_sha256": "d1da794d538158fda2febbcb3ed1edc81798a92a19ef61cab8da2e97b0cef94a",
-      "seconds": 527.75
+    "windows-workspace-check": {
+      "log": "docs/evidence/2026-10-25-completion-windows-workspace-check.log",
+      "proof": "docs/evidence/2026-10-25-completion-windows-workspace-check.result.json",
+      "log_sha256": "0caf9eedc8a5b0098bd53b7b47f771dacd9adbb9f38bc470711f092da65df14b",
+      "seconds": 0.33
+    },
+    "windows-workspace-clippy": {
+      "log": "docs/evidence/2026-10-25-completion-windows-workspace-clippy.log",
+      "proof": "docs/evidence/2026-10-25-completion-windows-workspace-clippy.result.json",
+      "log_sha256": "967fd50d10a51cbb05c5636d53c3bfc6a089001477ea89fc35d80dc6236f95b0",
+      "seconds": 0.32
+    },
+    "release-tests": {
+      "log": "docs/evidence/2026-10-25-completion-release-tests.log",
+      "proof": "docs/evidence/2026-10-25-completion-release-tests.result.json",
+      "log_sha256": "fa5ff4b1e20e79710ae36a580fb49b58c3a2ce0501dfc6a9f81f456220215bc4",
+      "seconds": 4.63
+    },
+    "sdk-script": {
+      "log": "docs/evidence/2026-10-25-completion-sdk-script.log",
+      "proof": "docs/evidence/2026-10-25-completion-sdk-script.result.json",
+      "log_sha256": "3dd9f81847fb4c1e8544d9274b96bb7d81e112892a07b59ffc5cf1013172aa1e",
+      "seconds": 22.55
     }
   },
   "windows_plugin_read": {
     "status": "isolated cross-target API/type checking only",
     "target": "x86_64-pc-windows-msvc",
+    "harness_manifest": "crates/capabilities/validation/windows-read/Cargo.toml",
     "production_module": "crates/capabilities/src/plugins/windows_read.rs",
     "production_module_sha256": "ac3f466d8a74c8b271d1e0dd2898d110350415f9f9160f8b8924162c7a8daec0",
+    "test_source": "crates/capabilities/src/plugins/windows_read_tests.rs",
+    "test_source_sha256": "7b740ee6911cfadeb800cac28c02c6daba4dac480a76e9ef0930b5b3d9f5994b",
     "test_bodies_typechecked": 8,
     "test_names": [
       "real_local_file_reads_support_unicode_and_canonical_workspace_roots",
@@ -746,11 +843,161 @@
       "actual_junctions_symlinks_streams_and_wrong_types_are_refused"
     ],
     "os_test_executions": 0,
-    "evidence": [
-      "docs/evidence/2026-10-25-recovery-windows-check.result.json",
-      "docs/evidence/2026-10-25-recovery-windows-clippy.result.json"
+    "gate_stages": [
+      "windows-check",
+      "windows-clippy"
     ],
-    "limitation": "Anchored native Windows implementation and all eight test bodies type-check. No Windows kernel execution, filesystem/permission acceptance, full application link or installer is claimed."
+    "limitation": "Native test bodies are compiled, not executed. No Windows kernel, full application link, filesystem/permission or installer acceptance."
   },
-  "current_worktree_note": "Further product implementation is in progress after the recorded recovery milestone. The source fingerprint, binaries, tests and benchmarks below identify that milestone and do not qualify a changed source tree."
+  "local_source_binding": {
+    "head": "0b1a4092466a712708efe42d52deca342702f33d",
+    "branch": "main",
+    "worktree_clean_before_documentation_publication": true,
+    "worktree_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "remote_publication_or_parity": "not checked by this postprocessor",
+    "source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d",
+    "bundled_build_git_head": "0b1a4092466a712708efe42d52deca342702f33d",
+    "scope": "Local HEAD/worktree snapshot rechecked before report publication; the bundle's build identity remains separate."
+  },
+  "platform_metadata_scope": "Host fields are retained historical metadata. Current build toolchain/SDK provenance is recorded in docs/evidence/build-provenance.json; no new hardware measurement is claimed.",
+  "recording_implementation": {
+    "role": "Independent postvalidation policy; not a gate producer",
+    "source_path": "/Users/govind/Documents/Codex/2026-10-25/wha/work/record-xylo-validation.py",
+    "sha256": "06d148343e945d551971cb9ff712297f11956b71bcbc47053fe379ddd30a435d",
+    "original_gate_producer_scripts_sha256": {
+      "completion_validation_common.py": "a763cde845213a4f5764c6fd76b243e13a342c9f3d51896814c7e3625fc40412",
+      "run-completion-gates.py": "0683cbf1427124c6f231e7c94a58944b8a8c58182ff6467b62fddeb7eed805ba",
+      "record-completion-validation.py": "f35ebdc2f64a67cefa4d1535b257beee82f948b18ac5038fda3a89bce0b331d3",
+      "record-recovery-validation.py": "629a312661ee6a6d3621129c7cc46b4532399280276b87f3ec6194bb5165ec7f"
+    },
+    "policies": {
+      "current_bundle_notices": "strict schema-2 validation with frozen-catalogue binding",
+      "historical_evidence": "exact original bytes and embedded identities retained",
+      "gate_headers_relabelled": false,
+      "gates_rerun_by_postprocessor": false,
+      "legal_approval_claimed": false
+    },
+    "archived_source": "docs/evidence/2026-10-25-xylo-postvalidation-06d148343e945d55.py",
+    "reviewed_source_fingerprint_sha256": "d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d",
+    "original_gate_run_index": "/Users/govind/Documents/Codex/2026-10-25/wha/work/completion-runs/d0bf29899278f316-1792922463851500000/run.json",
+    "original_gate_run_index_sha256": "eab11cce797e48b65bc65e3124f250b78a7b633767ffac12c83750bebf9505ed"
+  },
+  "historical_incomplete_attempts": [
+    {
+      "source_fingerprint_sha256": "a8b7ebb51c7d1875aa4dd4484fb107454fea737f03be56fd1861c6b345b03650",
+      "record": "docs/evidence/2026-10-25-pre-cache-format-attempt/attempt.json",
+      "run_index_sha256": "4e4dade58d3321605c3ea065565ac66432d79a2e9b5fa4c3e59966336112d6d8",
+      "source_manifest_sha256": "d42194d601164d6e739aa8784a9b5a2739f1f673483d379d68f92076eec114df",
+      "completed_stage_count": 8,
+      "interrupted_stage": "native-render",
+      "interrupted_exit_code": 130,
+      "scope": "All results belong only to this historical source. No stage, partial native-render output or historical test count contributes to current accepted totals.",
+      "reason": "The operator deliberately interrupted native rendering after live-profile inspection discovered a legacy project-cache format incompatibility requiring a versioned cache fix. Native tests had already completed before SIGINT arrived. This is an incomplete historical attempt, not a recorded production-test assertion failure."
+    },
+    {
+      "source_fingerprint_sha256": "afaf0c68703cc9d0a1a496eab07f0f1c87e2c5a81e205f89c7180cb48d5408b4",
+      "record": "docs/evidence/2026-10-25-pre-xylo-lint-attempt/attempt.json",
+      "failure_kind": "strict_lint_failure",
+      "run_index_sha256": "21fd956ae46072030238b5ec65e9eebf3c7521e18d241446ac5cedbbdf6aed01",
+      "source_manifest_sha256": "946a49d64a469401a7e3d92e5af5e0196142f62784fa99ad0a20b721fdb8b355",
+      "completed_stage_count": 9,
+      "failed_stage": "clippy",
+      "failed_exit_code": 101,
+      "scope": "Historical source only. No completed stage, test count, duration or capture is reused as acceptance or performance evidence for the next source.",
+      "reason": "This source-bound attempt stopped at strict Clippy: the new logo conversion used chunks_exact_mut(4), triggering chunks_exact_to_as_chunks. The first nine stages, including workspace tests, native tests and native rendering, completed for this old source. The tenth stage returned exit code 101 with source_verified_after=true. This was a lint failure, not an operator interruption or a recorded functional-test assertion failure."
+    }
+  ],
+  "plugin_sdk": {
+    "unit_executions": 5,
+    "doctest_executions": 1,
+    "total_executions": 6,
+    "installed_host_flow_checks": 9,
+    "check_names": [
+      "actual_reviewed_install",
+      "committed_artifact_bytes",
+      "compiled_rust_component",
+      "no_clobber_repeat",
+      "read_grant_revocation",
+      "source_unchanged",
+      "unicode_statistics",
+      "workspace_escape_refused",
+      "write_grant_revocation"
+    ],
+    "note": "Nine assertions within one actual installed-host validation flow; not nine independent tests.",
+    "package_sha256": "9731fede76d21a25fcb0b61e94573a18ed6bf0465aae1942a4fed12f6a754692",
+    "component_sha256": "f02e0e4efc729c215c675bc0321080623190359e09302bb834dbe8c3b45e9dc2",
+    "manifest_sha256": "40a1911a4056cb2d74b97ae86a8737b7be5c8b8230f972d83660747a4f0db7da",
+    "validation": "docs/evidence/2026-10-25-completion-sdk-validation.json"
+  },
+  "windows_environment_capture": {
+    "status": "isolated cross-target API/type checking only",
+    "target": "x86_64-pc-windows-msvc",
+    "harness_manifest": "crates/capabilities/validation/windows-read/Cargo.toml",
+    "production_module": "crates/capabilities/src/environments/capture_fs_windows.rs",
+    "production_module_sha256": "130ca7ddc61cefde6eb492524169167d80dc5ee41ee8115f4901335bc59b7b7e",
+    "test_source": "crates/capabilities/src/environments/capture_fs_windows.rs",
+    "test_source_sha256": "130ca7ddc61cefde6eb492524169167d80dc5ee41ee8115f4901335bc59b7b7e",
+    "test_bodies_typechecked": 5,
+    "test_names": [
+      "published_stream_can_be_verified_while_original_handle_is_live",
+      "atomic_publication_never_replaces_unrelated_existing_output",
+      "existing_private_staging_reopens_with_flush_authority",
+      "hardlinked_files_are_never_output_authorities",
+      "lease_handles_allow_a_second_open_instead_of_a_sharing_error"
+    ],
+    "os_test_executions": 0,
+    "gate_stages": [
+      "windows-check",
+      "windows-clippy"
+    ],
+    "limitation": "Native test bodies are compiled, not executed. No Windows kernel, full application link, filesystem/permission or installer acceptance."
+  },
+  "windows_workspace_read": {
+    "status": "isolated cross-target production reader compilation only",
+    "target": "x86_64-pc-windows-msvc",
+    "harness_manifest": "crates/runtime/validation/windows-workspace/Cargo.toml",
+    "production_modules_sha256": {
+      "crates/runtime/src/workspace/reader.rs": "3e01d33b7e6bc7e9d43e24504de5dcb8970a14861dabe9b7421b385d6e04111e",
+      "crates/runtime/src/workspace/reader_windows.rs": "efa67ba588a9d4759bb9b8c5172da7d2ef408b6726ff422ec98ab67cf3237c22"
+    },
+    "test_bodies_typechecked": 0,
+    "test_names": [],
+    "os_test_executions": 0,
+    "gate_stages": [
+      "windows-workspace-check",
+      "windows-workspace-clippy"
+    ],
+    "limitation": "Compiles the actual shared and Windows platform reader; Unix-only tests are excluded. No Windows OS execution, full runtime/application link, filesystem-race or installer acceptance."
+  },
+  "historical_release_build": {
+    "profile": "release",
+    "source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1",
+    "target_directory": "target/performance",
+    "evidence": "docs/evidence/release-build.log",
+    "proof": "docs/evidence/2026-10-25-recovery-release-build.result.json",
+    "artifacts": {
+      "agent-workbench": {
+        "path": "target/performance/release/agent-workbench",
+        "bytes": 56596960,
+        "sha256": "854f0b42e4159e8cb7a6c6c9bd9726cc239051a678a51863ee749dccdac0a66b"
+      },
+      "workbench-worker": {
+        "path": "target/performance/release/workbench-worker",
+        "bytes": 60095632,
+        "sha256": "b828496c1af0892c603e6c6c01e3dfccad65a756f13ade3df43b557c9d49aaa4"
+      },
+      "workbench-helper": {
+        "path": "target/performance/release/workbench-helper",
+        "bytes": 34726240,
+        "sha256": "988f401377dab3d4ca8fff4593d27a8e7fd4189b486031e4aec4278232610782"
+      }
+    },
+    "measure_overhead": {
+      "path": "target/performance/release/examples/measure_overhead",
+      "bytes": 7129488,
+      "sha256": "1d71f178bbd408caf6e71a5781a4cd3d16b64b37a78a80f2828d587c369e49b6"
+    },
+    "note": "All three optimized binaries and measure_overhead covered by the frozen-source Cargo gate. Cache reuse is permitted by Cargo; binary hashes are recorded. Development artifacts, not publisher-signed distribution acceptance."
+  },
+  "current_worktree_note": "After this recorded local milestone, startup identity and platform portability fixes were added. The recorded tests, debug binaries and captures remain bound to source d0bf29899278f316d68e01a2bd49c0a1d53e76a660a7e7a465206a40eda3d86d. Later changes receive separate focused checks and native CI; they do not relabel this milestone or its historical measurements. Focused changes and their separate evidence are recorded in docs/evidence/2026-10-25-xylo-platform-fixes/checks.json."
 }

@@ -1,0 +1,27 @@
+   Compiling workbench-services v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/services)
+error[E0433]: cannot find type `File` in this scope
+  --> crates/services/src/memory_records_tests.rs:85:33
+   |
+85 |         serde_json::from_reader(File::open(destination).unwrap()).unwrap();
+   |                                 ^^^^ use of undeclared type `File`
+   |
+   = note: struct `crate::providers::sign_in_service::tests::File` exists but is inaccessible
+help: consider importing this struct
+   |
+ 1 + use std::fs::File;
+   |
+
+error[E0433]: cannot find type `File` in this scope
+   --> crates/services/src/memory_records_tests.rs:132:33
+    |
+132 |         serde_json::from_reader(File::open(destination).unwrap()).unwrap();
+    |                                 ^^^^ use of undeclared type `File`
+    |
+    = note: struct `crate::providers::sign_in_service::tests::File` exists but is inaccessible
+help: consider importing this struct
+    |
+  1 + use std::fs::File;
+    |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `workbench-services` (lib test) due to 2 previous errors

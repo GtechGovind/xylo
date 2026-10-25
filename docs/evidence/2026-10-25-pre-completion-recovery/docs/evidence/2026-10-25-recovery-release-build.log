@@ -1,0 +1,133 @@
+{"reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1", "started_at_unix": 1792902676.801601, "commands": [["cargo", "build", "--locked", "--release", "--workspace", "--bins"], ["cargo", "build", "--locked", "--release", "-p", "workbench-runtime", "--example", "measure_overhead"]], "environment": {"CARGO_INCREMENTAL": "0", "CARGO_BUILD_JOBS": "2", "CARGO_TARGET_DIR": "/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/target/performance"}}
+   Compiling hermes-core v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-core)
+   Compiling workbench-resources v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/resources)
+   Compiling workbench-services v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/services)
+   Compiling workbench-capabilities v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/capabilities)
+   Compiling workbench-runtime v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/runtime)
+   Compiling hermes-intelligence v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-intelligence)
+   Compiling hermes-skills v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-skills)
+   Compiling hermes-auth v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-auth)
+   Compiling hermes-agent v0.22.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/vendor/hermes-ultra/crates/hermes-agent)
+   Compiling workbench-engine v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/engine)
+   Compiling agent-workbench v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop)
+   Compiling workbench-worker v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/worker)
+   Compiling workbench-helper v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/helper)
+   Compiling workbench-distribution v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/distribution)
+    Finished `release` profile [optimized] target(s) in 7m 30s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+   Compiling serde v1.0.229
+   Compiling smallvec v1.16.4
+   Compiling tokio v1.54.1
+   Compiling log v0.4.34
+   Compiling serde_json v1.0.154
+   Compiling num-traits v0.2.19
+   Compiling zerocopy v0.8.63
+   Compiling rustix v1.1.5
+   Compiling getrandom v0.4.3
+   Compiling tokio-util v0.7.20
+   Compiling tracing v0.1.44
+   Compiling icu_normalizer v2.4.0
+   Compiling idna_adapter v1.2.2
+   Compiling darling_core v0.20.11
+   Compiling hyper v1.12.0
+   Compiling digest v0.10.7
+   Compiling idna v1.1.0
+   Compiling hyper-util v0.1.21
+   Compiling url v2.5.8
+   Compiling tower v0.5.3
+   Compiling ahash v0.8.12
+   Compiling darling_macro v0.20.11
+   Compiling tokio-rustls v0.26.6
+   Compiling num-integer v0.1.47
+   Compiling uuid v1.29.0
+   Compiling hyper-rustls v0.27.10
+   Compiling darling v0.20.11
+   Compiling tower-http v0.6.11
+   Compiling serde_urlencoded v0.7.1
+   Compiling tempfile v3.27.0
+   Compiling sha2 v0.10.9
+   Compiling derive_builder_core v0.20.2
+   Compiling ppv-lite86 v0.2.21
+   Compiling thiserror-impl v1.0.69
+   Compiling derive_builder_macro v0.20.2
+   Compiling chrono v0.4.45
+   Compiling thiserror v1.0.69
+   Compiling rand_chacha v0.9.0
+   Compiling hashbrown v0.14.5
+   Compiling hmac v0.12.1
+   Compiling num-complex v0.4.6
+   Compiling monostate-impl v0.1.18
+   Compiling spm_precompiled v0.1.4
+   Compiling monostate v0.1.18
+   Compiling compact_str v0.9.1
+   Compiling hashbrown v0.16.1
+   Compiling event-listener v5.4.2
+   Compiling ndarray v0.17.2
+   Compiling hashlink v0.9.1
+   Compiling rand v0.9.5
+   Compiling derive_builder v0.20.2
+   Compiling num-bigint v0.4.8
+   Compiling rustls-platform-verifier v0.7.1
+   Compiling xattr v1.6.1
+   Compiling half v2.7.1
+   Compiling inout v0.1.4
+   Compiling dary_heap v0.3.9
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling ctor v0.2.9
+   Compiling tiff v0.11.3
+   Compiling tokenizers v0.23.2
+   Compiling rusqlite v0.32.1
+   Compiling moxcms v0.8.1
+   Compiling tar v0.4.46
+   Compiling ort v2.0.0-rc.15
+   Compiling cargo-packager-utils v0.1.1
+   Compiling cipher v0.4.4
+   Compiling reqwest v0.13.5
+   Compiling simple_asn1 v0.6.4
+   Compiling process-wrap v10.0.1
+   Compiling safetensors v0.8.0
+   Compiling event-listener-strategy v0.5.4
+   Compiling parking_lot_core v0.9.12
+   Compiling workbench-core v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/core)
+   Compiling objc2-foundation v0.3.2
+   Compiling reqwest v0.12.28
+   Compiling sse-stream v0.2.6
+   Compiling concurrent-queue v2.5.0
+   Compiling tokio-stream v0.1.19
+   Compiling keyring-core v1.0.1
+   Compiling arrayvec v0.7.8
+   Compiling bytemuck v1.25.2
+   Compiling image v0.25.10
+   Compiling vte v0.15.0
+   Compiling cargo-packager-updater v0.2.3
+   Compiling cron v0.15.0
+   Compiling apple-native-keyring-store v1.0.2
+   Compiling rmcp v3.7.0
+   Compiling async-channel v2.5.0
+   Compiling jsonwebtoken v9.3.1
+   Compiling parking_lot v0.12.5
+   Compiling objc2-user-notifications v0.3.2
+   Compiling fastembed v7.5.0
+   Compiling salsa20 v0.10.2
+   Compiling globset v0.4.20
+   Compiling pbkdf2 v0.12.2
+   Compiling filedescriptor v0.8.3
+   Compiling polling v3.11.0
+   Compiling rustix-openpty v0.2.0
+   Compiling alacritty_terminal v0.25.1
+   Compiling portable-pty v0.9.0
+   Compiling grep-searcher v0.1.17
+   Compiling notify v8.2.0
+   Compiling workbench-resources v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/resources)
+   Compiling scrypt v0.11.0
+   Compiling ignore v0.4.33
+   Compiling workbench-services v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/services)
+   Compiling workbench-notifications v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/notifications)
+   Compiling workbench-scheduler v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/scheduler)
+   Compiling workbench-distribution v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/distribution)
+   Compiling grep-regex v0.1.14
+   Compiling workbench-helper-client v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/helper-client)
+   Compiling minisign v0.8.0
+   Compiling workbench-runtime v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/runtime)
+    Finished `release` profile [optimized] target(s) in 1m 17s

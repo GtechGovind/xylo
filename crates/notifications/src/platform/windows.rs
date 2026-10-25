@@ -1,8 +1,7 @@
 //! Native WinRT toasts for the live desktop process. No COM activation server
 //! or cold-start routing is claimed; an installed app identity is required.
 use super::{actor, *};
-use std::collections::VecDeque;
-use windows::{
+use ::windows::{
     Data::Xml::Dom::XmlDocument,
     Foundation::TypedEventHandler,
     UI::Notifications::{
@@ -11,6 +10,7 @@ use windows::{
     Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize},
     core::{IInspectable, h},
 };
+use std::collections::VecDeque;
 
 pub(super) struct Backend {
     identity: AppIdentity,
