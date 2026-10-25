@@ -217,13 +217,46 @@ fn final_file_swap_after_directory_validation_cannot_return_private_bytes() {
         "Directory validation failed before the swap callback: {diagnostic}"
     );
     assert!(
-        original_removed && private_link_created,
-        "Private swap was not completed (removed={original_removed}, linked={private_link_created}): {diagnostic}"
+        original_removed,
+        "The swap callback did not remove the original file: {diagnostic}"
     );
     let error = result.expect_err("A private-file swap must never return a readable handle");
+    if private_link_created {
+        assert!(
+            error.to_string().contains("without links"),
+            "Final open failed at a different protection boundary: {error:#}"
+        );
+    } else {
+        // Native x64 and ARM64 Windows refuse CreateHardLinkW while these
+        // directory authorities deny write/delete sharing. Qualify that exact
+        // earlier fence instead of assuming the substitution must succeed.
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32),
+            "The private-link mutation failed outside the verified sharing fence: {error:#}"
+        );
+        assert!(
+            !fact.exists(),
+            "A rejected private-link creation must leave the removed destination absent"
+        );
+        // Once the reader releases its directory handles, the same mutation
+        // must succeed. This proves the fixture is valid, and separately
+        // exercises final-handle validation against the actual private alias.
+        std::fs::hard_link(&secret, &fact)
+            .expect("The private hard link must be creatable after authority release");
+    }
+    assert_eq!(
+        identity(&File::open(&fact).unwrap()).unwrap(),
+        identity(&File::open(&secret).unwrap()).unwrap(),
+        "The replacement must be the private file, not just equal text"
+    );
+    assert_eq!(std::fs::read(&fact).unwrap(), b"private profile secret");
+    let alias_error = fixture.read("fact.txt").unwrap_err();
     assert!(
-        error.to_string().contains("without links"),
-        "Final open failed at a different protection boundary: {error:#}"
+        alias_error.to_string().contains("without links"),
+        "The actual private alias must fail final-handle link validation: {alias_error:#}"
     );
     assert!(!diagnostic.contains("private profile secret"));
 }
