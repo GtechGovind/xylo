@@ -11,6 +11,7 @@ on:
       - "crates/runtime/src/workspace/reader*.rs"
       - "crates/runtime/validation/windows-workspace/**"
       - "crates/resources/**"
+      - "crates/services/src/learning/sanitize.rs"
       - ".github/workflows/windows-filesystem.yml"
   pull_request:
     paths:
@@ -20,6 +21,7 @@ on:
       - "crates/runtime/src/workspace/reader*.rs"
       - "crates/runtime/validation/windows-workspace/**"
       - "crates/resources/**"
+      - "crates/services/src/learning/sanitize.rs"
       - ".github/workflows/windows-filesystem.yml"
 
 permissions:

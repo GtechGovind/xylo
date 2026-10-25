@@ -71,7 +71,11 @@ pub(super) fn ignored_tool(name: &str) -> bool {
         )
 }
 fn relative_path(value: &str, scope: &str) -> Option<String> {
-    if sensitive(value) || value.len() > 256 || value.contains(['\0', '\\']) {
+    if value.len() > 256 || value.contains('\0') {
+        return None;
+    }
+    #[cfg(not(windows))]
+    if value.contains('\\') {
         return None;
     }
     let path = Path::new(value);
@@ -80,23 +84,30 @@ fn relative_path(value: &str, scope: &str) -> Option<String> {
     } else {
         path
     };
-    if path
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-    {
+    // The selected workspace may itself contain a private account directory.
+    // Discard that exact prefix before examining or retaining the relative
+    // evidence; unmatched absolute paths never enter the stored procedure.
+    if sensitive(path.to_str()?) {
         return None;
     }
-    let path = path.to_str()?;
-    if path
-        .split('/')
-        .any(|part| part.starts_with('.') && part != ".")
-    {
-        return None;
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part.to_str()?;
+                if part.starts_with('.') {
+                    return None;
+                }
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            _ => return None,
+        }
     }
-    Some(if path.is_empty() {
+    Some(if parts.is_empty() {
         ".".into()
     } else {
-        path.into()
+        parts.join("/")
     })
 }
 fn input(key: &str) -> Value {
@@ -270,4 +281,88 @@ pub(super) fn correction_command(guidance: &str, scope: &str) -> Option<Value> {
         })?;
     let words = command.split_whitespace().collect::<Vec<_>>();
     verification_command(&json!({"program":words.first()?,"args":&words[1..]}), scope)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn workspace() -> (&'static str, &'static str) {
+        if cfg!(windows) {
+            (
+                r"C:\Users\private-person\project",
+                r"C:\Users\private-person\project\src\main.rs",
+            )
+        } else {
+            (
+                "/Users/private-person/project",
+                "/Users/private-person/project/src/main.rs",
+            )
+        }
+    }
+
+    #[test]
+    fn native_workspace_paths_retain_only_safe_relative_evidence() {
+        let (scope, path) = workspace();
+        assert_eq!(relative_path(path, scope).as_deref(), Some("src/main.rs"));
+        assert_eq!(
+            relative_path("src/./main.rs", scope).as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(relative_path(scope, scope).as_deref(), Some("."));
+        let retained = arguments(&json!({"path":path,"api_key":"should-not-survive"}), scope);
+        assert_eq!(retained["path"], "src/main.rs");
+        assert_eq!(retained["api_key"], json!({"$input":"redacted"}));
+        let encoded = retained.to_string();
+        assert!(!encoded.contains("private-person"));
+        assert!(!encoded.contains("should-not-survive"));
+    }
+
+    #[test]
+    fn relative_evidence_refuses_external_hidden_traversal_and_auth_paths() {
+        let (scope, _) = workspace();
+        let outside = format!("{scope}-other/src/main.rs");
+        for path in [
+            outside.as_str(),
+            "../other/main.rs",
+            "src/../main.rs",
+            "src/.env",
+            "src/.private/main.rs",
+            "src/access_token.txt",
+            "src/main.rs?api_key=should-not-survive",
+            "https://example.invalid/private",
+            "src\0/main.rs",
+            r"src\..\..\private",
+        ] {
+            assert_eq!(
+                arguments(&json!({"path":path}), scope),
+                json!({"path":{"$input":"path"}}),
+                "Unsafe evidence was retained for {path:?}"
+            );
+        }
+        assert!(relative_path(&"x".repeat(257), scope).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_windows_namespaces_require_an_exact_workspace_prefix() {
+        let scope = r"\\?\C:\Users\private-person\project";
+        assert_eq!(
+            relative_path(r"\\?\C:\Users\private-person\project\src\main.rs", scope).as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            relative_path(r"src\main.rs", scope).as_deref(),
+            Some("src/main.rs")
+        );
+        for path in [
+            r"C:src\main.rs",
+            r"\src\main.rs",
+            r"\\?\C:\Users\private-person\project-other\src\main.rs",
+            r"\\?\D:\Users\private-person\project\src\main.rs",
+            r"C:\Users\private-person\project\src\main.rs",
+        ] {
+            assert!(relative_path(path, scope).is_none(), "Accepted {path:?}");
+        }
+    }
 }

@@ -35,3 +35,8 @@ pub fn open_workspace_read(
 #[allow(dead_code)]
 #[path = "../../../src/environments/capture_fs_windows.rs"]
 mod environment_capture_fs;
+
+// Execute the production learning sanitizer's native path/privacy regressions
+// without initializing the SQLite store, keychain, inference or provider stack.
+#[cfg(test)]
+mod learning;
