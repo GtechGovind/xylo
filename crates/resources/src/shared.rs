@@ -698,12 +698,22 @@ mod tests {
     fn traversal_unexpected_files_and_oversized_records_are_rejected() {
         let (temp, path) = directory();
         let cancel = CancellationToken::new();
-        let traversal = temp
-            .path()
-            .canonicalize()
-            .unwrap()
-            .join("admission/../outside");
-        assert!(try_acquire(&traversal, demand(), hardware(), &cancel).is_err());
+        // PathBuf::join normalizes parent components for Windows verbatim
+        // paths. Preserve the actual request bytes to exercise rejection.
+        let mut raw = temp.path().canonicalize().unwrap().into_os_string();
+        for part in ["admission", "..", "outside"] {
+            raw.push(std::path::MAIN_SEPARATOR_STR);
+            raw.push(part);
+        }
+        let traversal = PathBuf::from(raw);
+        assert!(
+            traversal
+                .components()
+                .any(|part| matches!(part, Component::ParentDir)),
+            "The fixture must reach admission with an actual parent component: {traversal:?}"
+        );
+        let error = try_acquire(&traversal, demand(), hardware(), &cancel).unwrap_err();
+        assert!(error.to_string().contains("without traversal"), "{error:#}");
         assert!(!temp.path().join("outside").exists());
         prepare_directory(&path, &cancel).unwrap();
         std::fs::write(path.join("credentials.json"), b"{}").unwrap();
