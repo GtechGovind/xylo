@@ -61,6 +61,15 @@ elif tool == "cmake" and args[:2] == ["-E", "sha256sum"]:
 elif tool == "cmake" and args[0] == "-S":
     if failure == "configure":
         sys.exit(7)
+    if os.environ["FIXTURE_OS"].startswith("MINGW"):
+        assert "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW" in args
+        assert "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" in args
+        assert "-DGGML_OPENMP=OFF" in args
+        if os.environ["CARGO_BUILD_TARGET"].startswith("aarch64"):
+            # Model the exact pinned ggml precondition: MSVC proper rejects
+            # GGML_NATIVE=OFF on ARM, while ClangCL supports a generic ISA.
+            assert args[args.index("-T") + 1] == "ClangCL"
+            assert "-DGGML_CPU_ARM_ARCH=armv8-a" in args
     Path(args[args.index("-B") + 1]).mkdir()
 elif tool == "cmake" and args[0] == "--build":
     if failure == "build":
@@ -156,6 +165,7 @@ exec "$BASH" "$FIXTURE_BUILD_SCRIPT" output
         self.assertIn("Verified native component prepared", result.stdout)
         manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual((manifest["revision"], manifest["source_sha256"]), (REVISION, SOURCE_SHA))
+        self.assertEqual(manifest["cpu_policy"], "portable-static-x64-sse2-arm-baseline")
         self.assertEqual({item["path"] for item in manifest["files"]},
                          {"runtime/" + executable, "notices/whisper-LICENSE"})
         for item in manifest["files"]:
@@ -173,6 +183,13 @@ exec "$BASH" "$FIXTURE_BUILD_SCRIPT" output
         self.assertIn("-DCMAKE_BUILD_TYPE=Release", configure)
         self.assertNotIn("-A", configure)
         self.assertIn("-DGGML_AVX2=OFF", configure)
+        self.assertIn("-DGGML_NATIVE=OFF", configure)
+        self.assertIn("-DGGML_METAL_EMBED_LIBRARY=ON", configure)
+        self.assertFalse(any(argument.startswith("-DCMAKE_MSVC_RUNTIME_LIBRARY=") for argument in configure))
+        self.assertFalse(any(argument.startswith("-DGGML_OPENMP=") for argument in configure))
+        manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual((manifest["compiler_policy"], manifest["runtime_policy"]),
+                         ("system-toolchain", "platform-runtime"))
         self.assertEqual([call["args"][:2] for call in calls if call["tool"] == "codesign"],
                          [["--force", "--sign"], ["--verify", "--strict"]])
         self.assertTrue((output / "runtime/whisper-cli").read_bytes().endswith(b"fixture signature\n"))
@@ -189,7 +206,31 @@ exec "$BASH" "$FIXTURE_BUILD_SCRIPT" output
                 self.assert_manifest(result, output, "whisper-cli.exe")
                 configure = next(call["args"] for call in calls if call["tool"] == "cmake" and call["args"][0] == "-S")
                 self.assertEqual(configure[configure.index("-A") + 1], architecture)
+                for argument in ("-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
+                                 "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded", "-DGGML_OPENMP=OFF",
+                                 "-DBUILD_SHARED_LIBS=OFF", "-DGGML_NATIVE=OFF", "-DGGML_AVX2=OFF"):
+                    prefix = argument.split("=", 1)[0] + "="
+                    self.assertEqual([value for value in configure if value.startswith(prefix)], [argument])
+                manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual(manifest["runtime_policy"], "static-msvc-no-openmp")
+                if architecture == "ARM64":
+                    self.assertEqual(configure[configure.index("-T") + 1], "ClangCL")
+                    self.assertIn("-DGGML_CPU_ARM_ARCH=armv8-a", configure)
+                    self.assertEqual(manifest["compiler_policy"], "clang-cl-arm64")
+                else:
+                    self.assertNotIn("-T", configure)
+                    self.assertFalse(any(argument.startswith("-DGGML_CPU_ARM_ARCH=") for argument in configure))
+                    self.assertEqual(manifest["compiler_policy"], "msvc-x64")
+                build = next(call["args"] for call in calls if call["tool"] == "cmake" and call["args"][0] == "--build")
+                self.assertEqual(build[build.index("--config") + 1], "Release")
                 self.assertFalse(any(call["tool"] == "codesign" for call in calls))
+
+    def test_unknown_windows_architecture_never_configures_or_publishes(self):
+        result, output, calls = self.run_build("MINGW64_NT-10.0", "i686-pc-windows-msvc")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("native Windows ARM64/x64 target", result.stderr)
+        self.assertFalse(any(call["tool"] == "cmake" and call["args"][0] == "-S" for call in calls))
+        self.assertFalse((output / "manifest.json").exists())
 
     def test_integrity_configure_build_and_signing_failures_are_not_successful(self):
         for failure, status in [("source_sha", 1), ("configure", 7), ("build", 8), ("codesign", 9)]:

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import uuid
 
 sys.dont_write_bytecode = True
 from release_common import (BINARIES, ROOT, TARGETS, build_env, digest, packager,
@@ -141,25 +142,45 @@ def configuration(target: str, output: Path, native: Path, notices: Path, *, pro
 
 
 def preflight_configuration(executable: str, config: dict) -> None:
-    """Exercise the real pinned parser without selecting or packaging any app.
+    """Parse the unchanged app config, selecting only an inert sibling config.
 
-    0.11.8 exits 1 with a specific no-selection diagnostic after successful
-    parsing. An I/O/serde failure (including its ENOTDIR name-autodetection bug)
-    is a different diagnostic and must never count as a successful preflight.
+    In 0.11.8, --packages filters automatic discovery, not --config inputs.
+    Deserialize [app, sentinel] together, then select only the empty-formats
+    sentinel. An invalid app makes the entire array fail parsing and exit
+    nonzero; a valid array reaches the sentinel's pre-I/O empty-formats return.
     """
-    selector = "__xylo_config_preflight_no_package__"
+    selector = "xylo-parser-sentinel-" + uuid.uuid4().hex
     if config.get("name") == selector:
-        raise ValueError("Configuration must not match the parser-only selector")
+        raise ValueError("Configuration must not match the parser-only sentinel")
+
+    output = Path(config["outDir"])
+
+    def output_state():
+        try:
+            info = output.lstat()
+        except FileNotFoundError:
+            return None
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    before = output_state()
+    environment = os.environ.copy()
+    environment.pop("CARGO_PACKAGER_SIGN_PRIVATE_KEY", None)
+    environment.pop("CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD", None)
     with tempfile.TemporaryDirectory(prefix="xylo-packager-config-") as directory:
-        path = Path(directory) / "packager.resolved.json"
-        write_json(path, config)
-        result = subprocess.run([executable, "--config", str(path), "--packages", selector],
-                                cwd=ROOT, text=True, capture_output=True, timeout=30)
+        root = Path(directory)
+        path = root / "packager.json"
+        # The original config is serialized unchanged, including its formats and
+        # nested platform fields. No hooks, binaries, or resources on the sentinel.
+        sentinel = {"name": selector, "formats": []}
+        write_json(path, [config, sentinel])
+        result = subprocess.run([str(Path(executable).resolve()) if Path(executable).is_file() else executable,
+                                 "--packages", selector],
+                                cwd=root, env=environment, text=True, capture_output=True, timeout=30)
         diagnostic = (result.stdout + "\n" + result.stderr).strip()
-        expected = ("Couldn't detect a valid configuration file or all configurations are disabled! "
-                    "Nothing to do here.")
-        if result.returncode != 1 or diagnostic != "ERROR " + expected:
-            raise ValueError("Pinned packager configuration parsing failed; no app was packaged. "
+        if sorted(root.iterdir()) != [path] or output_state() != before:
+            raise ValueError("Pinned packager preflight changed output files; no installer is accepted")
+        if result.returncode != 0:
+            raise ValueError("Pinned packager configuration preflight failed; no installer is accepted. "
                              + diagnostic[:2048])
 
 

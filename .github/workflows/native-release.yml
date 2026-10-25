@@ -130,10 +130,16 @@ jobs:
         env:
           WORKBENCH_PACKAGER: ${{ github.workspace }}/.release-tools/bin/cargo-packager${{ runner.os == 'Windows' && '.exe' || '' }}
         run: python scripts/release.py --target '${{ matrix.target }}' --mode preview --preflight
-      - name: Source and updater checks
+      - name: Formatting and release-script regressions
         run: |
           cargo fmt --all --check
           python -m unittest discover -s scripts -p 'test_release*.py' -v
+      # Exercise the platform compiler before the longer Rust build. Native
+      # assets live under release/ and survive the later debug-only cleanup.
+      - name: Build pinned native speech runtime
+        run: bash scripts/native-assets-build.sh "target/${{ matrix.target }}/release/native-assets/whisper-runtime"
+      - name: Source and updater checks
+        run: |
           cargo build --locked --workspace --bins
           cargo test --locked --workspace --lib
           cargo test --locked -p agent-workbench --bin agent-workbench startup::tests
@@ -150,8 +156,6 @@ jobs:
           cargo clippy --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
       - name: Rust plugin SDK and native component execution
         run: bash scripts/test-plugin-sdk.sh
-      - name: Build pinned native speech runtime
-        run: bash scripts/native-assets-build.sh "target/${{ matrix.target }}/release/native-assets/whisper-runtime"
       - name: Reclaim tested debug artifacts before optimized compilation
         run: cargo clean --target '${{ matrix.target }}' --profile dev
       - name: Build unsigned preview installers with complete license inventory

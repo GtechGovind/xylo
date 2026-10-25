@@ -37,18 +37,34 @@ jobs=${NATIVE_BUILD_JOBS:-2}
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { printf '%s\n' 'NATIVE_BUILD_JOBS must be a positive integer' >&2; exit 1; }
 # Keep this array nonempty: Bash 3.2 treats an empty array as unset under -u.
 cmake_arguments=(-DCMAKE_BUILD_TYPE=Release)
+compiler_policy=system-toolchain
+runtime_policy=platform-runtime
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
+    # Select the CRT before upstream's first project() call. Static ggml
+    # archives alone do not select a static MSVC runtime. Avoid an unstaged
+    # OpenMP DLL; ggml's own thread pool remains available.
+    cmake_arguments+=(-DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DGGML_OPENMP=OFF)
+    runtime_policy=static-msvc-no-openmp
     case "${CARGO_BUILD_TARGET:-${PROCESSOR_ARCHITECTURE:-}}" in
-      aarch64-*|ARM64|arm64) cmake_arguments+=(-A ARM64) ;;
-      x86_64-*|AMD64|amd64) cmake_arguments+=(-A x64) ;;
+      aarch64-*|ARM64|arm64)
+        # Pinned ggml rejects MSVC proper with GGML_NATIVE=OFF on ARM.
+        # The hosted ARM image includes the ClangCL toolset. Explicit ARMv8-A
+        # keeps this independent of the build host's optional ISA extensions.
+        cmake_arguments+=(-A ARM64 -T ClangCL -DGGML_CPU_ARM_ARCH=armv8-a)
+        compiler_policy=clang-cl-arm64
+        ;;
+      x86_64-*|AMD64|amd64)
+        cmake_arguments+=(-A x64)
+        compiler_policy=msvc-x64
+        ;;
       *) printf '%s\n' 'Set CARGO_BUILD_TARGET to the native Windows ARM64/x64 target' >&2; exit 1 ;;
     esac
     ;;
 esac
 # Upstream GGML_NATIVE=OFF alone still enables x64 AVX-family defaults. This
 # static preview runtime intentionally keeps a portable SSE2 CPU baseline.
-# ARM NEON/Metal remain available. Multi-variant shared backend loading requires
+# ARM baseline NEON/Metal remain available. Multi-variant backend loading requires
 # separate loader/packaging qualification; no unmeasured acceleration claim.
 cmake -S "$source_dir" -B "$scratch/build" "${cmake_arguments[@]}" \
   -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_SERVER=OFF \
@@ -72,7 +88,7 @@ if [[ "$(uname -s)" == Darwin ]]; then
 fi
 cp "$source_dir/LICENSE" "$output/notices/whisper-LICENSE"
 manifest="$output/manifest.json.tmp"
-printf '{"asset_id":"whisper-runtime","revision":"%s","source_sha256":"%s","cpu_policy":"portable-static-x64-sse2-arm-native","files":[' "$revision" "$source_sha" > "$manifest"
+printf '{"asset_id":"whisper-runtime","revision":"%s","source_sha256":"%s","cpu_policy":"portable-static-x64-sse2-arm-baseline","compiler_policy":"%s","runtime_policy":"%s","files":[' "$revision" "$source_sha" "$compiler_policy" "$runtime_policy" > "$manifest"
 separator=''
 for relative in "runtime/$native_name" notices/whisper-LICENSE; do
   checksum=$(cmake -E sha256sum "$output/$relative"); checksum=${checksum%% *}

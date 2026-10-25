@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 import platform
 import queue
+import re
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -23,6 +25,63 @@ from release_common import BINARIES, ROOT, TARGETS, digest, source_identity, wri
 from release_metadata import checksums, validate_inventory
 
 MAX_FRAME = 8 * 1024 * 1024
+
+
+def windows_namespace(path: PureWindowsPath) -> PureWindowsPath:
+    """Use one comparison namespace for resolved Windows drive and UNC paths.
+
+    Rust canonicalize returns extended paths. Python preserves that prefix only
+    when its input already had one, so resolve alone does not make the two
+    spelling forms comparable. Device namespaces and unresolved parents are
+    rejected rather than converted into ordinary filesystem paths.
+    """
+    value = str(path)
+    if value[:8].casefold() == "\\\\?\\unc\\":
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    normalized = PureWindowsPath(value)
+    drive = normalized.drive
+    ordinary_drive = re.fullmatch(r"[a-zA-Z]:", drive) is not None
+    unc = drive.startswith("\\\\") and len(drive[2:].split("\\")) == 2
+    if unc:
+        server, share = drive[2:].split("\\")
+        unc = bool(server and share and server not in (".", "?"))
+    if (not normalized.is_absolute() or not (ordinary_drive or unc)
+            or ".." in normalized.parts):
+        raise ValueError("Artifact path uses an unsupported Windows namespace")
+    return normalized
+
+
+def artifact_relative_path(artifact: PurePath, root: PurePath) -> PurePath:
+    """Component-wise comparison only; callers must resolve physical paths first."""
+    if isinstance(artifact, PureWindowsPath) and isinstance(root, PureWindowsPath):
+        artifact, root = windows_namespace(artifact), windows_namespace(root)
+    if not artifact.is_absolute() or not root.is_absolute() or ".." in artifact.parts or ".." in root.parts:
+        raise ValueError("Artifact paths must be resolved and absolute")
+    try:
+        relative = artifact.relative_to(root)
+    except ValueError as error:
+        raise ValueError("Packaged helper returned an unexpected artifact path") from error
+    if not relative.parts:
+        raise ValueError("Packaged helper returned a directory instead of an artifact")
+    return relative
+
+
+def confined_artifact(artifact: Path, root: Path) -> Path:
+    """Require an existing regular file physically inside the isolated root."""
+    resolved_root = root.resolve(strict=True)
+    resolved_artifact = artifact.resolve(strict=True)
+    if not resolved_root.is_dir() or not stat.S_ISREG(resolved_artifact.stat().st_mode):
+        raise ValueError("Packaged helper artifact must be a regular file in its artifact directory")
+    relative = artifact_relative_path(resolved_artifact, resolved_root)
+    # Windows supports case-sensitive directories. PureWindowsPath comparison
+    # intentionally ignores case; verify the actual parent identity too, so a
+    # differently cased sibling cannot borrow the root's lexical namespace.
+    expected_parent = resolved_root.joinpath(*relative.parts[:-1])
+    if not resolved_artifact.parent.samefile(expected_parent):
+        raise ValueError("Packaged helper artifact is outside its physical artifact directory")
+    return resolved_artifact
 
 
 def binary_architecture(path: Path) -> str:
@@ -228,9 +287,7 @@ def smoke(output: Path, target: str) -> dict:
             artifacts = result.get("artifacts", [])
             if len(artifacts) != 1:
                 raise ValueError("Packaged document operation returned no artifact")
-            artifact = Path(artifacts[0]).resolve()
-            if not artifact.is_relative_to(scratch / "helper-data/artifacts"):
-                raise ValueError("Packaged helper returned an unexpected artifact path")
+            artifact = confined_artifact(Path(artifacts[0]), scratch / "helper-data/artifacts")
             with zipfile.ZipFile(artifact) as archive:
                 if b"Xylo native package smoke" not in archive.read("word/document.xml"):
                     raise ValueError("Packaged helper document content mismatch")
