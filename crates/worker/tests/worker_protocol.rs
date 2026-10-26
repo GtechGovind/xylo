@@ -267,6 +267,44 @@ async fn real_worker_streams_executes_and_checkpoints() {
 }
 
 #[tokio::test]
+async fn authorized_worker_does_not_read_the_platform_vault() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("sample.txt"),
+        "durable fixture contents",
+    )
+    .unwrap();
+    let (endpoint, _) = provider_fixture("file_read", json!({"path":"sample.txt"}));
+    let mut worker = Worker::start().await;
+    let session = Uuid::new_v4();
+    let mut request = turn(session, workspace.path(), endpoint);
+    request.provider.credential_ref = Some(format!("nonexistent-{}", Uuid::new_v4()));
+    worker
+        .send(
+            session,
+            WorkerCommand::RunAuthorized {
+                turn: request,
+                credential: WorkerCredential(Some("fixture-private-secret".into())),
+            },
+        )
+        .await;
+    loop {
+        let event = worker.event().await;
+        assert!(
+            !serde_json::to_string(&event)
+                .unwrap()
+                .contains("fixture-private-secret")
+        );
+        match event.payload {
+            EngineEvent::Completed { .. } => break,
+            EngineEvent::Error { message, .. } => panic!("Authorized worker failed: {message}"),
+            _ => {}
+        }
+    }
+    worker.stop().await;
+}
+
+#[tokio::test]
 async fn denied_write_never_changes_the_workspace() {
     let workspace = tempfile::tempdir().unwrap();
     let (endpoint, _requests) = provider_fixture(

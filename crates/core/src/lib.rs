@@ -233,6 +233,16 @@ impl<T> Envelope<T> {
     }
 }
 
+/// Transient worker-only authentication. Never place this in settings, turns,
+/// checkpoints, event payloads, command-line arguments, or environment variables.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WorkerCredential(pub Option<String>);
+impl std::fmt::Debug for WorkerCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkerCredential([REDACTED])")
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 #[allow(
@@ -241,11 +251,24 @@ impl<T> Envelope<T> {
 )]
 pub enum WorkerCommand {
     Hello,
-    Run { turn: TurnRequest },
+    Run {
+        turn: TurnRequest,
+    },
+    RunAuthorized {
+        turn: TurnRequest,
+        credential: WorkerCredential,
+    },
     Cancel,
-    Steer { message: String },
-    SteerDurable { guidance: SteeringRequest },
-    Approve { action_id: Uuid, allow: bool },
+    Steer {
+        message: String,
+    },
+    SteerDurable {
+        guidance: SteeringRequest,
+    },
+    Approve {
+        action_id: Uuid,
+        allow: bool,
+    },
     Shutdown,
 }
 
@@ -416,6 +439,14 @@ pub struct TeamTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_credential_debug_is_redacted() {
+        let credential = WorkerCredential(Some("fixture-secret".into()));
+        assert!(!format!("{credential:?}").contains("fixture-secret"));
+        let decoded: WorkerCredential =
+            serde_json::from_str(&serde_json::to_string(&credential).unwrap()).unwrap();
+        assert_eq!(decoded.0, credential.0);
+    }
     #[test]
     fn incompatible_protocol_is_rejected() {
         let mut message = Envelope::new(Uuid::new_v4(), None, 0, WorkerCommand::Hello);

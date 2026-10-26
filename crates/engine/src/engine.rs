@@ -49,12 +49,14 @@ pub struct HermesEngine {
     approvals: ApprovalGate,
     interrupt: InterruptController,
     steering: crate::steering::SteeringControl,
+    provider_credential: Option<workbench_core::WorkerCredential>,
 }
 
 impl HermesEngine {
     pub fn new(store: Store, paths: AppPaths, approvals: ApprovalGate) -> Self {
         Self {
             steering: crate::steering::SteeringControl::new(store.clone()),
+            provider_credential: None,
             store,
             paths,
             approvals,
@@ -66,7 +68,22 @@ impl HermesEngine {
         self.steering.notify();
     }
 
-    fn provider(config: &ProviderConfig) -> Result<Arc<dyn LlmProvider>> {
+    pub fn with_provider_credential(
+        mut self,
+        credential: workbench_core::WorkerCredential,
+    ) -> Self {
+        self.provider_credential = Some(credential);
+        self
+    }
+
+    fn provider(&self, config: &ProviderConfig) -> Result<Arc<dyn LlmProvider>> {
+        if let Some(credential) = &self.provider_credential {
+            ensure!(
+                config.credential_ref.is_none() || credential.0.is_some(),
+                "Host did not authorize the provider credential"
+            );
+            return crate::providers::build(config, credential.0.clone());
+        }
         let key = match &config.credential_ref {
             Some(reference) => CredentialVault::new(workbench_core::CREDENTIAL_SERVICE)?
                 .get(reference)?
@@ -255,7 +272,7 @@ impl EngineBackend for HermesEngine {
         let start = Instant::now();
         let provider: Arc<dyn LlmProvider> = Arc::new(crate::provider_guard::GuardedProvider::new(
             Arc::new(crate::attachments::AttachmentProvider::new(
-                Self::provider(&request.provider)?,
+                self.provider(&request.provider)?,
                 attachment_store,
                 request.session_id,
                 cancel.clone(),

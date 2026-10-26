@@ -1834,6 +1834,10 @@ impl HostState {
         mut command: WorkerCommand,
         submission: Option<crate::drafts::DraftSubmission>,
     ) -> Result<Option<crate::drafts::DraftAdmission>> {
+        ensure!(
+            !matches!(command, WorkerCommand::RunAuthorized { .. }),
+            "Authenticated worker commands are host-internal"
+        );
         let session = match &command {
             WorkerCommand::Run { turn } => turn.session_id,
             _ => match target {
@@ -1872,6 +1876,7 @@ impl HostState {
                 return Ok(None);
             }
         }
+        let mut resolved_credential = None;
         let mut pending_run = None;
         let mut admitted = None;
         let mut model_activity = None;
@@ -1951,9 +1956,11 @@ impl HostState {
                 return Ok(receipt);
             }
             turn.provider.validate()?;
-            self.accounts
-                .prepare_provider_credential(&turn.provider, self.vault.clone(), &cancellation)
-                .await?;
+            resolved_credential = Some(workbench_core::WorkerCredential(
+                self.accounts
+                    .resolve_provider_credential(&turn.provider, self.vault.clone(), &cancellation)
+                    .await?,
+            ));
             {
                 let mut workers = self.workers.lock().await;
                 ensure!(
@@ -2087,6 +2094,15 @@ impl HostState {
             worker.active.store(true, Ordering::Release);
             *worker.lease.lock().await = admitted;
             *worker.model_activity.lock().await = model_activity;
+            // Add authentication only after durable admission. Only the private
+            // worker pipe sees this envelope; the persisted TurnRequest has refs.
+            let WorkerCommand::Run { turn } = command else {
+                unreachable!()
+            };
+            let command = WorkerCommand::RunAuthorized {
+                turn,
+                credential: resolved_credential.context("Provider credential was not resolved")?,
+            };
             permit.send(Envelope::new(request_id, Some(session), 0, command));
             let cancelled = {
                 let mut starting = self.queued.lock();

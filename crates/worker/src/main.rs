@@ -139,7 +139,14 @@ async fn main() -> Result<()> {
         }
         let request_id = envelope.request_id;
         let session_id = envelope.session_id;
-        match envelope.payload {
+        let (command, credential) = match envelope.payload {
+            WorkerCommand::RunAuthorized { turn, credential } => {
+                (WorkerCommand::Run { turn }, Some(credential))
+            }
+            command => (command, None),
+        };
+        match command {
+            WorkerCommand::RunAuthorized { .. } => unreachable!(),
             WorkerCommand::Hello => {
                 send(
                     &output,
@@ -171,11 +178,11 @@ async fn main() -> Result<()> {
                     .await?;
                     continue;
                 }
-                let engine = Arc::new(HermesEngine::new(
-                    store.clone(),
-                    paths.clone(),
-                    gate.clone(),
-                ));
+                let engine = HermesEngine::new(store.clone(), paths.clone(), gate.clone());
+                let engine = Arc::new(match credential {
+                    Some(credential) => engine.with_provider_credential(credential),
+                    None => engine,
+                });
                 let cancel = CancellationToken::new();
                 let run_engine = engine.clone();
                 let run_cancel = cancel.clone();

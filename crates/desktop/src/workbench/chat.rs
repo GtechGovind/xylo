@@ -171,7 +171,8 @@ impl Workbench {
             .flex()
             .justify_center()
             .px_6()
-            .py_3()
+            .py_1()
+            .when(index > 0 && index <= self.messages.len(), |row| row.py_3())
             .child(div().w_full().max_w(px(760.)).child(content))
             .into_any_element()
     }
@@ -183,34 +184,49 @@ impl Workbench {
     ) -> AnyElement {
         let id = tool.id;
         let expanded = self.expanded_tools.contains(&id);
-        let mut action = card().w_full().max_w(px(800.)).child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(icon(IconName::Settings))
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(action_label(&tool.name)),
-                        ),
+        let mut action = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .when(tool.approval, |row| {
+                row.p_3()
+                    .rounded_lg()
+                    .bg(rgb(panel()))
+                    .border_1()
+                    .border_color(rgb(border()))
+            })
+            .child(
+                button(
+                    ("tool-detail", i),
+                    format!(
+                        "{}  {}{}",
+                        if expanded { "⌄" } else { "›" },
+                        action_label(&tool.name),
+                        if tool.approval {
+                            " · Needs approval"
+                        } else if tool.success == Some(false) {
+                            " · Failed"
+                        } else if tool.success == Some(true) {
+                            ""
+                        } else {
+                            " · Working…"
+                        }
+                    ),
                 )
-                .child(subtitle(if tool.approval {
-                    "Needs approval"
-                } else if tool.success == Some(true) {
-                    "Completed"
-                } else if tool.success == Some(false) {
-                    "Failed"
-                } else {
-                    "Working…"
+                .w_full()
+                .justify_start()
+                .text_sm()
+                .text_color(rgb(muted()))
+                .px_1()
+                .py_1()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.expanded_tools.remove(&id) {
+                        this.expanded_tools.insert(id);
+                    }
+                    cx.notify();
                 })),
-        );
+            );
         if tool.approval {
             let summary = action_description(&tool.arguments);
             action = action.child(div().text_sm().child(summary)).child(
@@ -241,23 +257,6 @@ impl Workbench {
                     ))),
             );
         }
-        action = action.child(
-            button(
-                ("tool-detail", i),
-                if expanded {
-                    "Hide details"
-                } else {
-                    "View details"
-                },
-            )
-            .text_xs()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.expanded_tools.remove(&id) {
-                    this.expanded_tools.insert(id);
-                }
-                cx.notify();
-            })),
-        );
         if expanded {
             action = action.child(
                 TextView::markdown(("tool-args", i), action_description(&tool.arguments))
@@ -595,7 +594,8 @@ impl Workbench {
 }
 fn action_label(name: &str) -> String {
     match name {
-        "read_file" | "file_read" => "Read a file".into(),
+        "read_file" | "file_read" | "files_read" => "Read a file".into(),
+        "files_list" => "List project files".into(),
         "write_file" | "file_write" | "apply_patch" => "Update project files".into(),
         "run_command" | "shell" | "terminal" | "execute" => "Run a command".into(),
         "web_search" | "search" => "Search for information".into(),

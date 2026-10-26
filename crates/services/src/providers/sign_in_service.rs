@@ -136,8 +136,18 @@ impl ChatGptSignInService {
         vault: CredentialVault,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        self.resolve_provider_credential(config, vault, cancel)
+            .await
+            .map(|_| ())
+    }
+    pub async fn resolve_provider_credential(
+        &self,
+        config: &ProviderConfig,
+        vault: CredentialVault,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>> {
         let Some(reference) = config.credential_ref.as_deref() else {
-            return Ok(());
+            return Ok(None);
         };
         let _lease = self.lease(reference, cancel).await?;
         let record = Self::load(vault.clone(), reference.into())
@@ -150,8 +160,8 @@ impl ChatGptSignInService {
             .and_then(serde_json::Value::as_str)
             != Some("chatgpt")
         {
-            ProviderCredential::parse(Some(record))?;
-            return Ok(());
+            ProviderCredential::parse(Some(record.clone()))?;
+            return Ok(Some(record));
         }
         let endpoint = normalize_provider(config)?;
         ensure!(
@@ -165,10 +175,12 @@ impl ChatGptSignInService {
                 credential.plan_usage_authorized(),
                 "ChatGPT plan usage is not authorized"
             );
-            return Ok(());
+            return Ok(Some(record));
         }
         let renewed = refresh_chatgpt_credential(&credential, cancel).await?;
-        Self::save(vault, reference.into(), renewed).await
+        let record = serde_json::to_string(&renewed)?;
+        Self::save(vault, reference.into(), renewed).await?;
+        Ok(Some(record))
     }
     pub async fn account(
         &self,
