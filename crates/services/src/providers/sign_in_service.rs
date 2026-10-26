@@ -231,51 +231,85 @@ fn summary(reference: &str, credential: &ChatGptCredential) -> ChatGptAccountSum
     }
 }
 
+/// Browsers open speculative connections that may never send a request, and
+/// other local software can connect too. Each connection is read on its own,
+/// so an idle or broken one is dropped without delaying or ending sign-in.
 async fn receive_callback(
     listener: &tokio::net::TcpListener,
     pending: &PendingChatGptSignIn,
     redirect: &str,
     cancel: &CancellationToken,
 ) -> Result<(tokio::net::TcpStream, String)> {
+    use futures_util::{StreamExt, stream::FuturesUnordered};
+    const OPEN_CONNECTIONS: usize = 16;
+    const INVALID_REQUESTS: usize = 32;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
-    for _ in 0..32 {
-        let (socket, peer) = tokio::select! {_ = cancel.cancelled()=>bail!("ChatGPT sign-in cancelled"),_ = tokio::time::sleep_until(deadline)=>bail!("ChatGPT sign-in timed out"),accepted=listener.accept()=>accepted?};
-        ensure!(peer.ip().is_loopback(), "ChatGPT callback must be local");
-        let mut input = BufReader::new(socket);
-        let mut bytes = Vec::new();
-        let mut limited = (&mut input).take(16 * 1024 + 1);
-        let length = tokio::select! {_ = cancel.cancelled()=>bail!("ChatGPT sign-in cancelled"),read=tokio::time::timeout(Duration::from_secs(10),limited.read_until(b'\n',&mut bytes))=>read.context("ChatGPT callback read timed out")??};
-        let mut socket = input.into_inner();
-        if length > 16 * 1024 {
-            reply(&mut socket, 400, "Invalid callback.").await?;
-            continue;
-        }
-        let Ok(line) = String::from_utf8(bytes) else {
-            let _ = reply(&mut socket, 400, "Invalid callback.").await;
-            continue;
-        };
-        let Some(callback) = callback_request_url(&line, redirect) else {
-            // Do not log request targets: they can contain authorization codes.
-            tracing::debug!("Ignored unrelated ChatGPT callback HTTP request");
-            let _ = reply(
-                &mut socket,
-                404,
-                "This is Xylo's sign-in callback. Return to Xylo and start sign-in again.",
-            )
-            .await;
-            continue;
-        };
-        match pending.callback(&callback) {
-            Ok(_) => return Ok((socket, callback)),
-            Err(error) => {
-                reply(&mut socket, 400, "Invalid or declined sign-in callback.").await?;
-                if pending.is_matching_denial(&callback) {
-                    return Err(error);
+    let mut reads = FuturesUnordered::new();
+    let mut invalid = 0;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => bail!("ChatGPT sign-in cancelled"),
+            _ = tokio::time::sleep_until(deadline) => bail!("ChatGPT sign-in timed out"),
+            accepted = listener.accept() => {
+                // A failed accept affects one connection, not the listener.
+                let Ok((socket, peer)) = accepted else { continue };
+                if peer.ip().is_loopback() && reads.len() < OPEN_CONNECTIONS {
+                    reads.push(request_line(socket));
+                }
+            }
+            Some(read) = reads.next() => {
+                // Idle, closed or unreadable connections carry no callback.
+                let Ok((mut socket, line)) = read else { continue };
+                let callback = line.and_then(|line| callback_request_url(&line, redirect));
+                let Some(callback) = callback else {
+                    // Do not log request targets: they can contain authorization codes.
+                    tracing::debug!("Ignored unrelated ChatGPT callback HTTP request");
+                    let _ = reply(
+                        &mut socket,
+                        404,
+                        "This is Xylo's sign-in callback. Return to Xylo and start sign-in again.",
+                    )
+                    .await;
+                    invalid += 1;
+                    ensure!(invalid < INVALID_REQUESTS, "Too many invalid ChatGPT callbacks");
+                    continue;
+                };
+                match pending.callback(&callback) {
+                    Ok(_) => return Ok((socket, callback)),
+                    Err(error) => {
+                        let _ = reply(&mut socket, 400, "Invalid or declined sign-in callback.").await;
+                        if pending.is_matching_denial(&callback) {
+                            return Err(error);
+                        }
+                        invalid += 1;
+                        ensure!(invalid < INVALID_REQUESTS, "Too many invalid ChatGPT callbacks");
+                    }
                 }
             }
         }
     }
-    bail!("Too many invalid ChatGPT callbacks")
+}
+/// The HTTP request line of one connection; `None` when it is oversized or
+/// not UTF-8. An idle or closed connection is an error for that connection only.
+async fn request_line(
+    socket: tokio::net::TcpStream,
+) -> Result<(tokio::net::TcpStream, Option<String>)> {
+    let mut input = BufReader::new(socket);
+    let mut bytes = Vec::new();
+    let length = tokio::time::timeout(
+        Duration::from_secs(10),
+        (&mut input)
+            .take(16 * 1024 + 1)
+            .read_until(b'\n', &mut bytes),
+    )
+    .await
+    .context("ChatGPT callback read timed out")??;
+    ensure!(length > 0, "ChatGPT callback connection closed");
+    let socket = input.into_inner();
+    if length > 16 * 1024 {
+        return Ok((socket, None));
+    }
+    Ok((socket, String::from_utf8(bytes).ok()))
 }
 /// Accept HTTP origin-form and absolute-form targets without relaxing the
 /// registered redirect origin/path. OAuth state and code validation follows.
@@ -405,6 +439,48 @@ mod tests {
                 .unwrap();
             assert_eq!(received, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn idle_or_closed_preconnects_do_not_block_or_end_sign_in() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let redirect = format!("http://{address}/auth/callback");
+        let pending = PendingChatGptSignIn::begin(
+            &format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            &redirect,
+            None,
+        )
+        .unwrap();
+        let state = url::Url::parse(&pending.authorization_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        let task = tokio::spawn(async move {
+            receive_callback(&listener, &pending, &redirect, &CancellationToken::new()).await
+        });
+        // Browser speculative connections: one stays open silently, one closes.
+        let _idle = tokio::net::TcpStream::connect(address).await.unwrap();
+        drop(tokio::net::TcpStream::connect(address).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(
+                format!("GET /auth/callback?code=fixture-code&scope=openid+email&state={state}&client_id=oaiapp_fixture HTTP/1.1\r\nHost: {address}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        // Well before the idle connection's 10 s read deadline.
+        let (_, received) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("an idle connection must not delay the real callback")
+            .unwrap()
+            .unwrap();
+        assert!(received.contains("code=fixture-code"));
     }
 
     #[tokio::test]
