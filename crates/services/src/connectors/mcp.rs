@@ -102,6 +102,9 @@ impl ConnectorBroker {
                         "MCP executable must be an existing absolute path"
                     );
                     let mut command = Command::new(executable);
+                    // Background pipes must not create a separate Windows console.
+                    #[cfg(windows)]
+                    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
                     command.args(&config.args).kill_on_drop(true);
                     // A single explicit credential variable avoids inferring provider-specific names.
                     // Servers requiring other names should use a user-owned launcher.

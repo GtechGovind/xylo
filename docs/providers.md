@@ -22,6 +22,27 @@ The model catalog is read-only, cancellable, capped at 2,000 distinct IDs and ei
 
 Credential records can be a plain API-key string, `{"api_key":"..."}`, `{"access_token":"...","expires_at_ms":0}` (use the actual future Unix expiry in milliseconds), or `{"access_key_id":"...","secret_access_key":"...","session_token":"..."}`. Expired records fail before dispatch. For Vertex and Entra, token provisioning/refresh is external to this application; no service-account private key or arbitrary command is executed. A raw key entered for Vertex is sent as bearer authentication. OS vault references, rather than token values, are stored with provider settings.
 
+## Custom provider setup
+
+Choose **Custom provider**, enter a name and the provider's **Base URL**, then enter
+an API key or access token without a `Bearer` prefix. **Save & use provider** saves
+the credential in the OS vault before requesting the model catalog. The model
+field may be empty during setup; select a discovered model before starting a task.
+**Discover models** also saves the current form and credential before refreshing.
+
+Custom path prefixes are preserved: a base of `https://gateway.example/api/v1/llm`
+uses `/api/v1/llm/models` for discovery and `/api/v1/llm/chat/completions` for chat.
+No gateway-specific preset or model names are embedded. Catalogs that explicitly
+advertise `supported_apis` are filtered to the selected protocol. Discovery does
+not choose the largest model or switch providers. Azure and Vertex retain manual
+model/deployment selection because they do not expose this catalog through their
+configured inference endpoints.
+
+For a failed ChatGPT browser callback, return to Xylo and start a fresh sign-in.
+The listener accepts both origin-form and absolute-form HTTP requests for the
+exact registered loopback origin and path; state, PKCE, and identity checks remain
+required. Never share the callback query or reuse a link from a previous attempt.
+
 ## Wire behavior
 
 Chat uses native messages, image URL blocks, tool-call/result IDs and structured-output fields. Responses uses input items, instructions, `function_call_output`, `store=false` and encrypted reasoning history. Anthropic uses content blocks and native tool results; signed thinking blocks retain their order and signatures. Gemini/Vertex use `contents`, `systemInstruction`, native function calls/responses, inline image data and JSON response schema; `thoughtSignature` is preserved unchanged in assistant history. Bedrock uses Converse and CRC-validated AWS EventStream framing with native image/tool blocks and signed reasoning replay. Gemini, Anthropic and Bedrock inline images must use model-supported formats. Image payload fixtures test serialization, not a model's ability to interpret their contents.

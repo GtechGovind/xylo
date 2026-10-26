@@ -81,6 +81,9 @@ impl Client {
         events: async_channel::Sender<LspEvent>,
     ) -> Result<Self> {
         let mut command = tokio::process::Command::new(executable);
+        // Background pipes must not create a separate Windows console.
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         command
             .args(args)
             .current_dir(workspace)

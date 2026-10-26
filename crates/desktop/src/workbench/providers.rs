@@ -34,7 +34,7 @@ impl Workbench {
                         })),
                 )
                 .child(
-                    button("preset-openai", "OpenAI-compatible")
+                    button("preset-openai", "Custom provider")
                         .border_1()
                         .border_color(rgb(border()))
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -138,13 +138,13 @@ impl Workbench {
         }));
         for (label, input) in [
             ("Provider name", &self.provider_name),
-            ("Endpoint", &self.endpoint),
+            ("Base URL", &self.endpoint),
             ("Model identifier", &self.model),
             (
                 if self.settings.provider.family == ApiFamily::Vertex {
                     "Access token (leave blank to keep saved token)"
                 } else {
-                    "API key (leave blank to keep saved key)"
+                    "API key or access token (leave blank to keep saved credential)"
                 },
                 &self.secret,
             ),
@@ -163,26 +163,19 @@ impl Workbench {
                     .child(Input::new(input).aria_label(label)),
             );
         }
-        page =
-            page.child(
-                form.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(primary("provider-save", "Save & use provider").on_click(
-                            cx.listener(|this, _, window, cx| this.save_provider(window, cx)),
-                        ))
-                        .child(button("provider-discover", "Discover models").on_click(
-                            cx.listener(|this, _, _, cx| match this.provider_from_form(cx) {
-                                Ok(config) => this.host_call(cx, |h| h.discover_models(config)),
-                                Err(e) => {
-                                    this.error = Some(e.to_string());
-                                    cx.notify();
-                                }
-                            }),
-                        )),
-                ),
-            );
+        page = page.child(
+            form.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(primary("provider-save", "Save & use provider").on_click(
+                        cx.listener(|this, _, window, cx| this.save_provider(window, cx)),
+                    ))
+                    .child(button("provider-discover", "Discover models").on_click(
+                        cx.listener(|this, _, window, cx| this.save_provider(window, cx)),
+                    )),
+            ),
+        );
         if !self.models.is_empty() {
             let weak = cx.entity().downgrade();
             let rows = uniform_list(

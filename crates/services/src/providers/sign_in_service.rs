@@ -242,17 +242,17 @@ async fn receive_callback(
             let _ = reply(&mut socket, 400, "Invalid callback.").await;
             continue;
         };
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3
-            || fields[0] != "GET"
-            || !fields[1].starts_with("/auth/callback?")
-            || fields[1].contains('#')
-        {
-            reply(&mut socket, 404, "Not found.").await?;
+        let Some(callback) = callback_request_url(&line, redirect) else {
+            // Do not log request targets: they can contain authorization codes.
+            tracing::debug!("Ignored unrelated ChatGPT callback HTTP request");
+            let _ = reply(
+                &mut socket,
+                404,
+                "This is Xylo's sign-in callback. Return to Xylo and start sign-in again.",
+            )
+            .await;
             continue;
-        }
-        let origin = UrlOrigin::from_redirect(redirect)?;
-        let callback = format!("{}{}", origin.0, fields[1]);
+        };
         match pending.callback(&callback) {
             Ok(_) => return Ok((socket, callback)),
             Err(error) => {
@@ -265,18 +265,44 @@ async fn receive_callback(
     }
     bail!("Too many invalid ChatGPT callbacks")
 }
-struct UrlOrigin(String);
-impl UrlOrigin {
-    fn from_redirect(redirect: &str) -> Result<Self> {
-        Ok(Self(
-            url::Url::parse(redirect)?.origin().ascii_serialization(),
-        ))
+/// Accept HTTP origin-form and absolute-form targets without relaxing the
+/// registered redirect origin/path. OAuth state and code validation follows.
+fn callback_request_url(line: &str, redirect: &str) -> Option<String> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields[0] != "GET" || !matches!(fields[2], "HTTP/1.0" | "HTTP/1.1") {
+        return None;
     }
+    let expected = url::Url::parse(redirect).ok()?;
+    let target = fields[1];
+    let callback = if target.starts_with('/') && !target.starts_with("//") {
+        url::Url::parse(&format!(
+            "{}{target}",
+            expected.origin().ascii_serialization()
+        ))
+        .ok()?
+    } else {
+        url::Url::parse(target).ok()?
+    };
+    if callback.origin() != expected.origin()
+        || callback.path() != expected.path()
+        || !callback.username().is_empty()
+        || callback.password().is_some()
+        || callback.fragment().is_some()
+        || callback.query().is_none()
+    {
+        return None;
+    }
+    Some(callback.into())
 }
+
 async fn reply(socket: &mut tokio::net::TcpStream, status: u16, text: &str) -> Result<()> {
     let response = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
-        if status == 200 { "OK" } else { "Bad Request" },
+        match status {
+            200 => "OK",
+            404 => "Not Found",
+            _ => "Bad Request",
+        },
         text.len()
     );
     tokio::time::timeout(
@@ -290,6 +316,85 @@ async fn reply(socket: &mut tokio::net::TcpStream, status: u16, text: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn callback_routes_accept_browser_and_proxy_forms_but_not_other_origins() {
+        let redirect = "http://127.0.0.1:60649/auth/callback";
+        let query =
+            "code=fixture-code&scope=openid+email&state=fixture-state&client_id=oaiapp_fixture";
+        for target in [
+            format!("/auth/callback?{query}"),
+            format!("{redirect}?{query}"),
+        ] {
+            assert_eq!(
+                callback_request_url(&format!("GET {target} HTTP/1.1\r\n"), redirect),
+                Some(format!("{redirect}?{query}"))
+            );
+        }
+        for target in [
+            "http://evil.example/auth/callback?code=x",
+            "http://127.0.0.1:60650/auth/callback?code=x",
+            "//evil.example/auth/callback?code=x",
+            "/favicon.ico",
+            "/auth/callback?code=x#fragment",
+            "/callback?code=x",
+        ] {
+            assert!(callback_request_url(&format!("GET {target} HTTP/1.1"), redirect).is_none());
+        }
+        assert!(callback_request_url("POST /auth/callback?code=x HTTP/1.1", redirect).is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_callback_reaches_exchange_after_unrelated_requests() {
+        for absolute in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let redirect = format!("http://{address}/auth/callback");
+            let pending = PendingChatGptSignIn::begin(
+                &format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                &redirect,
+                None,
+            )
+            .unwrap();
+            let authorization = url::Url::parse(&pending.authorization_url).unwrap();
+            let state = authorization
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .unwrap()
+                .1
+                .into_owned();
+            let query = format!(
+                "code=fixture-code&scope=openid+email&state={state}&client_id=oaiapp_fixture"
+            );
+            let expected = format!("{redirect}?{query}");
+            let task = tokio::spawn(async move {
+                receive_callback(&listener, &pending, &redirect, &CancellationToken::new()).await
+            });
+            let mut noise = tokio::net::TcpStream::connect(address).await.unwrap();
+            noise
+                .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = [0; 512];
+            assert!(noise.read(&mut response).await.unwrap() > 0);
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            let target = if absolute {
+                expected.clone()
+            } else {
+                format!("/auth/callback?{query}")
+            };
+            socket
+                .write_all(format!("GET {target} HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let (_, received) = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, expected);
+        }
+    }
+
     #[tokio::test]
     async fn stale_or_duplicate_state_denials_do_not_abort_the_pending_sign_in() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

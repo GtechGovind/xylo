@@ -121,6 +121,9 @@ impl HelperClient {
             .context("Locate helper workspace")?;
         ensure!(workspace.is_dir(), "Helper workspace must be a directory");
         let mut process = tokio::process::Command::new(&executable);
+        // Background pipes must not create a separate Windows console.
+        #[cfg(windows)]
+        process.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         process
             .arg("--data-dir")
             .arg(data_dir)

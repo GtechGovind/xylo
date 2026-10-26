@@ -79,6 +79,9 @@ pub async fn run(
     cancel: CancellationToken,
 ) -> Result<ProcessResult> {
     let mut command = Command::new(program);
+    // Background pipes must not create a separate Windows console.
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
         .args(args)
         .current_dir(cwd)

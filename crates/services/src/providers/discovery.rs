@@ -122,6 +122,20 @@ pub(crate) async fn discover_with_credential(
             .and_then(Value::as_array)
             .context("Provider returned no model catalog")?;
         for row in rows {
+            // Gateways may advertise multiple protocols and non-chat models.
+            // Respect explicit catalog metadata; plain OpenAI catalogs omit it.
+            let api = match config.family {
+                ApiFamily::OpenAiChat => Some("chatCompletions"),
+                ApiFamily::OpenAiResponses => Some("responses"),
+                _ => None,
+            };
+            if api.is_some_and(|api| {
+                row.get("supported_apis")
+                    .and_then(Value::as_array)
+                    .is_some_and(|apis| !apis.iter().any(|value| value.as_str() == Some(api)))
+            }) {
+                continue;
+            }
             if matches!(config.family, ApiFamily::Gemini)
                 && row
                     .get("supportedGenerationMethods")

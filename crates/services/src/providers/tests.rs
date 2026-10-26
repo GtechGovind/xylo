@@ -293,3 +293,64 @@ async fn bedrock_catalog_uses_control_plane_signed_or_bearer_auth_and_lists_infe
         server.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn custom_gateway_discovery_preserves_base_path_and_filters_explicit_api_support() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            headers.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        assert!(headers.starts_with("GET /api/v1/llm/models HTTP/1.1"));
+        assert!(
+            headers
+                .to_lowercase()
+                .contains("authorization: bearer fixture-token")
+        );
+        let body = json!({"object":"list","data":[
+            {"id":"chat-model","supported_apis":["chatCompletions","responses"],"metadata":{"context_length":8192}},
+            {"id":"response-only","supported_apis":["responses"]},
+            {"id":"plain-compatible-model"}
+        ]}).to_string();
+        socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+    });
+    let config = config(
+        ApiFamily::OpenAiChat,
+        &format!("http://{address}/api/v1/llm"),
+    );
+    assert_eq!(
+        normalize_provider(&config).unwrap().inference_url.path(),
+        "/api/v1/llm/chat/completions"
+    );
+    let models = super::discovery::discover_with_credential(
+        &config,
+        &ProviderCredential::ApiKey("fixture-token".into()),
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        ["chat-model", "plain-compatible-model"]
+    );
+    server.await.unwrap();
+}
+
+#[test]
+fn provider_setup_allows_discovery_before_selecting_a_model() {
+    let provider = ProviderConfig::default();
+    assert!(provider.validate_connection().is_ok());
+    assert!(provider.validate().is_err());
+}

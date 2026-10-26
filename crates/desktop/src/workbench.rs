@@ -898,7 +898,16 @@ impl Workbench {
                 }
             }
             HostEvent::HistoryPage(page) => self.history_page(page, cx),
-            HostEvent::Models(models) => {
+            HostEvent::Models { provider, models } => {
+                let Ok(current) = self.provider_from_form(cx) else {
+                    return;
+                };
+                if current.endpoint != provider.endpoint
+                    || current.family != provider.family
+                    || current.credential_ref != provider.credential_ref
+                {
+                    return;
+                }
                 if self.native.select_local_model {
                     self.native.select_local_model = false;
                     if let Some(model) = models.first() {
@@ -1367,7 +1376,7 @@ impl Workbench {
     fn save_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let result = (|| -> anyhow::Result<()> {
             let mut provider = self.provider_from_form(cx)?;
-            provider.validate()?;
+            provider.validate_connection()?;
             let key = self.secret.read(cx).value().to_string();
             let host = self
                 .host
@@ -1378,7 +1387,6 @@ impl Workbench {
                     .credential_ref
                     .clone()
                     .unwrap_or_else(|| format!("provider:{}", Uuid::new_v4()));
-                host.set_credential(reference.clone(), key)?;
                 provider.credential_ref = Some(reference);
             }
             self.settings.provider = provider.clone();
@@ -1392,12 +1400,13 @@ impl Workbench {
             } else {
                 self.settings.providers.push(provider);
             }
-            host.save_settings(self.settings.clone())?;
+            host.save_provider(self.settings.clone(), (!key.is_empty()).then_some(key))?;
             Ok(())
         })();
         if result.is_ok() {
             Self::set_input(&self.secret, "", window, cx);
-            self.status = "Provider saved".into();
+            self.models.clear();
+            self.status = "Saving provider and discovering models…".into();
         }
         self.result(result, cx);
     }

@@ -64,6 +64,9 @@ fn command(spec: &ProcessSpec) -> Result<Command> {
         "NUL in process arguments"
     );
     let mut cmd = Command::new(executable);
+    // Background pipes must not create a separate Windows console.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
         .envs(&spec.env)

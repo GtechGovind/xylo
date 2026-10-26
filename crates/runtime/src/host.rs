@@ -197,7 +197,10 @@ pub enum HostEvent {
         version: Option<i32>,
         diagnostics: Value,
     },
-    Models(Vec<String>),
+    Models {
+        provider: ProviderConfig,
+        models: Vec<String>,
+    },
     /// May contain a returning account hint. Open in the system browser; never log.
     AuthorizationUrl(String),
     Error(String),
@@ -278,6 +281,7 @@ enum HostCommand {
     SaveSettings(AppSettings),
     Credential(String, String),
     Models(ProviderConfig),
+    SaveProvider(AppSettings, Option<String>),
     Workspace(PathBuf),
     Read(PathBuf),
     OpenFile(Uuid, PathBuf),
@@ -578,6 +582,10 @@ impl HostClient {
     }
     pub fn set_credential(&self, reference: String, secret: String) -> Result<()> {
         self.enqueue(HostCommand::Credential(reference, secret))
+    }
+    /// Persist credentials before settings and discovery, within one host operation.
+    pub fn save_provider(&self, settings: AppSettings, secret: Option<String>) -> Result<()> {
+        self.enqueue(HostCommand::SaveProvider(settings, secret))
     }
     pub fn discover_models(&self, config: ProviderConfig) -> Result<()> {
         self.enqueue(HostCommand::Models(config))
@@ -1266,25 +1274,31 @@ impl HostState {
                     ))
                     .await?;
             }
-            HostCommand::Models(config) => {
-                self.accounts
-                    .prepare_provider_credential(
-                        &config,
-                        self.vault.clone(),
-                        &CancellationToken::new(),
-                    )
-                    .await?;
-                let models = workbench_services::providers::discover_provider_models(
-                    &config,
-                    &self.vault,
-                    &CancellationToken::new(),
-                )
-                .await?
-                .into_iter()
-                .map(|model| model.id)
-                .collect();
-                self.events.send(HostEvent::Models(models)).await?;
+            HostCommand::SaveProvider(settings, secret) => {
+                let config = settings.provider.clone();
+                config.validate_connection()?;
+                workbench_services::providers::normalize_provider(&config)?;
+                if let Some(secret) = secret {
+                    let reference = config
+                        .credential_ref
+                        .clone()
+                        .context("Missing credential reference")?;
+                    let vault = self.vault.clone();
+                    tokio::task::spawn_blocking(move || vault.set(&reference, &secret)).await??;
+                }
+                let value = settings.clone();
+                let store = self.store.clone();
+                tokio::task::spawn_blocking(move || store.save_settings(&value)).await??;
+                *self.settings.lock().await = settings.clone();
+                self.events.send(HostEvent::Settings(settings)).await?;
+                if !matches!(
+                    config.family,
+                    workbench_core::ApiFamily::Azure | workbench_core::ApiFamily::Vertex
+                ) {
+                    self.discover_models(config).await?;
+                }
             }
+            HostCommand::Models(config) => self.discover_models(config).await?,
             HostCommand::Workspace(path) => {
                 let requested = path;
                 let path = tokio::fs::canonicalize(&requested).await?;
@@ -2113,9 +2127,32 @@ impl HostState {
         Ok(None)
     }
 
+    async fn discover_models(&self, config: ProviderConfig) -> Result<()> {
+        let cancel = CancellationToken::new();
+        self.accounts
+            .prepare_provider_credential(&config, self.vault.clone(), &cancel)
+            .await?;
+        let models =
+            workbench_services::providers::discover_provider_models(&config, &self.vault, &cancel)
+                .await?
+                .into_iter()
+                .map(|model| model.id)
+                .collect();
+        self.events
+            .send(HostEvent::Models {
+                provider: config,
+                models,
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn spawn_worker(&self, session: Uuid) -> Result<WorkerHandle> {
         let executable = native_executable("workbench-worker")?;
-        let mut child = tokio::process::Command::new(executable)
+        let mut command = tokio::process::Command::new(executable);
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: worker uses private pipes.
+        let mut child = command
             .arg("--data-dir")
             .arg(&self.paths.data)
             .stdin(Stdio::piped())

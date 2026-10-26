@@ -91,6 +91,11 @@ impl ProviderConfig {
             !self.model.trim().is_empty(),
             "Choose a model in Providers before starting a task"
         );
+        self.validate_connection()
+    }
+
+    /// Validate provider setup before a model has been discovered or selected.
+    pub fn validate_connection(&self) -> Result<()> {
         ensure!(
             self.context_tokens >= 1024 && self.output_tokens < self.context_tokens,
             "Output tokens must fit inside the context budget (minimum context: 1024)"

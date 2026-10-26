@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 extern crate gpui_kit as gpui;
 mod startup;
 mod state;
