@@ -237,6 +237,7 @@ pub struct Workbench {
     context: Entity<InputState>,
     output: Entity<InputState>,
     models: Vec<String>,
+    model_context_limits: std::collections::BTreeMap<String, u32>,
     memory_query: Entity<InputState>,
     memory_content: Entity<TextareaState>,
     memories: Vec<MemoryRecord>,
@@ -411,6 +412,7 @@ impl Workbench {
             context: input("Context tokens", window, cx),
             output: input("Output tokens", window, cx),
             models: vec![],
+            model_context_limits: Default::default(),
             memory_query: input("Search project memory", window, cx),
             memory_content,
             memories: vec![],
@@ -642,6 +644,8 @@ impl Workbench {
         input.update(cx, |s, cx| s.set_value(value, window, cx));
     }
     fn provider_form(&mut self, p: &ProviderConfig, window: &mut Window, cx: &mut Context<Self>) {
+        self.models.clear();
+        self.model_context_limits.clear();
         Self::set_input(&self.secret, "", window, cx);
         Self::set_input(&self.provider_name, p.name.clone(), window, cx);
         Self::set_input(&self.endpoint, p.endpoint.clone(), window, cx);
@@ -898,7 +902,11 @@ impl Workbench {
                 }
             }
             HostEvent::HistoryPage(page) => self.history_page(page, cx),
-            HostEvent::Models { provider, models } => {
+            HostEvent::Models {
+                provider,
+                models,
+                context_limits,
+            } => {
                 let Ok(current) = self.provider_from_form(cx) else {
                     return;
                 };
@@ -917,6 +925,22 @@ impl Workbench {
                         self.host_call(cx, |h| h.save_settings(settings));
                     }
                 }
+                if let Some(limit) = context_limits.get(&self.settings.provider.model) {
+                    self.settings.provider.context_tokens = *limit;
+                    self.settings.provider.output_tokens =
+                        self.settings.provider.output_tokens.min(*limit / 4);
+                    Self::set_input(
+                        &self.output,
+                        self.settings.provider.output_tokens.to_string(),
+                        window,
+                        cx,
+                    );
+                    Self::set_input(&self.context, limit.to_string(), window, cx);
+                    self.settings.remember_model(self.settings.provider.clone());
+                    let settings = self.settings.clone();
+                    self.host_call(cx, |host| host.save_settings(settings));
+                }
+                self.model_context_limits = context_limits;
                 self.status = format!("Discovered {} models", models.len());
                 self.models = models;
             }
@@ -1376,6 +1400,10 @@ impl Workbench {
     fn save_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let result = (|| -> anyhow::Result<()> {
             let mut provider = self.provider_from_form(cx)?;
+            if let Some(limit) = self.model_context_limits.get(&provider.model) {
+                provider.context_tokens = *limit;
+                provider.output_tokens = provider.output_tokens.min(*limit / 4);
+            }
             provider.validate_connection()?;
             let key = self.secret.read(cx).value().to_string();
             let host = self
@@ -1390,16 +1418,7 @@ impl Workbench {
                 provider.credential_ref = Some(reference);
             }
             self.settings.provider = provider.clone();
-            if let Some(p) = self
-                .settings
-                .providers
-                .iter_mut()
-                .find(|p| p.name == provider.name)
-            {
-                *p = provider;
-            } else {
-                self.settings.providers.push(provider);
-            }
+            self.settings.remember_model(provider);
             host.save_provider(self.settings.clone(), (!key.is_empty()).then_some(key))?;
             Ok(())
         })();
@@ -1427,6 +1446,7 @@ impl Workbench {
         self.settings.provider = p.clone();
         self.provider_form(&p, window, cx);
         self.models.clear();
+        self.model_context_limits.clear();
         cx.notify();
     }
     fn save_connector(&mut self, cx: &mut Context<Self>) {
@@ -1582,7 +1602,8 @@ impl Render for Workbench {
                     .text_sm()
                     .flex()
                     .justify_between()
-                    .child(product_error(error))
+                    .gap_3()
+                    .child(div().flex_1().min_w_0().child(product_error(error)))
                     .child(button("dismiss-error", "Dismiss").on_click(cx.listener(
                         |this, _, _, cx| {
                             this.error = None;
@@ -1718,7 +1739,11 @@ impl Render for Workbench {
 /// Keep setup and task errors actionable; detailed service errors stay in logs.
 fn product_error(error: &str) -> String {
     let lower = error.to_lowercase();
-    if lower.contains("sha256") || lower.contains("checksum") {
+    if lower.contains("http 401") {
+        "The provider rejected your credentials. Check the access token and any additional authentication required by your provider, then retry.".into()
+    } else if lower.contains("context budget exceeded") {
+        "This request still exceeds the model's context window after compaction. Reduce large attachments or choose a model with a larger context window.".into()
+    } else if lower.contains("sha256") || lower.contains("checksum") {
         "The download could not be verified. Please retry.".into()
     } else if lower.contains("clang") || lower.contains("cmake") || lower.contains("cargo build") {
         "This feature could not be prepared on your computer. Try another available package.".into()

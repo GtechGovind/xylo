@@ -200,6 +200,7 @@ pub enum HostEvent {
     Models {
         provider: ProviderConfig,
         models: Vec<String>,
+        context_limits: std::collections::BTreeMap<String, u32>,
     },
     /// May contain a returning account hint. Open in the system browser; never log.
     AuthorizationUrl(String),
@@ -2132,16 +2133,19 @@ impl HostState {
         self.accounts
             .prepare_provider_credential(&config, self.vault.clone(), &cancel)
             .await?;
-        let models =
+        let catalog =
             workbench_services::providers::discover_provider_models(&config, &self.vault, &cancel)
-                .await?
-                .into_iter()
-                .map(|model| model.id)
-                .collect();
+                .await?;
+        let context_limits = catalog
+            .iter()
+            .filter_map(|m| m.context_tokens.map(|n| (m.id.clone(), n)))
+            .collect();
+        let models = catalog.into_iter().map(|m| m.id).collect();
         self.events
             .send(HostEvent::Models {
                 provider: config,
                 models,
+                context_limits,
             })
             .await?;
         Ok(())

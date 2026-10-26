@@ -186,16 +186,43 @@ impl Workbench {
                         range
                             .filter_map(|i| {
                                 let model = view.models.get(i)?.clone();
+                                let saved = view.settings.providers.iter().any(|p| {
+                                    p.model == model
+                                        && p.endpoint == view.settings.provider.endpoint
+                                        && p.family == view.settings.provider.family
+                                        && p.credential_ref == view.settings.provider.credential_ref
+                                });
                                 Some(
-                                    button(("model", i), model.clone())
-                                        .h(px(34.))
-                                        .w_full()
-                                        .justify_start()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            Self::set_input(&this.model, model.clone(), window, cx);
-                                            cx.notify();
-                                        }))
-                                        .into_any_element(),
+                                    button(
+                                        ("model", i),
+                                        format!("{}  {}", if saved { "✓" } else { "+" }, model),
+                                    )
+                                    .h(px(34.))
+                                    .w_full()
+                                    .justify_start()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let mut provider = this.settings.provider.clone();
+                                        provider.model = model.clone();
+                                        if let Some(limit) = this.model_context_limits.get(&model) {
+                                            provider.context_tokens = *limit;
+                                            provider.output_tokens =
+                                                provider.output_tokens.min(*limit / 4);
+                                        }
+                                        if saved {
+                                            this.settings.providers.retain(|p| {
+                                                !(p.model == provider.model
+                                                    && p.endpoint == provider.endpoint
+                                                    && p.family == provider.family
+                                                    && p.credential_ref == provider.credential_ref)
+                                            });
+                                        } else {
+                                            this.settings.remember_model(provider);
+                                        }
+                                        let settings = this.settings.clone();
+                                        this.host_call(cx, |host| host.save_settings(settings));
+                                        cx.notify();
+                                    }))
+                                    .into_any_element(),
                                 )
                             })
                             .collect()
@@ -208,14 +235,14 @@ impl Workbench {
             page = page.child(
                 card()
                     .child(subtitle(format!(
-                        "AVAILABLE MODELS · {}",
+                        "Choose models for quick switching · {}",
                         self.models.len()
                     )))
                     .child(rows),
             );
         }
         if !self.settings.providers.is_empty() {
-            let mut saved = card().child(subtitle("SAVED PROVIDERS"));
+            let mut saved = card().child(subtitle("YOUR MODELS"));
             for (i, provider) in self.settings.providers.iter().enumerate() {
                 let provider = provider.clone();
                 saved = saved.child(

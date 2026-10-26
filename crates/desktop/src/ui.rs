@@ -70,7 +70,7 @@ pub fn hover() -> u32 {
     color(0xe9eaef, 0x353944)
 }
 pub fn message_bg() -> u32 {
-    color(0xe9efff, 0x27364d)
+    color(0xe9eaef, 0x292c34)
 }
 fn button_base(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_kit::base::Button {
     let label: SharedString = label.into();

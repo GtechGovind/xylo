@@ -1,5 +1,9 @@
 use super::*;
-use gpui_kit::component::IconName;
+use gpui_kit::component::{
+    IconName,
+    button::Button as MenuButton,
+    menu::{DropdownMenu, PopupMenuItem},
+};
 
 const ASSISTANTS: [(&str, &str, &str, IconName); 6] = [
     (
@@ -100,40 +104,27 @@ impl Workbench {
                         .on_click(cx.listener(|view, _, _, cx| view.load_older(cx)))
                         .into_any_element()
                 } else {
-                    subtitle("Beginning of conversation").into_any_element()
+                    div().into_any_element()
                 })
                 .into_any_element()
         } else if let Some(message) = self.messages.get(index - 1) {
             let user = message.role == "user";
             let content = message.content.clone();
-            div()
-                .w_full()
+            let body = div()
                 .flex()
                 .flex_col()
                 .gap_2()
-                .p_4()
-                .rounded_xl()
-                .bg(rgb(if user { message_bg() } else { panel() }))
-                .when(self.history_message_highlight(message.id), |row| {
-                    row.border_1().border_color(rgb(0x8f82e8))
+                .when(user, |row| {
+                    row.max_w(px(600.))
+                        .px_4()
+                        .py_3()
+                        .rounded_xl()
+                        .bg(rgb(message_bg()))
                 })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(if user { "You" } else { "Xylo" }),
-                        )
-                        .child(button(("copy-message", index), "Copy").text_xs().on_click(
-                            move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(content.clone()))
-                            },
-                        )),
-                )
+                .when(!user, |row| row.w_full().py_2())
+                .when(self.history_message_highlight(message.id), |row| {
+                    row.border_1().border_color(rgb(accent()))
+                })
                 .child(
                     TextView::markdown(
                         SharedString::from(message.id.to_string()),
@@ -141,7 +132,22 @@ impl Workbench {
                     )
                     .selectable(true),
                 )
-                .child(self.message_images(message, cx))
+                .child(self.message_images(message, cx));
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .when(user, |row| row.items_end())
+                .child(body)
+                .child(
+                    button(("copy-message", index), "Copy")
+                        .text_xs()
+                        .text_color(rgb(muted()))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(content.clone()))
+                        }),
+                )
                 .into_any_element()
         } else if let Some(turn) = self.turns.get(&self.session) {
             let offset = index - self.messages.len() - 1;
@@ -165,8 +171,8 @@ impl Workbench {
             .flex()
             .justify_center()
             .px_6()
-            .pb_5()
-            .child(div().w_full().max_w(px(800.)).child(content))
+            .py_3()
+            .child(div().w_full().max_w(px(760.)).child(content))
             .into_any_element()
     }
     fn tool_row(
@@ -408,6 +414,47 @@ impl Workbench {
             )
             .into_any_element()
     }
+    fn model_switcher(&self, label: String, cx: &Context<Self>) -> AnyElement {
+        let weak = cx.entity().downgrade();
+        let saved = self.settings.providers.clone();
+        let active = self.settings.provider.clone();
+        MenuButton::new("composer-model")
+            .label(label)
+            .icon(IconName::ChevronDown)
+            .max_w(px(200.))
+            .dropdown_menu(move |mut menu, _, _| {
+                menu = menu.label("Your models");
+                for provider in saved.iter().filter(|p| !p.model.is_empty()) {
+                    let provider = provider.clone();
+                    let checked = provider.endpoint == active.endpoint
+                        && provider.model == active.model
+                        && provider.family == active.family;
+                    let view = weak.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(format!("{} · {}", provider.model, provider.name))
+                            .checked(checked)
+                            .on_click(move |_, window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.settings.provider = provider.clone();
+                                    this.provider_form(&provider, window, cx);
+                                    let settings = this.settings.clone();
+                                    this.host_call(cx, |host| host.save_settings(settings));
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                let view = weak.clone();
+                menu.separator()
+                    .item(
+                        PopupMenuItem::new("Manage models…").on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| this.navigate(Page::Providers, cx));
+                        }),
+                    )
+            })
+            .into_any_element()
+    }
+
     fn prompt_box(&self, cx: &mut Context<Self>) -> AnyElement {
         let model = if self.settings.provider.model.is_empty() {
             "Select model".to_string()
@@ -426,7 +473,7 @@ impl Workbench {
             .unwrap_or_else(|| "Work in a project".into());
         div()
             .w_full()
-            .max_w(px(800.))
+            .max_w(px(760.))
             .when(!self.speech.transcript.is_empty(), |panel| {
                 panel.child(
                     button("review-voice-transcript", "Review voice transcript")
@@ -473,13 +520,7 @@ impl Workbench {
                             .h(px(32.))
                             .child(self.attachment_controls(cx))
                             .child(div().flex_1().min_w_0())
-                            .child(
-                                compact_selector("composer-model", model)
-                                    .max_w(px(180.))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.navigate(Page::Providers, cx)
-                                    })),
-                            )
+                            .child(self.model_switcher(model, cx))
                             .child(
                                 compact_selector(
                                     "permission-mode",

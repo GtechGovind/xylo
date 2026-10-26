@@ -345,6 +345,7 @@ async fn custom_gateway_discovery_preserves_base_path_and_filters_explicit_api_s
             .collect::<Vec<_>>(),
         ["chat-model", "plain-compatible-model"]
     );
+    assert_eq!(models[0].context_tokens, Some(8192));
     server.await.unwrap();
 }
 
@@ -353,4 +354,21 @@ fn provider_setup_allows_discovery_before_selecting_a_model() {
     let provider = ProviderConfig::default();
     assert!(provider.validate_connection().is_ok());
     assert!(provider.validate().is_err());
+}
+
+#[test]
+fn saved_models_survive_switches_and_roundtrip_without_duplicates() {
+    let mut settings = workbench_core::AppSettings::default();
+    let first = config(ApiFamily::OpenAiChat, "https://gateway.example/v1");
+    let mut second = first.clone();
+    second.model = "second-model".into();
+    settings.remember_model(first.clone());
+    settings.remember_model(second.clone());
+    settings.remember_model(first.clone());
+    settings.provider = second;
+    let saved = serde_json::to_vec(&settings).unwrap();
+    let restored: workbench_core::AppSettings = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(restored.providers.len(), 2);
+    assert_eq!(restored.provider.model, "second-model");
+    assert_eq!(restored.providers[0].model, first.model);
 }

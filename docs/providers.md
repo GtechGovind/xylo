@@ -82,3 +82,27 @@ Primary protocol and authentication sources:
 - [Vertex inference REST API](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference), [Google Cloud authentication](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/quickstart).
 - [Azure endpoint, token scope and deployment-name rules](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/how-to/switching-endpoints).
 - [Bedrock ConverseStream](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html), [Bedrock API keys](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys-use.html), [foundation models](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_ListFoundationModels.html), [inference profiles](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_ListInferenceProfiles.html), [AWS request signing](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html).
+
+## Saved models and context pressure
+
+Select several discovered models to add them to **Your models**. The composer
+menu switches between saved provider/model configurations without opening settings;
+switching affects the next submitted turn, not a turn already running. Each model
+keeps its endpoint, API family, credential reference, and context budget.
+
+Discovery uses reported `context_window`, `context_length`, `inputTokenLimit`, or
+`metadata.context_length` values. A catalog that omits capacity retains the existing
+configured fallback; the app does not invent a model limit. Refresh discovery to
+update the active model's reported limit.
+
+Before a provider call, context pressure at 80% triggers bounded, extractive
+compaction of earlier turns and large plain-text tool observations. Original
+history and action results remain stored. The current user request, system
+instructions, tool-call/result IDs, and signed provider blocks are preserved.
+Excerpts explicitly mark omitted content; this is not an LLM-generated semantic
+summary and can lose detail. A single oversized current request, images, signed
+blocks, or tool schemas can still exceed capacity and require user action.
+
+A catalog HTTP 401 means authentication was rejected by the provider. Check the
+current token and the service's additional authentication requirements. The app
+does not silently fall back to another provider.

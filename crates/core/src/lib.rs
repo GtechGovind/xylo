@@ -158,6 +158,25 @@ impl Default for UiPreferences {
     }
 }
 
+impl AppSettings {
+    /// Keep distinct model choices for the same endpoint without duplicates.
+    pub fn remember_model(&mut self, provider: ProviderConfig) {
+        if provider.model.is_empty() {
+            return;
+        }
+        if let Some(existing) = self.providers.iter_mut().find(|p| {
+            p.endpoint == provider.endpoint
+                && p.family == provider.family
+                && p.model == provider.model
+                && p.credential_ref == provider.credential_ref
+        }) {
+            *existing = provider;
+        } else {
+            self.providers.push(provider);
+        }
+    }
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {

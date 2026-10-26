@@ -10,6 +10,8 @@ use workbench_core::{ApiFamily, ProviderConfig};
 pub struct ProviderModel {
     pub id: String,
     pub display_name: String,
+    #[serde(default)]
+    pub context_tokens: Option<u32>,
 }
 
 /// Account-specific catalog, bounded to eight pages / 2,000 models. Discovery is
@@ -183,7 +185,21 @@ pub(crate) async fn discover_with_credential(
                     .and_then(Value::as_str)
                     .unwrap_or(&id)
                     .to_owned();
-                output.push(ProviderModel { id, display_name });
+                let context_tokens = [
+                    "/context_window",
+                    "/context_length",
+                    "/inputTokenLimit",
+                    "/metadata/context_length",
+                ]
+                .iter()
+                .find_map(|path| row.pointer(path).and_then(Value::as_u64))
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n >= 1024);
+                output.push(ProviderModel {
+                    id,
+                    display_name,
+                    context_tokens,
+                });
             }
             if output.len() >= 2000 {
                 return Ok(output);
@@ -285,6 +301,7 @@ async fn bedrock_catalog(
                 };
                 if seen.insert(id.to_owned()) {
                     output.push(ProviderModel {
+                        context_tokens: None,
                         id: id.into(),
                         display_name: row[if profiles {
                             "inferenceProfileName"

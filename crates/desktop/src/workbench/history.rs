@@ -21,7 +21,7 @@ pub(super) struct ChatHistory {
 }
 impl ChatHistory {
     fn new() -> Self {
-        let list = ListState::new(0, ListAlignment::Bottom, px(500.));
+        let list = ListState::new(0, ListAlignment::Top, px(500.));
         list.set_follow_mode(FollowMode::Tail);
         Self {
             list,
