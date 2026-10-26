@@ -8,7 +8,10 @@ actions!(
         NewConversation,
         FindConversation,
         FindProject,
-        ToggleProjectTerminal
+        ToggleProjectTerminal,
+        AllowPendingAction,
+        DenyOrStop,
+        FocusComposer
     ]
 );
 pub(super) fn bind(cx: &mut App) {
@@ -36,5 +39,15 @@ pub(super) fn bind(cx: &mut App) {
             ToggleProjectTerminal,
             Some("Workbench"),
         ),
+        // Text inputs own plain Enter/Escape; these chords still reach the
+        // workbench while the composer is focused.
+        KeyBinding::new(
+            &format!("{command}-shift-enter"),
+            AllowPendingAction,
+            Some("Workbench"),
+        ),
+        KeyBinding::new("escape", DenyOrStop, Some("Workbench")),
+        KeyBinding::new(&format!("{command}-."), DenyOrStop, Some("Workbench")),
+        KeyBinding::new(&format!("{command}-l"), FocusComposer, Some("Workbench")),
     ]);
 }

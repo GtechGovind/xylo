@@ -463,10 +463,18 @@ fn product_mode_is_opt_in_and_statuses_do_not_expose_engine_contracts() {
     assert!(!AgentConfig::default().native_product_finalization);
     assert_eq!(
         product_status("Retrying model request after HTTP 429"),
-        "Retrying…"
+        "Retrying the model request…"
+    );
+    assert_eq!(
+        product_status("Rate limit reached; waiting"),
+        "Waiting for the provider's rate limit…"
     );
     assert_eq!(
         product_status("Context compaction removed 14000 tokens"),
+        "Condensing earlier context…"
+    );
+    assert_eq!(
+        product_status("Context pressure at 85%"),
         "Preparing conversation…"
     );
     assert_eq!(product_status("Calling internal_tool_name"), "Working…");

@@ -5,10 +5,21 @@ use workbench_core::{ChatMessage, EngineEvent, Usage, now_ms};
 pub struct ToolCard {
     pub id: Uuid,
     pub name: String,
-    pub arguments: String,
+    /// What the action does, as presented by the engine (for changes, a diff).
+    pub input: serde_json::Value,
     pub result: Option<String>,
     pub approval: bool,
+    /// What "always allow" would cover, when the action can be remembered.
+    pub rule: Option<String>,
     pub success: Option<bool>,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+}
+impl ToolCard {
+    /// The parsed result envelope, when the result is structured.
+    pub fn output(&self) -> Option<serde_json::Value> {
+        serde_json::from_str(self.result.as_deref()?).ok()
+    }
 }
 #[derive(Default)]
 pub struct TurnState {
@@ -16,13 +27,17 @@ pub struct TurnState {
     pub text: String,
     pub tools: Vec<ToolCard>,
     pub status: String,
+    pub error: Option<String>,
     pub usage: Usage,
     pub started_at: Option<i64>,
     pub first_token_ms: Option<u64>,
 }
 impl TurnState {
+    /// Actions currently waiting for the user's decision.
+    pub fn pending_approvals(&self) -> impl Iterator<Item = &ToolCard> {
+        self.tools.iter().filter(|tool| tool.approval)
+    }
     pub fn apply(&mut self, event: EngineEvent) {
-        let is_approval = matches!(&event, EngineEvent::ApprovalRequired { .. });
         match event {
             EngineEvent::Started => {
                 self.running = true;
@@ -30,7 +45,8 @@ impl TurnState {
                 self.first_token_ms = None;
                 self.text.clear();
                 self.tools.clear();
-                self.status = "Working".into();
+                self.error = None;
+                self.status = "Working…".into();
             }
             EngineEvent::Delta { text } => {
                 if self.first_token_ms.is_none() {
@@ -43,26 +59,13 @@ impl TurnState {
                 action_id,
                 name,
                 arguments,
-            }
-            | EngineEvent::ApprovalRequired {
+            } => self.card(action_id, name, arguments, false, None),
+            EngineEvent::ApprovalRequired {
                 action_id,
                 name,
                 arguments,
-            } => {
-                let approval = is_approval;
-                if let Some(card) = self.tools.iter_mut().find(|t| t.id == action_id) {
-                    card.approval = approval;
-                } else {
-                    self.tools.push(ToolCard {
-                        id: action_id,
-                        name,
-                        arguments: serde_json::to_string_pretty(&arguments).unwrap_or_default(),
-                        result: None,
-                        approval,
-                        success: None,
-                    });
-                }
-            }
+                rule,
+            } => self.card(action_id, name, arguments, true, rule),
             EngineEvent::ToolFinished {
                 action_id,
                 result,
@@ -73,6 +76,7 @@ impl TurnState {
                     t.approval = false;
                     t.result = Some(result);
                     t.success = Some(success);
+                    t.finished_at = Some(now_ms());
                 }
             }
             EngineEvent::Completed { text, usage } => {
@@ -80,16 +84,53 @@ impl TurnState {
                 self.usage = usage;
                 self.running = false;
                 self.status = "Completed".into();
+                self.settle_tools();
             }
             EngineEvent::Cancelled => {
                 self.running = false;
                 self.status = "Cancelled".into();
+                self.settle_tools();
             }
             EngineEvent::Error { message, .. } => {
                 self.running = false;
-                self.status = message;
+                self.status = message.clone();
+                self.error = Some(message);
+                self.settle_tools();
             }
             EngineEvent::Ready { .. } | EngineEvent::Steering { .. } => {}
+        }
+    }
+    fn card(
+        &mut self,
+        id: Uuid,
+        name: String,
+        input: serde_json::Value,
+        approval: bool,
+        rule: Option<String>,
+    ) {
+        if let Some(card) = self.tools.iter_mut().find(|t| t.id == id) {
+            card.approval = approval;
+            if rule.is_some() {
+                card.rule = rule;
+            }
+        } else {
+            self.tools.push(ToolCard {
+                id,
+                name,
+                input,
+                result: None,
+                approval,
+                rule,
+                success: None,
+                started_at: now_ms(),
+                finished_at: None,
+            });
+        }
+    }
+    /// A finished turn has no pending decisions; unfinished cards stop spinning.
+    fn settle_tools(&mut self) {
+        for tool in &mut self.tools {
+            tool.approval = false;
         }
     }
 }
@@ -119,6 +160,7 @@ mod tests {
             action_id: id,
             name: "write_file".into(),
             arguments: serde_json::json!({}),
+            rule: None,
         });
         assert_eq!(state.tools.len(), 1);
         assert!(state.tools[0].approval);

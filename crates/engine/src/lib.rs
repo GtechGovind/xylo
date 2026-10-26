@@ -2,6 +2,7 @@
 
 mod attachments;
 mod engine;
+mod prompt;
 mod provider_guard;
 mod providers;
 mod steering;

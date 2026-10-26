@@ -255,8 +255,8 @@ async fn child_call_identity_does_not_reuse_sibling_result() {
     .unwrap()
     .unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(&second).unwrap()["summary"],
-        "second"
+        serde_json::from_str::<Value>(&second).unwrap()["summary"]["content"],
+        "     1\tsecond\n"
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -283,11 +283,51 @@ async fn execution_error_after_running_always_finishes_the_journal_state() {
             .is_empty()
     );
 }
+fn needles(directory: &std::path::Path) {
+    let body: String = (0..2000)
+        .map(|i| format!("needle {i} {}\n", "z".repeat(120)))
+        .collect();
+    std::fs::write(directory.join("large.txt"), body).unwrap();
+}
+async fn run(broker: &Arc<ToolBroker>, call: &str, name: &str, arguments: Value) -> Result<String> {
+    let task = broker.clone();
+    let (call, name) = (call.to_owned(), name.to_owned());
+    tokio::task::spawn_blocking(move || task.execute(&call, &name, arguments))
+        .await
+        .unwrap()
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn presentation_failure_does_not_erase_a_completed_result() {
     let (directory, broker, _events) = fixture(PermissionMode::ReadOnly);
-    std::fs::write(directory.path().join("large.txt"), "x".repeat(100_000)).unwrap();
+    needles(directory.path());
     std::fs::remove_dir_all(&broker.artifacts).unwrap();
+    let task = broker.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        task.execute(
+            "search-big",
+            "search_project",
+            json!({"query":"needle","path":"large.txt","max_results":2000}),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let value = serde_json::from_str::<Value>(&output).unwrap();
+    assert!(value.get("presentation_error").is_some());
+    assert!(
+        value["summary"]["results"]
+            .as_str()
+            .unwrap()
+            .contains("needle 0 ")
+    );
+    let action = broker.journaled("search-big").unwrap().unwrap();
+    assert_eq!(action.state, "succeeded");
+    assert_eq!(action.result.unwrap()["summary"]["matches"], 2000);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_results_reach_the_model_while_events_stay_small() {
+    let (directory, broker, mut events) = fixture(PermissionMode::ReadOnly);
+    needles(directory.path());
     let task = broker.clone();
     let output = tokio::task::spawn_blocking(move || {
         task.execute("read-big", "file_read", json!({"path":"large.txt"}))
@@ -295,17 +335,188 @@ async fn presentation_failure_does_not_erase_a_completed_result() {
     .await
     .unwrap()
     .unwrap();
+    let value = serde_json::from_str::<Value>(&output).unwrap();
+    let content = value["summary"]["content"].as_str().unwrap();
+    assert!(content.starts_with("     1\tneedle 0 "));
+    assert_eq!(value["summary"]["truncated"], true);
+    let next = value["summary"]["next_offset"].as_u64().unwrap();
+    while let Ok(event) = events.try_recv() {
+        if let EngineEvent::ToolFinished { result, .. } = event {
+            assert!(result.len() <= 8192);
+        }
+    }
+    let rest = run(
+        &broker,
+        "read-rest",
+        "file_read",
+        json!({"path":"large.txt","offset":next}),
+    )
+    .await
+    .unwrap();
+    assert!(rest.contains(&format!("needle {} ", next - 1)));
+    // Oversized observations keep both ends and a readable saved full result.
+    let search = run(
+        &broker,
+        "search-big",
+        "search_project",
+        json!({"query":"needle","path":"large.txt","max_results":2000}),
+    )
+    .await
+    .unwrap();
+    assert!(search.len() <= 64 * 1024);
+    let search: Value = serde_json::from_str(&search).unwrap();
+    assert_eq!(search["truncated"], true);
+    let full = search["full_result"].as_str().unwrap().to_owned();
+    let saved: Value = serde_json::from_str(
+        &run(
+            &broker,
+            "read-full",
+            "file_read",
+            json!({"path":full.clone()}),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
     assert!(
-        serde_json::from_str::<Value>(&output)
+        saved["summary"]["content"]
+            .as_str()
             .unwrap()
-            .get("presentation_error")
-            .is_some()
+            .contains("needle 0 ")
     );
-    let action = broker.journaled("read-big").unwrap().unwrap();
-    assert_eq!(action.state, "succeeded");
+    let total = saved["summary"]["total_lines"].as_u64().unwrap();
+    assert!(total > 2000);
+    let end = run(
+        &broker,
+        "read-full-end",
+        "file_read",
+        json!({"path":full,"offset":total - 3}),
+    )
+    .await
+    .unwrap();
+    assert!(end.contains("needle 1999"), "{end}");
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failing_commands_are_definitive_observations_with_their_output() {
+    let (directory, broker, _events) = fixture(PermissionMode::Auto);
+    let _ = directory;
+    let error = run(
+        &broker,
+        "fails",
+        "shell_command",
+        json!({"command":"git definitely-not-a-subcommand"}),
+    )
+    .await
+    .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("\"exit_code\":1"), "{text}");
+    assert!(text.contains("definitely-not-a-subcommand"), "{text}");
+    assert_eq!(broker.journaled("fails").unwrap().unwrap().state, "failed");
+    let missing = run(
+        &broker,
+        "missing",
+        "run_command",
+        json!({"program":"definitely-not-a-real-program-xyz","args":[]}),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{missing:#}").contains("was not found"));
     assert_eq!(
-        action.result.unwrap()["summary"].as_str().unwrap().len(),
-        100_000
+        broker.journaled("missing").unwrap().unwrap().state,
+        "failed"
+    );
+    let ok = run(
+        &broker,
+        "works",
+        "run_command",
+        json!({"program":"git","args":["--version"]}),
+    )
+    .await
+    .unwrap();
+    assert!(ok.contains("git version"));
+    assert!(
+        broker
+            .store
+            .unresolved_actions(broker.request.session_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_edits_apply_without_prompts_and_inapplicable_edits_leave_no_intent() {
+    let (directory, broker, mut events) = fixture(PermissionMode::AcceptEdits);
+    std::fs::write(directory.path().join("lib.rs"), "fn a() {}\n").unwrap();
+    let output = run(
+        &broker,
+        "edit",
+        "file_edit",
+        json!({"path":"lib.rs","old_string":"fn a()","new_string":"fn b()"}),
+    )
+    .await
+    .unwrap();
+    assert!(output.contains("+fn b() {}"));
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("lib.rs")).unwrap(),
+        "fn b() {}\n"
+    );
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, EngineEvent::ApprovalRequired { .. }));
+    }
+    assert!(
+        run(
+            &broker,
+            "edit-missing",
+            "file_edit",
+            json!({"path":"lib.rs","old_string":"absent","new_string":"x"}),
+        )
+        .await
+        .is_err()
+    );
+    assert!(broker.journaled("edit-missing").unwrap().is_none());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn always_allow_covers_matching_actions_for_the_session() {
+    let (directory, broker, mut events) = fixture(PermissionMode::AskForWrites);
+    let task = broker.clone();
+    let first = tokio::task::spawn_blocking(move || {
+        task.execute(
+            "write",
+            "file_write",
+            json!({"path":"notes.txt","content":"one\n"}),
+        )
+    });
+    while let Some(event) = events.recv().await {
+        if let EngineEvent::ApprovalRequired {
+            action_id,
+            arguments,
+            rule,
+            ..
+        } = event
+        {
+            assert_eq!(rule.as_deref(), Some("file edits in this project"));
+            assert!(arguments["diff"].as_str().unwrap().contains("+one"));
+            broker.approvals.decide_with(action_id, true, true).unwrap();
+            break;
+        }
+    }
+    first.await.unwrap().unwrap();
+    let task = broker.clone();
+    tokio::task::spawn_blocking(move || {
+        task.execute(
+            "edit",
+            "file_edit",
+            json!({"path":"notes.txt","old_string":"one","new_string":"two"}),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, EngineEvent::ApprovalRequired { .. }));
+    }
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("notes.txt")).unwrap(),
+        "two\n"
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -508,7 +719,7 @@ async fn bounded_presentations_preserve_status_refs_and_replay_without_overwrite
     let (_directory, broker, _events) = fixture(PermissionMode::ReadOnly);
     for length in [20_000, 100_000] {
         let id = Uuid::new_v4();
-        let result = json!({"status":"failed","summary":"é🪶".repeat(length),
+        let result = json!({"status":"failed","summary":"Ã©ðŸª¶".repeat(length),
             "artifacts":["original.txt"]});
         let first = broker.bound_result(id, result.clone());
         let replay = broker.bound_result(id, result.clone());

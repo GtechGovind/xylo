@@ -151,17 +151,20 @@ impl Workbench {
                 .into_any_element()
         } else if let Some(turn) = self.turns.get(&self.session) {
             let offset = index - self.messages.len() - 1;
+            let latest_plan = turn.tools.iter().rposition(|t| t.name == "todo_write");
+            let streamed = !turn.text.is_empty() && (turn.running || turn.status == "Cancelled");
             if let Some(tool) = turn.tools.get(offset) {
-                self.tool_row(offset, tool, cx)
-            } else if offset == turn.tools.len()
-                && !turn.text.is_empty()
-                && (turn.running || turn.status == "Cancelled")
-            {
+                self.tool_row(offset, tool, latest_plan == Some(offset), cx)
+            } else if offset == turn.tools.len() && streamed {
                 TextView::markdown("streamed-answer", turn.text.clone())
                     .selectable(true)
                     .into_any_element()
+            } else if turn.running {
+                turn_status(turn)
+            } else if let Some(error) = &turn.error {
+                self.turn_error(error, cx)
             } else {
-                subtitle("Working on your task…").into_any_element()
+                div().into_any_element()
             }
         } else {
             div().into_any_element()
@@ -176,100 +179,277 @@ impl Workbench {
             .child(div().w_full().max_w(px(760.)).child(content))
             .into_any_element()
     }
+    /// Records the decision immediately so the card responds before the worker
+    /// confirms; the engine still enforces the actual outcome.
+    pub(super) fn decide_action(
+        &mut self,
+        id: Uuid,
+        allow: bool,
+        remember: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(card) = self
+            .turns
+            .get_mut(&self.session)
+            .and_then(|turn| turn.tools.iter_mut().find(|t| t.id == id))
+        {
+            card.approval = false;
+            if !allow {
+                card.success = Some(false);
+                card.result = Some("You denied this action.".into());
+            }
+        }
+        self.engine_command(
+            WorkerCommand::Approve {
+                action_id: id,
+                allow,
+                remember,
+            },
+            cx,
+        );
+        self.sync_history_list(cx);
+        cx.notify();
+    }
+    /// Keyboard: allow the oldest pending action in this chat.
+    pub(super) fn allow_pending(&mut self, cx: &mut Context<Self>) {
+        let pending = self
+            .turns
+            .get(&self.session)
+            .and_then(|turn| turn.pending_approvals().next().map(|t| t.id));
+        if let Some(id) = pending {
+            self.decide_action(id, true, false, cx);
+        }
+    }
+    /// Keyboard: deny the oldest pending action, otherwise stop the task.
+    pub(super) fn deny_or_stop(&mut self, cx: &mut Context<Self>) {
+        let pending = self
+            .turns
+            .get(&self.session)
+            .and_then(|turn| turn.pending_approvals().next().map(|t| t.id));
+        match pending {
+            Some(id) => self.decide_action(id, false, false, cx),
+            None if self.running() => self.engine_command(WorkerCommand::Cancel, cx),
+            None => {}
+        }
+    }
     fn tool_row(
         &self,
         i: usize,
         tool: &crate::state::ToolCard,
+        latest_plan: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if tool.name == "todo_write" && tool.success != Some(false) {
+            return plan_card(i, tool, latest_plan);
+        }
         let id = tool.id;
         let expanded = self.expanded_tools.contains(&id);
-        let mut action = div()
+        let summary = describe(tool);
+        let (state, state_word): (AnyElement, &str) = if tool.approval {
+            (
+                icon(IconName::TriangleAlert)
+                    .text_color(rgb(warning()))
+                    .into_any_element(),
+                "needs approval",
+            )
+        } else {
+            match tool.success {
+                None => (
+                    Spinner::new()
+                        .small()
+                        .color(rgb(muted()).into())
+                        .into_any_element(),
+                    "in progress",
+                ),
+                Some(true) => (
+                    icon(IconName::CircleCheck)
+                        .text_color(rgb(success()))
+                        .into_any_element(),
+                    "done",
+                ),
+                Some(false) => (
+                    icon(IconName::CircleX)
+                        .text_color(rgb(danger()))
+                        .into_any_element(),
+                    "failed",
+                ),
+            }
+        };
+        let header = focus_ring(gpui_kit::base::Button::new(("tool-detail", i)))
+            .accessibility_label(format!(
+                "{} {}, {state_word}. {}",
+                summary.verb,
+                summary.target,
+                if expanded {
+                    "Hide details"
+                } else {
+                    "Show details"
+                }
+            ))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(hover())))
+            .child(div().flex_shrink_0().child(state))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(summary.verb.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(12.5))
+                    .font_family("monospace")
+                    .text_color(rgb(muted()))
+                    .child(summary.target.clone()),
+            )
+            .when_some(summary.meta.clone(), |row, (meta, tone)| {
+                row.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(rgb(tone.color()))
+                        .child(meta),
+                )
+            })
+            .child(
+                icon(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(px(14.))
+                .text_color(rgb(muted())),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded_tools.remove(&id) {
+                    this.expanded_tools.insert(id);
+                }
+                this.sync_history_list(cx);
+                cx.notify();
+            }));
+        let mut card = div()
             .w_full()
             .flex()
             .flex_col()
             .gap_2()
-            .when(tool.approval, |row| {
-                row.p_3()
+            .when(tool.approval, |card| {
+                card.p_3()
                     .rounded_lg()
-                    .bg(rgb(panel()))
+                    .bg(rgb(warning_bg()))
                     .border_1()
-                    .border_color(rgb(border()))
+                    .border_color(rgb(warning()))
             })
-            .child(
-                button(
-                    ("tool-detail", i),
-                    format!(
-                        "{}  {}{}",
-                        if expanded { "⌄" } else { "›" },
-                        action_label(&tool.name),
-                        if tool.approval {
-                            " · Needs approval"
-                        } else if tool.success == Some(false) {
-                            " · Failed"
-                        } else if tool.success == Some(true) {
-                            ""
-                        } else {
-                            " · Working…"
-                        }
-                    ),
-                )
-                .w_full()
-                .justify_start()
-                .text_sm()
-                .text_color(rgb(muted()))
-                .px_1()
-                .py_1()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if !this.expanded_tools.remove(&id) {
-                        this.expanded_tools.insert(id);
-                    }
-                    cx.notify();
-                })),
-            );
+            .child(header);
         if tool.approval {
-            let summary = action_description(&tool.arguments);
-            action = action.child(div().text_sm().child(summary)).child(
+            card = card.child(self.approval_panel(i, tool, &summary, cx));
+        } else if expanded {
+            card = card.child(div().pl_6().child(tool_detail(i, tool)));
+        }
+        card.into_any_element()
+    }
+    fn approval_panel(
+        &self,
+        i: usize,
+        tool: &crate::state::ToolCard,
+        summary: &ActionSummary,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = tool.id;
+        let shortcut = if cfg!(target_os = "macos") {
+            "⌘⇧↩ allow · Esc deny"
+        } else {
+            "Ctrl+Shift+Enter allow · Esc deny"
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(summary.question.clone()),
+            )
+            .child(approval_preview(i, tool))
+            .child(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .items_center()
                     .gap_2()
-                    .child(primary(("allow", i), "Allow once").on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            this.engine_command(
-                                WorkerCommand::Approve {
-                                    action_id: id,
-                                    allow: true,
-                                },
-                                cx,
-                            )
-                        },
-                    )))
-                    .child(button(("deny", i), "Don't allow").on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            this.engine_command(
-                                WorkerCommand::Approve {
-                                    action_id: id,
-                                    allow: false,
-                                },
-                                cx,
-                            )
-                        },
-                    ))),
-            );
-        }
-        if expanded {
-            action = action.child(
-                TextView::markdown(("tool-args", i), action_description(&tool.arguments))
-                    .selectable(true),
-            );
-            if let Some(result) = &tool.result {
-                action = action.child(
-                    TextView::markdown(("tool-result", i), truncate(result, 6000)).selectable(true),
-                );
-            }
-        }
-
-        action.into_any_element()
+                    .child(primary(("allow", i), "Allow").on_click(
+                        cx.listener(move |this, _, _, cx| this.decide_action(id, true, false, cx)),
+                    ))
+                    .when_some(tool.rule.clone(), |row, rule| {
+                        row.child(
+                            button(("allow-always", i), format!("Always allow {rule}"))
+                                .border_color(rgb(border()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.decide_action(id, true, true, cx)
+                                })),
+                        )
+                    })
+                    .child(button(("deny", i), "Deny").on_click(
+                        cx.listener(move |this, _, _, cx| this.decide_action(id, false, false, cx)),
+                    ))
+                    .child(div().flex_1())
+                    .child(subtitle(shortcut)),
+            )
+            .into_any_element()
+    }
+    fn turn_error(&self, error: &str, _cx: &mut Context<Self>) -> AnyElement {
+        let details = error.to_owned();
+        div()
+            .w_full()
+            .flex()
+            .items_start()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(danger_bg()))
+            .border_1()
+            .border_color(rgb(danger()))
+            .child(icon(IconName::CircleAlert).text_color(rgb(danger())))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("The task stopped with an error"),
+                    )
+                    .child(div().text_sm().child(product_error(error)))
+                    .child(subtitle(
+                        "Progress so far is saved. Send a message to continue or adjust the request.",
+                    )),
+            )
+            .child(
+                button("copy-turn-error", "Copy details")
+                    .text_xs()
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(details.clone()))
+                    }),
+            )
+            .into_any_element()
     }
     fn chat_home(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut assistants = div().flex().flex_col().gap_2().mt_6().child(
@@ -280,16 +460,15 @@ impl Workbench {
                 .text_center()
                 .child("Select an assistant to start a task"),
         );
-        for row in 0..2 {
-            let mut cards = div().flex().gap_2();
-            for col in 0..3 {
-                let index = row * 3 + col;
-                let (name, description, prompt, glyph) = ASSISTANTS[index].clone();
+        // Cards wrap onto more rows as the window narrows instead of squeezing.
+        let mut cards = div().flex().flex_wrap().gap_2();
+        {
+            for (index, (name, description, prompt, glyph)) in ASSISTANTS.into_iter().enumerate() {
                 cards = cards.child(
-                    gpui_kit::base::Button::new(("assistant", index))
-                        .accessibility_label(name)
+                    focus_ring(gpui_kit::base::Button::new(("assistant", index)))
+                        .accessibility_label(format!("{name}: {description}"))
                         .flex_1()
-                        .min_w_0()
+                        .min_w(px(200.))
                         .p_3()
                         .rounded(px(14.))
                         .bg(rgb(panel()))
@@ -356,7 +535,8 @@ impl Workbench {
             (3, "Research", IconName::Search),
         ] {
             modes = modes.child(
-                gpui_kit::base::Button::new(("mode", index))
+                focus_ring(gpui_kit::base::Button::new(("mode", index)))
+                    .selected(self.selected_assistant == index)
                     .accessibility_label(label)
                     .px_3()
                     .py_2()
@@ -454,6 +634,42 @@ impl Workbench {
             .into_any_element()
     }
 
+    /// How much the agent may do without asking, applied to the next message.
+    fn permission_switcher(&self, cx: &Context<Self>) -> AnyElement {
+        let weak = cx.entity().downgrade();
+        let current = self.settings.permissions;
+        MenuButton::new("permission-mode")
+            .label(current.label())
+            .icon(IconName::ChevronDown)
+            .max_w(px(200.))
+            .tooltip(current.description())
+            .dropdown_menu(move |mut menu, _, _| {
+                menu = menu.label("Permissions for the next message");
+                for mode in PermissionMode::ALL {
+                    let view = weak.clone();
+                    let hint = match mode {
+                        PermissionMode::AskForWrites => "approve every change",
+                        PermissionMode::AcceptEdits => "commands still ask",
+                        PermissionMode::Auto => "external actions still ask",
+                        PermissionMode::ReadOnly => "nothing is changed",
+                    };
+                    menu = menu.item(
+                        PopupMenuItem::new(format!("{} · {hint}", mode.label()))
+                            .checked(mode == current)
+                            .on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.settings.permissions = mode;
+                                    let settings = this.settings.clone();
+                                    this.host_call(cx, |host| host.save_settings(settings));
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
+    }
     fn prompt_box(&self, cx: &mut Context<Self>) -> AnyElement {
         let model = if self.settings.provider.model.is_empty() {
             "Select model".to_string()
@@ -514,41 +730,34 @@ impl Workbench {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap_1()
-                            .h(px(32.))
+                            .min_h(px(32.))
                             .child(self.attachment_controls(cx))
                             .child(div().flex_1().min_w_0())
                             .child(self.model_switcher(model, cx))
-                            .child(
-                                compact_selector(
-                                    "permission-mode",
-                                    if self.settings.permissions == PermissionMode::ReadOnly {
-                                        "Read only"
-                                    } else {
-                                        "Ask before changes"
-                                    },
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.settings.permissions = if this.settings.permissions
-                                            == PermissionMode::ReadOnly
-                                        {
-                                            PermissionMode::AskForWrites
-                                        } else {
-                                            PermissionMode::ReadOnly
-                                        };
-                                        let settings = this.settings.clone();
-                                        this.host_call(cx, |host| host.save_settings(settings));
-                                    },
-                                )),
-                            )
+                            .child(self.permission_switcher(cx))
                             .when(self.running(), |row| {
-                                row.child(button("cancel-task", "Stop").text_xs().on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.engine_command(WorkerCommand::Cancel, cx)
-                                    }),
-                                ))
+                                row.child(
+                                    focus_ring(gpui_kit::base::Button::new("cancel-task"))
+                                        .accessibility_label("Stop the task (Esc)")
+                                        .h(px(28.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .text_color(rgb(danger()))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgb(danger_bg())))
+                                        .child(icon(IconName::Square).size(px(12.)))
+                                        .child("Stop")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.engine_command(WorkerCommand::Cancel, cx)
+                                        })),
+                                )
                             })
                             .child(self.speech_capture_button(cx))
                             .child(
@@ -592,28 +801,556 @@ impl Workbench {
             .into_any_element()
     }
 }
-fn action_label(name: &str) -> String {
-    match name {
-        "read_file" | "file_read" | "files_read" => "Read a file".into(),
-        "files_list" => "List project files".into(),
-        "write_file" | "file_write" | "apply_patch" => "Update project files".into(),
-        "run_command" | "shell" | "terminal" | "execute" => "Run a command".into(),
-        "web_search" | "search" => "Search for information".into(),
-        "browser" | "browser_navigate" => "Browse a page".into(),
-        "agent_delegate" => "Work with a teammate".into(),
-        "memory_search" => "Recall project memory".into(),
-        "memory_remember" => "Remember a decision".into(),
-        _ => name.replace('_', " "),
-    }
+use crate::state::{ToolCard, TurnState};
+use gpui_kit::component::{Sizable, spinner::Spinner};
+use serde_json::Value;
+
+#[derive(Clone, Copy)]
+enum Tone {
+    Muted,
+    Bad,
 }
-fn action_description(arguments: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return truncate(arguments, 800);
-    };
-    for key in ["command", "path", "query", "url", "task", "content"] {
-        if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
-            return truncate(text, 800);
+impl Tone {
+    fn color(self) -> u32 {
+        match self {
+            Tone::Muted => muted(),
+            Tone::Bad => danger(),
         }
     }
-    "This action uses your project and connected tools.".into()
+}
+/// One-line, human description of an action for its card and approval.
+struct ActionSummary {
+    verb: String,
+    target: String,
+    meta: Option<(String, Tone)>,
+    question: String,
+}
+fn text_arg<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+/// The command line an action runs, for display only.
+fn command_line(tool: &ToolCard) -> String {
+    match tool.name.as_str() {
+        "shell_command" => text_arg(&tool.input, "command").to_owned(),
+        _ => {
+            let mut line = text_arg(&tool.input, "program").to_owned();
+            for arg in tool
+                .input
+                .get("args")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                line.push(' ');
+                if arg.is_empty() || arg.contains([' ', '"', '\'']) {
+                    line.push_str(&format!("\"{}\"", arg.replace('"', "\\\"")));
+                } else {
+                    line.push_str(arg);
+                }
+            }
+            line
+        }
+    }
+}
+fn summary_field<'a>(output: &'a Option<Value>, key: &str) -> Option<&'a Value> {
+    output.as_ref()?.get("summary")?.get(key)
+}
+fn elapsed(tool: &ToolCard) -> Option<(String, Tone)> {
+    let ms = tool.finished_at? - tool.started_at;
+    (ms >= 1000).then(|| (format!("{:.1} s", ms as f64 / 1000.0), Tone::Muted))
+}
+fn describe(tool: &ToolCard) -> ActionSummary {
+    let input = &tool.input;
+    let output = tool.output();
+    let path = text_arg(input, "path").to_owned();
+    let count = |key: &str, unit: &str| {
+        summary_field(&output, key)
+            .and_then(Value::as_u64)
+            .map(|n| {
+                (
+                    format!("{n} {unit}{}", if n == 1 { "" } else { "s" }),
+                    Tone::Muted,
+                )
+            })
+    };
+    let changes = || {
+        let added = input.get("added").and_then(Value::as_u64)?;
+        let removed = input.get("removed").and_then(Value::as_u64)?;
+        Some((format!("+{added} −{removed}"), Tone::Muted))
+    };
+    let (verb, target, meta, question): (&str, String, Option<(String, Tone)>, String) = match tool
+        .name
+        .as_str()
+    {
+        "file_read" => {
+            let lines = match (
+                summary_field(&output, "start_line").and_then(Value::as_u64),
+                summary_field(&output, "end_line").and_then(Value::as_u64),
+                summary_field(&output, "total_lines").and_then(Value::as_u64),
+            ) {
+                (Some(start), Some(end), Some(total)) if end > 0 && (start > 1 || end < total) => {
+                    Some((format!("lines {start}–{end} of {total}"), Tone::Muted))
+                }
+                (_, _, Some(total)) => Some((format!("{total} lines"), Tone::Muted)),
+                _ => None,
+            };
+            ("Read", path.clone(), lines, format!("Read {path}?"))
+        }
+        "file_edit" => (
+            "Edit",
+            path.clone(),
+            changes(),
+            format!("Allow Xylo to edit {path}?"),
+        ),
+        "file_write" => {
+            let created = input.get("created").and_then(Value::as_bool) == Some(true);
+            (
+                if created { "Create" } else { "Write" },
+                path.clone(),
+                changes(),
+                format!(
+                    "Allow Xylo to {} {path}?",
+                    if created { "create" } else { "overwrite" }
+                ),
+            )
+        }
+        "files_list" => (
+            "List",
+            if path.is_empty() {
+                ".".into()
+            } else {
+                path.clone()
+            },
+            None,
+            "List this folder?".into(),
+        ),
+        "find_files" => (
+            "Find files",
+            text_arg(input, "pattern").to_owned(),
+            count("count", "file"),
+            "Find files?".into(),
+        ),
+        "search_project" => {
+            let mut target = format!("“{}”", text_arg(input, "query"));
+            if let Some(glob) = input.get("glob").and_then(Value::as_str) {
+                target.push_str(&format!(" in {glob}"));
+            }
+            (
+                "Search",
+                target,
+                count("matches", "match"),
+                "Search the project?".into(),
+            )
+        }
+        "git_status" => (
+            "Git status",
+            String::new(),
+            None,
+            "Check Git status?".into(),
+        ),
+        "git_diff" => (
+            "Git diff",
+            if input.get("staged").and_then(Value::as_bool) == Some(true) {
+                "staged".into()
+            } else {
+                path.clone()
+            },
+            None,
+            "Read the Git diff?".into(),
+        ),
+        "run_command" | "shell_command" => {
+            let exit = output
+                .as_ref()
+                .and_then(|o| {
+                    o.get("exit_code")
+                        .or_else(|| o.pointer("/summary/exit_code"))
+                })
+                .and_then(Value::as_i64);
+            let meta = match (exit, tool.success) {
+                (Some(code), _) if code != 0 => Some((format!("exit {code}"), Tone::Bad)),
+                _ => elapsed(tool),
+            };
+            (
+                "Run",
+                command_line(tool),
+                meta,
+                "Allow Xylo to run this command in your project?".into(),
+            )
+        }
+        "agent_delegate" => (
+            "Delegate",
+            text_arg(input, "task").to_owned(),
+            elapsed(tool),
+            "Start a helper agent?".into(),
+        ),
+        "memory_search" => (
+            "Recall",
+            text_arg(input, "query").to_owned(),
+            None,
+            "Search project memory?".into(),
+        ),
+        "memory_remember" => (
+            "Remember",
+            text_arg(input, "content").to_owned(),
+            None,
+            "Allow Xylo to remember this fact for the project?".into(),
+        ),
+        "search_tools" => (
+            "Find tools",
+            text_arg(input, "query").to_owned(),
+            None,
+            "Look up tools?".into(),
+        ),
+        "connector_call" => (
+            "Use connector",
+            text_arg(input, "tool").to_owned(),
+            None,
+            "Allow Xylo to use this connected service?".into(),
+        ),
+        "connector_tools" => (
+            "Connect",
+            text_arg(input, "connector_id").to_owned(),
+            None,
+            "Allow Xylo to start this connector?".into(),
+        ),
+        "call_tool" => (
+            "Use",
+            text_arg(input, "name").replace('_', " "),
+            None,
+            "Allow this action?".into(),
+        ),
+        name => {
+            let target = ["command", "path", "query", "url", "task", "name"]
+                .iter()
+                .find_map(|key| input.get(*key).and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_owned();
+            let verb = name.replace('_', " ");
+            let question = format!("Allow Xylo to {verb}?");
+            return ActionSummary {
+                verb: capitalize(&verb),
+                target,
+                meta: elapsed(tool),
+                question,
+            };
+        }
+    };
+    ActionSummary {
+        verb: verb.into(),
+        target,
+        meta: if tool.success == Some(false) && meta.is_none() {
+            Some(("failed".into(), Tone::Bad))
+        } else {
+            meta
+        },
+        question,
+    }
+}
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
+}
+fn elapsed_label(turn: &TurnState) -> String {
+    let seconds = turn
+        .started_at
+        .map(|start| ((now_ms() - start).max(0) / 1000) as u64)
+        .unwrap_or(0);
+    if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+/// Live progress for a running turn: what it is doing, for how long, and how to stop it.
+fn turn_status(turn: &TurnState) -> AnyElement {
+    let waiting = turn.pending_approvals().count();
+    let (indicator, label): (AnyElement, String) = if waiting > 0 {
+        (
+            icon(IconName::TriangleAlert)
+                .text_color(rgb(warning()))
+                .into_any_element(),
+            if waiting == 1 {
+                "Waiting for your approval".into()
+            } else {
+                format!("Waiting for your approval on {waiting} actions")
+            },
+        )
+    } else {
+        (
+            Spinner::new()
+                .small()
+                .color(rgb(accent()).into())
+                .into_any_element(),
+            if turn.status.is_empty() || turn.status == "Working" {
+                "Working…".into()
+            } else {
+                turn.status.clone()
+            },
+        )
+    };
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .py_2()
+        .text_sm()
+        .child(indicator)
+        .child(div().text_color(rgb(text())).child(label))
+        .child(subtitle(format!("{} · Esc to stop", elapsed_label(turn))))
+        .into_any_element()
+}
+/// The agent's checklist; only the newest version is shown in full.
+fn plan_card(i: usize, tool: &ToolCard, latest: bool) -> AnyElement {
+    let items: Vec<(String, String)> = tool
+        .input
+        .get("todos")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            (
+                text_arg(item, "content").to_owned(),
+                text_arg(item, "status").to_owned(),
+            )
+        })
+        .collect();
+    let done = items.iter().filter(|(_, s)| s == "completed").count();
+    let heading = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_sm()
+        .child(icon(IconName::BookOpen).text_color(rgb(muted())))
+        .child(div().font_weight(FontWeight::MEDIUM).child(if latest {
+            "Plan"
+        } else {
+            "Updated plan"
+        }))
+        .child(subtitle(format!("{done} of {} done", items.len())));
+    if !latest {
+        return div()
+            .id(("plan", i))
+            .px_2()
+            .py_1()
+            .child(heading)
+            .into_any_element();
+    }
+    let mut list = div().flex().flex_col().gap_1();
+    for (index, (content, status)) in items.into_iter().enumerate() {
+        let (glyph, tone, weight) = match status.as_str() {
+            "completed" => (IconName::CircleCheck, success(), FontWeight::NORMAL),
+            "in_progress" => (IconName::ChevronRight, accent(), FontWeight::MEDIUM),
+            _ => (IconName::Square, muted(), FontWeight::NORMAL),
+        };
+        list = list.child(
+            div()
+                .id(("plan-item", i * 1000 + index))
+                .flex()
+                .items_start()
+                .gap_2()
+                .text_sm()
+                .child(icon(glyph).size(px(14.)).mt(px(2.)).text_color(rgb(tone)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_weight(weight)
+                        .text_color(rgb(if status == "completed" {
+                            muted()
+                        } else {
+                            text()
+                        }))
+                        .child(content),
+                ),
+        );
+    }
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3()
+        .rounded_lg()
+        .bg(rgb(panel()))
+        .border_1()
+        .border_color(rgb(border()))
+        .child(heading)
+        .child(list)
+        .into_any_element()
+}
+/// Unified diff with added and removed lines tinted; long diffs scroll.
+fn diff_view(id: impl Into<ElementId>, diff: &str) -> AnyElement {
+    const LINES: usize = 600;
+    let mut body = div().flex().flex_col().min_w_full();
+    let mut shown = 0;
+    for line in diff.lines().take(LINES) {
+        shown += 1;
+        let (background, foreground) = if line.starts_with("+++") || line.starts_with("---") {
+            (None, muted())
+        } else if line.starts_with('+') {
+            (Some(diff_added_bg()), success())
+        } else if line.starts_with('-') {
+            (Some(diff_removed_bg()), danger())
+        } else if line.starts_with("@@") {
+            (None, accent())
+        } else {
+            (None, text())
+        };
+        body = body.child(
+            div()
+                .px_2()
+                .whitespace_nowrap()
+                .when_some(background, |row, color| row.bg(rgb(color)))
+                .text_color(rgb(foreground))
+                .child(if line.is_empty() {
+                    " ".to_owned()
+                } else {
+                    line.to_owned()
+                }),
+        );
+    }
+    if diff.lines().count() > shown {
+        body = body.child(
+            div()
+                .px_2()
+                .text_color(rgb(muted()))
+                .child("… more lines in the full diff"),
+        );
+    }
+    div()
+        .id(id)
+        .w_full()
+        .max_h(px(360.))
+        .overflow_scroll()
+        .py_1()
+        .rounded_md()
+        .bg(rgb(code_bg()))
+        .border_1()
+        .border_color(rgb(border()))
+        .font_family("monospace")
+        .text_size(px(12.))
+        .child(body)
+        .into_any_element()
+}
+/// Selectable monospace text (commands, output, search results).
+fn code_block(id: impl Into<ElementId>, text: &str) -> AnyElement {
+    let fence = if text.contains("```") { "````" } else { "```" };
+    div()
+        .w_full()
+        .max_h(px(360.))
+        .overflow_hidden()
+        .rounded_md()
+        .child(
+            TextView::markdown(
+                id,
+                format!("{fence}text\n{}\n{fence}", truncate(text, 6000)),
+            )
+            .selectable(true),
+        )
+        .into_any_element()
+}
+fn approval_preview(i: usize, tool: &ToolCard) -> AnyElement {
+    match tool.name.as_str() {
+        "file_write" | "file_edit" => {
+            let diff = text_arg(&tool.input, "diff");
+            if diff.trim().is_empty() {
+                subtitle("No textual change.").into_any_element()
+            } else {
+                diff_view(("approval-diff", i), diff)
+            }
+        }
+        "run_command" | "shell_command" => code_block(
+            ("approval-command", i),
+            &format!("$ {}", command_line(tool)),
+        ),
+        _ => code_block(
+            ("approval-input", i),
+            &serde_json::to_string_pretty(&tool.input).unwrap_or_default(),
+        ),
+    }
+}
+fn tool_detail(i: usize, tool: &ToolCard) -> AnyElement {
+    let output = tool.output();
+    let summary = output.as_ref().and_then(|o| o.get("summary"));
+    let field = |key: &str| summary.and_then(|s| s.get(key)).and_then(Value::as_str);
+    let raw = tool.result.clone().unwrap_or_default();
+    let mut detail = div().flex().flex_col().gap_2();
+    match tool.name.as_str() {
+        "file_write" | "file_edit" => {
+            let diff = field("diff").unwrap_or_else(|| text_arg(&tool.input, "diff"));
+            if !diff.trim().is_empty() {
+                detail = detail.child(diff_view(("tool-diff", i), diff));
+            }
+        }
+        "run_command" | "shell_command" => {
+            let mut text = format!("$ {}\n", command_line(tool));
+            match (field("stdout"), field("stderr")) {
+                (None, None) if !raw.is_empty() && output.is_none() => text.push_str(&raw),
+                (stdout, stderr) => {
+                    text.push_str(stdout.unwrap_or_default());
+                    if let Some(stderr) = stderr.filter(|s| !s.trim().is_empty()) {
+                        text.push_str("\n[stderr]\n");
+                        text.push_str(stderr);
+                    }
+                }
+            }
+            detail = detail.child(code_block(("tool-output", i), &text));
+        }
+        "file_read" => {
+            if let Some(content) = field("content") {
+                detail = detail.child(code_block(("tool-output", i), content));
+            }
+        }
+        "search_project" => {
+            if let Some(results) = field("results") {
+                detail = detail.child(code_block(("tool-output", i), results));
+            }
+        }
+        "find_files" => {
+            let files: Vec<&str> = summary
+                .and_then(|s| s.get("files"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            detail = detail.child(code_block(("tool-output", i), &files.join("\n")));
+        }
+        _ => {
+            detail = detail.child(code_block(
+                ("tool-input", i),
+                &serde_json::to_string_pretty(&tool.input).unwrap_or_default(),
+            ));
+        }
+    }
+    let handled = detail_handled(tool.name.as_str(), &output);
+    if !handled && !raw.is_empty() {
+        let shown = output
+            .as_ref()
+            .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
+            .unwrap_or(raw);
+        detail = detail.child(code_block(("tool-result", i), &shown));
+    }
+    detail.into_any_element()
+}
+/// Whether the structured view above already shows the useful part of the result.
+fn detail_handled(name: &str, output: &Option<Value>) -> bool {
+    let Some(summary) = output.as_ref().and_then(|o| o.get("summary")) else {
+        return matches!(name, "run_command" | "shell_command");
+    };
+    match name {
+        "file_write" | "file_edit" => summary.get("diff").is_some(),
+        "run_command" | "shell_command" => {
+            summary.get("stdout").is_some() || summary.get("stderr").is_some()
+        }
+        "file_read" => summary.get("content").is_some(),
+        "search_project" => summary.get("results").is_some(),
+        "find_files" => summary.get("files").is_some(),
+        _ => false,
+    }
 }

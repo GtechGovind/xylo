@@ -226,7 +226,7 @@ impl Workbench {
                     + usize::from(
                         !turn.text.is_empty() && (turn.running || turn.status == "Cancelled"),
                     )
-                    + usize::from(turn.running)
+                    + usize::from(turn.running || turn.error.is_some())
             });
         let history = self
             .histories
