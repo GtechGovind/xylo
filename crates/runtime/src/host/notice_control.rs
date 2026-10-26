@@ -159,6 +159,7 @@ mod tests {
                 action_id: action,
                 name: "private-tool".into(),
                 arguments: serde_json::json!({"secret":"private-content"}),
+                rule: None,
             },
             false,
         );

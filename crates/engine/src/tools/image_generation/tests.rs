@@ -70,6 +70,7 @@ async fn approve(
             action_id,
             name,
             arguments,
+            ..
         } = tokio::time::timeout(Duration::from_secs(10), events.recv())
             .await
             .unwrap()

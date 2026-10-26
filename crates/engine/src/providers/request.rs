@@ -299,12 +299,36 @@ pub(super) fn body(
                     push_parts(&mut output, role, content);
                 }
             }
+            // Prompt-cache breakpoints: tools, system policy and the newest
+            // message. Agent loops resend the same prefix on every step, so
+            // later steps read it from cache instead of reprocessing it.
+            let ephemeral = json!({"type":"ephemeral"});
+            if let Some(last) = system.last_mut() {
+                last["cache_control"] = ephemeral.clone();
+            }
+            if let Some(block) = output
+                .last_mut()
+                .and_then(|message| message["content"].as_array_mut())
+                .and_then(|content| content.last_mut())
+                .filter(|block| {
+                    matches!(
+                        block["type"].as_str(),
+                        Some("text" | "tool_result" | "image" | "tool_use")
+                    )
+                })
+            {
+                block["cache_control"] = ephemeral.clone();
+            }
             let mut body = json!({"model":model,"messages":output,"max_tokens":max_tokens.unwrap_or(provider.config.output_tokens),"stream":stream});
             if !system.is_empty() {
                 body["system"] = Value::Array(system);
             }
             if !tools.is_empty() {
-                body["tools"]=Value::Array(tools.iter().map(|tool|json!({"name":tool.name,"description":tool.description,"input_schema":tool.parameters})).collect());
+                let mut definitions: Vec<Value> = tools.iter().map(|tool|json!({"name":tool.name,"description":tool.description,"input_schema":tool.parameters})).collect();
+                if let Some(last) = definitions.last_mut() {
+                    last["cache_control"] = ephemeral;
+                }
+                body["tools"] = Value::Array(definitions);
             }
             body
         }

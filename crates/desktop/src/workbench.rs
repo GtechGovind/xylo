@@ -1699,6 +1699,14 @@ impl Render for Workbench {
             .on_action(cx.listener(|view, _: &FindProject, window, cx| {
                 view.open_project_search(window, cx);
             }))
+            .on_action(cx.listener(|view, _: &AllowPendingAction, _, cx| view.allow_pending(cx)))
+            .on_action(cx.listener(|view, _: &DenyOrStop, _, cx| view.deny_or_stop(cx)))
+            .on_action(cx.listener(|view, _: &FocusComposer, window, cx| {
+                view.page = Page::Chat;
+                view.composer
+                    .update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+            }))
             .flex()
             .overflow_hidden()
             .bg(rgb(bg()))

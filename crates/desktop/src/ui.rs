@@ -72,9 +72,41 @@ pub fn hover() -> u32 {
 pub fn message_bg() -> u32 {
     color(0xe9eaef, 0x292c34)
 }
+/// Status and change colours; each meets 4.5:1 against its panel in both themes.
+pub fn success() -> u32 {
+    color(0x1a7f45, 0x6fd69a)
+}
+pub fn danger() -> u32 {
+    color(0xb42318, 0xff8a80)
+}
+pub fn warning() -> u32 {
+    color(0x9a5b00, 0xf5bd5c)
+}
+pub fn warning_bg() -> u32 {
+    color(0xfff8eb, 0x2d2618)
+}
+pub fn danger_bg() -> u32 {
+    color(0xfef3f2, 0x33201f)
+}
+pub fn code_bg() -> u32 {
+    color(0xf6f7f9, 0x191b21)
+}
+pub fn diff_added_bg() -> u32 {
+    color(0xe7f6ec, 0x1c3326)
+}
+pub fn diff_removed_bg() -> u32 {
+    color(0xfdecea, 0x3a2224)
+}
+/// Visible keyboard focus for every interactive control (WCAG 2.4.7).
+pub fn focus_ring(button: gpui_kit::base::Button) -> gpui_kit::base::Button {
+    button
+        .border_1()
+        .border_color(transparent_black())
+        .focus_visible(|style| style.border_color(rgb(accent())))
+}
 fn button_base(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_kit::base::Button {
     let label: SharedString = label.into();
-    gpui_kit::base::Button::new(id)
+    focus_ring(gpui_kit::base::Button::new(id))
         .accessibility_label(label.clone())
         .px_3()
         .py_1()
@@ -94,7 +126,7 @@ pub fn icon_button(
     label: impl Into<SharedString>,
     name: IconName,
 ) -> gpui_kit::base::Button {
-    gpui_kit::base::Button::new(id)
+    focus_ring(gpui_kit::base::Button::new(id))
         .accessibility_label(label)
         .size(px(28.))
         .flex_shrink_0()
@@ -112,7 +144,7 @@ pub fn compact_selector(
     label: impl Into<SharedString>,
 ) -> gpui_kit::base::Button {
     let label = label.into();
-    gpui_kit::base::Button::new(id)
+    focus_ring(gpui_kit::base::Button::new(id))
         .accessibility_label(label.clone())
         .flex()
         .items_center()
@@ -136,10 +168,12 @@ pub fn compact_selector(
         .child(icon(IconName::ChevronDown).size(px(12.)))
 }
 pub fn primary(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_kit::base::Button {
+    // Inverted in dark mode so the primary action keeps its contrast.
     button_base(id, label)
-        .bg(rgb(0x1d2129))
-        .text_color(rgb(0xffffff))
-        .hover(|d| d.bg(rgb(0x454d5f)))
+        .bg(rgb(color(0x1d2129, 0xe8ebf3)))
+        .text_color(rgb(color(0xffffff, 0x14161b)))
+        .hover(|d| d.bg(rgb(color(0x454d5f, 0xc9cfdc))))
+        .font_weight(FontWeight::MEDIUM)
 }
 pub fn icon(name: IconName) -> Icon {
     Icon::new(name).size(px(16.))
@@ -150,7 +184,7 @@ pub fn nav_button(
     name: IconName,
 ) -> gpui_kit::base::Button {
     let label: SharedString = label.into();
-    gpui_kit::base::Button::new(id)
+    focus_ring(gpui_kit::base::Button::new(id))
         .accessibility_label(label.clone())
         .w_full()
         .flex()

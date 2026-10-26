@@ -1,8 +1,10 @@
 //! Application-owned durable tool and permission boundary. External tool metadata
 //! cannot supply its own permission flag; native classifications come from code.
 mod builtin;
+mod code;
 mod image_generation;
 use anyhow::{Context, Result, bail, ensure};
+pub(crate) use code::shell_name;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::{
@@ -23,17 +25,84 @@ use workbench_services::{
 };
 
 type Delegate = Arc<dyn Fn(&str, Value) -> Result<Value> + Send + Sync>;
+#[derive(Default)]
+struct GateState {
+    pending: HashMap<Uuid, (mpsc::SyncSender<bool>, Option<String>)>,
+    /// Rules the user chose to always allow; they live as long as this
+    /// worker's chat session and never cover reads-only policy or other chats.
+    remembered: std::collections::HashSet<String>,
+}
 /// Approval channels are installed before emitting a request and authorize one action.
 #[derive(Clone, Default)]
-pub struct ApprovalGate(Arc<Mutex<HashMap<Uuid, mpsc::SyncSender<bool>>>>);
+pub struct ApprovalGate(Arc<Mutex<GateState>>);
 impl ApprovalGate {
     pub fn decide(&self, id: Uuid, allow: bool) -> Result<()> {
-        self.0
-            .lock()
-            .remove(&id)
-            .context("Approval is no longer pending")?
+        self.decide_with(id, allow, false)
+    }
+    /// `remember` also allows later actions with the same rule in this chat.
+    pub fn decide_with(&self, id: Uuid, allow: bool, remember: bool) -> Result<()> {
+        let sender = {
+            let mut state = self.0.lock();
+            let (sender, rule) = state
+                .pending
+                .remove(&id)
+                .context("Approval is no longer pending")?;
+            if allow
+                && remember
+                && let Some(rule) = rule
+            {
+                state.remembered.insert(rule);
+            }
+            sender
+        };
+        sender
             .send(allow)
             .context("Task stopped before receiving the decision")
+    }
+    fn remembered(&self, rule: &str) -> bool {
+        self.0.lock().remembered.contains(rule)
+    }
+    fn install(&self, id: Uuid, sender: mpsc::SyncSender<bool>, rule: Option<String>) {
+        self.0.lock().pending.insert(id, (sender, rule));
+    }
+    fn withdraw(&self, id: Uuid) {
+        self.0.lock().pending.remove(&id);
+    }
+}
+
+/// The rule key and its human description for "always allow in this chat".
+fn approval_rule(name: &str, arguments: &Value) -> Option<(String, String)> {
+    let text = |key: &str| arguments.get(key).and_then(Value::as_str);
+    match name {
+        "file_write" | "file_edit" => Some(("edit".into(), "file edits in this project".into())),
+        "run_command" => {
+            let program = text("program")?;
+            let first = arguments
+                .get("args")
+                .and_then(Value::as_array)
+                .and_then(|args| args.first())
+                .and_then(Value::as_str)
+                .filter(|arg| !arg.starts_with('-'));
+            let command = match first {
+                Some(first) => format!("{program} {first}"),
+                None => program.to_owned(),
+            };
+            Some((format!("run:{command}"), format!("`{command}` commands")))
+        }
+        "shell_command" => {
+            let command = text("command")?;
+            Some((format!("shell:{command}"), "this exact command".into()))
+        }
+        "memory_remember" => Some(("memory".into(), "saving project facts".into())),
+        "connector_call" => {
+            let connector = text("connector_id")?;
+            let tool = text("tool")?;
+            Some((
+                format!("connector:{connector}:{tool}"),
+                format!("`{tool}` on this connector"),
+            ))
+        }
+        _ => None,
     }
 }
 pub struct ToolBroker {
@@ -157,29 +226,48 @@ impl ToolBroker {
     pub fn set_delegate(&self, handler: Delegate) {
         *self.delegate.lock() = Some(handler);
     }
+    /// Core coding tools are always offered directly; specialized capabilities
+    /// stay discoverable through search_tools/call_tool to keep the prompt small.
     pub fn initial_definitions(&self) -> Vec<ToolDefinition> {
-        let always = [
+        const CORE: [&str; 16] = [
             "file_read",
+            "file_edit",
             "file_write",
             "files_list",
+            "find_files",
             "search_project",
+            "git_status",
+            "git_diff",
             "run_command",
+            "shell_command",
+            "todo_write",
+            "agent_delegate",
+            "memory_search",
+            "memory_remember",
             "search_tools",
             "call_tool",
         ];
         let prompt = self.request.prompt.to_lowercase();
-        self.definitions
+        let mut chosen: Vec<ToolDefinition> = self
+            .definitions
             .iter()
-            .filter(|d| {
-                always.contains(&d.name.as_str())
-                    || d.name
-                        .split('_')
-                        .next()
-                        .is_some_and(|prefix| prompt.contains(prefix))
-            })
-            .take(18)
+            .filter(|d| CORE.contains(&d.name.as_str()))
             .cloned()
-            .collect()
+            .collect();
+        chosen.extend(
+            self.definitions
+                .iter()
+                .filter(|d| {
+                    !CORE.contains(&d.name.as_str())
+                        && d.name
+                            .split('_')
+                            .next()
+                            .is_some_and(|prefix| prefix.len() > 2 && prompt.contains(prefix))
+                })
+                .take(8)
+                .cloned(),
+        );
+        chosen
     }
     pub(crate) fn journal_key(namespace: Option<&str>, call_id: &str) -> String {
         match namespace {
@@ -296,7 +384,7 @@ impl ToolBroker {
             match action.state.as_str() {
                 "succeeded" => {
                     return Ok(serde_json::to_string(
-                        &self.bound_result(
+                        &self.model_result(
                             action.intent.id,
                             action
                                 .result
@@ -314,7 +402,7 @@ impl ToolBroker {
                 "failed" => {
                     if let Some(result) = action.result {
                         return Err(
-                            ObservedFailure(self.bound_result(action.intent.id, result)).into()
+                            ObservedFailure(self.model_result(action.intent.id, result)).into()
                         );
                     }
                     bail!(
@@ -344,15 +432,22 @@ impl ToolBroker {
                 serde_json::from_value(arguments.clone())
                     .context("Invalid environment command request")?;
         }
-        let presentation = if name == "image_generate" {
-            self.image_generation.approval(&arguments)?
-        } else {
-            arguments.clone()
+        let presentation = match name {
+            "image_generate" => self.image_generation.approval(&arguments)?,
+            // Show the actual change, and reject an inapplicable edit before
+            // any intent or approval exists.
+            "file_write" | "file_edit" => {
+                builtin::change_preview(&self.request.workspace, name, &arguments)?
+            }
+            _ => arguments.clone(),
         };
         let id = Uuid::new_v4();
         // Native clients can close inherited descriptors and outlive a crashed
         // worker. Only proven in-process writes qualify for generic review.
-        let qualified = matches!(name, "file_write" | "memory_remember" | "skill_propose");
+        let qualified = matches!(
+            name,
+            "file_write" | "file_edit" | "memory_remember" | "skill_propose"
+        );
         let execution_lease = qualified
             .then(|| self.store.action_execution_lease(id, true))
             .transpose()?;
@@ -376,7 +471,7 @@ impl ToolBroker {
                     .action_for_key(self.request.session_id, self.request.turn_id, &key)?
                     .context("Reused action has no journal record")?;
                 return Ok(serde_json::to_string(
-                    &self.bound_result(previous.intent.id, result),
+                    &self.model_result(previous.intent.id, result),
                 )?);
             }
             ActionDecision::InFlight => bail!("Action is already executing"),
@@ -390,15 +485,28 @@ impl ToolBroker {
             let _ = self.store.deny_action(id);
             return Err(error);
         }
-        if definition.writes {
+        let rule = approval_rule(name, &arguments);
+        let preapproved = match self.request.permissions {
+            PermissionMode::AcceptEdits => matches!(name, "file_write" | "file_edit"),
+            PermissionMode::Auto => matches!(
+                name,
+                "file_write" | "file_edit" | "run_command" | "shell_command"
+            ),
+            PermissionMode::AskForWrites | PermissionMode::ReadOnly => false,
+        } || rule
+            .as_ref()
+            .is_some_and(|(key, _)| self.approvals.remembered(key));
+        if definition.writes && !preapproved {
             let (tx, rx) = mpsc::sync_channel(1);
-            self.approvals.0.lock().insert(id, tx);
+            let (key, label) = rule.unzip();
+            self.approvals.install(id, tx, key);
             if let Err(error) = self.emit(EngineEvent::ApprovalRequired {
                 action_id: id,
                 name: name.into(),
                 arguments: presentation.clone(),
+                rule: label,
             }) {
-                self.approvals.0.lock().remove(&id);
+                self.approvals.withdraw(id);
                 let _ = self.store.deny_action(id);
                 return Err(error);
             }
@@ -412,7 +520,7 @@ impl ToolBroker {
                     Err(_) => break false,
                 }
             };
-            self.approvals.0.lock().remove(&id);
+            self.approvals.withdraw(id);
             if !allowed || self.cancel.is_cancelled() {
                 self.store.deny_action(id)?;
                 let _ = self.emit(EngineEvent::ToolFinished {
@@ -512,6 +620,7 @@ impl ToolBroker {
                     return Err(error)
                         .context("Tool completed but durable result could not be confirmed");
                 }
+                let model = self.model_result(id, result.clone());
                 let presented = self.bound_result(id, result);
                 self.emit(EngineEvent::ToolFinished {
                     action_id: id,
@@ -519,13 +628,17 @@ impl ToolBroker {
                     result: serde_json::to_string(&presented)?,
                     success: true,
                 })?;
-                Ok(serde_json::to_string(&presented)?)
+                Ok(serde_json::to_string(&model)?)
             }
             Err(error) => {
                 if let Some(observation) = error.downcast_ref::<ObservedFailure>() {
                     let result = &observation.0;
                     let message = "Tool returned an unsuccessful or uncertain result";
-                    let unknown = definition.writes
+                    // A local process that exited with a code ran to completion:
+                    // its failure is an observed fact, not an uncertain write.
+                    let completed_process = matches!(name, "run_command" | "shell_command")
+                        && result.get("exit_code").is_some_and(Value::is_i64);
+                    let unknown = (definition.writes && !completed_process)
                         || result.get("status").and_then(Value::as_str) == Some("outcome_unknown");
                     if unknown {
                         self.store
@@ -533,6 +646,7 @@ impl ToolBroker {
                     } else {
                         self.store.fail_action_with_result(id, result, message)?;
                     }
+                    let model = self.model_result(id, result.clone());
                     let presented = self.bound_result(id, result.clone());
                     let _ = self.emit(EngineEvent::ToolFinished {
                         action_id: id,
@@ -540,12 +654,16 @@ impl ToolBroker {
                         result: serde_json::to_string(&presented)?,
                         success: false,
                     });
-                    return Err(ObservedFailure(presented).into());
+                    return Err(ObservedFailure(model).into());
                 }
                 let message = format!("{error:#}");
-                let definitive_rejection = error
-                    .downcast_ref::<image_generation::DefinitiveFailure>()
-                    .is_some()
+                let definitive_rejection = error.downcast_ref::<code::Unapplied>().is_some()
+                    || error
+                        .downcast_ref::<workbench_runtime::process::NotStarted>()
+                        .is_some()
+                    || error
+                        .downcast_ref::<image_generation::DefinitiveFailure>()
+                        .is_some()
                     || (name == "connector_call"
                         && error
                             .downcast_ref::<workbench_services::ConnectorNotDispatched>()
@@ -676,30 +794,10 @@ impl ToolBroker {
         if encoded.len() <= PRESENTATION_BYTES {
             return result;
         }
-        let path = self.artifacts.join(format!("tool-{id}.json"));
-        let write = (|| -> Result<()> {
-            use std::io::Write;
-            if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-                ensure!(
-                    metadata.is_file()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.len() == encoded.len() as u64
-                        && std::fs::read(&path)? == encoded,
-                    "Stored tool presentation differs from the action journal"
-                );
-                return Ok(());
-            }
-            let mut staging = tempfile::NamedTempFile::new_in(&self.artifacts)?;
-            staging.write_all(&encoded)?;
-            staging.as_file().sync_all()?;
-            staging
-                .persist_noclobber(&path)
-                .map_err(|error| error.error)?;
-            Ok(())
-        })();
+        let write = self.persist_full(id, &encoded);
         let mut references = Vec::new();
-        if write.is_ok() {
-            references.push(serde_json::to_value(&path).unwrap_or(Value::Null));
+        if let Ok(path) = &write {
+            references.push(serde_json::to_value(path).unwrap_or(Value::Null));
         }
         let mut presented = json!({"status":status,"summary":"Tool result recorded. Open the attached result or action journal for details.",
             "action_id":id,"next_actions":["Inspect the full result before retrying an unsuccessful or uncertain action"],
@@ -733,6 +831,82 @@ impl ToolBroker {
         }
         presented
     }
+    /// Saves the complete observation once; a replay must find identical bytes.
+    fn persist_full(&self, id: Uuid, encoded: &[u8]) -> Result<PathBuf> {
+        self.persist_once(&format!("tool-{id}.json"), encoded)
+    }
+    fn persist_once(&self, name: &str, encoded: &[u8]) -> Result<PathBuf> {
+        use std::io::Write;
+        let path = self.artifacts.join(name);
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            ensure!(
+                metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() == encoded.len() as u64
+                    && std::fs::read(&path)? == encoded,
+                "Stored tool presentation differs from the action journal"
+            );
+            return Ok(path);
+        }
+        let mut staging = tempfile::NamedTempFile::new_in(&self.artifacts)?;
+        staging.write_all(encoded)?;
+        staging.as_file().sync_all()?;
+        staging
+            .persist_noclobber(&path)
+            .map_err(|error| error.error)?;
+        Ok(path)
+    }
+    /// What the model observes. Unlike the small UI presentation it keeps the
+    /// actual content; oversized results keep both ends of every long field and
+    /// point at the saved complete result, which file_read can page through.
+    pub(crate) fn model_result(&self, id: Uuid, result: Value) -> Value {
+        const MODEL_BYTES: usize = 64 * 1024;
+        let Ok(encoded) = serde_json::to_vec(&result) else {
+            return self.bound_result(id, result);
+        };
+        if encoded.len() <= MODEL_BYTES {
+            return result;
+        }
+        let mut shortened = result;
+        for limit in [16_384, 8192, 4096, 2048, 1024, 512, 256] {
+            shorten_strings(&mut shortened, limit);
+            if serde_json::to_vec(&shortened)
+                .map_or(true, |bytes| bytes.len() <= MODEL_BYTES - 1024)
+            {
+                break;
+            }
+        }
+        if serde_json::to_vec(&shortened).map_or(true, |bytes| bytes.len() > MODEL_BYTES) {
+            let status = shortened.get("status").cloned().unwrap_or(json!("success"));
+            let text = serde_json::to_string(&shortened).unwrap_or_default();
+            shortened = json!({"status":status,"summary":excerpt(&text, MODEL_BYTES / 2)});
+        }
+        if let Some(object) = shortened.as_object_mut() {
+            object.insert("truncated".into(), json!(true));
+            object.insert(
+                "note".into(),
+                json!(format!(
+                    "Result was {} bytes; long fields were shortened in the middle. Page through full_result with file_read offset/limit for the omitted part.",
+                    encoded.len()
+                )),
+            );
+            // A text rendering keeps long outputs as real lines, so the model
+            // can page through them with file_read offset/limit.
+            let readable = readable_text(&serde_json::from_slice(&encoded).unwrap_or(Value::Null));
+            match self.persist_once(&format!("tool-{id}.txt"), readable.as_bytes()) {
+                Ok(path) => {
+                    object.insert("full_result".into(), json!(path));
+                }
+                Err(error) => {
+                    object.insert(
+                        "presentation_error".into(),
+                        json!(error.to_string().chars().take(256).collect::<String>()),
+                    );
+                }
+            }
+        }
+        shortened
+    }
     pub async fn shutdown(&self) -> Result<()> {
         self.capabilities.shutdown().await?;
         self.connectors.reap_idle(Duration::ZERO).await;
@@ -744,6 +918,92 @@ fn is_mcp(config: &ConnectorConfig) -> bool {
         config.transport.as_str(),
         "stdio" | "http" | "streamable_http"
     )
+}
+/// Flattens a result into labelled sections with long strings written verbatim.
+fn readable_text(value: &Value) -> String {
+    fn walk(value: &Value, path: &str, output: &mut String) {
+        match value {
+            Value::Object(map) => {
+                for (key, item) in map {
+                    let path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(item, &path, output);
+                }
+            }
+            Value::Array(items) if items.iter().all(|item| !item.is_object()) => {
+                output.push_str(&format!("## {path}\n"));
+                for item in items {
+                    match item {
+                        Value::String(text) => output.push_str(text),
+                        other => output.push_str(&other.to_string()),
+                    }
+                    output.push('\n');
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk(item, &format!("{path}[{index}]"), output);
+                }
+            }
+            Value::String(text) if text.contains('\n') || text.len() > 120 => {
+                output.push_str(&format!("## {path}\n{text}"));
+                if !text.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+            other => {
+                let shown = match other {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                output.push_str(&format!("{path}: {shown}\n"));
+            }
+        }
+    }
+    let mut output = String::new();
+    walk(value, "", &mut output);
+    output
+}
+/// UTF-8-safe head and tail with an explicit omission marker.
+fn excerpt(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_owned();
+    }
+    const MARKER: &str = "\n[… middle omitted; see full_result …]\n";
+    let keep = budget.saturating_sub(MARKER.len()) / 2;
+    let mut head = keep.min(text.len());
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len().saturating_sub(keep);
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{MARKER}{}", &text[..head], &text[tail..])
+}
+fn shorten_strings(value: &mut Value, limit: usize) {
+    match value {
+        Value::String(text) if text.len() > limit => *text = excerpt(text, limit),
+        Value::Array(items) => {
+            if items.len() > 400 {
+                let omitted = items.len() - 400;
+                items.truncate(400);
+                items.push(json!(format!(
+                    "[… {omitted} more items omitted; see full_result …]"
+                )));
+            }
+            items
+                .iter_mut()
+                .for_each(|item| shorten_strings(item, limit));
+        }
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|item| shorten_strings(item, limit)),
+        _ => {}
+    }
 }
 #[derive(Debug)]
 struct ObservedFailure(Value);

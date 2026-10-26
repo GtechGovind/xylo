@@ -133,7 +133,10 @@ impl Store {
         self.guard_metadata(id, &action.intent.name, protocol)
     }
     fn guard_metadata(&self, id: Uuid, name: &str, protocol: i64) -> Result<Vec<Arc<File>>> {
-        let eligible_local = matches!(name, "file_write" | "memory_remember" | "skill_propose");
+        let eligible_local = matches!(
+            name,
+            "file_write" | "file_edit" | "memory_remember" | "skill_propose"
+        );
         // Native clients can close inherited handles and legacy workers never
         // held this authority. Neither can be inferred quiescent from a new lock.
         ensure!(

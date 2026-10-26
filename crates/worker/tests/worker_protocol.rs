@@ -328,6 +328,7 @@ async fn denied_write_never_changes_the_workspace() {
                         WorkerCommand::Approve {
                             action_id,
                             allow: false,
+                            remember: false,
                         },
                     )
                     .await;

@@ -766,7 +766,8 @@ fn observation_text(value: &serde_json::Value) -> Option<String> {
 fn review_label(name: &str) -> &'static str {
     match name {
         "write_file" | "file_write" | "apply_patch" => "Update project files",
-        "run_command" | "shell" | "terminal" | "execute" => "Run a command",
+        "file_edit" => "Edit a project file",
+        "run_command" | "shell_command" | "shell" | "terminal" | "execute" => "Run a command",
         "environment_execute" | "remote_execute" => "Run a command in an environment",
         "plugin_run_installed" => "Run a plugin",
         "image_generate" => "Create an image",

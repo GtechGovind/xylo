@@ -306,8 +306,12 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
-            WorkerCommand::Approve { action_id, allow } => {
-                if let Err(error) = gate.decide(action_id, allow) {
+            WorkerCommand::Approve {
+                action_id,
+                allow,
+                remember,
+            } => {
+                if let Err(error) = gate.decide_with(action_id, allow, remember) {
                     send(
                         &output,
                         &sequence,

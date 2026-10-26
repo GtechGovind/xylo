@@ -46,6 +46,16 @@ impl Drop for AbortDrain {
     }
 }
 
+/// The program could not be started, so it cannot have had any side effect.
+#[derive(Debug)]
+pub struct NotStarted(pub String);
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(&self.0)
+    }
+}
+impl std::error::Error for NotStarted {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProcessResult {
     pub code: Option<i32>,
@@ -93,7 +103,7 @@ pub async fn run(
     command.process_group(0);
     let mut child = command
         .spawn()
-        .with_context(|| format!("Start {program}"))?;
+        .map_err(|error| anyhow::Error::new(NotStarted(format!("Start {program}: {error}"))))?;
     let group = ProcessGroup {
         #[cfg(unix)]
         pid: child.id(),

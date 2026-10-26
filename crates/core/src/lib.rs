@@ -117,9 +117,46 @@ impl ProviderConfig {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
+    /// Ask before every change, command and external write.
     #[default]
     AskForWrites,
+    /// Inspect only; any writing tool is refused.
     ReadOnly,
+    /// Apply file edits inside the project without asking; ask for commands
+    /// and external writes.
+    AcceptEdits,
+    /// Apply project file edits and run local commands without asking; ask for
+    /// connectors, plugins, remote environments and other external writes.
+    Auto,
+}
+
+impl PermissionMode {
+    pub const ALL: [PermissionMode; 4] = [
+        PermissionMode::AskForWrites,
+        PermissionMode::AcceptEdits,
+        PermissionMode::Auto,
+        PermissionMode::ReadOnly,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            PermissionMode::AskForWrites => "Ask before changes",
+            PermissionMode::AcceptEdits => "Auto-accept edits",
+            PermissionMode::Auto => "Edits and commands",
+            PermissionMode::ReadOnly => "Read only",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            PermissionMode::AskForWrites => "Approve each file change and command",
+            PermissionMode::AcceptEdits => {
+                "Project file edits apply automatically; commands still ask"
+            }
+            PermissionMode::Auto => {
+                "Project edits and local commands run without asking; external actions still ask"
+            }
+            PermissionMode::ReadOnly => "Read and search only; nothing is changed",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,6 +305,9 @@ pub enum WorkerCommand {
     Approve {
         action_id: Uuid,
         allow: bool,
+        /// Also allow matching actions for the rest of this chat session.
+        #[serde(default)]
+        remember: bool,
     },
     Shutdown,
 }
@@ -305,6 +345,10 @@ pub enum EngineEvent {
         action_id: Uuid,
         name: String,
         arguments: Value,
+        /// What "always allow" would cover for the rest of this chat, when the
+        /// action can be remembered (for example "`cargo test` commands").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
     },
     ToolFinished {
         action_id: Uuid,

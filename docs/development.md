@@ -83,6 +83,7 @@ The real Chromium smoke test is separate from offline tests and requires an inst
 - [Architecture and invariants](architecture.md)
 - [Storage, memory, credentials and connectors](services.md)
 - [Native service routes, pagination and failure behavior](native-connectors.md)
+- [Coding agent tools, permission modes and context](coding-agent.md)
 - [Interrupted actions, retained evidence and outcome review](action-review.md)
 - [Native action review and saved notes](action-review-ui.md)
 - [Evidence-based procedural learning](learning.md)
