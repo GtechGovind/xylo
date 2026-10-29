@@ -1,3 +1,0 @@
-{"reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1", "started_at_unix": 1792902605.794972, "command": ["cargo", "check", "--locked", "--manifest-path", "crates/capabilities/validation/windows-read/Cargo.toml", "--target", "x86_64-pc-windows-msvc", "--all-targets"]}
-    Checking workbench-windows-read-validation v0.0.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/capabilities/validation/windows-read)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.37s

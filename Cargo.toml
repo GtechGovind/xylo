@@ -20,16 +20,16 @@ tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-workbench-core = { path = "crates/core" }
-workbench-runtime = { path = "crates/runtime" }
-workbench-resources = { path = "crates/resources" }
-workbench-services = { path = "crates/services" }
-workbench-capabilities = { path = "crates/capabilities" }
-workbench-engine = { path = "crates/engine" }
-workbench-scheduler = { path = "crates/scheduler" }
-workbench-helper-client = { path = "crates/helper-client" }
-workbench-distribution = { path = "crates/distribution" }
-workbench-notifications = { path = "crates/notifications" }
+core = { path = "crates/core" }
+runtime = { path = "crates/runtime" }
+resources = { path = "crates/resources" }
+services = { path = "crates/services" }
+capabilities = { path = "crates/capabilities" }
+engine = { path = "crates/engine" }
+scheduler = { path = "crates/scheduler" }
+helper-client = { path = "crates/helper-client" }
+distribution = { path = "crates/distribution" }
+notifications = { path = "crates/notifications" }
 
 [profile.release]
 lto = "thin"

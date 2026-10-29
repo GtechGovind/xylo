@@ -1,5 +1,5 @@
 [package]
-name = "workbench-services"
+name = "services"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 test-support = []
 
 [dependencies]
-workbench-core.workspace = true
+core.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true

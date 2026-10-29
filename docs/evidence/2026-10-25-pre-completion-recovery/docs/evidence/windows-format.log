@@ -1,1 +1,0 @@
-{"reviewed_source_fingerprint_sha256": "497a50dea191c4785427d0d78304dd2f9f4c358ee1c777b9b6bd4a904ee4eea1", "started_at_unix": 1792902396.147159, "command": ["cargo", "fmt", "--manifest-path", "crates/capabilities/validation/windows-read/Cargo.toml", "--", "--check"]}

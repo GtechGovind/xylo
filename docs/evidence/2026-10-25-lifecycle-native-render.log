@@ -1,7 +1,0 @@
-{"reviewed_source_fingerprint_sha256": "3c0d03abdf3daebbee00a9a898dded5c51d46d6e2f70b29b26a5ac3d9550356d", "started_at_unix": 1792898539.7280629, "command": ["cargo", "test", "--locked", "--manifest-path", "crates/desktop/validation/Cargo.toml", "--test", "native-rendering"]}
-   Compiling workbench-native-validation v0.1.0 (/Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/crates/desktop/validation)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.84s
-warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
-note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
-     Running rendering.rs (target/debug/deps/native_rendering-ae1e47a9f9db96e4)
-Native layout captures: /Users/govind/Documents/Codex/2026-10-25/wha/outputs/agent-workbench/docs/native-preview (Plugins/Environments are controlled no-Host loading/setup snapshots; loaded states require the Host/helper fixtures)

@@ -8,9 +8,9 @@
   "binariesDir": "target/release",
   "outDir": "dist",
   "binaries": [
-    { "path": "agent-workbench", "main": true },
-    { "path": "workbench-worker" },
-    { "path": "workbench-helper" }
+    { "path": "xylo", "main": true },
+    { "path": "worker" },
+    { "path": "helper" }
   ],
   "resources": [
     { "src": "LICENSE", "target": "licenses/LICENSE" },

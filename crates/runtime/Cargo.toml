@@ -1,15 +1,15 @@
 [package]
-name = "workbench-runtime"
+name = "runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-workbench-core.workspace = true
-workbench-resources.workspace = true
-workbench-services.workspace = true
-workbench-scheduler.workspace = true
-workbench-helper-client.workspace = true
+core.workspace = true
+resources.workspace = true
+services.workspace = true
+scheduler.workspace = true
+helper-client.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true
@@ -36,8 +36,8 @@ ignore = "0.4"
 grep-searcher = "=0.1.17"
 grep-regex = "=0.1.14"
 grep-matcher = "=0.1.9"
-workbench-distribution.workspace = true
-workbench-notifications.workspace = true
+distribution.workspace = true
+notifications.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }

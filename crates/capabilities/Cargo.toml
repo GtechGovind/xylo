@@ -1,12 +1,12 @@
 [package]
-name = "workbench-capabilities"
+name = "capabilities"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-workbench-core.workspace = true
-workbench-resources.workspace = true
+core.workspace = true
+resources.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,7 +26,7 @@ xcap = "0.9.8"
 enigo = "0.6.1"
 wasmtime = { version = "50", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "reexport-wasmparser", "runtime", "std", "wat"] }
 wat = "=1.262.0"
-workbench-scheduler = { path = "../scheduler" }
+scheduler = { path = "../scheduler" }
 fs2 = "0.4"
 url = "2"
 libc = "0.2"

@@ -1,5 +1,5 @@
 [package]
-name = "workbench-distribution"
+name = "distribution"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
