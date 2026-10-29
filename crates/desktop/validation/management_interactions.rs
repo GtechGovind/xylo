@@ -10,13 +10,13 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
+mod xylo {
+    include!("../src/xylo.rs");
     mod management_tests {
         use super::{
             App, AppContext, AppSettings, Bounds, ContainerRuntime, ContainerTarget, Entity,
             EnvironmentProfile, EnvironmentTarget, HostClient, NativePluginManifest, Page,
-            PluginBudgets, TestAppContext, Uuid, WindowBounds, WindowOptions, Workbench, px, size,
+            PluginBudgets, TestAppContext, Uuid, WindowBounds, WindowOptions, Xylo, px, size,
         };
         use gpui_kit::{
             AnyWindowHandle,
@@ -31,15 +31,15 @@ mod workbench {
             directory: tempfile::TempDir,
             base: PathBuf,
             workspace: PathBuf,
-            paths: workbench_runtime::AppPaths,
+            paths: xylo_runtime::AppPaths,
             host: HostClient,
             window: AnyWindowHandle,
-            view: Entity<Workbench>,
+            view: Entity<Xylo>,
         }
         fn wait(
             cx: &mut TestAppContext,
-            view: &Entity<Workbench>,
-            condition: impl Fn(&Workbench, &App) -> bool,
+            view: &Entity<Xylo>,
+            condition: impl Fn(&Xylo, &App) -> bool,
         ) {
             let deadline = Instant::now() + Duration::from_secs(25);
             loop {
@@ -73,8 +73,8 @@ mod workbench {
             let base = directory.path().canonicalize().unwrap();
             let workspace = base.join("project");
             std::fs::create_dir(&workspace).unwrap();
-            let paths = workbench_runtime::AppPaths::at(base.join("profile")).unwrap();
-            let store = workbench_services::Store::open(&paths.database).unwrap();
+            let paths = xylo_runtime::AppPaths::at(base.join("profile")).unwrap();
+            let store = xylo_services::Store::open(&paths.database).unwrap();
             let mut settings = AppSettings {
                 last_workspace: initial_page.is_none().then(|| workspace.clone()),
                 ..Default::default()
@@ -96,7 +96,7 @@ mod workbench {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| Workbench::new(Ok(host), window, cx)),
+                    |window, cx| cx.new(|cx| Xylo::new(Ok(host), window, cx)),
                 )
                 .unwrap()
             });
@@ -130,6 +130,290 @@ mod workbench {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+        #[cfg(unix)]
+        #[gpui_kit::test]
+        fn approved_context_mcp_registers_discovers_and_persists_real_stdio_tools(
+            cx: &mut TestAppContext,
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+            let fixture = open(cx);
+            let server = fixture.base.join("mcp-fixture");
+            std::fs::write(&server, r#"#!/usr/bin/env python3
+import json,sys,time,pathlib
+for line in sys.stdin:
+    request=json.loads(line)
+    if 'id' not in request: continue
+    method=request['method']
+    if method=='initialize':
+        result={'protocolVersion':request['params']['protocolVersion'],'capabilities':{'tools':{}},'serverInfo':{'name':'native-ui-fixture','version':'1'}}
+    elif method=='tools/list':
+        mode_path=pathlib.Path(__file__+'.mode')
+        mode=mode_path.read_text() if mode_path.exists() else 'normal'
+        if mode=='slow': time.sleep(0.15)
+        if mode=='error':
+            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32603,'message':'Fixture catalogue failed'}}),flush=True)
+            continue
+        result={'tools':[{'name':'fixture_echo','description':'Local fixture echo','inputSchema':{'type':'object','properties':{'value':{'type':'string'}}},'annotations':{'readOnlyHint':True}}]}
+        if mode=='empty': result={'tools':[]}
+    else: result={}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+"#).unwrap();
+            std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("settings", cx);
+                window.click("nav-context", cx);
+                window.click("manage-context-connections", cx);
+                fixture.view.update(cx, |view, cx| {
+                    Xylo::set_input(&view.connector_name, "Local MCP fixture", window, cx);
+                    Xylo::set_input(
+                        &view.connector_command,
+                        server.to_string_lossy().to_string(),
+                        window,
+                        cx,
+                    );
+                    Xylo::set_input(&view.connector_args, "", window, cx);
+                });
+                window.click("connector-save", cx);
+            })
+            .unwrap();
+            wait(cx, &fixture.view, |view, _| {
+                view.connectors
+                    .iter()
+                    .any(|connection| connection.name == "Local MCP fixture")
+            });
+            let store = xylo_services::Store::open(&fixture.paths.database).unwrap();
+            let saved = store.connectors().unwrap();
+            let session = cx.update(|cx| fixture.view.read(cx).session);
+            store
+                .upsert_conversation(&xylo_core::Conversation {
+                    id: session,
+                    title: "Fixture guidance".into(),
+                    workspace: fixture.workspace.clone(),
+                    updated_at: xylo_core::now_ms(),
+                })
+                .unwrap();
+            let source = xylo_core::ChatMessage {
+                id: Uuid::new_v4(),
+                session_id: session,
+                role: "user".into(),
+                content: "Use `cargo test --offline` for verification.".into(),
+                created_at: xylo_core::now_ms(),
+                attachments: Vec::new(),
+            };
+            store.append_message(&source).unwrap();
+            xylo_services::LearningService::new(store.clone())
+                .record_scoped_correction(
+                    &fixture.workspace.to_string_lossy(),
+                    &xylo_services::CorrectionInput {
+                        user_message_id: source.id,
+                        guidance: source.content.clone(),
+                        expected_tools: vec!["run_command".into()],
+                        replaces: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].command.as_deref(), Some(server.as_path()));
+            assert!(saved[0].credential_ref.is_none());
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click(("connector-tools", 0usize), cx);
+            })
+            .unwrap();
+            wait(cx, &fixture.view, |view, _| {
+                view.connector_tools
+                    .iter()
+                    .any(|tool| tool.name == "fixture_echo")
+            });
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.click("nav-context", cx);
+                window.render_frame(cx);
+                assert!(window.find(("context-tools", 0usize)).visible());
+                window.click(("context-tools", 0usize), cx);
+                window.click("nav-skills", cx);
+                window.render_frame(cx);
+                assert!(window.find("refresh-learning").visible());
+                window.click("refresh-learning", cx);
+            })
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                cx.run_until_parked();
+                let loaded = cx
+                    .update_window(fixture.window, |_, window, cx| {
+                        window.render_frame(cx);
+                        window.try_find(("learned-procedure", 0usize)).is_some()
+                    })
+                    .unwrap();
+                if loaded {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Saved correction did not load in Skills"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.click(("learned-procedure", 0usize), cx);
+                window.render_frame(cx);
+                assert!(window.find("review-learned-procedure").visible());
+                // An empty review cannot promote a procedure or grant tools access.
+                window.click("review-learned-procedure", cx);
+            })
+            .unwrap();
+            assert!(
+                xylo_services::LearningService::new(store)
+                    .skills(&fixture.workspace.to_string_lossy(), 20)
+                    .unwrap()
+                    .iter()
+                    .all(|skill| skill.state != "promoted")
+            );
+            cx.update(|cx| {
+                assert!(
+                    fixture.view.read(cx).error.is_none(),
+                    "real MCP/Skills refresh error: {:?}",
+                    fixture.view.read(cx).error
+                )
+            });
+            let mode = PathBuf::from(format!("{}.mode", server.display()));
+            for state in ["empty", "slow", "error"] {
+                std::fs::write(&mode, state).unwrap();
+                cx.update_window(fixture.window, |_, window, cx| {
+                    window.click("nav-context", cx);
+                    window.render_frame(cx);
+                    window.click(("context-tools", 0usize), cx);
+                    assert!(fixture.view.read(cx).connector_loading);
+                    window.render_frame(cx);
+                    assert!(window.find_by_label("Loading tools…").visible());
+                })
+                .unwrap();
+                wait(cx, &fixture.view, |view, _| !view.connector_loading);
+                cx.update_window(fixture.window, |_, window, cx| {
+                    window.render_frame(cx);
+                    let view = fixture.view.read(cx);
+                    match state {
+                        "empty" => {
+                            assert!(view.connector_tools.is_empty());
+                            assert!(window.find_by_label("No tools returned").visible());
+                        }
+                        "slow" => assert!(
+                            view.connector_tools
+                                .iter()
+                                .any(|tool| tool.name == "fixture_echo")
+                        ),
+                        _ => {
+                            assert!(
+                                view.connector_error
+                                    .as_deref()
+                                    .unwrap()
+                                    .contains("Fixture catalogue failed")
+                            );
+                            assert!(window.find("retry-connector-inspection").visible());
+                        }
+                    }
+                })
+                .unwrap();
+            }
+            std::fs::write(&mode, "normal").unwrap();
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.click("retry-connector-inspection", cx)
+            })
+            .unwrap();
+            wait(cx, &fixture.view, |view, _| {
+                !view.connector_loading
+                    && view.connector_error.is_none()
+                    && view
+                        .connector_tools
+                        .iter()
+                        .any(|tool| tool.name == "fixture_echo")
+            });
+            shutdown(cx, &fixture);
+        }
+
+        #[gpui_kit::test]
+        fn approved_context_empty_error_and_stale_catalogues_settle_the_selected_server(
+            cx: &mut TestAppContext,
+        ) {
+            let fixture = open(cx);
+            let a = Uuid::new_v4();
+            let b = Uuid::new_v4();
+            cx.update_window(fixture.window, |_, window, cx| {
+                fixture.view.update(cx, |view, cx| {
+                    view.connector_inspected = Some(b);
+                    view.connector_loading = true;
+                    view.connector_tools.clear();
+                    view.connector_error = None;
+                    view.event(
+                        xylo_runtime::host::HostEvent::ConnectorTools {
+                            connector_id: a,
+                            tools: vec![xylo_core::ToolDefinition {
+                                name: "stale_tool".into(),
+                                description: String::new(),
+                                parameters: serde_json::json!({}),
+                                writes: false,
+                            }],
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(view.connector_loading);
+                    assert!(view.connector_tools.is_empty());
+                    view.event(
+                        xylo_runtime::host::HostEvent::ConnectorTools {
+                            connector_id: b,
+                            tools: Vec::new(),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(!view.connector_loading);
+                    assert!(view.connector_tools.is_empty());
+                    view.page = Page::Context;
+                    view.settings_open = true;
+                    cx.notify();
+                })
+            })
+            .unwrap();
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.find_by_label("No tools returned").visible());
+                fixture.view.update(cx, |view, cx| {
+                    view.connector_inspected = Some(b);
+                    view.connector_loading = true;
+                    view.connector_error = None;
+                    view.event(
+                        xylo_runtime::host::HostEvent::ConnectorToolsFailed {
+                            connector_id: a,
+                            message: "old failure".into(),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(view.connector_loading);
+                    assert!(view.connector_error.is_none());
+                    view.event(
+                        xylo_runtime::host::HostEvent::ConnectorToolsFailed {
+                            connector_id: b,
+                            message: "Fixture discovery failed".into(),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(!view.connector_loading);
+                    assert_eq!(
+                        view.connector_error.as_deref(),
+                        Some("Fixture discovery failed")
+                    );
+                });
+                window.render_frame(cx);
+                assert!(window.find_by_label("Fixture discovery failed").visible());
+            })
+            .unwrap();
+            shutdown(cx, &fixture);
+        }
+
         fn inspect(cx: &mut TestAppContext, fixture: &Fixture, path: PathBuf) {
             cx.update_window(fixture.window, |_, _, cx| {
                 fixture
@@ -260,11 +544,11 @@ mod workbench {
                 view.validation_plugin_idle()
                     && view.validation_plugin_catalog().is_some_and(|catalog| {
                         catalog.plugins.iter().any(|plugin| {
-                            plugin.manifest.id == "org.agentworkbench.echo" && plugin.enabled
+                            plugin.manifest.id == "com.qurkos.xylo.echo" && plugin.enabled
                         })
                     })
             });
-            select_plugin(cx, &fixture, "org.agentworkbench.echo");
+            select_plugin(cx, &fixture, "com.qurkos.xylo.echo");
             cx.update_window(fixture.window, |_, window, cx| {
                 fixture.view.update(cx, |view, cx| {
                     view.plugins
@@ -291,7 +575,7 @@ mod workbench {
             wait(cx, &fixture.view, |view, _| {
                 view.validation_plugin_catalog().is_some_and(|catalog| {
                     catalog.plugins.iter().any(|plugin| {
-                        plugin.manifest.id == "org.agentworkbench.echo" && plugin.enabled
+                        plugin.manifest.id == "com.qurkos.xylo.echo" && plugin.enabled
                     })
                 }) && view.validation_plugin_idle()
             });

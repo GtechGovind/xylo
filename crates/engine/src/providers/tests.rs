@@ -41,7 +41,7 @@ async fn fixture(
         let mut body = vec![0; length];
         socket.read_exact(&mut body).await.unwrap();
         let header = format!(
-            "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nx-request-id: req_transport_fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             payload.len()
         );
         socket.get_mut().write_all(header.as_bytes()).await.unwrap();
@@ -108,8 +108,8 @@ fn image_message() -> Message {
 async fn managed_image_refs_rehydrate_into_actual_streamed_images_for_every_api_family() {
     use crate::attachments::{AttachmentProvider, user_message};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use workbench_core::{AttachmentSource, PermissionMode, TurnRequest};
-    use workbench_services::attachments::AttachmentStore;
+    use xylo_core::{AttachmentSource, PermissionMode, TurnRequest};
+    use xylo_services::attachments::AttachmentStore;
     let directory = tempfile::tempdir().unwrap();
     let assets = AttachmentStore::new(directory.path().join("artifacts")).unwrap();
     let session = uuid::Uuid::new_v4();
@@ -853,4 +853,503 @@ async fn bedrock_requires_a_valid_unfiltered_terminal_reason_even_after_http_suc
         );
         server.await.unwrap();
     }
+}
+
+#[test]
+fn configured_reasoning_is_serialized_for_each_openai_protocol() {
+    for family in [ApiFamily::OpenAiChat, ApiFamily::OpenAiResponses] {
+        let mut saved =
+            serde_json::to_value(config(family.clone(), "http://127.0.0.1:8080/v1".into()))
+                .unwrap();
+        saved["model"] = json!("gpt-5.2");
+        saved["reasoning_effort"] = json!("high");
+        let config: ProviderConfig = serde_json::from_value(saved).unwrap();
+        let provider = NativeProvider::new(config, ProviderCredential::None).unwrap();
+        let body = provider
+            .body(
+                &[Message::user("query")],
+                &[],
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let effort = if family == ApiFamily::OpenAiResponses {
+            &body["reasoning"]["effort"]
+        } else {
+            &body["reasoning_effort"]
+        };
+        assert_eq!(effort, "high");
+    }
+}
+
+#[test]
+fn unsupported_or_overridden_models_do_not_receive_saved_reasoning() {
+    for (family, model) in [
+        (ApiFamily::OpenAiChat, "gpt-4.1"),
+        (ApiFamily::Anthropic, "claude-sonnet-4"),
+    ] {
+        let mut config = config(family, "http://127.0.0.1:8080/v1".into());
+        config.model = model.into();
+        config.reasoning_effort = Some("high".into());
+        let provider = NativeProvider::new(config, ProviderCredential::None).unwrap();
+        let body = provider
+            .body(
+                &[Message::user("query")],
+                &[],
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(body.get("reasoning_effort").is_none() && body.get("reasoning").is_none());
+    }
+    let mut config = config(ApiFamily::OpenAiChat, "http://127.0.0.1:8080/v1".into());
+    config.model = "gpt-5.2".into();
+    config.reasoning_effort = Some("high".into());
+    let provider = NativeProvider::new(config, ProviderCredential::None).unwrap();
+    let body = provider
+        .body(
+            &[Message::user("query")],
+            &[],
+            None,
+            None,
+            Some("gpt-4.1"),
+            None,
+            false,
+        )
+        .unwrap();
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn future_model_advertised_reasoning_is_sent_without_a_name_allowlist() {
+    for family in [ApiFamily::OpenAiChat, ApiFamily::OpenAiResponses] {
+        let mut value =
+            serde_json::to_value(config(family.clone(), "http://127.0.0.1:8080/v1".into()))
+                .unwrap();
+        value["model"] = json!("future-account-model");
+        value["reasoning_options"] = json!(["low", "high"]);
+        value["default_reasoning_effort"] = json!("low");
+        value["reasoning_effort"] = json!("high");
+        let config: ProviderConfig = serde_json::from_value(value).unwrap();
+        let provider = NativeProvider::new(config, ProviderCredential::None).unwrap();
+        let body = provider
+            .body(
+                &[Message::user("query")],
+                &[],
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let effort = if family == ApiFamily::OpenAiResponses {
+            &body["reasoning"]["effort"]
+        } else {
+            &body["reasoning_effort"]
+        };
+        assert_eq!(effort, "high");
+    }
+}
+
+#[test]
+fn model_override_does_not_inherit_another_models_catalog_metadata() {
+    let config = ProviderConfig {
+        model: "original-model".into(),
+        reasoning_options: Some(vec!["high".into()]),
+        reasoning_effort: Some("high".into()),
+        ..config(
+            ApiFamily::OpenAiResponses,
+            "http://127.0.0.1:8080/v1".into(),
+        )
+    };
+    let provider = NativeProvider::new(config, ProviderCredential::None).unwrap();
+    let body = provider
+        .body(
+            &[Message::user("query")],
+            &[],
+            None,
+            None,
+            Some("different-unknown-model"),
+            None,
+            false,
+        )
+        .unwrap();
+    assert!(body.get("reasoning").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plan_delegate_collects_required_responses_stream_with_inherited_model_and_reasoning() {
+    use hermes_agent::{
+        AgentConfig, InterruptController, SubAgentOrchestrator, SubAgentOrchestratorConfig,
+        SubAgentRequest,
+    };
+    let output = json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Plan child complete"}]}]);
+    let payload = sse(&[
+        json!({"type":"response.completed","response":{"status":"completed","model":"gpt-6.1-sol","output":output,"usage":{"input_tokens":5,"output_tokens":2}}}),
+    ]);
+    let (endpoint, server) = fixture(payload, 200, "text/event-stream").await;
+    let mut config = config(ApiFamily::OpenAiResponses, endpoint);
+    config.model = "gpt-6.1-sol".into();
+    config.reasoning_options = Some(vec!["high".into()]);
+    config.reasoning_effort = Some("high".into());
+    // Only transport is local: exercise plan serialization/collector with a fake
+    // API key, without relaxing production official-origin credential checks.
+    let mut native =
+        NativeProvider::new(config, ProviderCredential::ApiKey("fixture-key".into())).unwrap();
+    native.chatgpt_plan = true;
+    let directory = tempfile::tempdir().unwrap();
+    let orchestrator = Arc::new(SubAgentOrchestrator::new(SubAgentOrchestratorConfig {
+        parent_config: AgentConfig {
+            native_product_finalization: true,
+            model: "gpt-6.1-sol".into(),
+            skip_memory: true,
+            skip_context_files: true,
+            hermes_home: Some(directory.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        tool_registry: Arc::new(hermes_agent::agent_loop::ToolRegistry::new()),
+        llm_provider: Arc::new(native),
+        parent_credential_pool: None,
+        parent_interrupt: InterruptController::new(),
+        hermes_home: directory.path().into(),
+        parent_session_id: Some("plan-parent".into()),
+        timeout: Duration::from_secs(5),
+        background_delegation_callback: None,
+    }));
+    let result = orchestrator
+        .execute(SubAgentRequest {
+            task: "Return a short result".into(),
+            child_depth: 1,
+            max_depth: 1,
+            ..Default::default()
+        })
+        .await;
+    let result: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["result"], "Plan child complete");
+    let sent = server.await.unwrap();
+    assert_eq!(sent.body["model"], "gpt-6.1-sol");
+    assert_eq!(sent.body["stream"], true);
+    assert_eq!(sent.body["store"], false);
+    assert_eq!(sent.body["reasoning"]["effort"], "high");
+    assert!(sent.body.get("max_output_tokens").is_none());
+    let lineage: Value = serde_json::from_slice(
+        &std::fs::read(
+            directory
+                .path()
+                .join("subagents")
+                .join(format!("{}.json", result["sub_agent_id"].as_str().unwrap())),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(lineage["model"], "gpt-6.1-sol");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_delegate_model_fails_once_with_actionable_model_identity() {
+    use hermes_agent::{
+        AgentConfig, InterruptController, SubAgentOrchestrator, SubAgentOrchestratorConfig,
+        SubAgentRequest,
+    };
+    let (endpoint, server) = fixture(
+        br#"{"error":{"code":"model_not_found","message":"must not reflect credential details"}}"#
+            .to_vec(),
+        400,
+        "application/json",
+    )
+    .await;
+    let mut config = config(ApiFamily::OpenAiResponses, endpoint);
+    config.model = "gpt-6.1-sol".into();
+    let native =
+        NativeProvider::new(config, ProviderCredential::ApiKey("fixture-key".into())).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut parent = AgentConfig {
+        native_product_finalization: true,
+        model: "gpt-6.1-sol".into(),
+        skip_memory: true,
+        skip_context_files: true,
+        hermes_home: Some(directory.path().to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    parent.allow_model_fallbacks = false;
+    parent.retry.max_retries = 1;
+    parent.retry.base_delay_ms = 1;
+    let orchestrator = Arc::new(SubAgentOrchestrator::new(SubAgentOrchestratorConfig {
+        parent_config: parent,
+        tool_registry: Arc::new(hermes_agent::agent_loop::ToolRegistry::new()),
+        llm_provider: Arc::new(native),
+        parent_credential_pool: None,
+        parent_interrupt: InterruptController::new(),
+        hermes_home: directory.path().into(),
+        parent_session_id: Some("parent".into()),
+        timeout: Duration::from_secs(5),
+        background_delegation_callback: None,
+    }));
+    let result: Value = serde_json::from_str(
+        &orchestrator
+            .execute(SubAgentRequest {
+                task: "Return a short result".into(),
+                child_depth: 1,
+                max_depth: 1,
+                ..Default::default()
+            })
+            .await,
+    )
+    .unwrap();
+    assert_eq!(result["status"], "failed");
+    let error = result["error"].as_str().unwrap();
+    assert!(error.contains("gpt-6.1-sol"), "{error}");
+    assert!(error.contains("Responses"), "{error}");
+    assert!(error.contains("Refresh models"), "{error}");
+    assert!(
+        !error.contains("transport failed"),
+        "A fatal catalog rejection must not retry or select another model: {error}"
+    );
+    assert!(!error.contains("credential details"));
+    assert_eq!(server.await.unwrap().body["model"], "gpt-6.1-sol");
+}
+
+#[tokio::test]
+async fn native_selected_model_survives_sdk_cost_guard_without_substitution() {
+    use hermes_agent::{AgentConfig, AgentLoop};
+    let response = json!({"status":"completed","model":"gpt-6.1-sol","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Finished"}]}],"usage":{"input_tokens":10,"output_tokens":2}});
+    let (endpoint, server) =
+        fixture(response.to_string().into_bytes(), 200, "application/json").await;
+    let mut config = config(ApiFamily::OpenAiResponses, endpoint);
+    config.model = "gpt-6.1-sol".into();
+    let native = Arc::new(
+        NativeProvider::new(config, ProviderCredential::ApiKey("fixture-key".into())).unwrap(),
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let agent = AgentLoop::new(
+        AgentConfig {
+            model: "gpt-6.1-sol".into(),
+            native_product_finalization: true,
+            allow_model_fallbacks: false,
+            max_cost_usd: Some(1.0),
+            cost_guard_degrade_at_ratio: 0.1,
+            prompt_cost_per_million_usd: Some(50000.0),
+            completion_cost_per_million_usd: Some(0.0),
+            skip_memory: true,
+            skip_context_files: true,
+            hermes_home: Some(directory.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        Arc::new(hermes_agent::agent_loop::ToolRegistry::new()),
+        native,
+    );
+    let result = agent
+        .run(vec![Message::user("Return a short result")], Some(vec![]))
+        .await
+        .unwrap();
+    assert!(result.finished_naturally);
+    assert!(result.messages.iter().any(|message| {
+        message
+            .content
+            .as_deref()
+            .is_some_and(|text| text.contains("Cost guard warning"))
+    }));
+    assert!(!result.messages.iter().any(|message| {
+        message
+            .content
+            .as_deref()
+            .is_some_and(|text| text.contains("Switching to cheaper model"))
+    }));
+    assert_eq!(server.await.unwrap().body["model"], "gpt-6.1-sol");
+}
+
+#[tokio::test]
+async fn sse_request_rejection_preserves_safe_detail_and_redacts_reflected_credentials() {
+    let payload = sse(&[
+        json!({"type":"error","request_id":"req_fixture123","error":{"type":"invalid_request_error","code":"invalid_tool_output","param":"input[7].call_id","message":"No tool output found for function call 'call_private'. Authorization: Bearer fixture-key. Check https://user:password@provider.invalid/trace?api_key=private-query and API key sk-reflected-unknown-secret."}}),
+    ]);
+    let (endpoint, server) = fixture(payload, 200, "text/event-stream").await;
+    let error = collect(
+        &provider(ApiFamily::OpenAiResponses, endpoint),
+        &[Message::user("query")],
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("No tool output found"), "{error}");
+    assert!(error.contains("invalid_tool_output"), "{error}");
+    assert!(error.contains("invalid_request_error"));
+    assert!(error.contains("input[7].call_id"));
+    assert!(error.contains("req_fixture123"));
+    for secret in [
+        "fixture-key",
+        "call_private",
+        "https://",
+        "user:password",
+        "private-query",
+        "sk-reflected-unknown-secret",
+    ] {
+        assert!(!error.contains(secret), "Leaked {secret}: {error}");
+    }
+    assert!(error.len() < 1200);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_response_diagnostics_are_bounded_even_with_adversarial_metadata() {
+    let payload = sse(&[
+        json!({"type":"response.failed","response":{"error":{"type":"invalid_request_error","code":"fixture-key","param":"https://provider.invalid/?token=fixture-key","request_id":"Bearer fixture-key","message":format!("Invalid 'input[4].content': {} fixture-key", "敏感".repeat(10000))}}}),
+    ]);
+    let (endpoint, server) = fixture(payload, 200, "text/event-stream").await;
+    let error = collect(
+        &provider(ApiFamily::OpenAiResponses, endpoint),
+        &[Message::user("query")],
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("invalid_request_error"), "{error}");
+    assert!(error.contains("input[4].content"), "{error}");
+    assert!(!error.contains("fixture-key"));
+    assert!(!error.contains("https://"));
+    assert!(error.len() < 1200);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_error_uses_safe_transport_request_id_when_body_omits_it() {
+    let payload = sse(&[
+        json!({"type":"error","code":"invalid_request_error","param":"input","message":"Invalid request field 'input'."}),
+    ]);
+    let (endpoint, server) = fixture(payload, 200, "text/event-stream").await;
+    let error = collect(
+        &provider(ApiFamily::OpenAiResponses, endpoint),
+        &[Message::user("query")],
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("request=req_transport_fixture"), "{error}");
+    assert!(error.contains("Invalid request field input"), "{error}");
+    server.await.unwrap();
+}
+
+async fn classified_error_request_count(
+    status: u16,
+    request_id: &'static str,
+    streaming: bool,
+) -> usize {
+    use hermes_agent::{AgentConfig, AgentLoop};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server_stop = stop.clone();
+    let server = tokio::spawn(async move {
+        let mut requests = 0;
+        loop {
+            let accepted = tokio::select! {_=server_stop.cancelled()=>break,value=listener.accept()=>value.unwrap()};
+            let mut socket = BufReader::new(accepted.0);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if let Some((key, value)) = line.split_once(':') {
+                    if key.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut bytes = vec![0; length];
+            socket.read_exact(&mut bytes).await.unwrap();
+            requests += 1;
+            let body = if status == 200 {
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"error","request_id":request_id,"error":{"type":"invalid_request_error","code":"invalid_request_error","message":"Invalid input field 'input'."}})
+                )
+            } else {
+                json!({"error":{"code":if status==429 {"rate_limit_exceeded"} else {"server_error"}}}).to_string()
+            };
+            socket.get_mut().write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",if status==200 {"text/event-stream"} else {"application/json"},body.len()).as_bytes()).await.unwrap();
+        }
+        requests
+    });
+    // Delegated plan calls use the non-streaming AgentLoop entry point, while
+    // the native plan adapter collects the required HTTP SSE stream internally.
+    let mut native = provider(ApiFamily::OpenAiResponses, endpoint);
+    native.chatgpt_plan = true;
+    let native = Arc::new(native);
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = AgentConfig {
+        model: "fixture-model".into(),
+        allow_model_fallbacks: false,
+        native_product_finalization: true,
+        skip_memory: true,
+        skip_context_files: true,
+        hermes_home: Some(directory.path().to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    config.retry.max_retries = 1;
+    config.stream_read_max_retries = 1;
+    config.retry.base_delay_ms = 1;
+    config.retry.max_delay_ms = 2;
+    let agent = AgentLoop::new(
+        config,
+        Arc::new(hermes_agent::agent_loop::ToolRegistry::new()),
+        native,
+    );
+    if streaming {
+        agent
+            .run_stream(vec![Message::user("Return a result")], Some(vec![]), None)
+            .await
+            .unwrap_err();
+    } else {
+        agent
+            .run(vec![Message::user("Return a result")], Some(vec![]))
+            .await
+            .unwrap_err();
+    }
+    stop.cancel();
+    server.await.unwrap()
+}
+
+#[tokio::test]
+async fn invalid_request_ids_with_status_digits_are_terminal_without_retry() {
+    for request_id in ["req_503abc", "req_429abc"] {
+        assert_eq!(
+            classified_error_request_count(200, request_id, false).await,
+            1,
+            "Request metadata must not change invalid-request classification: {request_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn actual_http_rate_limits_and_server_failures_still_retry() {
+    for status in [429, 503] {
+        assert_eq!(
+            classified_error_request_count(status, "req_fixture", false).await,
+            2,
+            "HTTP status {status} must retain the configured retry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stream_request_ids_with_connection_text_do_not_retry_invalid_requests() {
+    assert_eq!(
+        classified_error_request_count(200, "req_connection_503abc", true).await,
+        1
+    );
 }

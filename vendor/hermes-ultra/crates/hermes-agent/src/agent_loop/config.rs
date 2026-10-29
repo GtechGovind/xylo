@@ -271,6 +271,11 @@ pub struct AgentConfig {
     #[serde(default)]
     pub retry: RetryConfig,
 
+    /// Permit SDK-driven model substitutions for reliability, cost, or retries.
+    /// Native hosts with an explicitly authorized model disable this.
+    #[serde(default = "default_allow_model_fallbacks")]
+    pub allow_model_fallbacks: bool,
+
     /// Optional system prompt prepended to every conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
@@ -690,6 +695,7 @@ impl Default for AgentConfig {
             model: default_model(),
             api_mode: ApiMode::default(),
             retry: RetryConfig::default(),
+            allow_model_fallbacks: true,
             system_prompt: None,
             personality: None,
             extra_body: None,
@@ -751,4 +757,8 @@ impl Default for AgentConfig {
             lsp_context_max_chars: default_lsp_context_max_chars(),
         }
     }
+}
+
+fn default_allow_model_fallbacks() -> bool {
+    true
 }

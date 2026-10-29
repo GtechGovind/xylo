@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
 };
 use uuid::Uuid;
-use workbench_core::*;
+use xylo_core::*;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 fn config(temp: &tempfile::TempDir) -> CapabilityConfig {
     CapabilityConfig {

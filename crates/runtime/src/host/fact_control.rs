@@ -144,7 +144,7 @@ impl HostState {
             FactCommand::Export(request_id, scope, selection, destination) => {
                 let database = self.paths.database.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    workbench_services::export_fact_versions(
+                    xylo_services::export_fact_versions(
                         &database,
                         &scope,
                         &selection,

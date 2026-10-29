@@ -9,7 +9,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
-use workbench_services::ConnectorNotDispatched;
+use xylo_services::ConnectorNotDispatched;
 
 const SECRET: &str = "offline-native-journal-token";
 

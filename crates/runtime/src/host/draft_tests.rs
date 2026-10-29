@@ -269,7 +269,7 @@ async fn successful_dispatch_returns_admission_even_when_postcommit_metadata_rec
     assert!(host.store.draft(&draft.key).unwrap().is_empty());
     assert_eq!(host.store.messages(turn.session_id, 10).unwrap().len(), 1);
     assert!(
-        matches!(incoming.recv().await.unwrap().payload,WorkerCommand::Run{turn:dispatched} if dispatched.turn_id==turn.turn_id && dispatched.workspace==turn.workspace)
+        matches!(incoming.recv().await.unwrap().payload,WorkerCommand::RunAuthorized { turn: dispatched, credential: WorkerCredential(None) } if dispatched.turn_id == turn.turn_id && dispatched.session_id == turn.session_id && dispatched.workspace == turn.workspace)
     );
 }
 #[tokio::test]
@@ -353,6 +353,7 @@ async fn cancellation_during_commit_reaches_a_full_single_slot_worker_after_rese
     let running = host.clone();
     let session = turn.session_id;
     let turn_id = turn.turn_id;
+    let workspace = turn.workspace.clone();
     let task = tokio::spawn(async move {
         running
             .worker_command_with_draft(Some(session), WorkerCommand::Run { turn }, Some(draft))
@@ -373,7 +374,9 @@ async fn cancellation_during_commit_reaches_a_full_single_slot_worker_after_rese
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(run.payload, WorkerCommand::Run { .. }));
+    assert!(
+        matches!(run.payload, WorkerCommand::RunAuthorized { turn: dispatched, credential: WorkerCredential(None) } if dispatched.turn_id == turn_id && dispatched.session_id == session && dispatched.workspace == workspace)
+    );
     let cancellation = tokio::time::timeout(Duration::from_secs(1), incoming.recv())
         .await
         .unwrap()

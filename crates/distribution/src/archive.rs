@@ -90,9 +90,9 @@ pub(super) fn preflight(target: &str, format: &str, bytes: &[u8]) -> Result<()> 
     let root = root.context("Update archive is empty")?;
     for required in [
         "Contents/Info.plist",
-        "Contents/MacOS/agent-workbench",
-        "Contents/MacOS/workbench-worker",
-        "Contents/MacOS/workbench-helper",
+        "Contents/MacOS/xylo",
+        "Contents/MacOS/xylo-worker",
+        "Contents/MacOS/xylo-helper",
     ] {
         ensure!(
             regular.contains(&root.join(required)),

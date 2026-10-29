@@ -10,9 +10,9 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
-    impl Workbench {
+mod xylo {
+    include!("../src/xylo.rs");
+    impl Xylo {
         pub(crate) fn tree_capture_ready(&self) -> bool {
             self.settings_loaded
                 && self.workspace_ready
@@ -94,16 +94,16 @@ fn run() {
     )
     .unwrap();
     let project = project.canonicalize().unwrap();
-    let paths = workbench_runtime::AppPaths::at(temporary.path().join("profile")).unwrap();
-    let store = workbench_services::Store::open(&paths.database).unwrap();
+    let paths = xylo_runtime::AppPaths::at(temporary.path().join("profile")).unwrap();
+    let store = xylo_services::Store::open(&paths.database).unwrap();
     store
-        .save_settings(&workbench_core::AppSettings {
+        .save_settings(&xylo_core::AppSettings {
             theme: "dark".into(),
             last_workspace: Some(project.clone()),
             ..Default::default()
         })
         .unwrap();
-    let host = workbench_runtime::host::HostClient::spawn_at(paths).unwrap();
+    let host = xylo_runtime::host::HostClient::spawn_at(paths).unwrap();
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
         Arc::new(gpui_kit::assets::Assets),
@@ -123,7 +123,7 @@ fn run() {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| workbench::Workbench::new(Ok(host), window, cx)),
+                |window, cx| cx.new(|cx| xylo::Xylo::new(Ok(host), window, cx)),
             )
         })
         .unwrap();
@@ -197,7 +197,7 @@ fn run() {
         }
         serde_json::json!({"scope":"Controlled native GPU/font fixture using real temporary Host/project, no inference or user files", "rows":rows})
     }).unwrap();
-    let output = std::env::var_os("WORKBENCH_RENDER_DIR")
+    let output = std::env::var_os("XYLO_RENDER_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| "target/native-file-tree-preview".into());
     std::fs::create_dir_all(&output).unwrap();

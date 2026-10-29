@@ -1,6 +1,6 @@
 //! Worker-side verification and acknowledgement of persisted guidance identities.
 use super::*;
-use workbench_core::{SteeringReceipt, SteeringRequest, SteeringState};
+use xylo_core::{SteeringReceipt, SteeringRequest, SteeringState};
 pub(super) async fn receive(
     store: Store,
     active: Option<&ActiveTask>,

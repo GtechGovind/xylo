@@ -96,7 +96,7 @@ impl actor::Backend for Backend {
         toast_element.AppendChild(&audio)?;
         let toast = ToastNotification::CreateToastNotification(&xml)?;
         toast.SetTag(&notice.tag.clone().into())?;
-        toast.SetGroup(h!("agent-workbench"))?;
+        toast.SetGroup(h!("xylo"))?;
         let sender = self.activations.clone();
         let tag = notice.tag.clone();
         toast.Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
@@ -127,7 +127,7 @@ impl actor::Backend for Backend {
         }
         ToastNotificationManager::History()?.RemoveGroupedTagWithId(
             &tag.into(),
-            h!("agent-workbench"),
+            h!("xylo"),
             &self.identity.id.clone().into(),
         )?;
         Ok(())

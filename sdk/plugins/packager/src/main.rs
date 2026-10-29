@@ -9,7 +9,7 @@ use std::{
     io::{Read, Write},
     path::Path,
 };
-use workbench_core::{NativePluginManifest, PluginBudgets};
+use xylo_core::{NativePluginManifest, PluginBudgets};
 
 const MODULE_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -80,7 +80,7 @@ fn main() -> Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     ensure!(
         arguments.len() == 3,
-        "Usage: workbench-plugin-pack <guest.wasm> <package-template.json> <new-output-directory>"
+        "Usage: xylo-plugin-pack <guest.wasm> <package-template.json> <new-output-directory>"
     );
     pack(
         Path::new(&arguments[0]),

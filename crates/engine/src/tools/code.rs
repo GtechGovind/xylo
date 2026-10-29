@@ -280,7 +280,7 @@ pub(crate) fn diff(shown: &str, before: &str, after: &str) -> Value {
 /// Atomic replacement that keeps an existing file's permissions.
 pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<()> {
     use std::io::Write;
-    let temp = path.with_file_name(format!(".workbench-{}.tmp", uuid::Uuid::new_v4()));
+    let temp = path.with_file_name(format!(".xylo-{}.tmp", uuid::Uuid::new_v4()));
     let permissions = std::fs::metadata(path).ok().map(|m| m.permissions());
     let result = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()

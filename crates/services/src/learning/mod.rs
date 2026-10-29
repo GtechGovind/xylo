@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::{ChatMessage, Conversation, now_ms};
+use xylo_core::{ChatMessage, Conversation, now_ms};
 
 const MAX_STEPS: usize = 16;
 const MAX_CASES: usize = 16;

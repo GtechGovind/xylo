@@ -26,7 +26,7 @@ pub struct OAuthTokens {
 impl OAuthTokens {
     pub fn is_expired(&self) -> bool {
         self.expires_at_ms
-            .is_some_and(|expiry| expiry <= workbench_core::now_ms() + 30_000)
+            .is_some_and(|expiry| expiry <= xylo_core::now_ms() + 30_000)
     }
 }
 /// One-use PKCE state. Keep in host memory; never put verifier into UI, logs or SQLite.
@@ -192,7 +192,7 @@ async fn exchange(
         .get("expires_in")
         .and_then(serde_json::Value::as_i64)
         .filter(|seconds| *seconds > 0)
-        .map(|seconds| workbench_core::now_ms().saturating_add(seconds.saturating_mul(1000)));
+        .map(|seconds| xylo_core::now_ms().saturating_add(seconds.saturating_mul(1000)));
     Ok(OAuthTokens {
         access_token: access.into(),
         refresh_token: value

@@ -21,7 +21,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
-use workbench_core::{
+use xylo_core::{
     ApiFamily, AttachmentSource, GeneratedImage, ImageGenerationProtocol, ImageGenerationProvider,
     ImageGenerationReceipt, ImageGenerationRequest, ImageGenerationState, ProviderConfig, now_ms,
 };
@@ -517,10 +517,7 @@ impl ImageGenerationService {
                             )),
                     "Invalid generated artifact path"
                 );
-                let bytes = read_file(
-                    &image.artifact_path,
-                    workbench_core::MAX_IMAGE_BYTES as usize,
-                )?;
+                let bytes = read_file(&image.artifact_path, xylo_core::MAX_IMAGE_BYTES as usize)?;
                 ensure!(
                     format!("{:x}", Sha256::digest(bytes)) == image.attachment.sha256,
                     "Generated artifact failed its integrity check"

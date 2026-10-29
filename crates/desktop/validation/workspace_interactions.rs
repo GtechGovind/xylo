@@ -10,11 +10,11 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
+mod xylo {
+    include!("../src/xylo.rs");
     #[cfg(test)]
     mod workspace_native_tests {
-        use super::{Page, Workbench};
+        use super::{Page, Xylo};
         use gpui_kit::{
             AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size,
             test::{TestQueryExt, TestWindowExt},
@@ -25,7 +25,7 @@ mod workbench {
             time::{Duration, Instant},
         };
         use uuid::Uuid;
-        use workbench_runtime::{
+        use xylo_runtime::{
             AppPaths,
             host::{HostClient, HostEvent},
             workspace::{SearchHit, SearchPage},
@@ -34,7 +34,7 @@ mod workbench {
         fn open_view(
             cx: &mut TestAppContext,
             host: anyhow::Result<(HostClient, async_channel::Receiver<HostEvent>)>,
-        ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Workbench>) {
+        ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Xylo>) {
             cx.update(gpui_kit::init);
             let (window, view) = cx.update(|cx| {
                 gpui_kit::open_window(
@@ -46,7 +46,7 @@ mod workbench {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| Workbench::new(host, window, cx)),
+                    |window, cx| cx.new(|cx| Xylo::new(host, window, cx)),
                 )
                 .unwrap()
             });
@@ -54,12 +54,14 @@ mod workbench {
         }
         fn wait_for(
             cx: &mut TestAppContext,
-            view: &gpui_kit::Entity<Workbench>,
+            view: &gpui_kit::Entity<Xylo>,
             description: &str,
-            condition: impl Fn(&Workbench, &gpui_kit::App) -> bool,
+            condition: impl Fn(&Xylo, &gpui_kit::App) -> bool,
         ) {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
+                // Drive the native receiver's bounded-backlog yield timer.
+                cx.executor().advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 if cx.update(|cx| condition(view.read(cx), cx)) {
                     return;
@@ -78,7 +80,7 @@ mod workbench {
             PathBuf,
             HostClient,
             gpui_kit::AnyWindowHandle,
-            gpui_kit::Entity<Workbench>,
+            gpui_kit::Entity<Xylo>,
         ) {
             cx.executor().allow_parking();
             let temporary = tempfile::tempdir().unwrap();
@@ -440,11 +442,8 @@ mod workbench {
                 assert_eq!(editor.cursor(), content.find("needle").unwrap());
             });
             let (editor_id, cursor) = cx.update(|cx| {
-                let workbench = view.read(cx);
-                (
-                    workbench.editor.entity_id(),
-                    workbench.editor.read(cx).cursor(),
-                )
+                let xylo = view.read(cx);
+                (xylo.editor.entity_id(), xylo.editor.read(cx).cursor())
             });
             cx.update(|cx| {
                 view.update(cx, |view, cx| {
@@ -456,19 +455,19 @@ mod workbench {
                 view.project_search.validation_opening().is_none()
             });
             cx.update(|cx| {
-                let workbench = view.read(cx);
+                let xylo = view.read(cx);
                 assert_eq!(
-                    workbench.editor.entity_id(),
+                    xylo.editor.entity_id(),
                     editor_id,
                     "unchanged refresh must retain the editor and its language assistance state"
                 );
                 assert_eq!(
-                    workbench.editor.read(cx).cursor(),
+                    xylo.editor.read(cx).cursor(),
                     cursor,
                     "unchanged refresh must retain the search-hit cursor"
                 );
-                assert_eq!(workbench.editor.read(cx).value().as_ref(), content);
-                assert!(!workbench.project_search.external_conflict);
+                assert_eq!(xylo.editor.read(cx).value().as_ref(), content);
+                assert!(!xylo.project_search.external_conflict);
             });
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| {

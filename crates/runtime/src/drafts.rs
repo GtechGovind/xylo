@@ -3,9 +3,9 @@
 use anyhow::{Result, ensure};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
-use workbench_core::TurnRequest;
-use workbench_services::Store;
-pub use workbench_services::{
+use xylo_core::TurnRequest;
+use xylo_services::Store;
+pub use xylo_services::{
     DraftAdmission, DraftCursor, DraftKey, DraftPage, DraftSave, DraftSnapshot, DraftSubmission,
     DraftSummary, DraftWrite, MAX_DRAFT_ATTACHMENTS, MAX_DRAFT_BYTES,
 };

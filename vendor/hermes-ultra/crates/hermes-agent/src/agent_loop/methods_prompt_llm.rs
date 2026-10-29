@@ -638,7 +638,8 @@ impl AgentLoop {
                             return Err(AgentError::LlmApi(err_str));
                         }
                         ErrorClass::Fatal => {
-                            if !tool_schemas.is_empty()
+                            if self.config.allow_model_fallbacks
+                                && !tool_schemas.is_empty()
                                 && is_tool_payload_validation_error(&err_str)
                             {
                                 let (provider_name, model_name) =
@@ -956,7 +957,7 @@ impl AgentLoop {
             if !reasoning_content.is_empty() {
                 m.reasoning_content = Some(reasoning_content.to_string());
             }
-            // Agent Workbench patch: preserve signed provider-native content for
+            // Xylo patch: preserve signed provider-native content for
             // exact replay after tool use and durable checkpoint restoration.
             m.anthropic_content_blocks = native_content_blocks.clone();
             m
@@ -1164,9 +1165,8 @@ impl AgentLoop {
                         }
                     }
                     if let Some(ref extra) = delta.extra {
-                        if let Some(blocks) = extra
-                            .get("workbench_content_blocks")
-                            .and_then(Value::as_array)
+                        if let Some(blocks) =
+                            extra.get("xylo_content_blocks").and_then(Value::as_array)
                         {
                             native_content_blocks = Some(blocks.clone());
                         }

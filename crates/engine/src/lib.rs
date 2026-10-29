@@ -8,4 +8,4 @@ mod providers;
 mod steering;
 pub mod tools;
 pub use engine::HermesEngine;
-pub use workbench_runtime::AppPaths;
+pub use xylo_runtime::AppPaths;

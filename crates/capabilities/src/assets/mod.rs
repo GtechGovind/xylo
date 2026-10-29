@@ -964,14 +964,14 @@ mod tests {
     fn native_asset_locations_match_packaged_and_development_layouts() {
         use std::path::Path;
         let (root, asset) =
-            super::packaged_asset_location(Path::new("/build/workbench-helper"), "whisper-runtime")
+            super::packaged_asset_location(Path::new("/build/xylo-helper"), "whisper-runtime")
                 .unwrap();
         assert_eq!(root, Path::new("/build"));
         assert_eq!(asset, Path::new("/build/native-assets/whisper-runtime"));
         #[cfg(target_os = "macos")]
         {
             let (root, asset) = super::packaged_asset_location(
-                Path::new("/Applications/Xylo.app/Contents/MacOS/workbench-helper"),
+                Path::new("/Applications/Xylo.app/Contents/MacOS/xylo-helper"),
                 "whisper-runtime",
             )
             .unwrap();

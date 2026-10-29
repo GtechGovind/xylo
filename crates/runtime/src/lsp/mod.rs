@@ -132,7 +132,7 @@ impl Manager {
         .await?;
         let uri = file_uri(&key.workspace)?;
         let initialize = json!({
-            "processId":std::process::id(), "clientInfo":{"name":workbench_core::APPLICATION_NAME,"version":env!("CARGO_PKG_VERSION")},
+            "processId":std::process::id(), "clientInfo":{"name":xylo_core::APPLICATION_NAME,"version":env!("CARGO_PKG_VERSION")},
             "rootUri":uri, "workspaceFolders":[{"uri":uri,"name":key.workspace.file_name().unwrap_or_default().to_string_lossy()}],
             "capabilities":{
                 "general":{"positionEncodings":["utf-16"]},

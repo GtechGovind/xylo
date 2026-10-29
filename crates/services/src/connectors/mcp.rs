@@ -22,7 +22,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::{ConnectorConfig, ToolDefinition};
+use xylo_core::{ConnectorConfig, ToolDefinition};
 
 type Client = RunningService<RoleClient, ()>;
 struct Session {
@@ -194,7 +194,7 @@ impl ConnectorBroker {
         let id = config.id;
         let json = serde_json::to_string(&result)?;
         let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(config)?));
-        tokio::task::spawn_blocking(move||store.call(move|conn|{conn.execute_batch("CREATE TABLE IF NOT EXISTS connector_tools(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,json TEXT NOT NULL,updated_at INTEGER NOT NULL)")?;conn.execute("INSERT INTO connector_tools(id,fingerprint,json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,json=excluded.json,updated_at=excluded.updated_at",rusqlite::params![id.to_string(),fingerprint,json,workbench_core::now_ms()])?;Ok(())})).await??;
+        tokio::task::spawn_blocking(move||store.call(move|conn|{conn.execute_batch("CREATE TABLE IF NOT EXISTS connector_tools(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,json TEXT NOT NULL,updated_at INTEGER NOT NULL)")?;conn.execute("INSERT INTO connector_tools(id,fingerprint,json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,json=excluded.json,updated_at=excluded.updated_at",rusqlite::params![id.to_string(),fingerprint,json,xylo_core::now_ms()])?;Ok(())})).await??;
         Ok(result)
     }
     pub fn cached_tools(&self, config: &ConnectorConfig) -> Result<Vec<ToolDefinition>> {

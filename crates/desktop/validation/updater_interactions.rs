@@ -10,25 +10,25 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
+mod xylo {
+    include!("../src/xylo.rs");
     #[cfg(test)]
     mod updater_native_tests {
-        use super::Workbench;
+        use super::Xylo;
         use gpui_kit::{
             AnyWindowHandle, AppContext, Context, Entity, TestAppContext, WindowOptions,
         };
         use serde_json::json;
         use std::path::PathBuf;
         use uuid::Uuid;
-        use workbench_runtime::host::HostEvent;
+        use xylo_runtime::host::HostEvent;
 
-        fn open_view(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workbench>) {
+        fn open_view(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Xylo>) {
             cx.update(gpui_kit::init);
             cx.update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
                     cx.new(|cx| {
-                        Workbench::new(
+                        Xylo::new(
                             Err(anyhow::anyhow!("Isolated native interaction fixture")),
                             window,
                             cx,
@@ -38,7 +38,7 @@ mod workbench {
                 .unwrap()
             })
         }
-        fn response(view: &mut Workbench, sequence: u64, phase: &str, cx: &mut Context<Workbench>) {
+        fn response(view: &mut Xylo, sequence: u64, phase: &str, cx: &mut Context<Xylo>) {
             let id = Uuid::new_v4();
             view.updates.pending.insert(id, "updates_status".into());
             assert!(view.update_result(
@@ -142,12 +142,18 @@ mod workbench {
             let directory = tempfile::tempdir().unwrap();
             // Shell creation is explicit test setup, away from production render.
             let (session, events) =
-                workbench_runtime::terminal::TerminalSession::spawn(directory.path()).unwrap();
+                xylo_runtime::terminal::TerminalSession::spawn(directory.path()).unwrap();
             let (window, view) = open_view(cx);
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| {
                     let terminal = cx.new(|cx| {
-                        crate::terminal_workspace::TerminalWorkspace::new(directory.path().to_path_buf(), session, events, window, cx)
+                        crate::terminal_workspace::TerminalWorkspace::new(
+                            directory.path().to_path_buf(),
+                            session,
+                            events,
+                            window,
+                            cx,
+                        )
                     });
                     let identity = terminal.entity_id();
                     view.terminal = Some(terminal);

@@ -15,8 +15,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::*;
-use workbench_services::{SqliteMemory, Store};
+use xylo_core::*;
+use xylo_services::{SqliteMemory, Store};
 
 struct Worker {
     child: Child,
@@ -232,12 +232,12 @@ fn embedding_provenance(config: Option<&Path>) -> Result<Value> {
         return Ok(Value::Null);
     };
     let bytes = std::fs::read(config)?;
-    let assets: workbench_services::EmbeddingAssets = serde_json::from_slice(&bytes)?;
+    let assets: xylo_services::EmbeddingAssets = serde_json::from_slice(&bytes)?;
     let model = assets.directory.join("model.onnx");
     let runtime = assets.runtime_library.unwrap_or_else(|| {
         assets
             .directory
-            .join(workbench_services::EmbeddingAssets::runtime_filename())
+            .join(xylo_services::EmbeddingAssets::runtime_filename())
     });
     Ok(
         json!({"model_id":assets.model_id,"dimensions":assets.dimensions,"pooling":assets.pooling,"configured_cpu_threads":assets.cpu_threads,"configuration_sha256":format!("{:x}",Sha256::digest(bytes)),"model_sha256":digest_file(&model)?,"model_bytes":std::fs::metadata(model)?.len(),"runtime_sha256":digest_file(&runtime)?}),

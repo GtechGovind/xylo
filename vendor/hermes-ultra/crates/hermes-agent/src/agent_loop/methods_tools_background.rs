@@ -464,6 +464,9 @@ impl AgentLoop {
     /// Resolve the model used for automatic degradation when nearing
     /// `max_cost_usd`.
     fn resolve_cost_degrade_model(&self) -> Option<String> {
+        if !self.config.allow_model_fallbacks {
+            return None;
+        }
         if let Some(ref m) = self.config.cost_guard_degrade_model {
             if !m.trim().is_empty() {
                 return Some(m.trim().to_string());
@@ -485,6 +488,9 @@ impl AgentLoop {
         active_model: &str,
         route: Option<&TurnRuntimeRoute>,
     ) -> Option<String> {
+        if !self.config.allow_model_fallbacks {
+            return None;
+        }
         if let Some(ref fallback) = self.config.retry.fallback_model {
             if !fallback.trim().is_empty() && !fallback.eq_ignore_ascii_case(active_model) {
                 return Some(fallback.trim().to_string());
@@ -514,6 +520,9 @@ impl AgentLoop {
     }
 
     fn resolve_retry_failover_chain(&self, active_model: &str) -> Vec<String> {
+        if !self.config.allow_model_fallbacks {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let active_lc = active_model.trim().to_ascii_lowercase();

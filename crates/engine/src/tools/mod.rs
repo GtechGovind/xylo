@@ -15,11 +15,11 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_capabilities::{CapabilityConfig, CapabilityService};
-use workbench_core::{
+use xylo_capabilities::{CapabilityConfig, CapabilityService};
+use xylo_core::{
     ConnectorConfig, EngineEvent, MemoryRecord, PermissionMode, ToolDefinition, TurnRequest,
 };
-use workbench_services::{
+use xylo_services::{
     ActionDecision, ActionIntent, ConnectorBroker, CredentialVault, JournalAction, LearningService,
     NativeConnectors, SqliteMemory, Store,
 };
@@ -111,12 +111,14 @@ pub struct ToolBroker {
     memory: SqliteMemory,
     capabilities: CapabilityService,
     definitions: Vec<ToolDefinition>,
+    /// Immutable turn-admission discovery snapshot; dispatch still authorizes live.
+    advertised: Vec<ToolDefinition>,
     approvals: ApprovalGate,
     events: tokio::sync::mpsc::Sender<EngineEvent>,
     cancel: CancellationToken,
     artifacts: PathBuf,
     runtime: tokio::runtime::Handle,
-    resources: workbench_runtime::resources::ResourceManager,
+    resources: xylo_runtime::resources::ResourceManager,
     delegate: Mutex<Option<Delegate>>,
     connectors: ConnectorBroker,
     native: NativeConnectors,
@@ -137,7 +139,20 @@ impl ToolBroker {
         let mut definitions = builtin::definitions();
         definitions.push(image_generation.definition());
         definitions.extend(capabilities.tool_definitions());
-        let vault = CredentialVault::new(workbench_core::CREDENTIAL_SERVICE)?;
+        let has_connectors = !store.connectors()?.is_empty();
+        let advertised = definitions
+            .iter()
+            .filter(|definition| {
+                (request.permissions != PermissionMode::ReadOnly || !definition.writes)
+                    && (definition.name != "image_generate" || image_generation.is_configured())
+                    && (!matches!(
+                        definition.name.as_str(),
+                        "connector_call" | "connector_tools"
+                    ) || has_connectors)
+            })
+            .cloned()
+            .collect();
+        let vault = CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?;
         Ok(Self {
             memory: SqliteMemory::configured(
                 store.clone(),
@@ -153,12 +168,13 @@ impl ToolBroker {
             store,
             capabilities,
             definitions,
+            advertised,
             approvals,
             events,
             cancel,
             artifacts,
             runtime: tokio::runtime::Handle::current(),
-            resources: workbench_runtime::resources::ResourceManager::new(),
+            resources: xylo_runtime::resources::ResourceManager::new(),
             delegate: Mutex::new(None),
         })
     }
@@ -249,13 +265,13 @@ impl ToolBroker {
         ];
         let prompt = self.request.prompt.to_lowercase();
         let mut chosen: Vec<ToolDefinition> = self
-            .definitions
+            .advertised
             .iter()
             .filter(|d| CORE.contains(&d.name.as_str()))
             .cloned()
             .collect();
         chosen.extend(
-            self.definitions
+            self.advertised
                 .iter()
                 .filter(|d| {
                     !CORE.contains(&d.name.as_str())
@@ -428,9 +444,8 @@ impl ToolBroker {
         if name == "environment_execute" {
             // Reject malformed fresh requests before an approval or running
             // intent exists. Cached identities above remain authoritative.
-            let _: workbench_core::EnvironmentExecuteRequest =
-                serde_json::from_value(arguments.clone())
-                    .context("Invalid environment command request")?;
+            let _: xylo_core::EnvironmentExecuteRequest = serde_json::from_value(arguments.clone())
+                .context("Invalid environment command request")?;
         }
         let presentation = match name {
             "image_generate" => self.image_generation.approval(&arguments)?,
@@ -453,7 +468,7 @@ impl ToolBroker {
             .transpose()?;
         let _action_scope = execution_lease
             .as_ref()
-            .map(|lease| workbench_runtime::resources::ActionLeaseScope::enter(lease.file()));
+            .map(|lease| xylo_runtime::resources::ActionLeaseScope::enter(lease.file()));
         let intent = ActionIntent {
             id,
             session_id: self.request.session_id,
@@ -548,7 +563,7 @@ impl ToolBroker {
                     .to_lowercase();
                 let words: Vec<_> = query.split_whitespace().collect();
                 let matches: Vec<_> = self
-                    .definitions
+                    .advertised
                     .iter()
                     .filter(|d| {
                         (namespace.is_none() || d.name != "agent_delegate")
@@ -560,12 +575,11 @@ impl ToolBroker {
                     .collect();
                 json!({"status":"success","summary":matches,"next_actions":["Use call_tool with the selected tool name and documented arguments"],"artifacts":[]})
             } else if name == "agent_delegate" {
-                self.delegate
-                    .lock()
-                    .clone()
-                    .context("Subagent executor is unavailable")?(
-                    &key, arguments.clone()
-                )?
+                // End the registration guard before the blocking callback;
+                // admission and resource leases govern parallel child work.
+                let handler =
+                    { self.delegate.lock().clone() }.context("Subagent executor is unavailable")?;
+                handler(&key, arguments.clone())?
             } else if name.starts_with("connector_") {
                 self.execute_connector(name, &arguments)?
             } else if name == "image_generate" {
@@ -574,17 +588,16 @@ impl ToolBroker {
                 builtin::execute(self, name, &arguments)?
             } else {
                 let operation = async {
-                    let _reservation = if let Some(demand) =
-                        workbench_runtime::resources::capability_demand(name)
-                    {
-                        Some(
-                            self.resources
-                                .acquire(demand, self.cancel.child_token())
-                                .await?,
-                        )
-                    } else {
-                        None
-                    };
+                    let _reservation =
+                        if let Some(demand) = xylo_runtime::resources::capability_demand(name) {
+                            Some(
+                                self.resources
+                                    .acquire(demand, self.cancel.child_token())
+                                    .await?,
+                            )
+                        } else {
+                            None
+                        };
                     // Capability execution owns the cross-process reservation;
                     // compiler and artifact closures retain it through cleanup.
                     self.capabilities
@@ -592,13 +605,10 @@ impl ToolBroker {
                         .await
                 };
                 let result = match &execution_lease {
-                    Some(lease) => {
-                        self.runtime
-                            .block_on(workbench_runtime::resources::scope_action(
-                                lease.file(),
-                                operation,
-                            ))
-                    }
+                    Some(lease) => self.runtime.block_on(xylo_runtime::resources::scope_action(
+                        lease.file(),
+                        operation,
+                    )),
                     None => self.runtime.block_on(operation),
                 }?;
                 serde_json::to_value(result)?
@@ -659,18 +669,18 @@ impl ToolBroker {
                 let message = format!("{error:#}");
                 let definitive_rejection = error.downcast_ref::<code::Unapplied>().is_some()
                     || error
-                        .downcast_ref::<workbench_runtime::process::NotStarted>()
+                        .downcast_ref::<xylo_runtime::process::NotStarted>()
                         .is_some()
                     || error
                         .downcast_ref::<image_generation::DefinitiveFailure>()
                         .is_some()
                     || (name == "connector_call"
                         && error
-                            .downcast_ref::<workbench_services::ConnectorNotDispatched>()
+                            .downcast_ref::<xylo_services::ConnectorNotDispatched>()
                             .is_some())
                     || (name == "environment_execute"
                         && error
-                            .downcast_ref::<workbench_capabilities::environments::CommandNotDispatched>()
+                            .downcast_ref::<xylo_capabilities::environments::CommandNotDispatched>()
                             .is_some());
                 if definition.writes && !definitive_rejection {
                     self.store.mark_action_unknown(id, &message)?

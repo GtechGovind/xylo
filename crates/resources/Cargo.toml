@@ -1,5 +1,5 @@
 [package]
-name = "resources"
+name = "xylo-resources"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

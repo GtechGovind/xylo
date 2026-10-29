@@ -10,12 +10,12 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
+mod xylo {
+    include!("../src/xylo.rs");
     mod review_tests {
         use super::{
             AnyWindowHandle, App, AppContext, Bounds, ElementId, Entity, HostClient,
-            TestAppContext, Uuid, WindowBounds, WindowOptions, Workbench, px, size,
+            TestAppContext, Uuid, WindowBounds, WindowOptions, Xylo, px, size,
         };
         use crate::recovery_fixture::{self, Delivery, Profile};
         use gpui_kit::test::{TestQueryExt, TestWindowExt};
@@ -23,7 +23,7 @@ mod workbench {
             sync::{Arc, atomic::Ordering},
             time::{Duration, Instant},
         };
-        use workbench_runtime::{
+        use xylo_runtime::{
             ActionResolutionOutcome, ActionReviewFormWrite, ActionReviewPage, ActionReviewScope,
         };
         struct Fixture {
@@ -31,7 +31,7 @@ mod workbench {
             host: HostClient,
             delivery: Arc<Delivery>,
             window: AnyWindowHandle,
-            view: Entity<Workbench>,
+            view: Entity<Xylo>,
         }
         impl Drop for Fixture {
             fn drop(&mut self) {
@@ -41,7 +41,7 @@ mod workbench {
         fn wait(
             cx: &mut TestAppContext,
             fixture: &Fixture,
-            condition: impl Fn(&Workbench, &App) -> bool,
+            condition: impl Fn(&Xylo, &App) -> bool,
         ) {
             let deadline = Instant::now() + Duration::from_secs(25);
             loop {
@@ -75,7 +75,7 @@ mod workbench {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| Workbench::new(Ok(host), window, cx)),
+                    |window, cx| cx.new(|cx| Xylo::new(Ok(host), window, cx)),
                 )
                 .unwrap()
             });
@@ -265,7 +265,7 @@ mod workbench {
             cx.update_window(fixture.window, |_, window, cx| {
                 fixture
                     .view
-                    .update(cx, |view, cx| *view = Workbench::new(Ok(host), window, cx))
+                    .update(cx, |view, cx| *view = Xylo::new(Ok(host), window, cx))
             })
             .unwrap();
             wait(cx, &fixture, |view, _| {
@@ -734,7 +734,7 @@ mod workbench {
                     view.turns
                         .entry(view.session)
                         .or_default()
-                        .apply(workbench_core::EngineEvent::Started);
+                        .apply(xylo_core::EngineEvent::Started);
                     view.composer.update(cx, |input, cx| {
                         input.set_value("A message that must stay unsent", window, cx)
                     });

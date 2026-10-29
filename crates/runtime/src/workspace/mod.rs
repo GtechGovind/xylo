@@ -1,5 +1,6 @@
 //! Rebuildable project catalogue and native change observation. File identities
 //! live on disk; neither the host nor the UI retains a project-sized path list.
+pub mod git;
 mod index;
 mod monitor;
 mod paths;
@@ -66,7 +67,7 @@ impl WorkspaceService {
     pub fn new(events: async_channel::Sender<WorkspaceEvent>) -> Self {
         Self::with_cache(
             events,
-            std::env::temp_dir().join(format!("workbench-workspace-{}", uuid::Uuid::new_v4())),
+            std::env::temp_dir().join(format!("xylo-workspace-{}", uuid::Uuid::new_v4())),
         )
     }
     pub fn with_cache(events: async_channel::Sender<WorkspaceEvent>, cache_root: PathBuf) -> Self {

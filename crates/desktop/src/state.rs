@@ -1,6 +1,8 @@
 //! Pure view-state reducer: engine events cannot leak between selected chats.
 use uuid::Uuid;
-use workbench_core::{ChatMessage, EngineEvent, Usage, now_ms};
+use xylo_core::{ChatMessage, EngineEvent, Usage, now_ms};
+#[path = "tool_presentation.rs"]
+pub mod tool_presentation;
 #[derive(Clone, Debug)]
 pub struct ToolCard {
     pub id: Uuid,
@@ -8,6 +10,7 @@ pub struct ToolCard {
     /// What the action does, as presented by the engine (for changes, a diff).
     pub input: serde_json::Value,
     pub result: Option<String>,
+    pub presentation: tool_presentation::ToolPresentation,
     pub approval: bool,
     /// What "always allow" would cover, when the action can be remembered.
     pub rule: Option<String>,
@@ -16,13 +19,23 @@ pub struct ToolCard {
     pub finished_at: Option<i64>,
 }
 impl ToolCard {
+    pub fn refresh_presentation(&mut self) {
+        self.presentation = tool_presentation::ToolPresentation::prepare(
+            &self.name,
+            &self.input,
+            self.result.as_deref(),
+            self.success,
+        );
+    }
     /// The parsed result envelope, when the result is structured.
     pub fn output(&self) -> Option<serde_json::Value> {
-        serde_json::from_str(self.result.as_deref()?).ok()
+        self.presentation.parsed_output.as_deref().cloned()
     }
 }
 #[derive(Default)]
 pub struct TurnState {
+    /// Changes only when a reducer event alters this turn, never while rendering.
+    pub render_revision: u64,
     pub running: bool,
     pub text: String,
     pub tools: Vec<ToolCard>,
@@ -38,6 +51,7 @@ impl TurnState {
         self.tools.iter().filter(|tool| tool.approval)
     }
     pub fn apply(&mut self, event: EngineEvent) {
+        self.render_revision = self.render_revision.wrapping_add(1);
         match event {
             EngineEvent::Started => {
                 self.running = true;
@@ -77,6 +91,7 @@ impl TurnState {
                     t.result = Some(result);
                     t.success = Some(success);
                     t.finished_at = Some(now_ms());
+                    t.refresh_presentation();
                 }
             }
             EngineEvent::Completed { text, usage } => {
@@ -114,7 +129,10 @@ impl TurnState {
                 card.rule = rule;
             }
         } else {
+            let presentation =
+                tool_presentation::ToolPresentation::prepare(&name, &input, None, None);
             self.tools.push(ToolCard {
+                presentation,
                 id,
                 name,
                 input,

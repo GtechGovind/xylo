@@ -26,7 +26,7 @@ use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-/// Immutable build-time trust configuration. A development build has no feed/key.
+/// Trusted update configuration. Fresh builds have no configured feed or key.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdatePolicy {
@@ -42,13 +42,22 @@ pub struct UpdatePolicy {
     #[serde(default)]
     pub macos_team_id: Option<String>,
 }
-impl UpdatePolicy {
-    pub fn embedded() -> Result<Self> {
-        Ok(serde_json::from_str(include_str!(concat!(
-            env!("OUT_DIR"),
-            "/update-policy.json"
-        )))?)
+impl Default for UpdatePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            application_id: "com.qurkos.xylo".into(),
+            channel: "stable".into(),
+            manifest_url: None,
+            signature_url: None,
+            public_key: None,
+            allowed_origins: Vec::new(),
+            max_artifact_bytes: 512 * 1024 * 1024,
+            macos_team_id: None,
+        }
     }
+}
+impl UpdatePolicy {
     fn key(&self) -> Result<PublicKey> {
         let bytes = STANDARD.decode(
             self.public_key
@@ -177,8 +186,8 @@ pub struct Updater {
     executable: PathBuf,
 }
 impl Updater {
-    pub fn from_embedded(data: PathBuf, executable: PathBuf) -> Result<Option<Self>> {
-        let policy = UpdatePolicy::embedded()?;
+    pub fn for_application(data: PathBuf, executable: PathBuf) -> Result<Option<Self>> {
+        let policy = UpdatePolicy::default();
         if !policy.enabled {
             return Ok(None);
         }

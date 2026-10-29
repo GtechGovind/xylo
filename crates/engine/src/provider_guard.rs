@@ -15,8 +15,8 @@ use std::{
 };
 use tiktoken_rs::CoreBPE;
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ApiFamily, ProviderConfig};
-use workbench_runtime::resources::{ResourceManager, TaskDemand};
+use xylo_core::{ApiFamily, ProviderConfig};
+use xylo_runtime::resources::{ResourceManager, TaskDemand};
 
 /// Non-OpenAI and custom tokenizers are estimated from o200k counts with a
 /// safety margin; observed Claude, Gemini and Llama-family code/prose ratios

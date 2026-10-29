@@ -59,16 +59,18 @@ pub fn create() -> Result<(TrayIcon, async_channel::Receiver<Event>)> {
     }
     Ok((builder.build()?, rx))
 }
-/// macOS receives the mark's alpha template. Other platforms receive its warm
-/// white application tile so the mark remains visible on a dark system panel.
+/// macOS receives an alpha template; other platforms receive a light tile.
 fn tray_icon() -> Result<Icon> {
+    let image = crate::ui::brand_pixels(24);
     #[cfg(target_os = "macos")]
-    let bytes = include_bytes!("../../../packaging/icons/tray.png").as_slice();
-    #[cfg(not(target_os = "macos"))]
-    let bytes = include_bytes!("../../../packaging/icons/app.png").as_slice();
-    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?.into_rgba8();
-    #[cfg(not(target_os = "macos"))]
-    let image = image::imageops::resize(&image, 24, 24, image::imageops::FilterType::Lanczos3);
+    let image = {
+        let mut image = image;
+        for pixel in image.pixels_mut() {
+            let alpha = if pixel.0[0] == 255 { 0 } else { 255 };
+            *pixel = image::Rgba([0, 0, 0, alpha]);
+        }
+        image
+    };
     let (width, height) = image.dimensions();
     Ok(Icon::from_rgba(image.into_raw(), width, height)?)
 }

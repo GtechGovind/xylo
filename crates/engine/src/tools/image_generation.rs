@@ -2,8 +2,8 @@
 //! Tool arguments cannot supply a provider, endpoint, credential or output path.
 use super::*;
 use serde::Deserialize;
-use workbench_core::{ImageGenerationProvider, ImageGenerationRequest, ImageGenerationState};
-use workbench_services::image_generation::ImageGenerationService;
+use xylo_core::{ImageGenerationProvider, ImageGenerationRequest, ImageGenerationState};
+use xylo_services::image_generation::ImageGenerationService;
 
 pub(super) struct Configuration {
     provider: Option<ImageGenerationProvider>,
@@ -25,6 +25,9 @@ impl Configuration {
             Ok(provider) => Self {provider,error:None},
             Err(_) => Self {provider:None,error:Some("Saved image provider is invalid. Review the Images page before using image_generate.".into())},
         }
+    }
+    pub(super) fn is_configured(&self) -> bool {
+        self.provider.is_some() && self.error.is_none()
     }
     fn provider(&self) -> Result<&ImageGenerationProvider> {
         if let Some(error) = &self.error {
@@ -110,13 +113,13 @@ pub(super) fn execute(broker: &ToolBroker, id: Uuid, arguments: &Value) -> Resul
         .context("Missing application data directory")?;
     let service = ImageGenerationService::new(data.to_path_buf(), broker.artifacts.clone())?;
     let secret=provider.credential_ref.as_deref().map(|reference|{
-        CredentialVault::new(workbench_core::CREDENTIAL_SERVICE)?.get(reference)?.context("Saved image provider credential is unavailable")
+        CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?.get(reference)?.context("Saved image provider credential is unavailable")
     }).transpose().map_err(|_|DefinitiveFailure("Read the selected image credential from the OS credential store before trying again. No request was dispatched.".into()))?;
     let receipt = broker.runtime.block_on(async {
-        let resources = workbench_runtime::resources::ResourceManager::new();
+        let resources = xylo_runtime::resources::ResourceManager::new();
         let _lease = resources
             .acquire(
-                workbench_runtime::resources::TaskDemand {
+                xylo_runtime::resources::TaskDemand {
                     memory_bytes: 384 * 1024 * 1024,
                     cpu_share: 1.0,
                 },

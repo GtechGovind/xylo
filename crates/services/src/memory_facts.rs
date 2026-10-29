@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::{MemoryRecord, now_ms};
+use xylo_core::{MemoryRecord, now_ms};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FactVersion {

@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
-use workbench_core::{MemoryBackend, MemoryRecord};
+use xylo_core::{MemoryBackend, MemoryRecord};
 
 /// Pooling is part of model compatibility, not an interchangeable tuning choice.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

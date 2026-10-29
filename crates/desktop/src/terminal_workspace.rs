@@ -12,7 +12,7 @@ use gpui_kit::{
 use std::path::PathBuf;
 use tokio::sync::watch;
 use uuid::Uuid;
-use workbench_runtime::terminal::{TerminalSession, TerminalSnapshot};
+use xylo_runtime::terminal::{TerminalSession, TerminalSnapshot};
 
 const MAX_SESSIONS: usize = 12;
 
@@ -159,7 +159,7 @@ impl TerminalWorkspace {
         }
     }
 
-    /// An explicit app-level close action. Workbench owns project/Quit/update
+    /// An explicit app-level close action. Xylo owns project/Quit/update
     /// confirmation. All outstanding start replies are fenced before dropping
     /// sessions, so a delayed spawn cannot recreate a closed workspace.
     pub fn close_all(&mut self, cx: &mut Context<Self>) {

@@ -219,7 +219,7 @@ impl HostState {
 mod tests {
     use super::*;
     use crate::{DocumentDraftSave, DocumentDraftState};
-    use workbench_core::{DocumentEdit, DocumentKind, DocumentSource};
+    use xylo_core::{DocumentEdit, DocumentKind, DocumentSource};
     #[tokio::test]
     async fn document_draft_host_routes_exact_receipts_and_rejects_foreign_source() {
         let (_dir, host, events) = super::super::tests::state();

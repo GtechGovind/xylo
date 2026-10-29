@@ -10,12 +10,12 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
+mod xylo {
+    include!("../src/xylo.rs");
     mod missing_tests {
         use super::{
             AnyWindowHandle, App, AppContext, Bounds, DocumentKind, Entity, HostClient,
-            TestAppContext, Uuid, WindowBounds, WindowOptions, Workbench, px, size,
+            TestAppContext, Uuid, WindowBounds, WindowOptions, Xylo, px, size,
         };
         use crate::document_recovery_fixture::{self, Delivery, Profile};
         use gpui_kit::test::{TestQueryExt, TestWindowExt};
@@ -28,13 +28,9 @@ mod workbench {
             delivery: Arc<Delivery>,
             host: HostClient,
             window: AnyWindowHandle,
-            view: Entity<Workbench>,
+            view: Entity<Xylo>,
         }
-        fn wait(
-            cx: &mut TestAppContext,
-            f: &Fixture,
-            condition: impl Fn(&Workbench, &App) -> bool,
-        ) {
+        fn wait(cx: &mut TestAppContext, f: &Fixture, condition: impl Fn(&Xylo, &App) -> bool) {
             let deadline = Instant::now() + Duration::from_secs(25);
             loop {
                 cx.executor().advance_clock(Duration::from_millis(25));
@@ -67,7 +63,7 @@ mod workbench {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| Workbench::new(Ok(host), window, cx)),
+                    |window, cx| cx.new(|cx| Xylo::new(Ok(host), window, cx)),
                 )
                 .unwrap()
             });
@@ -266,7 +262,7 @@ mod workbench {
             f.host = host.0.clone();
             cx.update_window(f.window, |_, window, cx| {
                 f.view
-                    .update(cx, |view, cx| *view = Workbench::new(Ok(host), window, cx))
+                    .update(cx, |view, cx| *view = Xylo::new(Ok(host), window, cx))
             })
             .unwrap();
             wait(cx, &f, |view, _| {
@@ -346,7 +342,7 @@ mod workbench {
                 .document_draft(f.profile.key.clone())
                 .unwrap();
             let mut state = snapshot.state.unwrap();
-            state.pending_copy = Some(workbench_runtime::DocumentCopyIntent {
+            state.pending_copy = Some(xylo_runtime::DocumentCopyIntent {
                 operation_id: operation,
                 generation: 1,
                 name: state.export_name.clone(),
@@ -354,7 +350,7 @@ mod workbench {
             });
             f.profile
                 .store
-                .save_document_draft(workbench_runtime::DocumentDraftWrite {
+                .save_document_draft(xylo_runtime::DocumentDraftWrite {
                     key: f.profile.key.clone(),
                     expected_revision: snapshot.revision,
                     mutation_id: Uuid::new_v4(),
@@ -409,14 +405,14 @@ mod workbench {
             })
             .unwrap();
             wait(cx, &f, |view, _| view.documents_validation_saved());
-            let destination = workbench_runtime::DocumentDraftKey {
+            let destination = xylo_runtime::DocumentDraftKey {
                 workspace: f.profile.workspace.clone(),
                 source: f.profile.moved.clone(),
             };
             let snapshot = f.profile.store.document_draft(destination.clone()).unwrap();
             f.profile
                 .store
-                .save_document_draft(workbench_runtime::DocumentDraftWrite {
+                .save_document_draft(xylo_runtime::DocumentDraftWrite {
                     key: destination,
                     expected_revision: snapshot.revision,
                     mutation_id: Uuid::new_v4(),
@@ -460,7 +456,7 @@ mod workbench {
             assert!(cx.has_pending_prompt());
             cx.simulate_prompt_answer("Keep previous location");
             wait(cx, &f, |view, _| view.documents_validation_conflict());
-            let destination = workbench_runtime::DocumentDraftKey {
+            let destination = xylo_runtime::DocumentDraftKey {
                 workspace: f.profile.workspace.clone(),
                 source: f.profile.moved.clone(),
             };

@@ -4,7 +4,7 @@ use crate::ui::{accent, border, button, muted, panel, sidebar, text};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::{prelude::*, *};
 use std::ops::Range;
-use workbench_runtime::terminal::{TerminalSession, TerminalSnapshot};
+use xylo_runtime::terminal::{TerminalSession, TerminalSnapshot};
 
 const SURFACE: u32 = 0x11151d;
 const MAX_ASSIST_CONTEXT: usize = 12 * 1024;
@@ -401,7 +401,7 @@ impl Render for TerminalView {
                     .p(px(10.))
                     .overflow_hidden()
                     .track_focus(&self.focus)
-                    .key_context("WorkbenchTerminal")
+                    .key_context("XyloTerminal")
                     .cursor(CursorStyle::IBeam)
                     .on_key_down(cx.listener(Self::key))
                     .on_mouse_down(
@@ -897,8 +897,8 @@ pub(crate) mod tests {
         terminal_run,
     };
     use gpui_kit::{App, Bounds, Element, Entity, Font, Window, point, px, size};
-    use workbench_runtime::terminal::TerminalCell;
-    use workbench_runtime::terminal::TerminalSnapshot;
+    use xylo_runtime::terminal::TerminalCell;
+    use xylo_runtime::terminal::TerminalSnapshot;
 
     #[test]
     fn assistance_context_is_bounded_and_prefers_the_explicit_selection() {

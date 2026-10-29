@@ -227,15 +227,14 @@ impl SubAgentOrchestrator {
     async fn execute_inner(self: Arc<Self>, req: SubAgentRequest, sub_agent_id: String) -> String {
         let started_at = Utc::now();
 
+        let effective_config = self.build_child_config(&req, &sub_agent_id);
         let mut lineage = SubAgentLineage {
             sub_agent_id: sub_agent_id.clone(),
             parent_session_id: self.cfg.parent_session_id.clone(),
             task: req.task.clone(),
             context: req.context.clone(),
             toolset: req.toolset.clone(),
-            model: clean_config_string(req.model.as_deref())
-                .or_else(|| clean_config_string(self.cfg.parent_config.delegation_model.as_deref()))
-                .map(str::to_string),
+            model: Some(diagnostic_model(&effective_config.model)),
             provider: self.effective_delegation_provider(),
             depth: req.child_depth,
             max_depth: req.max_depth,
@@ -787,19 +786,23 @@ mod tests {
             .await;
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["status"], "timeout");
-        assert!(parsed["sub_agent_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("subagent-"));
+        assert!(
+            parsed["sub_agent_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("subagent-")
+        );
         // Lineage file should exist under $HERMES_HOME/subagents/<id>.json
         let dir = tmp.path().join("subagents");
         let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
         let entry = entries.next_entry().await.unwrap().unwrap();
-        assert!(entry
-            .path()
-            .extension()
-            .map(|s| s == "json")
-            .unwrap_or(false));
+        assert!(
+            entry
+                .path()
+                .extension()
+                .map(|s| s == "json")
+                .unwrap_or(false)
+        );
     }
 
     #[tokio::test]
@@ -855,11 +858,12 @@ mod tests {
         assert!(completion.contains("ASYNC DELEGATION COMPLETE"));
         assert!(completion.contains("background task"));
         assert!(completion.contains("Result:\ndone"));
-        assert!(tmp
-            .path()
-            .join("subagents")
-            .join(format!("{sub_agent_id}.json"))
-            .exists());
+        assert!(
+            tmp.path()
+                .join("subagents")
+                .join(format!("{sub_agent_id}.json"))
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1092,9 +1096,25 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
 
         assert_eq!(parsed["status"], "failed");
-        assert!(parsed["error"]
-            .as_str()
-            .unwrap()
-            .contains("definitely-missing-provider"));
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("definitely-missing-provider")
+        );
+    }
+}
+
+fn diagnostic_model(model: &str) -> String {
+    if model.len() <= 160
+        && !model.contains("://")
+        && !model.is_empty()
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/'))
+    {
+        model.to_owned()
+    } else {
+        "<configured model>".into()
     }
 }

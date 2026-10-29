@@ -795,7 +795,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "workbench-core"
+name = "xylo-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -808,7 +808,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "workbench-plugin-pack"
+name = "xylo-plugin-pack"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -817,23 +817,23 @@ dependencies = [
  "sha2",
  "tempfile",
  "wit-component 0.261.0",
- "workbench-core",
+ "xylo-core",
 ]
 
 [[package]]
-name = "workbench-plugin-sdk"
+name = "xylo-plugin-sdk"
 version = "0.1.0"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
-name = "workbench-text-report"
+name = "xylo-text-report"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "workbench-plugin-sdk",
+ "xylo-plugin-sdk",
 ]
 
 [[package]]

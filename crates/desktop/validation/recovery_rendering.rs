@@ -11,9 +11,9 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
-    impl Workbench {
+mod xylo {
+    include!("../src/xylo.rs");
+    impl Xylo {
         // Harness-only observations and a production navigation call. No
         // recovery catalogue, permission, receipt or outcome is injected.
         pub(crate) fn capture_services_ready(&self, session: Uuid) -> bool {
@@ -84,7 +84,7 @@ fn render() {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| workbench::Workbench::new(Ok(host), window, cx)),
+                |window, cx| cx.new(|cx| xylo::Xylo::new(Ok(host), window, cx)),
             )
         })
         .unwrap();
@@ -134,7 +134,7 @@ fn render() {
         assert!(target.bounds().origin.x > action.bounds().right());
     })
     .unwrap();
-    let output = std::env::var_os("WORKBENCH_RENDER_DIR")
+    let output = std::env::var_os("XYLO_RENDER_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -148,21 +148,18 @@ fn render() {
     let pixel_size = [screenshot.width(), screenshot.height()];
     screenshot.save(&image).unwrap();
     let compiled_sources = [
-        (
-            "workbench.rs",
-            include_bytes!("../src/workbench.rs").as_slice(),
-        ),
+        ("xylo.rs", include_bytes!("../src/xylo.rs").as_slice()),
         (
             "recovery.rs",
-            include_bytes!("../src/workbench/recovery.rs").as_slice(),
+            include_bytes!("../src/xylo/recovery.rs").as_slice(),
         ),
         (
             "recovery_forms.rs",
-            include_bytes!("../src/workbench/recovery_forms.rs").as_slice(),
+            include_bytes!("../src/xylo/recovery_forms.rs").as_slice(),
         ),
         (
             "recovery_view.rs",
-            include_bytes!("../src/workbench/recovery_view.rs").as_slice(),
+            include_bytes!("../src/xylo/recovery_view.rs").as_slice(),
         ),
         (
             "recovery_fixture.rs",

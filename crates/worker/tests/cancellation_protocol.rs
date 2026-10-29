@@ -15,8 +15,8 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout},
 };
 use uuid::Uuid;
-use workbench_core::*;
-use workbench_services::Store;
+use xylo_core::*;
+use xylo_services::Store;
 const CANCELLATIONS: usize = 64;
 struct Worker {
     child: Child,
@@ -25,7 +25,7 @@ struct Worker {
 }
 impl Worker {
     async fn start(profile: &Path) -> Self {
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_workbench-worker"))
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_xylo-worker"))
             .arg("--data-dir")
             .arg(profile)
             .stdin(Stdio::piped())
@@ -139,7 +139,7 @@ async fn repeated_active_stream_cancellation_emits_correlated_ack_and_cancelled_
  {
     let workspace = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
-    let paths = workbench_runtime::AppPaths::at(profile.path().into()).unwrap();
+    let paths = xylo_runtime::AppPaths::at(profile.path().into()).unwrap();
     let store = Store::open(&paths.database).unwrap();
     let (endpoint, fixture, calls) = open_stream_fixture().await;
     let mut worker = Worker::start(profile.path()).await;

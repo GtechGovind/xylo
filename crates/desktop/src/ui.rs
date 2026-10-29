@@ -1,31 +1,17 @@
-//! Native presentation tokens aligned with AionUi's default light theme.
-//! Reference: iOfficeAI/AionUi default-color-scheme.css (Apache-2.0).
+//! Native presentation tokens for the approved Xylo workspace design.
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{prelude::*, *};
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Decode the embedded 64 px mark once, before its first paint. A ready render
-/// image avoids the asynchronous asset loader and retains one texture identity.
-pub fn brand_image() -> Arc<RenderImage> {
-    static IMAGE: OnceLock<Arc<RenderImage>> = OnceLock::new();
-    IMAGE
-        .get_or_init(|| {
-            let mut pixels = image::load_from_memory_with_format(
-                include_bytes!("../../../packaging/icons/sidebar.png"),
-                image::ImageFormat::Png,
-            )
-            .expect("committed Xylo sidebar PNG is valid")
-            .into_rgba8();
-            // GPUI's texture atlas consumes BGRA, matching its own PNG loader.
-            for pixel in pixels.pixels_mut() {
-                pixel.0.swap(0, 2);
-            }
-            Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]))
-        })
-        .clone()
+/// A small X monogram drawn directly in Rust, with no external branding assets.
+pub fn brand_pixels(size: u32) -> image::RgbaImage {
+    let margin = size / 5;
+    let stroke = (size / 12).max(1);
+    image::RgbaImage::from_fn(size, size, |x, y| {
+        let inside = x >= margin && x < size - margin && y >= margin && y < size - margin;
+        let mark = inside && (x.abs_diff(y) <= stroke || x.abs_diff(size - 1 - y) <= stroke);
+        image::Rgba(if mark { [32, 35, 43, 255] } else { [255; 4] })
+    })
 }
 
 static DARK: AtomicBool = AtomicBool::new(false);
@@ -69,9 +55,6 @@ pub fn selected() -> u32 {
 pub fn hover() -> u32 {
     color(0xe9eaef, 0x353944)
 }
-pub fn message_bg() -> u32 {
-    color(0xe9eaef, 0x292c34)
-}
 /// Status and change colours; each meets 4.5:1 against its panel in both themes.
 pub fn success() -> u32 {
     color(0x1a7f45, 0x6fd69a)
@@ -110,9 +93,9 @@ fn button_base(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui
         .accessibility_label(label.clone())
         .px_3()
         .py_1()
-        .min_h(px(30.))
+        .min_h(px(28.))
         .rounded_md()
-        .text_sm()
+        .text_size(px(12.))
         .text_color(rgb(text()))
         .cursor_pointer()
         .child(label)
@@ -139,37 +122,11 @@ pub fn icon_button(
         .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
         .child(icon(name))
 }
-pub fn compact_selector(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-) -> gpui_kit::base::Button {
-    let label = label.into();
-    focus_ring(gpui_kit::base::Button::new(id))
-        .accessibility_label(label.clone())
-        .flex()
-        .items_center()
-        .gap_1()
-        .min_w_0()
-        .h(px(28.))
-        .px_2()
-        .rounded_md()
-        .text_xs()
-        .text_color(rgb(muted()))
-        .cursor_pointer()
-        .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
-        .child(
-            div()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .child(label),
-        )
-        .child(icon(IconName::ChevronDown).size(px(12.)))
-}
 pub fn primary(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_kit::base::Button {
     // Inverted in dark mode so the primary action keeps its contrast.
     button_base(id, label)
+        .self_start()
+        .flex_shrink_0()
         .bg(rgb(color(0x1d2129, 0xe8ebf3)))
         .text_color(rgb(color(0xffffff, 0x14161b)))
         .hover(|d| d.bg(rgb(color(0x454d5f, 0xc9cfdc))))
@@ -196,7 +153,7 @@ pub fn nav_button(
         .whitespace_nowrap()
         .px_3()
         .rounded_md()
-        .text_sm()
+        .text_size(px(12.))
         .text_color(rgb(text()))
         .hover(|d| d.bg(rgb(border())))
         .child(icon(name))

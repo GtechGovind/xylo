@@ -1,5 +1,5 @@
 <div align="center">
-  <h1><img src="packaging/branding/xylo-lockup.png" alt="Xylo" width="480"></h1>
+  <h1>Xylo</h1>
   <h3>Your projects. Your models. One workspace.</h3>
   <p>A native desktop workspace for AI conversations, coding and everyday tools.</p>
   <p>
@@ -15,14 +15,14 @@ Xylo keeps conversations, project files and practical tools together. Bring a lo
 
 ## What you can do
 
-| Workspace | Capabilities |
-| --- | --- |
-| **Work with your project** | Browse and search files, use the native editor and terminal, and review Git diffs alongside chat. |
-| **Choose your model** | Connect local model servers, cloud providers or a compatible endpoint. Choose models explicitly. |
-| **Keep useful context** | Save project facts, search conversation history, and review reusable skills. |
-| **Stay in control** | Review tool approvals and inspect interrupted actions before recording an observed outcome. |
-| **Work with documents** | Edit supported DOCX content and multi-sheet XLSX files, save a separate copy, and recover retained drafts. |
-| **Connect your tools** | Add MCP connections, review plugin permissions, and configure SSH or container environments. |
+| Workspace                  | Capabilities                                                                                               |
+|----------------------------|------------------------------------------------------------------------------------------------------------|
+| **Work with your project** | Browse and search files, use the native editor and terminal, and review Git diffs alongside chat.          |
+| **Choose your model**      | Connect local model servers, cloud providers or a compatible endpoint. Choose models explicitly.           |
+| **Keep useful context**    | Save project facts, search conversation history, and review reusable skills.                               |
+| **Stay in control**        | Review tool approvals and inspect interrupted actions before recording an observed outcome.                |
+| **Work with documents**    | Edit supported DOCX content and multi-sheet XLSX files, save a separate copy, and recover retained drafts. |
+| **Connect your tools**     | Add MCP connections, review plugin permissions, and configure SSH or container environments.               |
 
 Browser actions, images, voice and local model tools extend the workspace through services that start when used. Some features need an explicit asset download, a configured service or an operating system permission. [Explore capabilities →](docs/capabilities.md)
 
@@ -36,13 +36,20 @@ Choose the provider and model under **Settings → Model**. Credentials use the 
 
 ## Get started
 
-**Xylo is in development preview. The first downloadable release is being prepared.** Follow the [Releases page](https://github.com/GtechGovind/xylo/releases) for published files and release notes, or [build the preview from source](docs/development.md#run-the-preview) now.
+**Xylo is in development preview. The first downloadable release is being prepared.** Follow the [Releases page](https://github.com/GtechGovind/xylo/releases) for published files and release notes, or build from source with standard Cargo commands:
 
-| Platform | Target architectures | Planned preview formats |
-| --- | --- | --- |
-| macOS | Apple Silicon, Intel x64 | DMG, app archive |
-| Windows | ARM64, x64 | Installer EXE |
-| Linux | ARM64, x64 | AppImage, DEB |
+```sh
+cargo build --locked --workspace --bins
+cargo run --locked
+```
+
+The pinned Rust toolchain is selected by `rust-toolchain.toml`. Application builds do not require packaging scripts, icon files, or updater configuration. Automatic updates are disabled until a trusted release feed is configured.
+
+| Platform | Target architectures     | Planned preview formats |
+|----------|--------------------------|-------------------------|
+| macOS    | Apple Silicon, Intel x64 | DMG, app archive        |
+| Windows  | ARM64, x64               | Installer EXE           |
+| Linux    | ARM64, x64               | AppImage, DEB           |
 
 These are release targets, not a claim that every platform is already qualified. Preview signing and installation limits are documented in the [release guide](docs/preview-release.md).
 
@@ -51,16 +58,6 @@ Once the app is running:
 1. Open a project folder.
 2. Choose a provider and model in **Settings → Model**.
 3. Start a conversation and review requested actions as you work.
-
-## Documentation
-
-- [Models and providers](docs/providers.md) · [Native assets](docs/assets.md)
-- [Project memory](docs/memory-management.md) · [Saved chats and drafts](docs/drafts.md)
-- [Documents and recovery](docs/native-documents.md) · [Interrupted action review](docs/action-review-ui.md)
-- [Plugins](docs/native-plugins.md) · [Execution environments](docs/native-environments.md)
-- [Modern native terminal direction](docs/terminal-roadmap.md)
-- [Build, contribute and browse the full docs index](docs/development.md)
-- [Current verification and remaining acceptance](docs/completion-audit.md)
 
 ## Contribute and get help
 

@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 use tokio_util::sync::CancellationToken;
-use workbench_core::*;
+use xylo_core::*;
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }

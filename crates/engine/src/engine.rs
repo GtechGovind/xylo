@@ -21,9 +21,9 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use workbench_capabilities::CapabilityConfig;
-use workbench_core::{EngineBackend, EngineEvent, ProviderConfig, TurnRequest, Usage};
-use workbench_services::{CredentialVault, LearningService, Store};
+use xylo_capabilities::CapabilityConfig;
+use xylo_core::{EngineBackend, EngineEvent, ProviderConfig, TurnRequest, Usage};
+use xylo_services::{CredentialVault, LearningService, Store};
 
 /// Upper bound on model calls in one turn, a runaway guard rather than a budget.
 const MAX_MODEL_CALLS: u32 = 200;
@@ -52,7 +52,7 @@ pub struct HermesEngine {
     approvals: ApprovalGate,
     interrupt: InterruptController,
     steering: crate::steering::SteeringControl,
-    provider_credential: Option<workbench_core::WorkerCredential>,
+    provider_credential: Option<xylo_core::WorkerCredential>,
 }
 
 impl HermesEngine {
@@ -71,10 +71,7 @@ impl HermesEngine {
         self.steering.notify();
     }
 
-    pub fn with_provider_credential(
-        mut self,
-        credential: workbench_core::WorkerCredential,
-    ) -> Self {
+    pub fn with_provider_credential(mut self, credential: xylo_core::WorkerCredential) -> Self {
         self.provider_credential = Some(credential);
         self
     }
@@ -88,7 +85,7 @@ impl HermesEngine {
             return crate::providers::build(config, credential.0.clone());
         }
         let key = match &config.credential_ref {
-            Some(reference) => CredentialVault::new(workbench_core::CREDENTIAL_SERVICE)?
+            Some(reference) => CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?
                 .get(reference)?
                 .with_context(|| format!("Credential {reference} is not configured"))
                 .map(Some)?,
@@ -226,9 +223,14 @@ impl EngineBackend for HermesEngine {
                 .await?;
             return Ok(());
         }
+        if cancel.is_cancelled() {
+            events.send(EngineEvent::Cancelled).await?;
+            return Ok(());
+        }
+        let admission_start = Instant::now();
         request.provider.validate()?;
         let attachment_store =
-            workbench_services::attachments::AttachmentStore::new(self.paths.artifacts.clone())?;
+            xylo_services::attachments::AttachmentStore::new(self.paths.artifacts.clone())?;
         let validation_store = attachment_store.clone();
         let attachment_refs = request.attachments.clone();
         let attachment_session = request.session_id;
@@ -247,6 +249,7 @@ impl EngineBackend for HermesEngine {
             turn: request.turn_id,
             completed: false,
         };
+        let broker_start = Instant::now();
         let broker = Arc::new(ToolBroker::new(
             request.clone(),
             self.store.clone(),
@@ -255,6 +258,13 @@ impl EngineBackend for HermesEngine {
             events.clone(),
             cancel.clone(),
         )?);
+        tracing::debug!(session_id=%request.session_id, turn_id=%request.turn_id,
+            elapsed_ms=broker_start.elapsed().as_millis(),
+            advertised_tools=broker.initial_definitions().len(), "Turn tool manifest assembled");
+        if cancel.is_cancelled() {
+            events.send(EngineEvent::Cancelled).await?;
+            return Ok(());
+        }
         // Inspect exact inner receipts before blocking resume on the outer
         // journal. This pass never dispatches a tool or probes its target, and
         // uses each saved intent's original ID, turn and key, including children.
@@ -307,6 +317,7 @@ impl EngineBackend for HermesEngine {
         std::fs::create_dir_all(&home)?;
         let config = AgentConfig {
             native_product_finalization: true,
+            allow_model_fallbacks: false,
             // Coding work routinely needs dozens of tool rounds; the user can
             // stop or steer at any time, and context is compacted as needed.
             max_turns: MAX_MODEL_CALLS,
@@ -371,12 +382,12 @@ impl EngineBackend for HermesEngine {
         let child_session = request.session_id.to_string();
         let handle = tokio::runtime::Handle::current();
         let delegate_cancel = cancel.clone();
-        let helper_resources = workbench_runtime::resources::ResourceManager::new();
+        let helper_resources = xylo_runtime::resources::ResourceManager::new();
         let helper_slots = Arc::new(tokio::sync::Semaphore::new(
             helper_resources.suggested_parallelism(64 * 1024 * 1024)?,
         ));
         let helper_demand =
-            workbench_runtime::resources::TaskDemand::interactive(request.provider.context_tokens);
+            xylo_runtime::resources::TaskDemand::interactive(request.provider.context_tokens);
         broker.set_delegate(Arc::new(move|parent_call_key,args|{
             let task=args.get("task").and_then(Value::as_str).filter(|s|!s.trim().is_empty()).context("Subtask text is required")?;
             let _permit=handle.block_on(async{tokio::select!{_ = delegate_cancel.cancelled()=>Err(anyhow::anyhow!("Delegation cancelled")),permit=helper_slots.acquire()=>permit.map_err(Into::into)}})?;
@@ -397,6 +408,8 @@ impl EngineBackend for HermesEngine {
             request.turn_id,
             &serde_json::to_value(&messages)?,
         )?;
+        tracing::debug!(session_id=%request.session_id, turn_id=%request.turn_id,
+            elapsed_ms=admission_start.elapsed().as_millis(), "Turn admission prepared");
         events.send(EngineEvent::Started).await?;
 
         let deltas = Arc::new(Mutex::new(String::new()));

@@ -1,5 +1,5 @@
 {
-  "id": "org.agentworkbench.text-report",
+  "id": "com.qurkos.xylo.text-report",
   "name": "Text report",
   "version": "1.0.0",
   "capabilities": ["read_workspace", "write_artifacts"],

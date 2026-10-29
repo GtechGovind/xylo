@@ -1,5 +1,5 @@
 use super::*;
-use workbench_core::DocumentKind;
+use xylo_core::DocumentKind;
 
 fn key(root: &Path, name: &str) -> DocumentDraftKey {
     DocumentDraftKey {

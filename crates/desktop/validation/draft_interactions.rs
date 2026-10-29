@@ -10,31 +10,33 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
+mod xylo {
+    include!("../src/xylo.rs");
     #[cfg(test)]
     mod draft_native_tests {
-        use super::{DraftFlushAction, Page, Workbench};
+        use super::{DraftFlushAction, Page, Xylo};
         use gpui_kit::{
             AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size,
             test::TestWindowExt,
         };
         use std::time::{Duration, Instant};
         use uuid::Uuid;
-        use workbench_runtime::{
+        use xylo_runtime::{
             AppPaths,
             drafts::{DraftKey, DraftSave, DraftSnapshot, DraftWrite},
             host::HostClient,
         };
-        use workbench_services::Store;
+        use xylo_services::Store;
         fn wait(
             cx: &mut TestAppContext,
-            view: &gpui_kit::Entity<Workbench>,
+            view: &gpui_kit::Entity<Xylo>,
             description: &str,
-            condition: impl Fn(&Workbench, &gpui_kit::App) -> bool,
+            condition: impl Fn(&Xylo, &gpui_kit::App) -> bool,
         ) {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
+                // Drive the native receiver's bounded-backlog yield timer.
+                cx.executor().advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 if cx.update(|cx| condition(view.read(cx), cx)) {
                     return;
@@ -50,9 +52,9 @@ mod workbench {
             cx: &mut TestAppContext,
             host: anyhow::Result<(
                 HostClient,
-                async_channel::Receiver<workbench_runtime::host::HostEvent>,
+                async_channel::Receiver<xylo_runtime::host::HostEvent>,
             )>,
-        ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Workbench>) {
+        ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Xylo>) {
             cx.update(gpui_kit::init);
             cx.update(|cx| {
                 gpui_kit::open_window(
@@ -64,7 +66,7 @@ mod workbench {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| Workbench::new(host, window, cx)),
+                    |window, cx| cx.new(|cx| Xylo::new(host, window, cx)),
                 )
                 .unwrap()
             })
@@ -390,7 +392,7 @@ mod workbench {
             wait(cx, &view, "initial draft revision", |view, _| {
                 view.drafts.validation_revision(&key).is_some()
             });
-            let oversized = "x".repeat(workbench_runtime::drafts::MAX_DRAFT_BYTES + 1);
+            let oversized = "x".repeat(xylo_runtime::drafts::MAX_DRAFT_BYTES + 1);
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| {
                     view.composer.update(cx, |input, cx| {
@@ -503,15 +505,61 @@ mod workbench {
             client.shutdown().unwrap();
         }
 
+        #[gpui_kit::test]
+        fn second_native_message_dispatches_guidance_during_long_running_response(cx: &mut TestAppContext) {
+            use gpui_kit::EntityInputHandler;
+            cx.executor().allow_parking();
+            let directory=tempfile::tempdir().unwrap();
+            let base=directory.path().canonicalize().unwrap();
+            let workspace=base.join("project");std::fs::create_dir(&workspace).unwrap();
+            let paths=AppPaths::at(base.join("profile")).unwrap();
+            let store=Store::open(&paths.database).unwrap();
+            let host=HostClient::spawn_at(paths).unwrap();let client=host.0.clone();
+            let (window,view)=open(cx,Ok(host));
+            wait(cx,&view,"settings",|view,_|view.settings_loaded);
+            cx.update_window(window,|_,window,cx|view.update(cx,|view,cx|view.set_workspace(workspace.clone(),window,cx))).unwrap();
+            let session=cx.update(|cx|view.read(cx).session);
+            let key=DraftKey {session_id:session,workspace:Some(workspace.clone())};
+            wait(cx,&view,"initial draft",|view,_|view.drafts.validation_revision(&key).is_some());
+            let turn=Uuid::new_v4();
+            store.upsert_conversation(&xylo_core::Conversation {id:session,title:"Live task".into(),workspace,updated_at:1}).unwrap();
+            store.save_checkpoint(session,turn,&serde_json::json!([{"role":"user","content":"Original task"}])).unwrap();
+            cx.update_window(window,|_,window,cx|{
+                view.update(cx,|view,cx|{
+                    let state=view.turns.entry(session).or_default();state.apply(xylo_core::EngineEvent::Started);
+                    state.apply(xylo_core::EngineEvent::Delta {text:"Long reasoning paragraph with Unicode αβ.\n\n".repeat(2000)});
+                    view.error=None;cx.notify();
+                });
+                window.render_frame(cx);
+                let composer=view.read(cx).composer.clone();
+                composer.update(cx,|input,cx|{input.focus(window,cx);input.replace_text_in_range(None,"Use the second instruction while reasoning αβ",window,cx);});
+                view.update(cx,|view,cx|view.draft_changed(cx));
+                window.render_frame(cx);window.click("send-prompt",cx);
+                assert!(view.read(cx).turns[&session].running,"Sending guidance must not cancel the active turn");
+                assert!(view.read(cx).drafts.validation_guidance_pending(&key),"Busy Send must capture guidance rather than start another run");
+            }).unwrap();
+            // The native fixture controls EngineEvents, without a paid/live
+            // worker. The real Host must therefore refuse dispatch safely;
+            // backend host tests separately exercise queue -> worker -> receipt.
+            wait(cx,&view,"guidance refusal from the real host",|view,_|view.error.as_deref()==Some("Guidance could not be added. Your draft is still here."));
+            assert_eq!(store.draft(&key).unwrap().text,"Use the second instruction while reasoning αβ");
+            cx.update(|cx| {
+                assert_eq!(view.read(cx).composer.read(cx).value().as_ref(),"Use the second instruction while reasoning αβ");
+                assert!(view.read(cx).turns[&session].running);
+                assert!(!view.read(cx).drafts.validation_guidance_pending(&key));
+            });
+            client.shutdown().unwrap();
+        }
+
         type GuidanceFixture = (
             tempfile::TempDir,
             Store,
             HostClient,
             gpui_kit::AnyWindowHandle,
-            gpui_kit::Entity<Workbench>,
+            gpui_kit::Entity<Xylo>,
             DraftKey,
-            workbench_core::SteeringRequest,
-            workbench_runtime::steering::SteeringOutcome,
+            xylo_core::SteeringRequest,
+            xylo_runtime::steering::SteeringOutcome,
         );
         fn guidance_fixture(cx: &mut TestAppContext) -> GuidanceFixture {
             cx.executor().allow_parking();
@@ -554,7 +602,7 @@ mod workbench {
             let snapshot = store.draft(&key).unwrap();
             let turn = Uuid::new_v4();
             store
-                .upsert_conversation(&workbench_core::Conversation {
+                .upsert_conversation(&xylo_core::Conversation {
                     id: key.session_id,
                     title: "Task".into(),
                     workspace,
@@ -568,7 +616,7 @@ mod workbench {
                     &serde_json::json!([{"role":"user","content":"Original task"}]),
                 )
                 .unwrap();
-            let guidance = workbench_core::SteeringRequest {
+            let guidance = xylo_core::SteeringRequest {
                 id: Uuid::new_v4(),
                 session_id: key.session_id,
                 turn_id: turn,
@@ -577,7 +625,7 @@ mod workbench {
             let queued = store
                 .queue_steering(
                     &guidance,
-                    &workbench_runtime::drafts::DraftSubmission {
+                    &xylo_runtime::drafts::DraftSubmission {
                         key: key.clone(),
                         expected_revision: snapshot.revision,
                         text: snapshot.text,

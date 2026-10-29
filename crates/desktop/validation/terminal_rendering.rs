@@ -29,7 +29,7 @@ fn run() {
     });
     let cwd = tempfile::tempdir().unwrap();
     let (session, _live_updates) =
-        workbench_runtime::terminal::TerminalSession::spawn(cwd.path()).unwrap();
+        xylo_runtime::terminal::TerminalSession::spawn(cwd.path()).unwrap();
     let (_fixture_sender, fixture_updates) = tokio::sync::watch::channel(Default::default());
     let (handle, view) = cx
         .update(|cx| {
@@ -69,7 +69,7 @@ fn run() {
             terminal_view::tests::assert_render_geometry(terminal, window, cx)
         })
         .unwrap();
-    let output = std::env::var_os("WORKBENCH_RENDER_DIR")
+    let output = std::env::var_os("XYLO_RENDER_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| "target/native-terminal-preview".into());
     std::fs::create_dir_all(&output).unwrap();

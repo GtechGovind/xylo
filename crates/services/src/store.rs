@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
-use workbench_core::{
+use xylo_core::{
     AppSettings, ChatMessage, ConnectorConfig, Conversation, ConversationCursor, ConversationPage,
     HistoryPage, TurnRequest, Usage, now_ms,
 };
@@ -27,7 +27,7 @@ pub(crate) fn register_user_turn_in_transaction(
     turn: &TurnRequest,
 ) -> Result<()> {
     ensure!(
-        turn.attachments.len() <= workbench_core::MAX_ATTACHMENTS_PER_TURN,
+        turn.attachments.len() <= xylo_core::MAX_ATTACHMENTS_PER_TURN,
         "Attach at most four images"
     );
     ensure!(
@@ -166,12 +166,11 @@ impl Store {
         let (sender, receiver) = mpsc::sync_channel::<Job>(QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         thread::Builder::new()
-            .name("workbench-sqlite".into())
+            .name("xylo-sqlite".into())
             .spawn(move || {
                 let connection = (|| -> Result<Connection> {
                     register_vec();
-                    let conn =
-                        Connection::open(connection_path).context("Open workbench database")?;
+                    let conn = Connection::open(connection_path).context("Open xylo database")?;
                     conn.busy_timeout(Duration::from_secs(5))?;
                     conn.execute_batch(
                         "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",

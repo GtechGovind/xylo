@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use std::{path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_capabilities::{CapabilityConfig, CapabilityService};
-use workbench_core::{PluginCatalog, PluginInspection, PluginManagementResult};
+use xylo_capabilities::{CapabilityConfig, CapabilityService};
+use xylo_core::{PluginCatalog, PluginInspection, PluginManagementResult};
 
 async fn control(service: &CapabilityService, name: &str, args: Value) -> Result<Value> {
     tokio::time::timeout(
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
         .await?,
     )?;
     ensure!(
-        inspected.manifest.id == "org.agentworkbench.text-report",
+        inspected.manifest.id == "com.qurkos.xylo.text-report",
         "Unexpected example package"
     );
     let empty: PluginCatalog =

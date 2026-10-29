@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 use tokio_util::sync::CancellationToken;
-use workbench_core::{
+use xylo_core::{
     DocumentCell, DocumentCellValue as Value, DocumentContent, DocumentEdit, DocumentOpenRequest,
     DocumentSheet,
 };

@@ -1,14 +1,14 @@
 [package]
-name = "worker"
+name = "xylo-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-core.workspace = true
-runtime.workspace = true
-services.workspace = true
-engine.workspace = true
+xylo-core.workspace = true
+xylo-runtime.workspace = true
+xylo-services.workspace = true
+xylo-engine.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
-use workbench_distribution::{StagedUpdate, UpdateProgress, Updater, VerifiedUpdate};
+use xylo_distribution::{StagedUpdate, UpdateProgress, Updater, VerifiedUpdate};
 
 #[derive(Default)]
 struct State {
@@ -68,7 +68,7 @@ pub struct Service {
 
 impl Service {
     pub fn new(data: PathBuf, executable: PathBuf) -> Result<Self> {
-        Ok(Self::from_updater(Updater::from_embedded(
+        Ok(Self::from_updater(Updater::for_application(
             data.join("updates"),
             executable,
         )?))
@@ -127,7 +127,7 @@ impl Service {
     }
 
     fn failed(&self, error: anyhow::Error) -> anyhow::Error {
-        let message = workbench_distribution::product_error(&error);
+        let message = xylo_distribution::product_error(&error);
         tracing::debug!(error = ?error, "Application update action failed");
         let mut state = self.state.lock();
         state.restore();
@@ -263,7 +263,7 @@ mod tests {
             "macos_team_id": "TEST000000"
         }))
         .unwrap();
-        let target = workbench_distribution::native_target().unwrap();
+        let target = xylo_distribution::native_target().unwrap();
         let format = if target.starts_with("macos-") {
             "app"
         } else if target.starts_with("linux-") {

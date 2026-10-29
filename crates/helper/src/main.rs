@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     }
     ensure!(
         args.len() == 4 && args[0] == "--data-dir" && args[2] == "--workspace",
-        "Usage: workbench-helper --data-dir ABSOLUTE_PATH --workspace ABSOLUTE_PATH"
+        "Usage: xylo-helper --data-dir ABSOLUTE_PATH --workspace ABSOLUTE_PATH"
     );
     let data = PathBuf::from(&args[1]);
     let workspace = PathBuf::from(&args[3]);

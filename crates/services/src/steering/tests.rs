@@ -1,6 +1,6 @@
 use super::*;
 use crate::{DraftKey, DraftSave, DraftWrite};
-use workbench_core::Conversation;
+use xylo_core::Conversation;
 fn fixture() -> (tempfile::TempDir, Store, SteeringRequest, DraftSubmission) {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path().join("store.db")).unwrap();

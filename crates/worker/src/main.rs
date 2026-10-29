@@ -16,10 +16,10 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
-use workbench_core::*;
-use workbench_engine::{HermesEngine, tools::ApprovalGate};
-use workbench_runtime::AppPaths;
-use workbench_services::Store;
+use xylo_core::*;
+use xylo_engine::{HermesEngine, tools::ApprovalGate};
+use xylo_runtime::AppPaths;
+use xylo_services::Store;
 
 struct ActiveTask {
     session_id: uuid::Uuid,

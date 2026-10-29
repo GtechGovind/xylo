@@ -10,11 +10,11 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
+mod xylo {
+    include!("../src/xylo.rs");
     #[cfg(test)]
     mod notification_native_tests {
-        use super::{Page, Workbench};
+        use super::{Page, Xylo};
         use gpui_kit::{
             AnyWindowHandle, AppContext, Bounds, Context, Entity, Role, TestAppContext,
             WindowBounds, WindowOptions, px, size,
@@ -23,7 +23,7 @@ mod workbench {
         use serde_json::{Value, json};
         use uuid::Uuid;
 
-        fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workbench>) {
+        fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Xylo>) {
             cx.update(gpui_kit::init);
             cx.update(|cx| {
                 gpui_kit::open_window(
@@ -37,7 +37,7 @@ mod workbench {
                     cx,
                     |window, cx| {
                         cx.new(|cx| {
-                            Workbench::new(
+                            Xylo::new(
                                 Err(anyhow::anyhow!("Isolated native notification fixture")),
                                 window,
                                 cx,
@@ -51,7 +51,7 @@ mod workbench {
         fn snapshot(sequence: u64, enabled: bool, permission: &str) -> Value {
             json!({"sequence":sequence,"loaded":true,"preferences":{"enabled":enabled,"completion":true,"approval":true,"failure":true,"schedule":true,"background_only":true},"permission":permission,"capabilities":{"request_permission":true,"live_activation":true,"cold_activation":false,"retraction":true},"message":null})
         }
-        fn response(view: &mut Workbench, name: &str, value: Value, cx: &mut Context<Workbench>) {
+        fn response(view: &mut Xylo, name: &str, value: Value, cx: &mut Context<Xylo>) {
             let id = Uuid::new_v4();
             view.notifications.pending.insert(id, name.into());
             assert!(view.notification_result(id, &value, cx));

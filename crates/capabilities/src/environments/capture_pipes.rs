@@ -41,7 +41,7 @@ impl Reader {
     ) -> Self {
         let (send, mut receive) = mpsc::channel::<Vec<u8>>(4);
         let writer_lease = lease.clone();
-        let writer = workbench_resources::spawn_blocking(move || {
+        let writer = xylo_resources::spawn_blocking(move || {
             let _lease = writer_lease;
             let mut failed = false;
             while let Some(bytes) = receive.blocking_recv() {

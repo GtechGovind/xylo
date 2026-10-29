@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::{Conversation, now_ms};
+use xylo_core::{Conversation, now_ms};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionReviewScope {

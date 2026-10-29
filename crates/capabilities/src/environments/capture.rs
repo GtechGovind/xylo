@@ -382,7 +382,7 @@ impl Session {
         self.intent.dispatched = true;
         self.intent.operation.receipt.state = EnvironmentOperationState::Running;
         let (mut session, guard) = (self, lease.clone());
-        session = workbench_resources::spawn_blocking(move || {
+        session = xylo_resources::spawn_blocking(move || {
             let _lease = guard;
             session.write_intent()?;
             Ok::<_, anyhow::Error>(session)
@@ -398,7 +398,7 @@ impl Session {
             .context("Missing error stream staging file")?;
         let result = pipes::run(spec, preview_limit, stdout, stderr, cancel, lease.clone()).await;
         let guard = lease;
-        workbench_resources::spawn_blocking(move || {
+        xylo_resources::spawn_blocking(move || {
             let _lease = guard;
             let mut session = session;
             let (state, message) = match &result.status {

@@ -6,7 +6,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use workbench_core::MAX_IMAGE_BYTES;
+use xylo_core::MAX_IMAGE_BYTES;
 
 pub(super) fn loopback(url: &Url) -> bool {
     matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))

@@ -91,7 +91,7 @@ pub struct BedrockProvider {
     region: String,
     model: String,
     client: Arc<Mutex<Client>>,
-    // Agent Workbench patch: a configured OS-vault identity must not be ignored
+    // Xylo patch: a configured OS-vault identity must not be ignored
     // in favour of unrelated process-global AWS credentials.
     explicit_auth: Option<BedrockAuth>,
 }
@@ -373,7 +373,7 @@ impl LlmProvider for BedrockProvider {
                             return;
                         }
                     };
-                    // Agent Workbench: retain signed reasoning and exact native
+                    // Xylo: retain signed reasoning and exact native
                     // content blocks across a tool round trip and checkpoint.
                     if let Some(start) = event.get("contentBlockStart") {
                         let index = start["contentBlockIndex"].as_u64().unwrap_or(0);
@@ -404,7 +404,7 @@ impl LlmProvider for BedrockProvider {
                             let parsed=match serde_json::from_str::<Value>(arguments){Ok(parsed)=>parsed,Err(_)=>{yield Err(AgentError::LlmApi("Incomplete Bedrock tool arguments".into()));return;}};
                             if let Some(block)=native_blocks.get_mut(index) {block["toolUse"]["input"]=parsed;}
                         }
-                        yield Ok(StreamChunk{delta:Some(StreamDelta{content:None,tool_calls:None,extra:Some(json!({"workbench_content_blocks":native_blocks.values().map(|item|json!({"type":"workbench_bedrock_block","item":item})).collect::<Vec<_>>()}))}),finish_reason:None,usage:None});
+                        yield Ok(StreamChunk{delta:Some(StreamDelta{content:None,tool_calls:None,extra:Some(json!({"xylo_content_blocks":native_blocks.values().map(|item|json!({"type":"xylo_bedrock_block","item":item})).collect::<Vec<_>>()}))}),finish_reason:None,usage:None});
                     }
                     let chunks = match bedrock_stream_event_to_chunks(&event) {
                         Ok(chunks) => chunks,
@@ -800,7 +800,7 @@ fn convert_messages_to_bedrock(messages: &[Message]) -> (Vec<Value>, Vec<Value>)
                 if let Some(blocks) = message.anthropic_content_blocks.as_ref() {
                     let raw = blocks
                         .iter()
-                        .filter(|block| block["type"] == "workbench_bedrock_block")
+                        .filter(|block| block["type"] == "xylo_bedrock_block")
                         .filter_map(|block| block.get("item").cloned())
                         .collect::<Vec<_>>();
                     if !raw.is_empty() {

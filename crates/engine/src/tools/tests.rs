@@ -1,5 +1,5 @@
 use super::*;
-use workbench_core::{Conversation, ProviderConfig, now_ms};
+use xylo_core::{Conversation, ProviderConfig, now_ms};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_native_connector_writes_do_not_create_uncertain_actions_or_approvals() {
@@ -91,7 +91,7 @@ pub(super) fn fixture(
     tokio::sync::mpsc::Receiver<EngineEvent>,
 ) {
     let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path().join("workbench.db")).unwrap();
+    let store = Store::open(directory.path().join("xylo.db")).unwrap();
     let session = Uuid::new_v4();
     store
         .upsert_conversation(&Conversation {
@@ -795,7 +795,7 @@ async fn retrieved_verified_command_remains_advisory_and_cannot_bypass_read_only
                 request.turn_id,
                 &json!([]),
                 "Verified",
-                &workbench_core::Usage::default(),
+                &xylo_core::Usage::default(),
             )
             .unwrap();
         learning
@@ -828,5 +828,146 @@ async fn retrieved_verified_command_remains_advisory_and_cannot_bypass_read_only
             )
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_turn_advertises_no_writing_tools() {
+    let (_directory, broker, _events) = fixture(PermissionMode::ReadOnly);
+    assert!(broker.initial_definitions().iter().all(|tool| !tool.writes));
+    assert!(
+        broker
+            .initial_definitions()
+            .iter()
+            .any(|tool| tool.name == "file_read")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unconfigured_image_provider_is_not_advertised_by_tool_search() {
+    let (_directory, broker, _events) = fixture(PermissionMode::AskForWrites);
+    tokio::task::spawn_blocking(move || {
+        let result = broker
+            .execute(
+                "discover-images",
+                "search_tools",
+                json!({"query":"image_generate"}),
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert!(!value.to_string().contains("Generate one image"), "{value}");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connector_discovery_snapshot_never_grants_execution_after_removal() {
+    let (directory, broker, _events) = fixture(PermissionMode::AskForWrites);
+    assert!(
+        !broker
+            .advertised
+            .iter()
+            .any(|tool| tool.name == "connector_tools")
+    );
+    let id = Uuid::new_v4();
+    broker
+        .store
+        .save_connector(&ConnectorConfig {
+            id,
+            name: "Fixture connection".into(),
+            transport: "gmail".into(),
+            endpoint: "https://gmail.googleapis.com".into(),
+            command: None,
+            args: vec![],
+            credential_ref: None,
+        })
+        .unwrap();
+    assert!(
+        !broker
+            .advertised
+            .iter()
+            .any(|tool| tool.name == "connector_tools")
+    );
+    let (events, _receiver) = tokio::sync::mpsc::channel(16);
+    let next = ToolBroker::new(
+        broker.request.clone(),
+        broker.store.clone(),
+        CapabilityConfig {
+            workspace: directory.path().into(),
+            artifacts: directory.path().join("artifacts"),
+            management_root: Some(directory.path().join("native-management")),
+            ..Default::default()
+        },
+        ApprovalGate::default(),
+        events,
+        CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(
+        next.advertised
+            .iter()
+            .any(|tool| tool.name == "connector_tools")
+    );
+    broker.store.delete_connector(id).unwrap();
+    tokio::task::spawn_blocking(move || {
+        assert!(
+            next.execute(
+                "removed-connector",
+                "connector_tools",
+                json!({"connector_id": id})
+            )
+            .is_err()
+        );
+        assert!(next.journaled("removed-connector").unwrap().is_none());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_delegates_enter_callbacks_before_either_finishes() {
+    let (_directory, broker, _events) = fixture(PermissionMode::ReadOnly);
+    let (entered, mut arrivals) = tokio::sync::mpsc::channel(2);
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let waiting = release.clone();
+    broker.set_delegate(Arc::new(move |_, _| {
+        entered.blocking_send(()).unwrap();
+        let (lock, changed) = &*waiting;
+        let released = lock.lock().unwrap();
+        let (released, _) = changed
+            .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+            .unwrap();
+        ensure!(*released, "Test did not release delegate callback");
+        Ok(json!({"status":"completed","result":"independent"}))
+    }));
+    let mut work = Vec::new();
+    for index in 0..2 {
+        let task = broker.clone();
+        work.push(tokio::task::spawn_blocking(move || {
+            task.execute(
+                &format!("parallel-delegate-{index}"),
+                "agent_delegate",
+                json!({"task":"independent read-only investigation"}),
+            )
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(2), arrivals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let both_entered = tokio::time::timeout(Duration::from_millis(500), arrivals.recv())
+        .await
+        .is_ok();
+    {
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+    }
+    for task in work {
+        task.await.unwrap().unwrap();
+    }
+    assert!(
+        both_entered,
+        "A delegate callback held the registration mutex and serialized independent work"
     );
 }

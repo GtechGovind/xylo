@@ -1,12 +1,12 @@
 [package]
-name="workbench-native-validation"
+name="xylo-native-validation"
 version="0.1.0"
 edition="2024"
 [dependencies]
 gpui-kit={version="=0.8.0",features=["test-support","tree-sitter","tree-sitter-rust", "tree-sitter-c", "tree-sitter-cpp","tree-sitter-python","tree-sitter-typescript","tree-sitter-javascript","tree-sitter-markdown"]}
-workbench-core={path="../../core"}
-workbench-runtime={path="../../runtime"}
-workbench-services={path="../../services"}
+xylo-core={path="../../core"}
+xylo-runtime={path="../../runtime"}
+xylo-services={path="../../services"}
 anyhow="1"
 serde={version="1",features=["derive"]}
 serde_json="1"
@@ -29,14 +29,22 @@ image={version="=0.25.10",default-features=false,features=["png"]}
 
 [workspace]
 
+# Match the desktop application's development debug information setting.
+[profile.dev]
+debug = 1
+
 [profile.release]
 lto = "thin"
 strip = "symbols"
 codegen-units = 16
 
+[features]
+performance = []
+
 [[bin]]
 name="native-performance"
 path="performance.rs"
+required-features = ["performance"]
 
 [[test]]
 name="native-interactions"
@@ -123,3 +131,11 @@ path="file_tree_interactions.rs"
 name="file-tree-rendering"
 path="file_tree_rendering.rs"
 harness=false
+
+[[test]]
+name="account-interactions"
+path="account_interactions.rs"
+
+[[test]]
+name="composer-interactions"
+path="composer_interactions.rs"

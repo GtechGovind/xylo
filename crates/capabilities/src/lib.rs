@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ToolDefinition, ToolObservation};
+use xylo_core::{ToolDefinition, ToolObservation};
 
 /// Optional assets are local paths supplied by the reviewed asset manager or an
 /// explicit import. Service construction never downloads or loads them.
@@ -144,16 +144,13 @@ impl CapabilityService {
         cancel: CancellationToken,
     ) -> Result<ToolObservation> {
         if let (Some(demand), Some(root)) = (
-            workbench_resources::capability_demand(name),
+            xylo_resources::capability_demand(name),
             self.config.management_root.as_ref(),
         ) {
-            let lease = workbench_resources::shared::acquire(
-                root.join("admission"),
-                demand,
-                cancel.clone(),
-            )
-            .await?;
-            return workbench_resources::scope_shared(
+            let lease =
+                xylo_resources::shared::acquire(root.join("admission"), demand, cancel.clone())
+                    .await?;
+            return xylo_resources::scope_shared(
                 std::sync::Arc::new(lease),
                 self.execute_admitted(name, args, cancel),
             )
@@ -217,16 +214,13 @@ impl CapabilityService {
         cancel: CancellationToken,
     ) -> Result<Value> {
         if let (Some(demand), Some(root)) = (
-            workbench_resources::capability_demand(name),
+            xylo_resources::capability_demand(name),
             self.config.management_root.as_ref(),
         ) {
-            let lease = workbench_resources::shared::acquire(
-                root.join("admission"),
-                demand,
-                cancel.clone(),
-            )
-            .await?;
-            return workbench_resources::scope_shared(
+            let lease =
+                xylo_resources::shared::acquire(root.join("admission"), demand, cancel.clone())
+                    .await?;
+            return xylo_resources::scope_shared(
                 std::sync::Arc::new(lease),
                 self.execute_control_admitted(name, args, cancel),
             )

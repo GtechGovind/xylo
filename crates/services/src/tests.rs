@@ -2,11 +2,11 @@ use super::*;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
-use workbench_core::{ChatMessage, ConnectorConfig, Conversation, MemoryRecord, now_ms};
+use xylo_core::{ChatMessage, ConnectorConfig, Conversation, MemoryRecord, now_ms};
 
 fn database() -> (tempfile::TempDir, Store, Uuid) {
     let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path().join("workbench.db")).unwrap();
+    let store = Store::open(directory.path().join("xylo.db")).unwrap();
     let id = Uuid::new_v4();
     store
         .upsert_conversation(&Conversation {
@@ -40,7 +40,7 @@ fn memory(scope: &str, text: &str) -> MemoryRecord {
     }
 }
 fn vault() -> CredentialVault {
-    CredentialVault::from_test_store("workbench-tests", keyring_core::mock::Store::new().unwrap())
+    CredentialVault::from_test_store("xylo-tests", keyring_core::mock::Store::new().unwrap())
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn history_and_checkpoint_survive_reopen() {
             &json!([{"role":"user","content":"engine-private-state"}]),
         )
         .unwrap();
-    let restored = Store::open(directory.path().join("workbench.db")).unwrap();
+    let restored = Store::open(directory.path().join("xylo.db")).unwrap();
     assert_eq!(
         restored.messages(session, 50).unwrap()[0].content,
         "resume me"
@@ -206,7 +206,7 @@ fn user_turn_registration_is_atomic_idempotent_and_preserves_conversation_title(
     let database_path = directory.path().join("turn-history.db");
     let host = Store::open(&database_path).unwrap();
     let worker = Store::open(&database_path).unwrap();
-    let mut turn = workbench_core::TurnRequest {
+    let mut turn = xylo_core::TurnRequest {
         attachments: Vec::new(),
         session_id: Uuid::new_v4(),
         turn_id: Uuid::new_v4(),
@@ -275,7 +275,7 @@ fn interrupted_write_is_unknown_until_evidence_is_recorded() {
     let action = intent(session, true);
     store.begin_action(&action).unwrap();
     store.mark_action_running(action.id).unwrap();
-    let restarted = Store::open(directory.path().join("workbench.db")).unwrap();
+    let restarted = Store::open(directory.path().join("xylo.db")).unwrap();
     assert_eq!(restarted.recover_interrupted().unwrap(), 1);
     assert_eq!(
         restarted.begin_action(&action).unwrap(),
@@ -319,7 +319,7 @@ fn unsuccessful_observations_keep_artifacts_after_restart_and_reconciliation() {
                 .fail_action_with_result(action.id, &observation, "Read failed")
                 .unwrap();
         }
-        let reopened = Store::open(directory.path().join("workbench.db")).unwrap();
+        let reopened = Store::open(directory.path().join("xylo.db")).unwrap();
         assert_eq!(
             reopened.action(action.id).unwrap().unwrap().result,
             Some(observation.clone())
@@ -561,6 +561,7 @@ fn credential_boundary_uses_store_and_has_no_plaintext_fallback() {
     assert_eq!(vault.get("token").unwrap(), None);
     assert!(vault.set("", "secret").is_err());
 }
+
 #[test]
 fn native_tool_catalogues_declare_mutations_and_bounded_pages() {
     for transport in [
@@ -748,7 +749,7 @@ async fn mcp_discovery_call_and_metadata_cache_use_real_protocol() {
 fn completion_receipt_checkpoint_and_assistant_history_commit_once() {
     let (directory, store, session) = database();
     let turn = Uuid::new_v4();
-    let usage = workbench_core::Usage {
+    let usage = xylo_core::Usage {
         input_tokens: 10,
         output_tokens: 20,
         elapsed_ms: 30,
@@ -757,7 +758,7 @@ fn completion_receipt_checkpoint_and_assistant_history_commit_once() {
     store
         .complete_turn(session, turn, &checkpoint, "finished", &usage)
         .unwrap();
-    let reopened = Store::open(directory.path().join("workbench.db")).unwrap();
+    let reopened = Store::open(directory.path().join("xylo.db")).unwrap();
     assert_eq!(
         reopened
             .completed_turn(session, turn)
@@ -790,7 +791,7 @@ fn schema_one_database_migrates_without_losing_history() {
             Ok(())
         })
         .unwrap();
-    let migrated = Store::open(directory.path().join("workbench.db")).unwrap();
+    let migrated = Store::open(directory.path().join("xylo.db")).unwrap();
     assert_eq!(migrated.conversations(10).unwrap()[0].id, session);
     assert!(
         migrated

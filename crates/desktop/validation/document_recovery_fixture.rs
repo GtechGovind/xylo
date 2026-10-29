@@ -8,12 +8,12 @@ use std::{
     },
 };
 use uuid::Uuid;
-use workbench_core::{AppSettings, DocumentCellValue, DocumentEdit, DocumentKind, DocumentSource};
-use workbench_runtime::{
+use xylo_core::{AppSettings, DocumentCellValue, DocumentEdit, DocumentKind, DocumentSource};
+use xylo_runtime::{
     AppPaths, DocumentDraftKey, DocumentDraftState, DocumentDraftWrite,
     host::{HostClient, HostEvent},
 };
-use workbench_services::Store;
+use xylo_services::Store;
 #[derive(Default)]
 pub struct Delivery {
     pub drop_relink: AtomicBool,

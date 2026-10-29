@@ -77,14 +77,14 @@ jobs:
         run: cargo test --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}'
       - name: Native resource admission tests
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p workbench-resources --lib --target '${{ matrix.target }}'
+        run: cargo test --locked -p xylo-resources --lib --target '${{ matrix.target }}'
       - name: Native notification regressions
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p workbench-notifications --lib --target '${{ matrix.target }}'
+        run: cargo test --locked -p xylo-notifications --lib --target '${{ matrix.target }}'
       - name: Strict platform-module Clippy
         if: ${{ !cancelled() }}
         run: |
           cargo clippy --locked --manifest-path crates/capabilities/validation/windows-read/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
           cargo clippy --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
-          cargo clippy --locked -p workbench-resources --lib --tests --target '${{ matrix.target }}' -- -D warnings
-          cargo clippy --locked -p workbench-notifications --all-targets --target '${{ matrix.target }}' -- -D warnings
+          cargo clippy --locked -p xylo-resources --lib --tests --target '${{ matrix.target }}' -- -D warnings
+          cargo clippy --locked -p xylo-notifications --all-targets --target '${{ matrix.target }}' -- -D warnings

@@ -10,10 +10,10 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
+mod xylo {
+    include!("../src/xylo.rs");
     mod tree_tests {
-        use super::{Page, Workbench, file_browser::RowKey};
+        use super::{Page, Xylo, file_browser::RowKey};
         use gpui_kit::{
             AnyWindowHandle, App, AppContext, Bounds, Entity, TestAppContext, WindowBounds,
             WindowOptions, px, size,
@@ -23,7 +23,7 @@ mod workbench {
             path::{Path, PathBuf},
             time::{Duration, Instant},
         };
-        use workbench_runtime::{
+        use xylo_runtime::{
             AppPaths,
             host::{HostClient, HostEvent},
             workspace::{FileEntry, FilePage},
@@ -34,16 +34,18 @@ mod workbench {
             root: PathBuf,
             host: HostClient,
             window: AnyWindowHandle,
-            view: Entity<Workbench>,
+            view: Entity<Xylo>,
         }
         fn wait(
             cx: &mut TestAppContext,
             f: &Fixture,
             description: &str,
-            condition: impl Fn(&Workbench, &App) -> bool,
+            condition: impl Fn(&Xylo, &App) -> bool,
         ) {
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
+                // Drive the native receiver's bounded-backlog yield timer.
+                cx.executor().advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 if cx.update(|cx| condition(f.view.read(cx), cx)) {
                     return;
@@ -72,7 +74,7 @@ mod workbench {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| Workbench::new(Ok(host), window, cx)),
+                    |window, cx| cx.new(|cx| Xylo::new(Ok(host), window, cx)),
                 )
                 .unwrap()
             });

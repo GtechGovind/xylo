@@ -870,7 +870,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "workbench-terminal-validation"
+name = "xylo-terminal-validation"
 version = "0.0.0"
 dependencies = [
  "alacritty_terminal",

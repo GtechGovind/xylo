@@ -9,37 +9,37 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
+mod xylo {
+    include!("../src/xylo.rs");
     #[cfg(test)]
     mod vision_native_tests {
-        use super::{AttachmentUi, DraftUi, Workbench};
+        use super::{AttachmentUi, DraftUi, Xylo};
         use gpui_kit::{
             AppContext, Bounds, ClipboardEntry, ClipboardItem, ExternalPaths, FileDropEvent,
             InputEvent, SharedString, TestAppContext, WindowBounds, WindowOptions, px, size,
-            test::TestWindowExt,
+            test::{TestQueryExt, TestWindowExt},
         };
         use std::{
             path::PathBuf,
             time::{Duration, Instant},
         };
         use uuid::Uuid;
-        use workbench_core::{AttachmentSource, PermissionMode, ProviderConfig, TurnRequest};
-        use workbench_runtime::{
+        use xylo_core::{AttachmentSource, PermissionMode, ProviderConfig, TurnRequest};
+        use xylo_runtime::{
             AppPaths,
             drafts::DraftKey,
             host::{HostClient, HostEvent},
         };
-        use workbench_services::{Store, attachments::AttachmentStore};
+        use xylo_services::{Store, attachments::AttachmentStore};
 
-        const PNG: &[u8] = include_bytes!("../../../packaging/icons/app.png");
+        const PNG: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x02\x00\x00\x00\x02\x08\x06\x00\x00\x00\x72\xb6\x0d\x24\x00\x00\x00\x11\x49\x44\x41\x54\x78\x9c\x63\x50\x70\x48\xf8\x0f\xc2\x0c\x30\x06\x00\x39\x74\x06\xfd\x20\x19\xfd\xfb\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
         fn open(
             cx: &mut TestAppContext,
             paths: AppPaths,
         ) -> (
             HostClient,
             gpui_kit::AnyWindowHandle,
-            gpui_kit::Entity<Workbench>,
+            gpui_kit::Entity<Xylo>,
         ) {
             cx.executor().allow_parking();
             cx.update(gpui_kit::init);
@@ -55,7 +55,7 @@ mod workbench {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| Workbench::new(Ok(host), window, cx)),
+                    |window, cx| cx.new(|cx| Xylo::new(Ok(host), window, cx)),
                 )
                 .unwrap()
             });
@@ -64,12 +64,14 @@ mod workbench {
         }
         fn wait(
             cx: &mut TestAppContext,
-            view: &gpui_kit::Entity<Workbench>,
+            view: &gpui_kit::Entity<Xylo>,
             description: &str,
-            condition: impl Fn(&Workbench, &gpui_kit::App) -> bool,
+            condition: impl Fn(&Xylo, &gpui_kit::App) -> bool,
         ) {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
+                // Drive the native receiver's bounded-backlog yield timer.
+                cx.executor().advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 if cx.update(|cx| condition(view.read(cx), cx)) {
                     return;
@@ -106,7 +108,15 @@ mod workbench {
                     ExternalPaths(vec![selected.clone()].into()),
                 )));
                 window.render_frame(cx);
-                window.click("paste-image-files", cx);
+                window.click("composer-context-actions", cx);
+                window.render_frame(cx);
+                let paste = window
+                    .find_by_label("Paste image")
+                    .path()
+                    .last()
+                    .unwrap()
+                    .clone();
+                window.click(paste, cx);
                 assert!(view.read(cx).attachments.importing());
             })
             .unwrap();
@@ -118,7 +128,7 @@ mod workbench {
             assert_eq!(first.name, "selected.png");
             cx.update_window(window, |_, window, cx| {
                 window.render_frame(cx);
-                let position = window.find("paste-image-files").bounds().center();
+                let position = window.find("composer-context-actions").bounds().center();
                 window.dispatch_event(
                     FileDropEvent::Entered {
                         position,
@@ -156,6 +166,7 @@ mod workbench {
             };
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
+                cx.executor().advance_clock(Duration::from_millis(2));
                 cx.run_until_parked();
                 if store.draft(&key).unwrap().attachments == vec![remaining.clone()] {
                     break;

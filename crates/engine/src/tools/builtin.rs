@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
-use workbench_core::{MemoryRecord, ToolDefinition, now_ms};
+use xylo_core::{MemoryRecord, ToolDefinition, now_ms};
 
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![
@@ -368,16 +368,16 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
             json!(record)
         }
         "skill_list" => {
-            let skills = workbench_services::LearningService::new(broker.store.clone())
+            let skills = xylo_services::LearningService::new(broker.store.clone())
                 .skills(&root.to_string_lossy(), 100)?;
             json!({"promoted":skills.iter().filter(|skill|skill.state=="promoted").collect::<Vec<_>>(),"candidates":skills.iter().filter(|skill|skill.state!="promoted").collect::<Vec<_>>()})
         }
         "skill_read" => json!(
-            workbench_services::LearningService::new(broker.store.clone())
+            xylo_services::LearningService::new(broker.store.clone())
                 .active_skill(&root.to_string_lossy(), text(args, "name")?)?
         ),
         "skill_propose" => {
-            json!({"queued_turn_id":workbench_services::LearningService::new(broker.store.clone()).queue_latest_completed(broker.request.session_id)?,"state":"background_evaluation"})
+            json!({"queued_turn_id":xylo_services::LearningService::new(broker.store.clone()).queue_latest_completed(broker.request.session_id)?,"state":"background_evaluation"})
         }
         "git_status" | "git_diff" => {
             let mut argv: Vec<String> = if name == "git_status" {
@@ -400,7 +400,7 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
                 }
             }
             let git = code::resolve_program("git", root)?;
-            let result = broker.runtime.block_on(workbench_runtime::process::run(
+            let result = broker.runtime.block_on(xylo_runtime::process::run(
                 &git.to_string_lossy(),
                 &argv,
                 root,
@@ -439,7 +439,7 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
                 .and_then(Value::as_u64)
                 .unwrap_or(120)
                 .clamp(1, 1200);
-            let result = broker.runtime.block_on(workbench_runtime::process::run(
+            let result = broker.runtime.block_on(xylo_runtime::process::run(
                 &program.to_string_lossy(),
                 &argv,
                 root,

@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ApiFamily, ProviderConfig, now_ms};
+use xylo_core::{ApiFamily, ProviderConfig, now_ms};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatGptAccountSummary {
@@ -178,8 +178,13 @@ impl ChatGptSignInService {
             return Ok(Some(record));
         }
         let renewed = refresh_chatgpt_credential(&credential, cancel).await?;
+        let authorized = renewed.plan_usage_authorized();
         let record = serde_json::to_string(&renewed)?;
         Self::save(vault, reference.into(), renewed).await?;
+        ensure!(
+            authorized,
+            "ChatGPT plan usage is not authorized; reconnect and allow plan usage"
+        );
         Ok(Some(record))
     }
     pub async fn account(
@@ -612,6 +617,118 @@ mod tests {
                 .lease("one-account", &CancellationToken::new())
                 .await
                 .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod account_resolution_tests {
+    use super::*;
+    use serde_json::json;
+
+    // These fixtures represent an already validated registration in an isolated
+    // keyring. Signature/nonce/audience verification is tested in chatgpt.rs.
+    fn fixture(
+        scopes: &str,
+        expires: i64,
+    ) -> (
+        tempfile::TempDir,
+        ChatGptSignInService,
+        CredentialVault,
+        ProviderConfig,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ChatGptSignInService::new(directory.path()).unwrap();
+        let vault = CredentialVault::from_test_store(
+            "chatgpt-resolution-fixture",
+            keyring_core::mock::Store::new().unwrap(),
+        );
+        let record = json!({"type":"chatgpt","client_id":"oaiapp_fixture","subject":"fixture-account","issuer":"https://auth.openai.com","email":"fixture@example.invalid","ext_agent_host_id":"urn:uuid:00000000-0000-4000-8000-000000000000","id_token":"fixture-validated-id","access_token":"fixture-access","refresh_token":null,"expires_at_ms":expires,"scopes":scopes.split_whitespace().collect::<Vec<_>>()});
+        vault.set("selected-account", &record.to_string()).unwrap();
+        let config = ProviderConfig {
+            family: ApiFamily::OpenAiResponses,
+            endpoint: "https://api.openai.com/v1".into(),
+            credential_ref: Some("selected-account".into()),
+            ..Default::default()
+        };
+        (directory, service, vault, config)
+    }
+
+    #[tokio::test]
+    async fn selected_authorized_registration_resolves_the_same_bearer_for_catalog_and_inference() {
+        let (_directory, service, vault, config) = fixture(
+            "openid profile email chatgpt.tokens.use.direct",
+            now_ms() + 3_600_000,
+        );
+        let original = vault.get("selected-account").unwrap().unwrap();
+        service
+            .prepare_provider_credential(&config, vault.clone(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let resolved = service
+            .resolve_provider_credential(&config, vault.clone(), &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, original);
+        let parsed = ProviderCredential::parse(Some(resolved)).unwrap();
+        assert!(matches!(parsed, ProviderCredential::ChatGpt { .. }));
+        assert_eq!(
+            parsed.headers(&config.family, &config.headers).unwrap()["authorization"],
+            "Bearer fixture-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_only_account_remains_visible_but_cannot_authorize_inference() {
+        let (_directory, service, vault, config) =
+            fixture("openid profile email", now_ms() + 3_600_000);
+        let account = service
+            .account(vault.clone(), "selected-account")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(account.connected);
+        assert!(!account.plan_usage_authorized);
+        let error = service
+            .resolve_provider_credential(&config, vault.clone(), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("plan usage is not authorized"));
+        assert!(vault.get("selected-account").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn expired_nonrenewable_registration_fails_before_any_inference_and_explains_reconnect() {
+        let (_directory, service, vault, config) = fixture("chatgpt.tokens.use.direct", 0);
+        let error = service
+            .resolve_provider_credential(&config, vault, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Reconnect ChatGPT"));
+        assert!(!error.to_string().contains("fixture-access"));
+    }
+
+    #[tokio::test]
+    async fn account_registration_never_resolves_for_a_custom_inference_origin_or_chat_protocol() {
+        let (_directory, service, vault, mut config) =
+            fixture("chatgpt.tokens.use.direct", now_ms() + 3_600_000);
+        config.endpoint = "https://custom.example/v1".into();
+        assert!(
+            service
+                .resolve_provider_credential(&config, vault.clone(), &CancellationToken::new())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("official public Responses API")
+        );
+        config.endpoint = "https://api.openai.com/v1".into();
+        config.family = ApiFamily::OpenAiChat;
+        assert!(
+            service
+                .resolve_provider_credential(&config, vault, &CancellationToken::new())
+                .await
+                .is_err()
         );
     }
 }

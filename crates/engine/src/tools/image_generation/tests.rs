@@ -1,7 +1,7 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use workbench_core::{Conversation, ImageGenerationProtocol, ProviderConfig, now_ms};
+use xylo_core::{Conversation, ImageGenerationProtocol, ProviderConfig, now_ms};
 
 fn fixture(
     mode: PermissionMode,
@@ -131,7 +131,7 @@ async fn approved_image_tool_uses_frozen_saved_provider_actual_output_and_durabl
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["model"], "explicit-image-model");
         assert_eq!(body["size"], "1024x1024");
-        let body=json!({"data":[{"b64_json":STANDARD.encode(include_bytes!("../../../../../packaging/icons/app.png"))}]}).to_string();
+        let body=json!({"data":[{"b64_json":STANDARD.encode(b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x02\x00\x00\x00\x02\x08\x06\x00\x00\x00\x72\xb6\x0d\x24\x00\x00\x00\x11\x49\x44\x41\x54\x78\x9c\x63\x50\x70\x48\xf8\x0f\xc2\x0c\x30\x06\x00\x39\x74\x06\xfd\x20\x19\xfd\xfb\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82")}]}).to_string();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()

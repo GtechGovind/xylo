@@ -13,7 +13,7 @@ async fn settle_capture(
     leases: Arc<capture::RunLease>,
 ) -> Result<()> {
     let (manager, operation) = (manager.clone(), operation.clone());
-    workbench_resources::spawn_blocking(move || {
+    xylo_resources::spawn_blocking(move || {
         let _lease = leases;
         capture::settled(&manager, &operation)
     })
@@ -697,7 +697,7 @@ pub(super) async fn execute(
         cancel.clone(),
         lease.clone(),
     );
-    let prepared = workbench_resources::spawn_blocking(move || {
+    let prepared = xylo_resources::spawn_blocking(move || {
         let _lease = guard;
         capture::prepare(&storage, &intent, output_limit, &token)
     })
@@ -749,7 +749,7 @@ async fn reconcile(
 ) -> Result<EnvironmentReceipt> {
     if operation.receipt.action == EnvironmentAction::Execute {
         let (storage, original, guard) = (manager.clone(), operation.clone(), leases.clone());
-        let recovered = workbench_resources::spawn_blocking(move || {
+        let recovered = xylo_resources::spawn_blocking(move || {
             let _lease = guard;
             if pending(original.receipt.state) {
                 capture::recover(&storage, &original)
@@ -933,7 +933,7 @@ pub(super) async fn recover_execution(
     ) {
         let guard = capture::RunLease::new(manager.root.clone(), _operation_lease, _profile_lease)?;
         let (storage, original) = (manager.clone(), operation.clone());
-        workbench_resources::spawn_blocking(move || {
+        xylo_resources::spawn_blocking(move || {
             let _lease = guard;
             capture::verify(&storage, &original)
         })

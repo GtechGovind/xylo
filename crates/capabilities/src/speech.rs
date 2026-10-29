@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
-use workbench_core::ToolObservation;
+use xylo_core::ToolObservation;
 
 struct TemporaryAudio(Option<PathBuf>);
 impl Drop for TemporaryAudio {

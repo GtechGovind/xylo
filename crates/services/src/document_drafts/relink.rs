@@ -8,7 +8,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 mod source_file;
-use workbench_core::DocumentKind;
+use xylo_core::DocumentKind;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

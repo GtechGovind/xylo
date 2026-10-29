@@ -4,18 +4,18 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
-use workbench_core::*;
-use workbench_runtime::{
+use xylo_core::*;
+use xylo_runtime::{
     AppPaths,
     host::{HostClient, HostEvent},
 };
-use workbench_services::{
+use xylo_services::{
     ActionIntent, ActionResolutionOutcome, ActionResolutionRequest, ActionReviewScope, Store,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_host_denies_resolution_during_active_worker_then_records_after_cancel() {
-    assert!(std::path::Path::new(env!("CARGO_BIN_EXE_workbench-worker")).is_file());
+    assert!(std::path::Path::new(env!("CARGO_BIN_EXE_xylo-worker")).is_file());
     let directory = tempfile::tempdir().unwrap();
     let workspace = directory.path().canonicalize().unwrap();
     let paths = AppPaths::at(workspace.clone()).unwrap();
