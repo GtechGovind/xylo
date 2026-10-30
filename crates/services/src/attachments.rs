@@ -11,7 +11,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::{
+use xylo_core::{
     AttachmentSource, ImageAttachment, MAX_ATTACHMENTS_PER_TURN, MAX_IMAGE_BYTES, now_ms,
 };
 

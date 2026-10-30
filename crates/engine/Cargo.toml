@@ -1,14 +1,14 @@
 [package]
-name = "engine"
+name = "xylo-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-core.workspace = true
-runtime.workspace = true
-services.workspace = true
-capabilities.workspace = true
+xylo-core.workspace = true
+xylo-runtime.workspace = true
+xylo-services.workspace = true
+xylo-capabilities.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true
@@ -26,16 +26,18 @@ tiktoken-rs = "0.12.1"
 url = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ignore = "0.4"
 globset = "0.4"
 grep-searcher = "=0.1.17"
 grep-regex = "=0.1.14"
 similar = "2"
+shell-words = "1"
 hermes-agent = { path = "../../vendor/hermes-ultra/crates/hermes-agent" }
 hermes-core = { path = "../../vendor/hermes-ultra/crates/hermes-core" }
 
 [dev-dependencies]
 sha2 = "0.10"
-services = { workspace = true, features = ["test-support"] }
+xylo-services = { workspace = true, features = ["test-support"] }
 keyring-core = "1.0.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }

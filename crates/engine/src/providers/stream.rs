@@ -105,11 +105,13 @@ fn tool(
     )
 }
 fn native(blocks: Vec<Value>) -> StreamChunk {
-    delta(None, None, Some(json!({"workbench_content_blocks":blocks})))
+    delta(None, None, Some(json!({"xylo_content_blocks":blocks})))
 }
 
 pub(super) struct EventState {
     protocol: ProviderProtocol,
+    error_redactions: Arc<Vec<String>>,
+    request_id: Option<String>,
     terminal: bool,
     choice_finished: bool,
     tools: HashMap<u64, u32>,
@@ -122,9 +124,15 @@ pub(super) struct EventState {
     text_emitted: bool,
 }
 impl EventState {
-    pub fn new(protocol: ProviderProtocol) -> Self {
+    pub fn new(
+        protocol: ProviderProtocol,
+        error_redactions: Arc<Vec<String>>,
+        request_id: Option<String>,
+    ) -> Self {
         Self {
             protocol,
+            error_redactions,
+            request_id,
             terminal: false,
             choice_finished: false,
             tools: HashMap::new(),
@@ -154,12 +162,12 @@ impl EventState {
         let value: Value = serde_json::from_str(&event.data)
             .map_err(|error| failure(format!("Invalid provider SSE JSON: {error}")))?;
         if value.get("error").is_some() || event.kind == "error" || value["type"] == "error" {
-            let code = value
-                .pointer("/error/type")
-                .or_else(|| value.pointer("/error/code"))
-                .and_then(Value::as_str)
-                .unwrap_or("stream_error");
-            return Err(failure(format!("Provider stream error ({code})")));
+            return Err(failure(diagnostics::stream_error(
+                &value,
+                &self.error_redactions,
+                "stream_error",
+                self.request_id.as_deref(),
+            )));
         }
         let mut output = Vec::new();
         match self.protocol {
@@ -307,13 +315,11 @@ impl EventState {
                         self.terminal = true;
                     }
                     "response.failed" | "response.incomplete" | "error" => {
-                        let code = value
-                            .pointer("/response/error/code")
-                            .or_else(|| value.pointer("/response/incomplete_details/reason"))
-                            .and_then(Value::as_str)
-                            .unwrap_or(kind);
-                        return Err(failure(format!(
-                            "Responses request did not complete ({code})"
+                        return Err(failure(diagnostics::stream_error(
+                            &value,
+                            &self.error_redactions,
+                            kind,
+                            self.request_id.as_deref(),
                         )));
                     }
                     _ => {}
@@ -522,7 +528,7 @@ impl EventState {
                     output.push(native(
                         self.gemini_parts
                             .iter()
-                            .map(|part| json!({"type":"workbench_gemini_part","item":part}))
+                            .map(|part| json!({"type":"xylo_gemini_part","item":part}))
                             .collect(),
                     ));
                     output.push(StreamChunk {
@@ -566,7 +572,7 @@ impl Collected {
                 if let Some(thinking) = extra["thinking"].as_str() {
                     self.thinking.push_str(thinking);
                 }
-                if let Some(blocks) = extra["workbench_content_blocks"].as_array() {
+                if let Some(blocks) = extra["xylo_content_blocks"].as_array() {
                     self.blocks = Some(blocks.clone());
                 }
             }

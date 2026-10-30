@@ -21,7 +21,7 @@ use pdfium_render::prelude::*;
 use serde_json::{Value, json};
 use std::{fs::File, io::Read, path::Path, time::Duration};
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ToolDefinition, ToolObservation};
+use xylo_core::{ToolDefinition, ToolObservation};
 
 const MAX_INPUT: u64 = 64 * 1024 * 1024;
 const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
@@ -58,7 +58,7 @@ pub async fn execute(
     let args = args.clone();
     let timeout = Duration::from_secs(config.operation_timeout_seconds);
     let cancellation = cancel.clone();
-    let mut work = workbench_resources::spawn_blocking(move || {
+    let mut work = xylo_resources::spawn_blocking(move || {
         execute_blocking(&config, &name, &args, &cancellation)
     });
     tokio::select! {

@@ -10,7 +10,7 @@ pub mod bindings {
         path: "../wit",
         world: "plugin",
         pub_export_macro: true,
-        default_bindings_module: "::workbench_plugin_sdk::bindings",
+        default_bindings_module: "::xylo_plugin_sdk::bindings",
     });
 }
 

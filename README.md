@@ -1,5 +1,5 @@
 <div align="center">
-  <h1><img src="packaging/branding/xylo-lockup.png" alt="Xylo" width="480"></h1>
+  <h1>Xylo</h1>
   <h3>Your projects. Your models. One workspace.</h3>
   <p>A native desktop workspace for AI conversations, coding and everyday tools.</p>
   <p>
@@ -15,14 +15,14 @@ Xylo keeps conversations, project files and practical tools together. Bring a lo
 
 ## What you can do
 
-| Workspace | Capabilities |
-| --- | --- |
-| **Work with your project** | Browse and search files, use the native editor and terminal, and review Git diffs alongside chat. |
-| **Choose your model** | Connect local model servers, cloud providers or a compatible endpoint. Choose models explicitly. |
-| **Keep useful context** | Save project facts, search conversation history, and review reusable skills. |
-| **Stay in control** | Review tool approvals and inspect interrupted actions before recording an observed outcome. |
-| **Work with documents** | Edit supported DOCX content and multi-sheet XLSX files, save a separate copy, and recover retained drafts. |
-| **Connect your tools** | Add MCP connections, review plugin permissions, and configure SSH or container environments. |
+| Workspace                  | Capabilities                                                                                               |
+|----------------------------|------------------------------------------------------------------------------------------------------------|
+| **Work with your project** | Browse and search files, use the native editor and terminal, and review Git diffs alongside chat.          |
+| **Choose your model**      | Connect local model servers, cloud providers or a compatible endpoint. Choose models explicitly.           |
+| **Keep useful context**    | Save project facts, search conversation history, and review reusable skills.                               |
+| **Stay in control**        | Review tool approvals and inspect interrupted actions before recording an observed outcome.                |
+| **Work with documents**    | Edit supported DOCX content and multi-sheet XLSX files, save a separate copy, and recover retained drafts. |
+| **Connect your tools**     | Add MCP connections, review plugin permissions, and configure SSH or container environments.               |
 
 Browser actions, images, voice and local model tools extend the workspace through services that start when used. Some features need an explicit asset download, a configured service or an operating system permission. [Explore capabilities →](docs/capabilities.md)
 
@@ -36,13 +36,38 @@ Choose the provider and model under **Settings → Model**. Credentials use the 
 
 ## Get started
 
-**Xylo is in development preview. The first downloadable release is being prepared.** Follow the [Releases page](https://github.com/GtechGovind/xylo/releases) for published files and release notes, or [build the preview from source](docs/development.md#run-the-preview) now.
+**Xylo is in development preview. The first downloadable release is being prepared.** Follow the [Releases page](https://github.com/GtechGovind/xylo/releases) for published files and release notes, or build from source with standard Cargo commands:
 
-| Platform | Target architectures | Planned preview formats |
-| --- | --- | --- |
-| macOS | Apple Silicon, Intel x64 | DMG, app archive |
-| Windows | ARM64, x64 | Installer EXE |
-| Linux | ARM64, x64 | AppImage, DEB |
+```sh
+cargo build --locked --workspace --bins
+npm ci --prefix crates/services/sandbox-helper --ignore-scripts --no-audit --no-fund
+cargo run --locked
+```
+
+The pinned Rust toolchain is selected by `rust-toolchain.toml`. Application builds do not require packaging scripts, icon files, or updater configuration. Automatic updates are disabled until a trusted release feed is configured.
+
+Local executable tools use a pinned OS sandbox helper and require Node.js 22.12 or later. Install its locked dependencies with the command above. Missing sandbox dependencies fail closed; Xylo does not fall back to unrestricted execution. The native UI and Rust backend do not run in Node.js. macOS sandbox execution has local regression coverage; Linux packaging and Windows execution remain unqualified.
+
+Portable skills and plugins are managed in **Settings → Plugins**. Installation preserves package contents without executing them. Enable packages explicitly; configure a project, credentials and network access before running executable components. Readiness and verification belong to each component and installed version, not the entire plugin ecosystem.
+
+Current extension qualification uses isolated local fixtures:
+
+| Component | Current execution coverage |
+|-----------|----------------------------|
+| Skills and commands | Explicit/automatic invocation, arguments, package resources, Codex invocation policy and approved dynamic context |
+| Agent definitions | Named roles, supervised forks, restricted tools, inherited provider/model and cancellation |
+| Hooks | Approved before/after-tool events; session lifecycle events are not automatically delivered |
+| Local MCP | Initialization, tool discovery/calls, configured credentials, cancellation and failure recovery |
+| Language servers | Initialization, bounded read requests and shutdown; automatic editor integration is not qualified |
+| WASM modules | Existing Wasmtime execution and permission boundary retained |
+
+Unbound hosted dependencies, unsupported host directives and command-pattern tool restrictions are reported explicitly. Live account integrations, arbitrary Git-host federation and packaged cross-platform runtimes still require qualification. Post-tool events currently have a narrow crash window between saving the tool result and creating the hook action; they are not guaranteed to be delivered across that interruption. Never infer ecosystem-wide compatibility from a successful import or one verified component.
+
+| Platform | Target architectures     | Planned preview formats |
+|----------|--------------------------|-------------------------|
+| macOS    | Apple Silicon, Intel x64 | DMG, app archive        |
+| Windows  | ARM64, x64               | Installer EXE           |
+| Linux    | ARM64, x64               | AppImage, DEB           |
 
 These are release targets, not a claim that every platform is already qualified. Preview signing and installation limits are documented in the [release guide](docs/preview-release.md).
 
@@ -51,16 +76,6 @@ Once the app is running:
 1. Open a project folder.
 2. Choose a provider and model in **Settings → Model**.
 3. Start a conversation and review requested actions as you work.
-
-## Documentation
-
-- [Models and providers](docs/providers.md) · [Native assets](docs/assets.md)
-- [Project memory](docs/memory-management.md) · [Saved chats and drafts](docs/drafts.md)
-- [Documents and recovery](docs/native-documents.md) · [Interrupted action review](docs/action-review-ui.md)
-- [Plugins](docs/native-plugins.md) · [Execution environments](docs/native-environments.md)
-- [Modern native terminal direction](docs/terminal-roadmap.md)
-- [Build, contribute and browse the full docs index](docs/development.md)
-- [Current verification and remaining acceptance](docs/completion-audit.md)
 
 ## Contribute and get help
 

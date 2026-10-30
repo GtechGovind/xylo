@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
-use workbench_core::{ImageAttachment, TurnRequest, now_ms};
+use xylo_core::{ImageAttachment, TurnRequest, now_ms};
 
 /// Composer metadata caps. Reaching a cap returns an error; nonempty drafts are
 /// never automatically deleted. Empty revision tombstones fence old saves.

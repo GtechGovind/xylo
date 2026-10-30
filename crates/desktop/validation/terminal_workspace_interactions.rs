@@ -22,7 +22,7 @@ mod tests {
         rc::Rc,
         time::{Duration, Instant},
     };
-    use workbench_runtime::terminal::{TerminalSession, TerminalSnapshot};
+    use xylo_runtime::terminal::{TerminalSession, TerminalSnapshot};
 
     type Fixture = (
         tempfile::TempDir,

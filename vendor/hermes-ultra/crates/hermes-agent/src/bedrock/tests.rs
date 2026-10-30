@@ -316,9 +316,11 @@ fn aws_event_stream_decoder_maps_bedrock_events_to_chunks() {
     ];
     let mut buffer = Vec::new();
     buffer.extend_from_slice(&frames[0][..frames[0].len() / 2]);
-    assert!(take_aws_event_stream_message(&mut buffer)
-        .expect("partial frame")
-        .is_none());
+    assert!(
+        take_aws_event_stream_message(&mut buffer)
+            .expect("partial frame")
+            .is_none()
+    );
     buffer.extend_from_slice(&frames[0][frames[0].len() / 2..]);
     for frame in frames.iter().skip(1) {
         buffer.extend_from_slice(frame);
@@ -411,7 +413,7 @@ fn aws_event_stream_decoder_maps_payload_exceptions() {
         .expect("event frame")
         .expect("complete frame");
     let err = decode_bedrock_event_stream_message(&message).expect_err("stream exception error");
-    assert!(matches!(err, AgentError::LlmApi(message) if message.contains("400")));
+    assert!(matches!(err, AgentError::ProviderHttp { status: 400, .. }));
 }
 
 #[tokio::test]
@@ -725,5 +727,20 @@ fn sigv4_headers_include_required_bedrock_fields() {
     assert_eq!(
         headers.get("anthropic-beta").map(String::as_str),
         Some(CONTEXT_1M_BETA)
+    );
+}
+
+#[test]
+fn bedrock_error_retry_policy_uses_status_and_preserves_server_delay() {
+    let invalid = map_bedrock_error(
+        400,
+        r#"{"request_id":"req_503","message":"rate limit connection reset"}"#,
+    );
+    assert_eq!(invalid.provider_retry_policy(), Some((false, None)));
+    let unavailable = bedrock_attach_retry_after(map_bedrock_error(503, "{}"), Some(12));
+    assert_eq!(unavailable.provider_retry_policy(), Some((true, Some(12))));
+    assert_eq!(
+        map_bedrock_error(403, "{}").provider_retry_policy(),
+        Some((false, None))
     );
 }

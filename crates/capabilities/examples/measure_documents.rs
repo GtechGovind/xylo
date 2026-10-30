@@ -1,7 +1,7 @@
 //! Offline native XLSX paging workload; no GUI, helper IPC, or comparison claims.
 //!
 //! CARGO_TARGET_DIR="$PWD/target/performance" cargo run --locked --release \
-//!   -p workbench-capabilities --example measure_documents -- \
+//!   -p xylo-capabilities --example measure_documents -- \
 //!   --output /absolute/path/documents.json --source-fingerprint SHA256 --samples 80
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -13,10 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
-use workbench_capabilities::{CapabilityConfig, documents};
-use workbench_core::{
-    DocumentCellValue, DocumentContent, DocumentSnapshot, DocumentSource, now_ms,
-};
+use xylo_capabilities::{CapabilityConfig, documents};
+use xylo_core::{DocumentCellValue, DocumentContent, DocumentSnapshot, DocumentSource, now_ms};
 
 const SMALL_ROWS: u32 = 100;
 const LARGE_ROWS: u32 = 12_000;

@@ -7,9 +7,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::*;
-use workbench_runtime::AppPaths;
-use workbench_services::{Store, attachments::AttachmentStore};
+use xylo_core::*;
+use xylo_runtime::AppPaths;
+use xylo_services::{Store, attachments::AttachmentStore};
 
 struct Worker {
     child: Child,
@@ -18,7 +18,7 @@ struct Worker {
 }
 impl Worker {
     async fn start(paths: &AppPaths) -> Self {
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_workbench-worker"))
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_xylo-worker"))
             .arg("--data-dir")
             .arg(&paths.data)
             .stdin(Stdio::piped())
@@ -148,7 +148,7 @@ async fn actual_worker_sends_managed_image_and_rehydrates_it_after_process_resta
         .import_bytes(
             session,
             "selected.png",
-            include_bytes!("../../../packaging/icons/app.png"),
+            b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x02\x00\x00\x00\x02\x08\x06\x00\x00\x00\x72\xb6\x0d\x24\x00\x00\x00\x11\x49\x44\x41\x54\x78\x9c\x63\x50\x70\x48\xf8\x0f\xc2\x0c\x30\x06\x00\x39\x74\x06\xfd\x20\x19\xfd\xfb\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82",
             AttachmentSource::Picker,
             &CancellationToken::new(),
         )

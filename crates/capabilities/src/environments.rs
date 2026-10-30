@@ -21,7 +21,7 @@ use std::{
 use storage::{Manager, Operation};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::*;
+use xylo_core::*;
 
 /// The requested command was rejected by local preflight validation, after its
 /// operation lease and prior receipts were checked, before a durable receipt

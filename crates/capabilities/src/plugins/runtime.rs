@@ -25,7 +25,7 @@ use wasmtime::{
         types::{ComponentItem, Type},
     },
 };
-use workbench_core::{PluginBudgets, ToolObservation};
+use xylo_core::{PluginBudgets, ToolObservation};
 
 #[derive(Clone)]
 struct Authority {
@@ -158,7 +158,7 @@ async fn read_text(authority: Authority, raw: String) -> Result<String> {
         "read_workspace capability not granted"
     );
     checked(&authority.cancel)?;
-    workbench_resources::spawn_blocking(move || {
+    xylo_resources::spawn_blocking(move || {
         // Opening and reading share one authority-bound handle. Retain both
         // native resource and plugin execution leases through actual disk IO.
         let _lease = &authority.lease;
@@ -200,7 +200,7 @@ async fn write_text(authority: Authority, name: String, text: String) -> Result<
     let mut reservation = WriteReservation::reserve(&authority, text.len())?;
     // The blocking phase retains the run lease and records a committed artifact
     // even if the async caller has gone away while the filesystem is syncing.
-    workbench_resources::spawn_blocking(move || {
+    xylo_resources::spawn_blocking(move || {
         let _lease = &authority.lease;
         checked(&authority.cancel)?;
         let path = output_path(&authority.config, &name, "txt")?;
@@ -411,7 +411,7 @@ pub(super) async fn compile(
         permit = admission.acquire_owned() => permit?,
         _ = cancel.cancelled() => anyhow::bail!("Plugin compilation cancelled"),
     };
-    workbench_resources::spawn_blocking(move || {
+    xylo_resources::spawn_blocking(move || {
         let _permit = permit;
         let _lease = lease;
         let _compile = catalog::lock(&root.join("compile.lock"), false, true, &cancel)?;
@@ -612,7 +612,7 @@ pub(super) async fn legacy(
         max_input_bytes: config.max_output_bytes.min(1024 * 1024) as u64,
         max_output_bytes: config.max_output_bytes.min(1024 * 1024) as u64,
     };
-    let validation = workbench_core::NativePluginManifest {
+    let validation = xylo_core::NativePluginManifest {
         format: 1,
         id: "legacy".into(),
         name: "Local component".into(),
@@ -626,7 +626,7 @@ pub(super) async fn legacy(
     let cfg = config.clone();
     let raw = crate::required_str(args, "path")?.to_owned();
     let read_cancel = cancel.clone();
-    let module = workbench_resources::spawn_blocking(move || {
+    let module = xylo_resources::spawn_blocking(move || {
         checked(&read_cancel)?;
         bounded_read(&input_path(&cfg, &raw)?, catalog::MAX_MODULE)
     })

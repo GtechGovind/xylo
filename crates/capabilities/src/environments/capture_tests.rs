@@ -438,7 +438,7 @@ async fn detached_blocking_output_work_retains_real_operation_and_profile_leases
     let (started, admitted) = std::sync::mpsc::channel();
     let (release, finished) = std::sync::mpsc::channel();
     let guard = fixture.lease.clone();
-    let task = workbench_resources::spawn_blocking(move || {
+    let task = xylo_resources::spawn_blocking(move || {
         let _lease = guard;
         started.send(()).unwrap();
         finished.recv_timeout(Duration::from_secs(3)).unwrap();

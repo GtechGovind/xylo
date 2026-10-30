@@ -89,7 +89,7 @@ pub(super) fn replace(
 ) -> Result<()> {
     let parent = destination.parent().context("Invalid install location")?;
     let staging = tempfile::Builder::new()
-        .prefix(".workbench-update-")
+        .prefix(".xylo-update-")
         .tempdir_in(parent)
         .context(
             "The application folder is not writable; install the downloaded package manually",

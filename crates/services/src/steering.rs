@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
-use workbench_core::{
+use xylo_core::{
     ChatMessage, MAX_STEERING_BYTES, SteeringReceipt, SteeringRequest, SteeringState, now_ms,
 };
 const MAX_PER_TURN: i64 = 64;
@@ -125,7 +125,7 @@ fn outcome(conn: &Connection, record: Record) -> Result<SteeringOutcome> {
     })
 }
 pub fn guidance_name(id: Uuid) -> String {
-    format!("workbench_guidance_{}", id.simple())
+    format!("xylo_guidance_{}", id.simple())
 }
 impl Store {
     /// Startup-only recovery, before accepting work or spawning new workers.

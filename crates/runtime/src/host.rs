@@ -25,23 +25,39 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::*;
-use workbench_helper_client::HelperClient;
-use workbench_services::{ConnectorBroker, CredentialVault, SqliteMemory, Store};
+use xylo_core::*;
+use xylo_helper_client::HelperClient;
+use xylo_services::{ConnectorBroker, CredentialVault, SqliteMemory, Store};
 #[path = "host/action_control.rs"]
 mod action_control;
+#[path = "host/credential_control.rs"]
+mod credential_control;
 #[path = "host/document_control.rs"]
 mod document_control;
+#[path = "host/event_control.rs"]
+mod event_control;
 #[path = "host/fact_control.rs"]
 mod fact_control;
 #[path = "host/image_control.rs"]
 mod image_control;
 #[path = "host/notice_control.rs"]
 mod notice_control;
+#[path = "host/provider_control.rs"]
+mod provider_control;
+#[path = "host/settings_control.rs"]
+mod settings_control;
 #[path = "host/steering_control.rs"]
 mod steering_control;
+#[path = "host/turn_queue_control.rs"]
+mod turn_queue_control;
 #[path = "host/update_control.rs"]
 mod update_control;
+
+#[derive(Clone)]
+pub struct ConnectorMutationReceipt {
+    pub saved: Option<ConnectorConfig>,
+    pub removed: Option<Uuid>,
+}
 
 #[derive(Clone)]
 pub enum HostEvent {
@@ -198,9 +214,17 @@ pub enum HostEvent {
         diagnostics: Value,
     },
     Models {
+        generation: u64,
         provider: ProviderConfig,
         models: Vec<String>,
         context_limits: std::collections::BTreeMap<String, u32>,
+        reasoning_options: std::collections::BTreeMap<String, Vec<String>>,
+        default_reasoning_efforts: std::collections::BTreeMap<String, String>,
+    },
+    ModelsFailed {
+        generation: u64,
+        provider: ProviderConfig,
+        message: String,
     },
     /// May contain a returning account hint. Open in the system browser; never log.
     AuthorizationUrl(String),
@@ -221,6 +245,16 @@ pub enum HostEvent {
         message: String,
     },
     Diff(String),
+    GitStatus {
+        request_id: Uuid,
+        root: PathBuf,
+        result: std::result::Result<crate::workspace::git::GitStatus, String>,
+    },
+    GitFileDiff {
+        request_id: Uuid,
+        root: PathBuf,
+        result: std::result::Result<String, String>,
+    },
     MemoryPage {
         request_id: Uuid,
         result: std::result::Result<crate::MemoryPage, String>,
@@ -233,12 +267,41 @@ pub enum HostEvent {
         request_id: Uuid,
         result: std::result::Result<crate::MemoryExport, String>,
     },
+    QueueAdded {
+        request_id: Uuid,
+        result: Result<crate::turn_queue::QueueReceipt, String>,
+    },
+    TurnQueue {
+        request_id: Uuid,
+        session_id: Uuid,
+        result: Result<Vec<crate::turn_queue::QueuedTurn>, String>,
+    },
+    QueuedTurnStarted {
+        session_id: Uuid,
+        item: crate::turn_queue::QueuedTurn,
+    },
     Connectors(Vec<ConnectorConfig>),
+    ConnectorMutation {
+        request_id: Uuid,
+        result: std::result::Result<ConnectorMutationReceipt, String>,
+    },
     ConnectorTools {
+        request_id: Uuid,
+        workspace: Option<PathBuf>,
         connector_id: Uuid,
         tools: Vec<ToolDefinition>,
     },
+    ConnectorToolsFailed {
+        request_id: Uuid,
+        workspace: Option<PathBuf>,
+        connector_id: Uuid,
+        message: String,
+    },
     Schedules(Vec<crate::scheduler::ScheduledTask>),
+    ScheduleMutation {
+        request_id: Uuid,
+        result: Result<(), String>,
+    },
     TeamTasks(Vec<TeamTask>),
     Capability {
         request_id: Uuid,
@@ -249,6 +312,8 @@ pub enum HostEvent {
 }
 
 enum HostCommand {
+    PreparedCancel(Vec<turn_queue_control::PreparedStop>),
+    RefusedCancel,
     Action(action_control::ActionCommand),
     Document(document_control::DocumentCommand),
     Fact(fact_control::FactCommand),
@@ -281,23 +346,39 @@ enum HostCommand {
     ConversationPage(Option<ConversationCursor>, usize),
     SaveSettings(AppSettings),
     Credential(String, String),
-    Models(ProviderConfig),
-    SaveProvider(AppSettings, Option<String>),
+    Models(u64, ProviderConfig),
+    SaveProvider(u64, AppSettings, ProviderConfig, Option<String>),
     Workspace(PathBuf),
     Read(PathBuf),
     OpenFile(Uuid, PathBuf),
     Save(PathBuf, String),
     Diff(PathBuf),
+    GitStatus(Uuid, PathBuf),
+    GitFileDiff(
+        Uuid,
+        PathBuf,
+        PathBuf,
+        Option<PathBuf>,
+        crate::workspace::git::ChangeGroup,
+    ),
     MemorySearch(Uuid, String, String, Option<crate::MemoryCursor>),
     Remember(Uuid, MemoryRecord),
     Forget(Uuid, String, Uuid),
     ExportMemory(Uuid, String, PathBuf),
+    QueueDraft(Uuid, TurnRequest, crate::drafts::DraftSubmission),
+    ListTurnQueue(Uuid, Uuid),
+    RemoveQueuedTurn(Uuid, Uuid, Uuid),
+    RunQueuedTurn(Uuid, Uuid, Uuid),
     Connectors,
     SaveConnector(ConnectorConfig),
-    ConnectorTools(Uuid),
+    MutateConnector(Uuid, Option<ConnectorConfig>, Option<Uuid>, Option<String>),
+    ConnectorTools(Uuid, Uuid, Option<PathBuf>),
     Schedules,
     SaveSchedule(crate::scheduler::ScheduledTask),
     CreateSchedule(String, String, PathBuf),
+    CreateScheduleTracked(Uuid, String, String, PathBuf),
+    SaveScheduleTracked(Uuid, crate::scheduler::ScheduledTask),
+    RemoveScheduleTracked(Uuid, Uuid),
     RemoveSchedule(Uuid),
     TeamTasks,
     Capability(Uuid, String, Value),
@@ -308,6 +389,7 @@ enum HostCommand {
 #[derive(Clone)]
 pub struct HostClient {
     commands: Sender<HostCommand>,
+    discovery: Arc<provider_control::DiscoveryControl>,
 }
 
 impl HostClient {
@@ -324,18 +406,21 @@ impl HostClient {
             .open(paths.data.join("host.lock"))?;
         lock.try_lock_exclusive()
             .context("Xylo is already running for this profile")?;
+        let discovery = Arc::new(provider_control::DiscoveryControl::default());
+        let host_discovery = discovery.clone();
         let (commands, incoming) = async_channel::bounded(128);
         let (events, receiver) = async_channel::bounded(EVENT_QUEUE_CAPACITY);
-        std::thread::Builder::new().name("workbench-host".into()).spawn(move || {
+        std::thread::Builder::new().name("xylo-host".into()).spawn(move || {
             let _profile_lock = lock;
             let result = (|| -> Result<()> {
                 let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
                 let store = Store::open(&paths.database)?;
                 let recovered = store.recover_interrupted()?;
                 store.recover_steering()?;
+                store.recover_turn_queue()?;
                 let settings = store.settings()?;
-                let vault = CredentialVault::new(workbench_core::CREDENTIAL_SERVICE)?;
-                let accounts=workbench_services::providers::ChatGptSignInService::new(&paths.data)?;
+                let vault = CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?;
+                let accounts=xylo_services::providers::ChatGptSignInService::new(&paths.data)?;
                 let notifications=crate::notifications::Service::new(paths.data.clone(),crate::notifications::AppIdentity{id:APPLICATION_ID.into(),name:APPLICATION_NAME.into()})?;
                 let (notices,notice_incoming)=async_channel::bounded(128);
                 let updates=crate::updates::Service::new(paths.data.clone(),std::env::current_exe()?)?;
@@ -352,17 +437,17 @@ impl HostClient {
                 let context=runtime.enter();
                 let lsp=crate::lsp::Service::new(paths.data.clone(),editor_events);
                 drop(context);
-                let state = Arc::new(HostState { paths, memory,accounts,updates,notifications,notices,foreground:Arc::new(AtomicBool::new(false)),operations:tokio::sync::RwLock::new(()),installing:Arc::new(AtomicBool::new(false)),install_request:Arc::new(parking_lot::Mutex::new(None)),workspace,search_requests:Mutex::new(HashMap::new()),image_import_gate:Mutex::new(()),
+                let state = Arc::new(HostState { discovery:host_discovery, provider_save_gate:Mutex::new(()), paths, memory,accounts,updates,notifications,notices,foreground:Arc::new(AtomicBool::new(false)),operations:tokio::sync::RwLock::new(()),installing:Arc::new(AtomicBool::new(false)),install_request:Arc::new(parking_lot::Mutex::new(None)),workspace,search_requests:Mutex::new(HashMap::new()),image_import_gate:Mutex::new(()),
                     connectors:ConnectorBroker::new(store.clone(),vault.clone()),vault,store,
                     settings:Mutex::new(settings.clone()),workers:Mutex::new(HashMap::new()),events:events.clone(),
-                    resources:ResourceManager::new(),queued:Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                    resources:ResourceManager::new(),queued:Arc::new(parking_lot::Mutex::new(HashMap::new())),turn_queue:turn_queue_control::TurnQueueControl::default(),
                     scheduled:Arc::new(Mutex::new(HashMap::new())),stopping:Arc::new(AtomicBool::new(false)),
                     helpers:Mutex::new(HashMap::new()),capability_requests:Mutex::new(HashMap::new()),lsp });
                 runtime.block_on(async move {
                     let maintenance_stop=CancellationToken::new();
                     let _maintenance_guard=maintenance_stop.clone().drop_guard();
                     let notification_tasks=state.start_notifications(notice_incoming,maintenance_stop.clone());
-                    let learning=workbench_services::LearningService::new(state.store.clone());
+                    let learning=xylo_services::LearningService::new(state.store.clone());
                     let learning_stop=maintenance_stop.clone();
                     let learning_task=tokio::spawn(async move {
                         if let Err(error)=learning.run(learning_stop).await {tracing::warn!(%error,"Background procedure evaluation stopped");}
@@ -408,8 +493,11 @@ impl HostClient {
                     state.send_conversations().await?;
                     let scheduling_state=state.clone();
                     let scheduling=tokio::spawn(async move{scheduling_state.schedule_loop().await;});
+                    let settings_commits = settings_control::CommitOrder::default();
                     while let Ok(command) = incoming.recv().await {
                         if matches!(command,HostCommand::Shutdown) {maintenance_stop.cancel();state.shutdown().await;scheduling.abort();editor_forwarder.abort();project_forwarder.abort();let _=learning_task.await;let _=history_indexer.await;for task in notification_tasks {let _=task.await;}state.events.send(HostEvent::Stopped).await?;break;}
+                        // Reserve at receipt, before any task can race to acquire admission.
+                        let settings_commit = matches!(&command, HostCommand::SaveSettings(_) | HostCommand::SaveProvider(..) | HostCommand::Workspace(_)).then(|| settings_commits.reserve());
                         // Preserve document ordering independently of concurrent
                         // host work. The language-server actor owns synchronization.
                         if state.installing.load(Ordering::Acquire) && matches!(&command,HostCommand::Workspace(_)|HostCommand::Lsp(_)) {
@@ -425,6 +513,7 @@ impl HostClient {
                                 continue;
                             },
                             HostCommand::Workspace(path)=>{
+                                let _commit = settings_commit.expect("Workspace commit receipt").enter().await;
                                 if let Err(error)=state.handle(HostCommand::Workspace(path)).await{state.events.send(HostEvent::Error(error.to_string())).await?;}
                                 continue;
                             },
@@ -445,11 +534,24 @@ impl HostClient {
                             },
                             command=>command,
                         };
+                        let command=state.capture_stop(command);
                         if !state.prepare_command(&command).await? {continue;}
+                        let provider_context = match &command {
+                            HostCommand::SaveProvider(generation, _, provider, _) => Some((*generation, provider.clone())),
+                            HostCommand::Models(generation, config) => Some((*generation, config.clone())),
+                            _ => None,
+                        };
                         let state = state.clone();
                         tokio::spawn(async move {
+                            let _commit = match settings_commit { Some(receipt) => Some(receipt.enter().await), None => None };
                             if let Err(error) = state.handle(command).await {
-                                let _ = state.events.send(HostEvent::Error(format!("{error:#}"))).await;
+                                if let Some((generation, provider)) = provider_context {
+                                    if state.discovery.generation() == generation {
+                                        let _ = state.events.send(HostEvent::ModelsFailed { generation, message: provider_control::discovery_error(&provider, error), provider }).await;
+                                    }
+                                } else {
+                                    let _ = state.events.send(HostEvent::Error(format!("{error:#}"))).await;
+                                }
                             }
                         });
                     }
@@ -458,7 +560,13 @@ impl HostClient {
             })();
             if let Err(error) = result {let _ = events.send_blocking(HostEvent::Error(format!("Host stopped: {error:#}")));}
         })?;
-        Ok((Self { commands }, receiver))
+        Ok((
+            Self {
+                commands,
+                discovery,
+            },
+            receiver,
+        ))
     }
 
     fn enqueue(&self, command: HostCommand) -> Result<()> {
@@ -586,10 +694,32 @@ impl HostClient {
     }
     /// Persist credentials before settings and discovery, within one host operation.
     pub fn save_provider(&self, settings: AppSettings, secret: Option<String>) -> Result<()> {
-        self.enqueue(HostCommand::SaveProvider(settings, secret))
+        let provider = settings.provider.clone();
+        self.save_provider_connection(settings, provider, secret)
+    }
+    /// Save one connection without replacing the active model before its catalog succeeds.
+    pub fn save_provider_connection(
+        &self,
+        settings: AppSettings,
+        provider: ProviderConfig,
+        secret: Option<String>,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::SaveProvider(
+            self.discovery.begin(),
+            settings,
+            provider,
+            secret,
+        ))
+    }
+    pub fn cancel_model_discovery(&self) -> Result<()> {
+        self.discovery.begin();
+        Ok(())
+    }
+    pub fn provider_discovery_generation(&self) -> u64 {
+        self.discovery.generation()
     }
     pub fn discover_models(&self, config: ProviderConfig) -> Result<()> {
-        self.enqueue(HostCommand::Models(config))
+        self.enqueue(HostCommand::Models(self.discovery.begin(), config))
     }
     pub fn open_workspace(&self, path: PathBuf) -> Result<()> {
         self.enqueue(HostCommand::Workspace(path))
@@ -626,6 +756,21 @@ impl HostClient {
     pub fn save_file(&self, path: PathBuf, content: String) -> Result<()> {
         self.enqueue(HostCommand::Save(path, content))
     }
+    pub fn git_status(&self, request_id: Uuid, root: PathBuf) -> Result<()> {
+        self.enqueue(HostCommand::GitStatus(request_id, root))
+    }
+    pub fn git_file_diff(
+        &self,
+        request_id: Uuid,
+        root: PathBuf,
+        path: PathBuf,
+        original: Option<PathBuf>,
+        group: crate::workspace::git::ChangeGroup,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::GitFileDiff(
+            request_id, root, path, original, group,
+        ))
+    }
     pub fn git_diff(&self, path: PathBuf) -> Result<()> {
         self.enqueue(HostCommand::Diff(path))
     }
@@ -658,8 +803,37 @@ impl HostClient {
     pub fn save_connector(&self, config: ConnectorConfig) -> Result<()> {
         self.enqueue(HostCommand::SaveConnector(config))
     }
+    pub fn save_connector_authenticated(
+        &self,
+        request_id: Uuid,
+        config: ConnectorConfig,
+        secret: Option<String>,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::MutateConnector(
+            request_id,
+            Some(config),
+            None,
+            secret,
+        ))
+    }
+    pub fn remove_connector(&self, request_id: Uuid, id: Uuid) -> Result<()> {
+        self.enqueue(HostCommand::MutateConnector(
+            request_id,
+            None,
+            Some(id),
+            None,
+        ))
+    }
     pub fn connector_tools(&self, id: Uuid) -> Result<()> {
-        self.enqueue(HostCommand::ConnectorTools(id))
+        self.enqueue(HostCommand::ConnectorTools(Uuid::new_v4(), id, None))
+    }
+    pub fn connector_tools_scoped(
+        &self,
+        request_id: Uuid,
+        id: Uuid,
+        workspace: Option<PathBuf>,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::ConnectorTools(request_id, id, workspace))
     }
     pub fn list_schedules(&self) -> Result<()> {
         self.enqueue(HostCommand::Schedules)
@@ -672,6 +846,27 @@ impl HostClient {
     }
     pub fn remove_schedule(&self, id: Uuid) -> Result<()> {
         self.enqueue(HostCommand::RemoveSchedule(id))
+    }
+    pub fn create_schedule_tracked(
+        &self,
+        request_id: Uuid,
+        prompt: String,
+        cron: String,
+        workspace: PathBuf,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::CreateScheduleTracked(
+            request_id, prompt, cron, workspace,
+        ))
+    }
+    pub fn save_schedule_tracked(
+        &self,
+        request_id: Uuid,
+        task: crate::scheduler::ScheduledTask,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::SaveScheduleTracked(request_id, task))
+    }
+    pub fn remove_schedule_tracked(&self, request_id: Uuid, id: Uuid) -> Result<()> {
+        self.enqueue(HostCommand::RemoveScheduleTracked(request_id, id))
     }
     pub fn team_tasks(&self) -> Result<()> {
         self.enqueue(HostCommand::TeamTasks)
@@ -689,8 +884,11 @@ impl HostClient {
 }
 
 struct WorkerHandle {
+    credentials: Arc<parking_lot::Mutex<Option<Arc<credential_control::RunCredentials>>>>,
     commands: mpsc::Sender<Envelope<WorkerCommand>>,
     active: Arc<AtomicBool>,
+    queue_epoch: Arc<std::sync::atomic::AtomicU64>,
+    queue_stopped: Arc<AtomicBool>,
     lease: Arc<Mutex<Option<ResourceLease>>>,
     stop: CancellationToken,
     exited: tokio::sync::watch::Receiver<bool>,
@@ -747,13 +945,15 @@ impl Drop for PendingRun {
     }
 }
 struct HostState {
+    discovery: Arc<provider_control::DiscoveryControl>,
+    provider_save_gate: Mutex<()>,
     workspace: crate::workspace::WorkspaceService,
     search_requests: Mutex<HashMap<Uuid, CancellationToken>>,
     image_import_gate: Mutex<()>,
     paths: AppPaths,
     store: Store,
     memory: SqliteMemory,
-    accounts: workbench_services::providers::ChatGptSignInService,
+    accounts: xylo_services::providers::ChatGptSignInService,
     vault: CredentialVault,
     connectors: ConnectorBroker,
     settings: Mutex<AppSettings>,
@@ -761,6 +961,7 @@ struct HostState {
     events: Sender<HostEvent>,
     resources: ResourceManager,
     queued: PendingRuns,
+    turn_queue: turn_queue_control::TurnQueueControl,
     scheduled: Arc<Mutex<HashMap<Uuid, Uuid>>>,
     stopping: Arc<AtomicBool>,
     installing: Arc<AtomicBool>,
@@ -779,8 +980,39 @@ impl HostState {
     /// Register cancellation before dispatching asynchronous work. The command
     /// stream is ordered even when its execution tasks are scheduled differently.
     async fn prepare_command(&self, command: &HostCommand) -> Result<bool> {
+        if let HostCommand::PreparedCancel(stops) = command {
+            self.publish_prepared_startup_stops(stops).await?;
+        }
+        if let HostCommand::Worker(target, WorkerCommand::Cancel) = command {
+            self.turn_queue.stop(*target);
+            for (session, (_, cancel)) in self.queued.lock().iter() {
+                if target.is_none_or(|target| target == *session) {
+                    cancel.cancel();
+                }
+            }
+        }
         if self.installing.load(Ordering::Acquire) {
             match command {
+                HostCommand::QueueDraft(id, _, _) => {
+                    self.events
+                        .send(HostEvent::QueueAdded {
+                            request_id: *id,
+                            result: Err("Wait for the update installation to finish".into()),
+                        })
+                        .await?;
+                    return Ok(false);
+                }
+                HostCommand::ListTurnQueue(id, session)
+                | HostCommand::RemoveQueuedTurn(id, session, _)
+                | HostCommand::RunQueuedTurn(id, session, _) => {
+                    self.emit_turn_queue(
+                        *id,
+                        *session,
+                        Some("Wait for the update installation to finish".into()),
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 HostCommand::Document(command) => {
                     self.events
                         .send(command.refused("Wait for the update installation to finish"))
@@ -978,6 +1210,27 @@ impl HostState {
                 }
                 return Ok(false);
             }
+            HostCommand::RunQueuedTurn(request, session, item) => {
+                let accepted = {
+                    let mut queued = self.queued.lock();
+                    if let std::collections::hash_map::Entry::Vacant(entry) = queued.entry(*session)
+                    {
+                        entry.insert((*item, CancellationToken::new()));
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !accepted {
+                    self.emit_turn_queue(
+                        *request,
+                        *session,
+                        Some("This chat is already waiting to start".into()),
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+            }
             HostCommand::Worker(_, WorkerCommand::Run { turn })
             | HostCommand::DraftSubmit(_, turn, _) => {
                 let accepted = {
@@ -1083,6 +1336,18 @@ impl HostState {
             HostCommand::Action(command) => self.handle_action(command).await?,
             HostCommand::Fact(command) => self.handle_fact(command).await?,
             HostCommand::Image(command) => self.handle_image(command).await?,
+            HostCommand::QueueDraft(id, turn, submission) => {
+                self.handle_queue_draft(id, turn, submission).await?
+            }
+            HostCommand::ListTurnQueue(id, session) => {
+                self.handle_list_turn_queue(id, session).await?
+            }
+            HostCommand::RemoveQueuedTurn(id, session, item) => {
+                self.handle_remove_queued_turn(id, session, item).await?
+            }
+            HostCommand::RunQueuedTurn(id, session, item) => {
+                self.handle_run_queued_turn(id, session, item).await?
+            }
             HostCommand::SteerDraft(id, submission) => self.steer_draft(id, submission).await?,
             HostCommand::DraftLoad(request_id, key) => {
                 let result = crate::drafts::load(self.store.clone(), key, CancellationToken::new())
@@ -1117,17 +1382,23 @@ impl HostState {
             }
             HostCommand::DraftSubmit(request_id, turn, submission) => {
                 let result = self
-                    .worker_command_with_draft(
+                    .worker_command_with_draft_and_receipt(
                         Some(turn.session_id),
                         WorkerCommand::Run { turn },
                         Some(submission),
+                        Some(request_id),
                     )
                     .await
                     .and_then(|receipt| receipt.context("The draft was not admitted"))
                     .map_err(|error| error.to_string());
-                self.events
-                    .send(HostEvent::DraftAdmitted { request_id, result })
-                    .await?;
+                if let Err(error) = result {
+                    self.events
+                        .send(HostEvent::DraftAdmitted {
+                            request_id,
+                            result: Err(error),
+                        })
+                        .await?;
+                }
             }
             HostCommand::ImageImport(request_id, session_id, path, source) => {
                 let result = self
@@ -1148,7 +1419,7 @@ impl HostState {
                 let attachment_id = attachment.id;
                 let artifacts = self.paths.artifacts.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    workbench_services::attachments::AttachmentStore::new(artifacts)?
+                    xylo_services::attachments::AttachmentStore::new(artifacts)?
                         .preview_path(&attachment)
                 })
                 .await?
@@ -1233,6 +1504,14 @@ impl HostState {
                     token.cancel();
                 }
             }
+            HostCommand::PreparedCancel(stops) => self.handle_prepared_stops(stops).await?,
+            HostCommand::RefusedCancel => {
+                self.events
+                    .send(HostEvent::Error(
+                        "Select a single active task for this control action".into(),
+                    ))
+                    .await?;
+            }
             HostCommand::Worker(session, command) => self.worker_command(session, command).await?,
             HostCommand::Load(id) => {
                 let store = self.store.clone();
@@ -1275,10 +1554,13 @@ impl HostState {
                     ))
                     .await?;
             }
-            HostCommand::SaveProvider(settings, secret) => {
-                let config = settings.provider.clone();
+            HostCommand::SaveProvider(generation, settings, config, secret) => {
+                let _save = self.provider_save_gate.lock().await;
+                if self.discovery.generation() != generation {
+                    return Ok(());
+                }
                 config.validate_connection()?;
-                workbench_services::providers::normalize_provider(&config)?;
+                let normalized = xylo_services::providers::normalize_provider(&config)?;
                 if let Some(secret) = secret {
                     let reference = config
                         .credential_ref
@@ -1291,21 +1573,44 @@ impl HostState {
                 let store = self.store.clone();
                 tokio::task::spawn_blocking(move || store.save_settings(&value)).await??;
                 *self.settings.lock().await = settings.clone();
+                if self.discovery.generation() != generation {
+                    return Ok(());
+                }
                 self.events.send(HostEvent::Settings(settings)).await?;
-                if !matches!(
-                    config.family,
-                    workbench_core::ApiFamily::Azure | workbench_core::ApiFamily::Vertex
-                ) {
-                    self.discover_models(config).await?;
+                if normalized.models_url.is_some() {
+                    // The ordered commit ends with Settings publication. Catalog
+                    // HTTP must not retain the settings receipt or save gate.
+                    let state = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = state.discover_models(generation, config).await {
+                            tracing::debug!(%error, "Provider catalog delivery ended");
+                        }
+                    });
+                } else if self.discovery.generation() == generation {
+                    self.events
+                        .send(HostEvent::Models {
+                            generation,
+                            provider: config,
+                            models: Vec::new(),
+                            context_limits: Default::default(),
+                            reasoning_options: Default::default(),
+                            default_reasoning_efforts: Default::default(),
+                        })
+                        .await?;
                 }
             }
-            HostCommand::Models(config) => self.discover_models(config).await?,
+            HostCommand::Models(generation, config) => {
+                self.discover_models(generation, config).await?
+            }
             HostCommand::Workspace(path) => {
                 let requested = path;
                 let path = tokio::fs::canonicalize(&requested).await?;
                 ensure!(path.is_dir(), "Choose a directory");
                 let mut settings = self.settings.lock().await;
                 settings.last_workspace = Some(path.clone());
+                if !settings.ui.open_projects.contains(&path) {
+                    settings.ui.open_projects.push(path.clone());
+                }
                 let store = self.store.clone();
                 let value = settings.clone();
                 drop(settings);
@@ -1360,15 +1665,45 @@ impl HostState {
                 };
                 self.events.send(event).await?;
             }
+            HostCommand::GitStatus(request_id, root) => {
+                let result = async {
+                    self.authorized_git_root(&root).await?;
+                    crate::workspace::git::status(&root).await
+                }
+                .await
+                .map_err(|error: anyhow::Error| format!("{error:#}"));
+                self.events
+                    .send(HostEvent::GitStatus {
+                        request_id,
+                        root,
+                        result,
+                    })
+                    .await?;
+            }
+            HostCommand::GitFileDiff(request_id, root, path, original, group) => {
+                let result = async {
+                    self.authorized_git_root(&root).await?;
+                    crate::workspace::git::diff(&root, &path, original.as_deref(), group).await
+                }
+                .await
+                .map_err(|error: anyhow::Error| format!("{error:#}"));
+                self.events
+                    .send(HostEvent::GitFileDiff {
+                        request_id,
+                        root,
+                        result,
+                    })
+                    .await?;
+            }
             HostCommand::Diff(path) => {
-                let result = crate::process::run(
-                    "git",
+                self.authorized_git_root(&path).await?;
+                let result = crate::workspace::git::run_read(
+                    &path,
                     &[
                         "diff".into(),
                         "--no-ext-diff".into(),
                         "--no-textconv".into(),
                     ],
-                    &path,
                     Duration::from_secs(30),
                     Default::default(),
                 )
@@ -1435,7 +1770,7 @@ impl HostState {
             HostCommand::ExportMemory(request_id, scope, destination) => {
                 let database = self.paths.database.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    workbench_services::export_memories(
+                    xylo_services::export_memories(
                         &database,
                         &scope,
                         &destination,
@@ -1460,20 +1795,115 @@ impl HostState {
                 let rows = tokio::task::spawn_blocking(move || store.connectors()).await??;
                 self.events.send(HostEvent::Connectors(rows)).await?;
             }
-            HostCommand::ConnectorTools(id) => {
+            HostCommand::MutateConnector(request_id, config, remove, secret) => {
+                let id = remove
+                    .or_else(|| config.as_ref().map(|config| config.id))
+                    .context("Connector mutation has no target")?;
+                let _configuration = match self.connectors.configuration_guard(id).await {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        self.events
+                            .send(HostEvent::ConnectorMutation {
+                                request_id,
+                                result: Err(error.to_string()),
+                            })
+                            .await?;
+                        return Ok(());
+                    }
+                };
                 let store = self.store.clone();
-                let configs = tokio::task::spawn_blocking(move || store.connectors()).await??;
-                let config = configs
-                    .into_iter()
-                    .find(|c| c.id == id)
-                    .context("Connector no longer exists")?;
-                let tools = self.connectors.tools(&config, &Default::default()).await?;
+                let vault = self.vault.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || -> Result<ConnectorMutationReceipt> {
+                        if let Some(config) = &config {
+                            if let Some(secret) = secret {
+                                vault.set(
+                                    config
+                                        .credential_ref
+                                        .as_deref()
+                                        .context("Missing connector credential reference")?,
+                                    &secret,
+                                )?;
+                            }
+                            store.save_connector(config)?;
+                        }
+                        if let Some(id) = remove {
+                            store.delete_connector(id)?;
+                        }
+                        Ok(ConnectorMutationReceipt {
+                            saved: config,
+                            removed: remove,
+                        })
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                let invalidated = result.as_ref().ok().and_then(|receipt| {
+                    receipt
+                        .removed
+                        .or_else(|| receipt.saved.as_ref().map(|config| config.id))
+                });
                 self.events
-                    .send(HostEvent::ConnectorTools {
+                    .send(HostEvent::ConnectorMutation { request_id, result })
+                    .await?;
+                if let Some(id) = invalidated {
+                    self.connectors.disconnect(id).await.context("Connection change saved, but ending its previous inspection session failed")?;
+                }
+            }
+            HostCommand::ConnectorTools(request_id, id, workspace) => {
+                let _configuration = match self.connectors.configuration_guard(id).await {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        self.events
+                            .send(HostEvent::ConnectorToolsFailed {
+                                request_id,
+                                workspace,
+                                connector_id: id,
+                                message: error.to_string(),
+                            })
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                let result = async {
+                    let store = self.store.clone();
+                    let configs = tokio::task::spawn_blocking(move || store.connectors()).await??;
+                    let config = configs
+                        .into_iter()
+                        .find(|config| config.id == id)
+                        .context("Connection no longer exists")?;
+                    if config.transport == "stdio" {
+                        let workspace = workspace
+                            .clone()
+                            .context("Choose a project before inspecting a local MCP connection")?;
+                        let scope = xylo_services::ConnectorLaunchScope {
+                            workspace,
+                            protected_paths: vec![self.paths.data.clone()],
+                            ..Default::default()
+                        };
+                        self.connectors
+                            .tools_scoped(&config, &scope, &Default::default())
+                            .await
+                    } else {
+                        self.connectors.tools(&config, &Default::default()).await
+                    }
+                }
+                .await;
+                let event = match result {
+                    Ok(tools) => HostEvent::ConnectorTools {
+                        request_id,
+                        workspace,
                         connector_id: id,
                         tools,
-                    })
-                    .await?;
+                    },
+                    Err(error) => HostEvent::ConnectorToolsFailed {
+                        request_id,
+                        workspace,
+                        connector_id: id,
+                        message: format!("{error:#}"),
+                    },
+                };
+                self.events.send(event).await?;
             }
             HostCommand::Schedules => self.send_schedules().await?,
             HostCommand::SaveSchedule(task) => {
@@ -1487,6 +1917,30 @@ impl HostState {
             HostCommand::RemoveSchedule(id) => {
                 self.default_scheduler()?.remove(id).await?;
                 self.send_schedules().await?;
+            }
+            HostCommand::CreateScheduleTracked(request_id, prompt, cron, workspace) => {
+                let result = async {
+                    self.scheduler(workspace)?.create(prompt, cron).await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                self.schedule_mutated(request_id, result).await?;
+            }
+            HostCommand::SaveScheduleTracked(request_id, task) => {
+                let result = async {
+                    self.scheduler(task.workspace.clone())?.save(task).await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                self.schedule_mutated(request_id, result).await?;
+            }
+            HostCommand::RemoveScheduleTracked(request_id, id) => {
+                let result = async {
+                    self.default_scheduler()?.remove(id).await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                self.schedule_mutated(request_id, result).await?;
             }
             HostCommand::TeamTasks => {
                 let store = self.store.clone();
@@ -1538,7 +1992,7 @@ impl HostState {
                     .get(&request_id)
                     .cloned()
                     .context("Action is no longer pending")?;
-                let result = self.run_capability(&name, &args, cancel).await;
+                let result = self.run_capability(request_id, &name, &args, cancel).await;
                 self.capability_requests.lock().await.remove(&request_id);
                 if let Err(error) = &result {
                     tracing::warn!(action=%name, %error, "Product action failed");
@@ -1565,6 +2019,7 @@ impl HostState {
 
     async fn run_capability(
         &self,
+        request_id: Uuid,
         name: &str,
         args: &Value,
         cancel: CancellationToken,
@@ -1574,6 +2029,17 @@ impl HostState {
             "Application is closing"
         );
         ensure!(!cancel.is_cancelled(), "Action cancelled");
+        if name.starts_with("extension_") {
+            return crate::extensions::execute(
+                self.paths.data.join("extensions"),
+                self.store.clone(),
+                request_id,
+                name,
+                args,
+                cancel,
+            )
+            .await;
+        }
         match name {
             "updates_status" => return Ok(self.updates.status()),
             "updates_check" => return self.updates.check(cancel).await,
@@ -1708,7 +2174,7 @@ impl HostState {
                     "Finish current project actions before opening another tool session"
                 );
                 let helper = HelperClient::spawn(
-                    native_executable("workbench-helper")?,
+                    native_executable("xylo-helper")?,
                     &self.paths.data,
                     &workspace,
                 )
@@ -1718,6 +2184,21 @@ impl HostState {
             }
         };
         Ok(helper)
+    }
+
+    async fn authorized_git_root(&self, root: &std::path::Path) -> Result<()> {
+        let selected = self
+            .settings
+            .lock()
+            .await
+            .last_workspace
+            .clone()
+            .context("Select a project first")?;
+        ensure!(
+            tokio::fs::canonicalize(root).await? == tokio::fs::canonicalize(selected).await?,
+            "Git request leaves the selected project"
+        );
+        Ok(())
     }
 
     async fn authorized_file(&self, path: PathBuf, writing: bool) -> Result<PathBuf> {
@@ -1751,7 +2232,7 @@ impl HostState {
             content.len() <= 8 * 1024 * 1024,
             "File exceeds editor save limit"
         );
-        let temp = path.with_file_name(format!(".workbench-{}.tmp", Uuid::new_v4()));
+        let temp = path.with_file_name(format!(".xylo-{}.tmp", Uuid::new_v4()));
         let result = async {
             let mut file = tokio::fs::OpenOptions::new()
                 .write(true)
@@ -1810,7 +2291,7 @@ impl HostState {
             .await?;
         let artifacts = self.paths.artifacts.clone();
         tokio::task::spawn_blocking(move || {
-            let images = workbench_services::attachments::AttachmentStore::new(artifacts)?;
+            let images = xylo_services::attachments::AttachmentStore::new(artifacts)?;
             let attachment = images.import_file(session_id, path, source, &cancel)?;
             let preview = images.preview_path(&attachment)?;
             Ok((attachment, preview))
@@ -1831,11 +2312,59 @@ impl HostState {
     async fn worker_command_with_draft(
         self: &Arc<Self>,
         target: Option<Uuid>,
-        mut command: WorkerCommand,
+        command: WorkerCommand,
         submission: Option<crate::drafts::DraftSubmission>,
     ) -> Result<Option<crate::drafts::DraftAdmission>> {
+        self.worker_command_with_draft_and_receipt(target, command, submission, None)
+            .await
+    }
+
+    async fn publish_draft_admission(
+        &self,
+        request_id: Option<Uuid>,
+        receipt: &Option<crate::drafts::DraftAdmission>,
+    ) {
+        if let (Some(request_id), Some(receipt)) = (request_id, receipt) {
+            // Commit owns admission. A closed UI receiver must never prevent the
+            // reserved Run from dispatching after its user message was committed.
+            if self
+                .events
+                .send(HostEvent::DraftAdmitted {
+                    request_id,
+                    result: Ok(receipt.clone()),
+                })
+                .await
+                .is_err()
+            {
+                tracing::debug!("Draft admission receiver closed after durable commit");
+            }
+        }
+    }
+
+    async fn worker_command_with_draft_and_receipt(
+        self: &Arc<Self>,
+        target: Option<Uuid>,
+        command: WorkerCommand,
+        submission: Option<crate::drafts::DraftSubmission>,
+        draft_request_id: Option<Uuid>,
+    ) -> Result<Option<crate::drafts::DraftAdmission>> {
+        self.worker_command_with_queue_receipt(target, command, submission, draft_request_id, None)
+            .await
+    }
+    async fn worker_command_with_queue_receipt(
+        self: &Arc<Self>,
+        target: Option<Uuid>,
+        mut command: WorkerCommand,
+        submission: Option<crate::drafts::DraftSubmission>,
+        draft_request_id: Option<Uuid>,
+        queued_item: Option<(crate::turn_queue::QueuedTurn, Arc<AtomicBool>, bool)>,
+    ) -> Result<Option<crate::drafts::DraftAdmission>> {
         ensure!(
-            !matches!(command, WorkerCommand::RunAuthorized { .. }),
+            !matches!(
+                command,
+                WorkerCommand::RunAuthorized { .. }
+                    | WorkerCommand::ProviderCredentialUpdated { .. }
+            ),
             "Authenticated worker commands are host-internal"
         );
         let session = match &command {
@@ -1858,6 +2387,31 @@ impl HostState {
             },
         };
         if matches!(command, WorkerCommand::Cancel) {
+            // Stop must reach a worker even while SQLite admission is blocked.
+            // The synchronous stop fence already prevents automatic dispatch.
+            self.turn_queue.stop(Some(session));
+            let fence = self.turn_queue.fence(session);
+            let host = self.clone();
+            tokio::spawn(async move {
+                let Ok(_guard) = host.turn_queue.gate(session).await else {
+                    return;
+                };
+                if fence
+                    .as_ref()
+                    .is_some_and(|(epoch, expected)| epoch.load(Ordering::Acquire) != *expected)
+                {
+                    return;
+                }
+                let store = host.store.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.pause_turn_queue(
+                        session,
+                        "The task stopped. Send a queued message when ready.",
+                    )
+                })
+                .await;
+                let _ = host.emit_turn_queue(Uuid::nil(), session, None).await;
+            });
             let queued = self
                 .queued
                 .lock()
@@ -1934,6 +2488,26 @@ impl HostState {
                     .await??
             {
                 self.complete_schedule(session).await?;
+                let receipt = if let Some(submission) = submission {
+                    Some(
+                        crate::drafts::admit_turn(self.store.clone(), turn.clone(), submission)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+                if let Some((item, admitted, _)) = &queued_item {
+                    let store = self.store.clone();
+                    let item = item.clone();
+                    tokio::task::spawn_blocking(move || {
+                        store.admit_queued_turn(item.turn.session_id, item.id, &item.turn)
+                    })
+                    .await??;
+                    admitted.store(true, Ordering::Release);
+                }
+                self.publish_draft_admission(draft_request_id, &receipt)
+                    .await;
+                self.publish_queued_admission(&queued_item).await;
                 self.events
                     .send(HostEvent::Engine(Envelope::new(
                         turn_id,
@@ -1945,18 +2519,10 @@ impl HostState {
                         },
                     )))
                     .await?;
-                let receipt = if let Some(submission) = submission {
-                    Some(
-                        crate::drafts::admit_turn(self.store.clone(), turn.clone(), submission)
-                            .await?,
-                    )
-                } else {
-                    None
-                };
                 return Ok(receipt);
             }
             turn.provider.validate()?;
-            resolved_credential = Some(workbench_core::WorkerCredential(
+            resolved_credential = Some(xylo_core::WorkerCredential(
                 self.accounts
                     .resolve_provider_credential(&turn.provider, self.vault.clone(), &cancellation)
                     .await?,
@@ -2061,13 +2627,32 @@ impl HostState {
                 !pending.cancel.is_cancelled() && !self.stopping.load(Ordering::Acquire),
                 "Task cancelled before admission"
             );
+            // An explicit fresh Run may resume a paused chat. Never reset this
+            // latch after an await: Stop during durable commit must survive.
+            if !queued_item
+                .as_ref()
+                .is_some_and(|(_, _, automatic)| *automatic)
+            {
+                worker.queue_stopped.store(false, Ordering::Release);
+            }
+            if queued_item.is_some()
+                && let WorkerCommand::Run { turn } = &mut command
+            {
+                turn.permissions = turn_queue_control::tighter(
+                    turn.permissions,
+                    self.settings.lock().await.permissions,
+                );
+            }
             let WorkerCommand::Run { turn } = &command else {
                 unreachable!()
             };
+            let credential = resolved_credential
+                .take()
+                .context("Provider credential was not resolved")?;
             let attachments = turn.attachments.clone();
             let artifacts = self.paths.artifacts.clone();
             tokio::task::spawn_blocking(move || {
-                workbench_services::attachments::AttachmentStore::new(artifacts)?
+                xylo_services::attachments::AttachmentStore::new(artifacts)?
                     .validate(session, &attachments)
             })
             .await??;
@@ -2075,14 +2660,48 @@ impl HostState {
                 !pending.cancel.is_cancelled(),
                 "Task cancelled before admission"
             );
+            if queued_item.is_some()
+                && let WorkerCommand::Run { turn } = &mut command
+            {
+                turn.permissions = turn_queue_control::tighter(
+                    turn.permissions,
+                    self.settings.lock().await.permissions,
+                );
+            }
+            let WorkerCommand::Run { turn } = &command else {
+                unreachable!()
+            };
+            if queued_item
+                .as_ref()
+                .is_some_and(|(_, _, automatic)| *automatic)
+            {
+                ensure!(
+                    !worker.queue_stopped.load(Ordering::Acquire),
+                    "Task stopped before admission"
+                );
+            }
             let receipt = if let Some(submission) = submission {
                 Some(crate::drafts::admit_turn(self.store.clone(), turn.clone(), submission).await?)
             } else {
                 let store = self.store.clone();
                 let turn = turn.clone();
-                tokio::task::spawn_blocking(move || store.register_user_turn(&turn)).await??;
+                let queued = queued_item.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some((item, admitted, _)) = queued {
+                        store.admit_queued_turn(session, item.id, &turn).map(|_| {
+                            admitted.store(true, Ordering::Release);
+                        })
+                    } else {
+                        store.register_user_turn(&turn)
+                    }
+                })
+                .await??;
                 None
             };
+            // Publish the durable user message before this Run can emit a reply.
+            self.publish_draft_admission(draft_request_id, &receipt)
+                .await;
+            self.publish_queued_admission(&queued_item).await;
             // The durable user turn and conditional draft clear have committed.
             // Always dispatch the reserved Run, even if cancellation arrived
             // during SQLite commit; a following Cancel stops that exact run.
@@ -2091,6 +2710,7 @@ impl HostState {
             if let WorkerCommand::Run { turn } = &command {
                 *worker.run_turn.lock() = Some(turn.turn_id);
             }
+            worker.queue_epoch.fetch_add(1, Ordering::AcqRel);
             worker.active.store(true, Ordering::Release);
             *worker.lease.lock().await = admitted;
             *worker.model_activity.lock().await = model_activity;
@@ -2099,10 +2719,13 @@ impl HostState {
             let WorkerCommand::Run { turn } = command else {
                 unreachable!()
             };
-            let command = WorkerCommand::RunAuthorized {
-                turn,
-                credential: resolved_credential.context("Provider credential was not resolved")?,
-            };
+            *worker.credentials.lock() = Some(Arc::new(credential_control::RunCredentials::new(
+                request_id,
+                turn.provider.clone(),
+                credential.clone(),
+                worker.stop.child_token(),
+            )));
+            let command = WorkerCommand::RunAuthorized { turn, credential };
             permit.send(Envelope::new(request_id, Some(session), 0, command));
             let cancelled = {
                 let mut starting = self.queued.lock();
@@ -2137,6 +2760,11 @@ impl HostState {
             }
             return Ok(receipt);
         }
+        if matches!(command, WorkerCommand::Cancel | WorkerCommand::Shutdown) {
+            if let Some(credentials) = worker.credentials.lock().as_ref() {
+                credentials.cancel.cancel();
+            }
+        }
         worker
             .commands
             .send(Envelope::new(Uuid::new_v4(), Some(session), 0, command))
@@ -2144,31 +2772,62 @@ impl HostState {
         Ok(None)
     }
 
-    async fn discover_models(&self, config: ProviderConfig) -> Result<()> {
-        let cancel = CancellationToken::new();
-        self.accounts
-            .prepare_provider_credential(&config, self.vault.clone(), &cancel)
-            .await?;
-        let catalog =
-            workbench_services::providers::discover_provider_models(&config, &self.vault, &cancel)
+    async fn discover_models(&self, generation: u64, config: ProviderConfig) -> Result<()> {
+        let Some(cancel) = self.discovery.token(generation) else {
+            return Ok(());
+        };
+        let result = async {
+            self.accounts
+                .prepare_provider_credential(&config, self.vault.clone(), &cancel)
                 .await?;
+            xylo_services::providers::discover_provider_models(&config, &self.vault, &cancel).await
+        }
+        .await;
+        // Superseded requests must not emit either a catalog or an error that
+        // could replace the newer provider's state, including after auth changes.
+        if cancel.is_cancelled() || self.discovery.generation() != generation {
+            return Ok(());
+        }
+        let catalog = match result {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => {},
+                    result = self.events.send(HostEvent::ModelsFailed { generation, message: provider_control::discovery_error(&config, error), provider: config }) => { result?; },
+                }
+                return Ok(());
+            }
+        };
         let context_limits = catalog
             .iter()
             .filter_map(|m| m.context_tokens.map(|n| (m.id.clone(), n)))
             .collect();
-        let models = catalog.into_iter().map(|m| m.id).collect();
-        self.events
-            .send(HostEvent::Models {
-                provider: config,
-                models,
-                context_limits,
+        let reasoning_options = catalog
+            .iter()
+            .filter_map(|m| {
+                m.reasoning_options
+                    .clone()
+                    .map(|options| (m.id.clone(), options))
             })
-            .await?;
+            .collect();
+        let default_reasoning_efforts = catalog
+            .iter()
+            .filter_map(|m| {
+                m.default_reasoning_effort
+                    .clone()
+                    .map(|effort| (m.id.clone(), effort))
+            })
+            .collect();
+        let models = catalog.into_iter().map(|m| m.id).collect();
+        tokio::select! {
+            _ = cancel.cancelled() => {},
+            result = self.events.send(HostEvent::Models { generation, provider: config, models, context_limits, reasoning_options, default_reasoning_efforts }) => { result?; },
+        }
         Ok(())
     }
 
-    async fn spawn_worker(&self, session: Uuid) -> Result<WorkerHandle> {
-        let executable = native_executable("workbench-worker")?;
+    async fn spawn_worker(self: &Arc<Self>, session: Uuid) -> Result<WorkerHandle> {
+        let executable = native_executable("xylo-worker")?;
         let mut command = tokio::process::Command::new(executable);
         #[cfg(windows)]
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: worker uses private pipes.
@@ -2186,8 +2845,22 @@ impl HostState {
         let (tx, mut rx) = mpsc::channel::<Envelope<WorkerCommand>>(64);
         let active = Arc::new(AtomicBool::new(false));
         let active_reader = active.clone();
+        let queue_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reader_queue_epoch = queue_epoch.clone();
+        let queue_stopped = Arc::new(AtomicBool::new(false));
+        let reader_queue_stopped = queue_stopped.clone();
+        self.turn_queue
+            .register(session, &queue_stopped, &queue_epoch);
         let run_request = Arc::new(parking_lot::Mutex::new(None::<Uuid>));
         let reader_request = run_request.clone();
+        let credentials = Arc::new(parking_lot::Mutex::new(
+            None::<Arc<credential_control::RunCredentials>>,
+        ));
+        let reader_credentials = credentials.clone();
+        let credential_commands = tx.clone();
+        let accounts = self.accounts.clone();
+        let vault = self.vault.clone();
+        let renewal_capacity = Arc::new(tokio::sync::Semaphore::new(4));
         let run_turn = Arc::new(parking_lot::Mutex::new(None::<Uuid>));
         let reader_turn = run_turn.clone();
         let notice_sender = self.notices.clone();
@@ -2203,6 +2876,7 @@ impl HostState {
         let reader_lease = lease.clone();
         let stop = CancellationToken::new();
         let reader_stop = stop.clone();
+        let queue_host = Arc::downgrade(self);
         let writer_stop = stop.clone();
         let (exited_tx, exited) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
@@ -2287,10 +2961,54 @@ impl HostState {
                                 | EngineEvent::Cancelled
                                 | EngineEvent::Error { .. }
                         );
-                        let matched = *reader_request.lock() == Some(envelope.request_id);
-                        if terminal && !matched {
-                            if let EngineEvent::Error { message, .. } = envelope.payload {
+                        let active_request = *reader_request.lock();
+                        let matched = active_request == Some(envelope.request_id);
+                        if !event_control::accepts(active_request, &envelope) {
+                            if active_request.is_none()
+                                && let EngineEvent::Error { message, .. } = envelope.payload
+                            {
                                 let _ = events.send(HostEvent::Error(message)).await;
+                            }
+                            continue;
+                        }
+                        if let EngineEvent::ProviderCredentialRequested {
+                            request_id,
+                            generation,
+                            force,
+                        } = &envelope.payload
+                        {
+                            let renewal = reader_credentials.lock().clone();
+                            if let Some(renewal) = renewal {
+                                let commands = credential_commands.clone();
+                                let accounts = accounts.clone();
+                                let vault = vault.clone();
+                                let run = envelope.request_id;
+                                let request_id = *request_id;
+                                let generation = *generation;
+                                let force = *force;
+                                let permit = renewal_capacity.clone().try_acquire_owned();
+                                tokio::spawn(async move {
+                                    let result = match permit {
+                                        Ok(_permit) => renewal.resolve(run, generation, force, accounts, vault).await
+                                            .map_err(|_| "ChatGPT access could not be renewed. Reconnect the account in Settings → Providers.".to_string()),
+                                        Err(_) => Err("Too many pending credential requests".into()),
+                                    };
+                                    tracing::debug!(%session, %run, %request_id, force, success=result.is_ok(), "Provider credential renewal finished");
+                                    let envelope = Envelope::new(
+                                        run,
+                                        Some(session),
+                                        0,
+                                        WorkerCommand::ProviderCredentialUpdated {
+                                            request_id,
+                                            result,
+                                        },
+                                    );
+                                    tokio::select! {
+                                        biased;
+                                        _ = renewal.cancel.cancelled() => {},
+                                        _ = tokio::time::timeout(Duration::from_secs(5), commands.send(envelope)) => {},
+                                    }
+                                });
                             }
                             continue;
                         }
@@ -2313,7 +3031,11 @@ impl HostState {
                                 scheduled_task,
                             );
                         }
+                        let terminal_epoch = reader_queue_epoch.load(Ordering::Acquire);
                         if terminal {
+                            if let Some(credentials) = reader_credentials.lock().take() {
+                                credentials.cancel.cancel();
+                            }
                             if let Err(error) = steering_control::finish_turn(
                                 steering_store.clone(),
                                 &events,
@@ -2330,8 +3052,18 @@ impl HostState {
                             reader_lease.lock().await.take();
                             reader_activity.lock().await.take();
                         }
+                        let successful = matches!(envelope.payload, EngineEvent::Completed { .. });
                         if events.send(HostEvent::Engine(envelope)).await.is_err() {
                             break;
+                        }
+                        if terminal && let Some(host) = queue_host.upgrade() {
+                            tokio::spawn(host.settle_turn_queue(
+                                session,
+                                successful,
+                                reader_queue_epoch.clone(),
+                                terminal_epoch,
+                                reader_queue_stopped.clone(),
+                            ));
                         }
                     }
                     _ => {
@@ -2357,7 +3089,19 @@ impl HostState {
             if !matches!(recovered, Ok(Ok(_))) {
                 tracing::error!(?recovered,%session,"Recover reaped task journal");
             }
+            if let Some(host) = queue_host.upgrade() {
+                tokio::spawn(host.settle_turn_queue(
+                    session,
+                    false,
+                    reader_queue_epoch.clone(),
+                    reader_queue_epoch.load(Ordering::Acquire),
+                    reader_queue_stopped.clone(),
+                ));
+            }
             reader_stop.cancel();
+            if let Some(credentials) = reader_credentials.lock().take() {
+                credentials.cancel.cancel();
+            }
             let crashed_turn = reader_turn.lock().take();
             reader_request.lock().take();
             if active_reader.swap(false, Ordering::AcqRel) {
@@ -2392,8 +3136,11 @@ impl HostState {
             let _ = exited_tx.send(true);
         });
         Ok(WorkerHandle {
+            credentials,
             commands: tx,
             active,
+            queue_epoch,
+            queue_stopped,
             lease,
             stop,
             exited,
@@ -2478,6 +3225,20 @@ impl HostState {
         self.scheduler(self.paths.data.clone())
     }
 
+    async fn schedule_mutated(&self, request_id: Uuid, result: Result<()>) -> Result<()> {
+        let success = result.is_ok();
+        self.events
+            .send(HostEvent::ScheduleMutation {
+                request_id,
+                result: result.map_err(|error| error.to_string()),
+            })
+            .await?;
+        // The durable acknowledgement is independent of a subsequent list refresh.
+        if success {
+            self.send_schedules().await?;
+        }
+        Ok(())
+    }
     async fn send_schedules(&self) -> Result<()> {
         self.events
             .send(HostEvent::Schedules(

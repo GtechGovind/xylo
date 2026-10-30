@@ -1,4 +1,18 @@
 impl AgentLoop {
+    async fn wait_provider_retry(&self, mut delay: std::time::Duration) -> Result<(), AgentError> {
+        self.interrupt.check_interrupt()?;
+        if delay > std::time::Duration::from_millis(self.config.retry.max_delay_ms.max(1)) {
+            return Err(AgentError::LlmApi("Provider Retry-After exceeds the automatic retry wait limit; retry later after the server delay.".into()));
+        }
+        while !delay.is_zero() {
+            self.interrupt.check_interrupt()?;
+            let slice = delay.min(std::time::Duration::from_millis(50));
+            sleep(slice).await;
+            delay = delay.saturating_sub(slice);
+        }
+        self.interrupt.check_interrupt()
+    }
+
     fn credential_pool_for_route<'a>(
         &'a self,
         rt: &'a TurnRuntimeRoute,
@@ -249,6 +263,9 @@ impl AgentLoop {
 
     /// Compress when total chars exceed 80% of the context budget (Python auto-compaction).
     fn auto_compress_if_over_threshold(&self, ctx: &mut ContextManager) {
+        if self.config.external_context_management {
+            return;
+        }
         let total_chars = ctx.total_chars();
         let max_c = ctx.max_context_chars().max(1);
         let threshold = (max_c as f64 * 0.8) as usize;
@@ -617,12 +634,16 @@ impl AgentLoop {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     let err_str = e.to_string();
-                    let class = classify_error(&err_str);
+                    let class = match e.provider_retry_policy() {
+                        Some((false, _)) => ErrorClass::Fatal,
+                        Some((true, _)) => ErrorClass::Retryable,
+                        None => classify_error(&err_str),
+                    };
                     tracing::warn!(
                         attempt,
                         error_class = ?class,
                         "LLM API error: {}",
-                        &err_str[..err_str.len().min(200)]
+                        err_str.chars().take(200).collect::<String>()
                     );
 
                     match class {
@@ -638,7 +659,9 @@ impl AgentLoop {
                             return Err(AgentError::LlmApi(err_str));
                         }
                         ErrorClass::Fatal => {
-                            if !tool_schemas.is_empty()
+                            if e.provider_retry_policy().is_none()
+                                && self.config.allow_model_fallbacks
+                                && !tool_schemas.is_empty()
                                 && is_tool_payload_validation_error(&err_str)
                             {
                                 let (provider_name, model_name) =
@@ -920,7 +943,12 @@ impl AgentLoop {
                                 attempt,
                                 effective_base_delay_ms,
                                 retry.max_delay_ms,
-                            );
+                            )
+                            .max(std::time::Duration::from_secs(
+                                e.provider_retry_policy()
+                                    .and_then(|(_, delay)| delay)
+                                    .unwrap_or(0),
+                            ));
                             tracing::info!(
                                 "Retrying in {}ms (attempt {}/{})",
                                 delay.as_millis(),
@@ -936,7 +964,7 @@ impl AgentLoop {
                                     effective_max_retries
                                 ),
                             );
-                            sleep(delay).await;
+                            self.wait_provider_retry(delay).await?;
                         }
                     }
                 }
@@ -956,7 +984,7 @@ impl AgentLoop {
             if !reasoning_content.is_empty() {
                 m.reasoning_content = Some(reasoning_content.to_string());
             }
-            // Agent Workbench patch: preserve signed provider-native content for
+            // Xylo patch: preserve signed provider-native content for
             // exact replay after tool use and durable checkpoint restoration.
             m.anthropic_content_blocks = native_content_blocks.clone();
             m
@@ -997,6 +1025,7 @@ impl AgentLoop {
             .unwrap_or(self.config.stream_read_max_retries.min(10));
 
         'stream_attempt: for stream_attempt in 0..=max_stream_retries {
+            self.interrupt.check_interrupt()?;
             let mut stream = if let Some(rt) = route {
                 let (provider_name, model_name) = self.extract_provider_and_model(active_model);
                 let runtime_provider_name =
@@ -1088,56 +1117,26 @@ impl AgentLoop {
                 let chunk = match chunk_result {
                     Ok(chunk) => chunk,
                     Err(err) => {
-                        let partial_tool_in_flight = tool_calls.iter().any(|tc| {
-                            !tc.id.is_empty()
-                                || !tc.function.name.is_empty()
-                                || !tc.function.arguments.trim().is_empty()
-                        });
-                        let should_retry_for_partial_tool = deltas_were_sent
-                            && partial_tool_in_flight
-                            && is_transient_stream_error(&err)
-                            && stream_attempt < max_stream_retries;
                         let should_retry_before_deltas = !deltas_were_sent
                             && is_transient_stream_error(&err)
                             && stream_attempt < max_stream_retries;
 
-                        if should_retry_for_partial_tool || should_retry_before_deltas {
-                            let next_attempt = stream_attempt + 2;
-                            let total_attempts = max_stream_retries + 1;
-                            if should_retry_for_partial_tool {
-                                on_chunk(StreamChunk {
-                                    delta: Some(hermes_core::StreamDelta {
-                                        content: Some(
-                                            "\n\n[connection dropped mid tool-call; reconnecting...]\n\n"
-                                                .to_string(),
-                                        ),
-                                        tool_calls: None,
-                                        extra: None,
-                                    }),
-                                    finish_reason: None,
-                                    usage: None,
-                                });
-                                self.emit_status(
-                                    "lifecycle",
-                                    &format!(
-                                        "Connection dropped mid tool-call; reconnecting (attempt {}/{})",
-                                        next_attempt, total_attempts
-                                    ),
-                                );
-                                tracing::warn!(
-                                    "Streaming attempt {}/{} failed after partial tool-call data; retrying: {}",
-                                    stream_attempt + 1,
-                                    total_attempts,
-                                    err
-                                );
-                            } else {
-                                tracing::warn!(
-                                    "Streaming attempt {}/{} failed before deltas; retrying: {}",
-                                    stream_attempt + 1,
-                                    total_attempts,
-                                    err
-                                );
-                            }
+                        if should_retry_before_deltas {
+                            tracing::warn!(
+                                attempt = stream_attempt,
+                                "Stream failed before visible output; retrying"
+                            );
+                            let delay = jittered_backoff(
+                                stream_attempt,
+                                self.config.retry.base_delay_ms,
+                                self.config.retry.max_delay_ms,
+                            )
+                            .max(std::time::Duration::from_secs(
+                                err.provider_retry_policy()
+                                    .and_then(|(_, delay)| delay)
+                                    .unwrap_or(0),
+                            ));
+                            self.wait_provider_retry(delay).await?;
                             continue 'stream_attempt;
                         }
                         return Err(err);
@@ -1146,6 +1145,14 @@ impl AgentLoop {
 
                 let mut emit_chunk = chunk.clone();
                 if let Some(ref delta) = chunk.delta {
+                    if delta
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty())
+                        || delta.extra.is_some()
+                    {
+                        deltas_were_sent = true;
+                    }
                     if let Some(ref text) = delta.content {
                         let scrubbed = stream_scrubber.feed(text);
                         if let Some(ref mut emit_delta) = emit_chunk.delta {
@@ -1164,9 +1171,8 @@ impl AgentLoop {
                         }
                     }
                     if let Some(ref extra) = delta.extra {
-                        if let Some(blocks) = extra
-                            .get("workbench_content_blocks")
-                            .and_then(Value::as_array)
+                        if let Some(blocks) =
+                            extra.get("xylo_content_blocks").and_then(Value::as_array)
                         {
                             native_content_blocks = Some(blocks.clone());
                         }

@@ -1,5 +1,5 @@
 use super::*;
-use workbench_core::{PermissionMode, ProviderConfig, TurnRequest, Usage};
+use xylo_core::{PermissionMode, ProviderConfig, TurnRequest, Usage};
 
 fn setup() -> (tempfile::TempDir, Store, LearningService, Uuid, String) {
     let directory = tempfile::tempdir().unwrap();

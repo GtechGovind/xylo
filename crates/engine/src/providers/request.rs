@@ -177,7 +177,7 @@ pub(super) fn body(
                     continue;
                 }
                 if message.role == MessageRole::Assistant
-                    && let Some(items) = native_blocks(message, "workbench_responses_item")
+                    && let Some(items) = native_blocks(message, "xylo_responses_item")
                 {
                     input.extend(items);
                     continue;
@@ -207,7 +207,7 @@ pub(super) fn body(
                     for call in message.tool_calls.as_deref().unwrap_or(&[]) {
                         let mut item = json!({"type":"function_call","call_id":call.id,"name":call.function.name,"arguments":call.function.arguments});
                         if provider.chatgpt_plan {
-                            item["namespace"] = json!("workbench");
+                            item["namespace"] = json!("xylo");
                         }
                         input.push(item);
                     }
@@ -220,7 +220,7 @@ pub(super) fn body(
             if !tools.is_empty() {
                 let functions = tools.iter().map(function).collect::<Vec<_>>();
                 body["tools"] = if provider.chatgpt_plan {
-                    json!([{"type":"namespace","name":"workbench","description":"Application tools with enforced permissions.","tools":functions}])
+                    json!([{"type":"namespace","name":"xylo","description":"Application tools with enforced permissions.","tools":functions}])
                 } else {
                     Value::Array(functions)
                 };
@@ -365,7 +365,7 @@ pub(super) fn body(
                             parts.push(json!({"inlineData":{"mimeType":mime,"data":data}}));
                         }
                     }
-                } else if let Some(raw) = native_blocks(message, "workbench_gemini_part") {
+                } else if let Some(raw) = native_blocks(message, "xylo_gemini_part") {
                     parts = raw;
                 } else {
                     if let Some(text) = &message.content
@@ -469,6 +469,25 @@ pub(super) fn body(
                 }
                 _ => {}
             }
+        }
+    }
+    // Apply only a capability-checked user selection. The selected model can be
+    // overridden by the agent, so do not infer support from the original model.
+    let mut reasoning_config = provider.config.clone();
+    if reasoning_config.model != model {
+        reasoning_config.reasoning_options = None;
+        reasoning_config.default_reasoning_effort = None;
+    }
+    reasoning_config.model = model.to_owned();
+    if let Some(effort) = reasoning_config.effective_reasoning_effort() {
+        match provider.endpoint.protocol {
+            ProviderProtocol::ChatCompletions => {
+                body["reasoning_effort"] = json!(effort);
+            }
+            ProviderProtocol::Responses => {
+                body["reasoning"] = json!({"effort": effort});
+            }
+            _ => {}
         }
     }
     Ok(body)
@@ -585,7 +604,7 @@ pub(super) fn parse_response(
             message.anthropic_content_blocks = Some(
                 output
                     .iter()
-                    .map(|item| json!({"type":"workbench_responses_item","item":item}))
+                    .map(|item| json!({"type":"xylo_responses_item","item":item}))
                     .collect(),
             );
             (
@@ -686,7 +705,7 @@ pub(super) fn parse_response(
             message.anthropic_content_blocks = Some(
                 parts
                     .iter()
-                    .map(|part| json!({"type":"workbench_gemini_part","item":part}))
+                    .map(|part| json!({"type":"xylo_gemini_part","item":part}))
                     .collect(),
             );
             let finish = match candidate["finishReason"].as_str() {

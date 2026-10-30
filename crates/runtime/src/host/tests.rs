@@ -32,13 +32,15 @@ pub(super) fn state() -> (tempfile::TempDir, Arc<HostState>, Receiver<HostEvent>
     let dir = tempfile::tempdir().unwrap();
     let paths = AppPaths::at(dir.path().to_owned()).unwrap();
     let store = Store::open(&paths.database).unwrap();
-    let vault = CredentialVault::new("org.agentworkbench.host-tests").unwrap();
-    let accounts = workbench_services::providers::ChatGptSignInService::new(&paths.data).unwrap();
+    let vault = CredentialVault::new("com.qurkos.xylo.host-tests").unwrap();
+    let accounts = xylo_services::providers::ChatGptSignInService::new(&paths.data).unwrap();
     let (events, receiver) = async_channel::bounded(256);
     let (editor_events, _editor_receiver) = async_channel::bounded(128);
     let lsp = crate::lsp::Service::new(paths.data.clone(), editor_events);
     let (workspace_events, _) = async_channel::bounded(16);
     let host = Arc::new(HostState {
+        discovery: Arc::new(provider_control::DiscoveryControl::default()),
+        provider_save_gate: Mutex::new(()),
         workspace: crate::workspace::WorkspaceService::new(workspace_events),
         search_requests: Mutex::new(HashMap::new()),
         image_import_gate: Mutex::new(()),
@@ -50,8 +52,8 @@ pub(super) fn state() -> (tempfile::TempDir, Arc<HostState>, Receiver<HostEvent>
         notifications: crate::notifications::Service::new(
             paths.data.clone(),
             crate::notifications::AppIdentity {
-                id: "org.agentworkbench.host-tests".into(),
-                name: "Workbench tests".into(),
+                id: "com.qurkos.xylo.host-tests".into(),
+                name: "Xylo tests".into(),
             },
         )
         .unwrap(),
@@ -68,6 +70,7 @@ pub(super) fn state() -> (tempfile::TempDir, Arc<HostState>, Receiver<HostEvent>
         events,
         resources: ResourceManager::new(),
         queued: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        turn_queue: turn_queue_control::TurnQueueControl::default(),
         scheduled: Arc::new(Mutex::new(HashMap::new())),
         stopping: Arc::new(AtomicBool::new(false)),
         helpers: Mutex::new(HashMap::new()),
@@ -234,8 +237,11 @@ async fn retiring_workers_remain_supervised_until_reaped_and_active_turns_surviv
         let (exited_tx, exited) = tokio::sync::watch::channel(false);
         (
             WorkerHandle {
+            credentials: Arc::new(parking_lot::Mutex::new(None)),
                 commands,
                 active: Arc::new(AtomicBool::new(active)),
+                queue_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                queue_stopped: Arc::new(AtomicBool::new(false)),
                 lease: Arc::new(Mutex::new(None)),
                 stop: CancellationToken::new(),
                 exited,
@@ -268,4 +274,624 @@ async fn retiring_workers_remain_supervised_until_reaped_and_active_turns_surviv
     retire_idle_workers(&mut workers, current);
     assert!(!workers.contains_key(&idle));
     assert!(workers.contains_key(&active));
+}
+
+#[tokio::test]
+async fn replacing_provider_discovery_discards_an_older_catalog_response() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (_directory, host, events) = state();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel();
+    let older = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let old_endpoint = format!("http://{}/v1", older.local_addr().unwrap());
+    let newer = older.clone();
+    let new_endpoint = old_endpoint.clone();
+    let old_server = tokio::spawn(async move {
+        let (socket, _) = older.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        started.send(()).unwrap();
+        let _ = held.await;
+        let body = r#"{"data":[{"id":"old-auth-catalog"}]}"#;
+        let _ = socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+    });
+    let old_host = host.clone();
+    let old_generation = host.discovery.begin();
+    let old_run = tokio::spawn(async move {
+        old_host
+            .discover_models(
+                old_generation,
+                ProviderConfig {
+                    endpoint: old_endpoint,
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    let new_server = tokio::spawn(async move {
+        let (socket, _) = newer.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let body = r#"{"data":[{"id":"new-auth-catalog"}]}"#;
+        socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    });
+    host.discover_models(
+        host.discovery.begin(),
+        ProviderConfig {
+            endpoint: new_endpoint,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let _ = release.send(());
+    old_run.await.unwrap().unwrap();
+    old_server.await.unwrap();
+    new_server.await.unwrap();
+    let mut catalogs = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let HostEvent::Models { models, .. } = event {
+            catalogs.push(models);
+        }
+    }
+    assert_eq!(catalogs, vec![vec!["new-auth-catalog".to_owned()]]);
+}
+
+#[tokio::test]
+async fn discovery_auth_failure_is_correlated_to_the_selected_provider() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (_directory, host, events) = state();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let body = r#"{"error":{"code":"catalog_denied","message":"reflected fixture-secret must not appear"}}"#;
+        socket.get_mut().write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    });
+    let generation = host.discovery.begin();
+    host.discover_models(
+        generation,
+        ProviderConfig {
+            endpoint: endpoint.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let HostEvent::ModelsFailed {
+        generation: received,
+        provider,
+        message,
+    } = events.recv().await.unwrap()
+    else {
+        panic!("Missing correlated discovery error");
+    };
+    assert_eq!(received, generation);
+    assert_eq!(provider.endpoint, endpoint);
+    assert!(message.contains("401") && message.contains("catalog_denied"));
+    assert!(!message.contains("fixture-secret"));
+    server.await.unwrap();
+}
+
+#[test]
+fn visible_discovery_cancel_invalidates_the_same_generation_read_by_the_ui() {
+    let (commands, _incoming) = async_channel::bounded(1);
+    let discovery = Arc::new(provider_control::DiscoveryControl::default());
+    let client = HostClient {
+        commands,
+        discovery: discovery.clone(),
+    };
+    let old = discovery.begin();
+    let token = discovery.token(old).unwrap();
+    client.cancel_model_discovery().unwrap();
+    assert!(token.is_cancelled());
+    assert_ne!(client.provider_discovery_generation(), old);
+}
+
+#[tokio::test]
+async fn saving_a_manual_deployment_without_catalog_has_a_correlated_terminal_result() {
+    let (_directory, host, events) = state();
+    let generation = host.discovery.begin();
+    let mut settings = AppSettings::default();
+    settings.provider = ProviderConfig { family:ApiFamily::Azure, endpoint:"https://resource.openai.azure.com/openai/deployments/explicit-deployment?api-version=2024-10-21".into(), model:"explicit-deployment".into(), ..Default::default() };
+    host.handle(HostCommand::SaveProvider(
+        generation,
+        settings.clone(),
+        settings.provider,
+        None,
+    ))
+    .await
+    .unwrap();
+    let mut catalogs = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let HostEvent::Models {
+            generation,
+            provider,
+            models,
+            ..
+        } = event
+        {
+            catalogs.push((generation, provider.model, models));
+        }
+    }
+    assert_eq!(
+        catalogs,
+        vec![(
+            generation,
+            "explicit-deployment".to_owned(),
+            Vec::<String>::new()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn saving_a_separate_connection_keeps_active_model_until_catalog_selection() {
+    let (_directory, host, events) = state();
+    let generation = host.discovery.begin();
+    let mut settings = AppSettings::default();
+    settings.provider.model = "existing-active-model".into();
+    let target = ProviderConfig { family:ApiFamily::Azure, endpoint:"https://resource.openai.azure.com/openai/deployments/explicit-deployment?api-version=2024-10-21".into(), model:"".into(), ..Default::default() };
+    settings.providers.push(target.clone());
+    host.handle(HostCommand::SaveProvider(
+        generation, settings, target, None,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        host.settings.lock().await.provider.model,
+        "existing-active-model"
+    );
+    let persisted = host.store.settings().unwrap();
+    assert_eq!(persisted.provider.model, "existing-active-model");
+    let mut terminal = 0;
+    while let Ok(event) = events.try_recv() {
+        if let HostEvent::Models {
+            generation: observed,
+            provider,
+            models,
+            ..
+        } = event
+        {
+            assert_eq!(observed, generation);
+            assert!(provider.model.is_empty());
+            assert!(models.is_empty());
+            terminal += 1;
+        }
+    }
+    assert_eq!(terminal, 1);
+}
+
+#[tokio::test]
+async fn separate_connection_catalog_results_preserve_active_and_carry_model_metadata() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    for denied in [false, true] {
+        let (_directory, host, events) = state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let (status, body) = if denied {
+                ("401 Unauthorized", r#"{"error":{"code":"denied"}}"#)
+            } else {
+                (
+                    "200 OK",
+                    r#"{"data":[{"id":"future-model","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"default_reasoning_level":"high"}]}"#,
+                )
+            };
+            socket.get_mut().write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let mut settings = AppSettings::default();
+        settings.provider.model = "existing-active-model".into();
+        let target = ProviderConfig {
+            endpoint,
+            ..Default::default()
+        };
+        settings.providers.push(target.clone());
+        let generation = host.discovery.begin();
+        host.handle(HostCommand::SaveProvider(
+            generation, settings, target, None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            host.store.settings().unwrap().provider.model,
+            "existing-active-model"
+        );
+        let mut terminal = 0;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                HostEvent::Models {
+                    generation: observed,
+                    models,
+                    reasoning_options,
+                    default_reasoning_efforts,
+                    ..
+                } => {
+                    assert!(!denied);
+                    assert_eq!(observed, generation);
+                    assert_eq!(models, vec!["future-model"]);
+                    assert_eq!(
+                        reasoning_options.get("future-model"),
+                        Some(&vec!["low".to_owned(), "high".to_owned()])
+                    );
+                    assert_eq!(
+                        default_reasoning_efforts
+                            .get("future-model")
+                            .map(String::as_str),
+                        Some("high")
+                    );
+                    terminal += 1;
+                }
+                HostEvent::ModelsFailed {
+                    generation: observed,
+                    message,
+                    ..
+                } => {
+                    assert!(denied);
+                    assert_eq!(observed, generation);
+                    assert!(message.contains("401"));
+                    terminal += 1;
+                }
+                _ => {}
+            }
+            if terminal > 0 {
+                break;
+            }
+        }
+        assert_eq!(terminal, 1);
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receipt_ordered_settings_keep_newer_snapshot_after_a_delayed_first_commit() {
+    let (_directory, host, events) = state();
+    let order = settings_control::CommitOrder::default();
+    let first = order.reserve();
+    let second = order.reserve();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    let old_host = host.clone();
+    let older = tokio::spawn(async move {
+        let _commit = first.enter().await;
+        let _ = started.send(());
+        let _ = resume.await;
+        let mut settings = AppSettings::default();
+        settings.theme = "older".into();
+        old_host
+            .handle(HostCommand::SaveSettings(settings))
+            .await
+            .unwrap();
+    });
+    ready.await.unwrap();
+    let new_host = host.clone();
+    let newer = tokio::spawn(async move {
+        let _commit = second.enter().await;
+        let mut settings = AppSettings::default();
+        settings.theme = "newer".into();
+        new_host
+            .handle(HostCommand::SaveSettings(settings))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release.send(()).unwrap();
+    older.await.unwrap();
+    newer.await.unwrap();
+    assert_eq!(host.store.settings().unwrap().theme, "newer");
+    assert_eq!(host.settings.lock().await.theme, "newer");
+    let mut observed = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let HostEvent::Settings(settings) = event {
+            observed.push(settings.theme);
+        }
+    }
+    assert_eq!(observed, vec!["older", "newer"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_earlier_settings_writer_releases_newer_commit_in_receipt_order() {
+    let (_directory, host, events) = state();
+    let order = settings_control::CommitOrder::default();
+    let first = order.reserve();
+    let second = order.reserve();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    let old = host.clone();
+    let older = tokio::spawn(async move {
+        let _commit = first.enter().await;
+        entered.send(()).unwrap();
+        resume.await.unwrap();
+        let bad = ProviderConfig {
+            context_tokens: 1,
+            ..Default::default()
+        };
+        old.handle(HostCommand::SaveProvider(
+            old.discovery.begin(),
+            AppSettings::default(),
+            bad,
+            None,
+        ))
+        .await
+        .unwrap_err();
+    });
+    started.await.unwrap();
+    let new = host.clone();
+    let newer = tokio::spawn(async move {
+        let _commit = second.enter().await;
+        let mut settings = AppSettings::default();
+        settings.theme = "newer-after-error".into();
+        new.handle(HostCommand::SaveSettings(settings))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!newer.is_finished());
+    release.send(()).unwrap();
+    older.await.unwrap();
+    newer.await.unwrap();
+    assert_eq!(host.store.settings().unwrap().theme, "newer-after-error");
+    assert_eq!(host.settings.lock().await.theme, "newer-after-error");
+    let mut observed = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let HostEvent::Settings(settings) = event {
+            observed.push(settings.theme);
+        }
+    }
+    assert_eq!(observed, vec!["newer-after-error"]);
+}
+
+#[tokio::test]
+async fn dropping_a_queued_settings_ticket_does_not_overtake_the_active_writer() {
+    let order = settings_control::CommitOrder::default();
+    let first = order.reserve().enter().await;
+    let abandoned = order.reserve();
+    let last = order.reserve();
+    let pending = tokio::spawn(async move {
+        let _commit = abandoned.enter().await;
+    });
+    tokio::task::yield_now().await;
+    pending.abort();
+    let _ = pending.await;
+    let following = tokio::spawn(async move {
+        let _commit = last.enter().await;
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!following.is_finished());
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(1), following)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_catalog_network_does_not_hold_settings_commit_admission() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (_directory, host, events) = state();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        entered.send(()).unwrap();
+        resume.await.unwrap();
+        let body = r#"{"data":[{"id":"catalog-model"}]}"#;
+        socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+    });
+    let order = settings_control::CommitOrder::default();
+    {
+        let _commit = order.reserve().enter().await;
+        let target = ProviderConfig {
+            endpoint,
+            ..Default::default()
+        };
+        host.handle(HostCommand::SaveProvider(
+            host.discovery.begin(),
+            AppSettings::default(),
+            target,
+            None,
+        ))
+        .await
+        .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let _commit = order.reserve().enter().await;
+        let mut settings = AppSettings::default();
+        settings.theme = "committed-while-catalog-waits".into();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            host.handle(HostCommand::SaveSettings(settings)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    assert_eq!(
+        host.store.settings().unwrap().theme,
+        "committed-while-catalog-waits"
+    );
+    release.send(()).unwrap();
+    server.await.unwrap();
+    loop {
+        if matches!(
+            tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            HostEvent::Models { .. }
+        ) {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn connector_mutation_ack_is_durable_when_catalog_read_is_corrupt() {
+    let (_directory, host, events) = state();
+    rusqlite::Connection::open(&host.paths.database).unwrap().execute("INSERT INTO connectors(id,name,json) VALUES('broken','Broken legacy row','invalid JSON')", []).unwrap();
+    let config = ConnectorConfig { id:Uuid::new_v4(),name:"Durable fixture".into(),transport:"stdio".into(),endpoint:String::new(),command:Some(PathBuf::from("/usr/bin/true")),args:vec!["one".into(),"two".into()],credential_ref:None };
+    let request_id = Uuid::new_v4();
+    host.handle(HostCommand::MutateConnector(request_id,Some(config.clone()),None,None)).await.unwrap();
+    match events.recv().await.unwrap() {
+        HostEvent::ConnectorMutation { request_id:actual,result:Ok(receipt) } => {
+            assert_eq!(actual,request_id); assert_eq!(receipt.saved.unwrap().id,config.id);
+        }
+        _ => panic!("Durable save must acknowledge success independently of catalog decoding"),
+    }
+    assert!(host.store.connectors().is_err(),"Fixture must fail catalog refresh");
+    let count:i64=rusqlite::Connection::open(&host.paths.database).unwrap().query_row("SELECT COUNT(*) FROM connectors WHERE id=?1",[config.id.to_string()],|row|row.get(0)).unwrap(); assert_eq!(count,1);
+}
+
+#[tokio::test]
+async fn tracked_schedule_failure_is_correlated_and_does_not_claim_success() {
+    let (_directory,host,events)=state();
+    std::fs::write(host.paths.artifacts.join("schedules.json"),"invalid JSON").unwrap();
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::CreateScheduleTracked(request_id,"Fixture task".into(),"0 * * * * * *".into(),host.paths.data.clone())).await.unwrap();
+    match events.recv().await.unwrap() {
+        HostEvent::ScheduleMutation { request_id:actual,result:Err(_) } => assert_eq!(actual,request_id),
+        _=>panic!("Failed durable save requires correlated failure"),
+    }
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn schedule_durable_ack_precedes_failed_list_refresh() {
+    let (_directory,host,events)=state();
+    std::fs::write(host.paths.artifacts.join("schedules.json"),"invalid JSON").unwrap();
+    let request_id=Uuid::new_v4();
+    assert!(host.schedule_mutated(request_id,Ok(())).await.is_err());
+    match events.recv().await.unwrap() {
+        HostEvent::ScheduleMutation { request_id:actual,result:Ok(()) } => assert_eq!(actual,request_id),
+        _=>panic!("Refresh failure must not replace durable success"),
+    }
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn connector_failed_write_and_missing_reference_have_redacted_correlated_errors() {
+    let (_directory,host,events)=state();
+    let config = ConnectorConfig { id:Uuid::new_v4(),name:"Rejected fixture".into(),transport:"http".into(),endpoint:"https://example.test/mcp".into(),command:None,args:vec![],credential_ref:None };
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::MutateConnector(request_id,Some(config.clone()),None,Some("never-log-this-secret".into()))).await.unwrap();
+    match events.recv().await.unwrap() {
+        HostEvent::ConnectorMutation { request_id:actual,result:Err(error) } => { assert_eq!(actual,request_id); assert!(!error.contains("never-log-this-secret")); assert!(error.contains("Missing connector credential reference")); },
+        _=>panic!("Credential precondition must fail before any platform vault operation"),
+    }
+    assert!(host.store.connectors().unwrap().is_empty());
+    rusqlite::Connection::open(&host.paths.database).unwrap().execute_batch("CREATE TRIGGER reject_connector BEFORE INSERT ON connectors BEGIN SELECT RAISE(ABORT,'fixture write rejected'); END").unwrap();
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::MutateConnector(request_id,Some(config),None,None)).await.unwrap();
+    match events.recv().await.unwrap() {
+        HostEvent::ConnectorMutation { request_id:actual,result:Err(error) } => { assert_eq!(actual,request_id); assert!(error.contains("fixture write rejected")); },
+        _=>panic!("Failed SQLite write must not acknowledge success"),
+    }
+    assert!(host.store.connectors().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tracked_schedule_create_update_remove_acknowledge_actual_durable_state() {
+    let (_directory,host,events)=state();
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::CreateScheduleTracked(request_id,"Fixture task".into(),"0 0 * * * * *".into(),host.paths.data.clone())).await.unwrap();
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::ScheduleMutation{request_id:actual,result:Ok(())} if actual==request_id));
+    let mut task=match events.recv().await.unwrap() { HostEvent::Schedules(mut rows)=>{assert_eq!(rows.len(),1);rows.remove(0)}, _=>panic!("Expected durable task list") };
+    assert_eq!(host.default_scheduler().unwrap().list().await.unwrap()[0].id,task.id);
+    task.enabled=false;
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::SaveScheduleTracked(request_id,task.clone())).await.unwrap();
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::ScheduleMutation{request_id:actual,result:Ok(())} if actual==request_id));
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::Schedules(rows) if rows.len()==1 && !rows[0].enabled));
+    assert!(!host.default_scheduler().unwrap().list().await.unwrap()[0].enabled);
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::RemoveScheduleTracked(request_id,task.id)).await.unwrap();
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::ScheduleMutation{request_id:actual,result:Ok(())} if actual==request_id));
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::Schedules(rows) if rows.is_empty()));
+    assert!(host.default_scheduler().unwrap().list().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn local_connector_inspection_without_project_is_rejected_before_launch() {
+    let (_directory,host,events)=state();
+    let config=ConnectorConfig { id:Uuid::new_v4(),name:"Local fixture".into(),transport:"stdio".into(),endpoint:String::new(),command:Some(PathBuf::from("/usr/bin/true")),args:vec![],credential_ref:None };
+    host.store.save_connector(&config).unwrap();
+    host.handle(HostCommand::ConnectorTools(Uuid::new_v4(),config.id,None)).await.unwrap();
+    match events.recv().await.unwrap() {
+        HostEvent::ConnectorToolsFailed { connector_id,message,.. } => { assert_eq!(connector_id,config.id); assert!(message.contains("Choose a project")); },
+        _=>panic!("Local inspection requires an explicit captured project"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn connector_remove_gate_prevents_waiting_inspection_from_launching_deleted_config() {
+    let (directory,host,events)=state();
+    let workspace=directory.path().join("project"); std::fs::create_dir(&workspace).unwrap();
+    let script=workspace.join("must-not-launch.sh");let marker=workspace.join("launched");
+    std::fs::write(&script,"#!/bin/sh\ntouch launched\nsleep 30\n").unwrap();
+    let config=ConnectorConfig { id:Uuid::new_v4(),name:"Deleted fixture".into(),transport:"stdio".into(),endpoint:String::new(),command:Some(PathBuf::from("/bin/sh")),args:vec![script.to_string_lossy().into_owned()],credential_ref:None };
+    host.store.save_connector(&config).unwrap();
+    let held=host.connectors.configuration_guard(config.id).await.unwrap();
+    let removal_id=Uuid::new_v4();let connector_id=config.id;let deleting=host.clone();
+    let removal=tokio::spawn(async move { deleting.handle(HostCommand::MutateConnector(removal_id,None,Some(connector_id),None)).await });
+    tokio::task::yield_now().await;
+    let inspection_id=Uuid::new_v4();let inspecting=host.clone();
+    let inspection=tokio::spawn(async move { inspecting.handle(HostCommand::ConnectorTools(inspection_id,connector_id,Some(workspace))).await });
+    tokio::task::yield_now().await;
+    assert!(!removal.is_finished()); assert!(!inspection.is_finished()); drop(held);
+    removal.await.unwrap().unwrap();inspection.await.unwrap().unwrap();
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::ConnectorMutation{request_id,result:Ok(_)} if request_id==removal_id));
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::ConnectorToolsFailed{request_id,message,..} if request_id==inspection_id && message.contains("no longer exists")));
+    assert!(!marker.exists(),"No process may launch from a configuration removed before inspection obtains ownership");
+    assert!(host.store.connectors().unwrap().is_empty());assert!(host.connectors.cached_tools(&config).unwrap().is_empty());
 }

@@ -142,7 +142,7 @@ pub fn parse_bedrock_response(json: &Value, model: &str) -> Result<LlmResponse, 
             anthropic_content_blocks: Some(
                 content_blocks
                     .iter()
-                    .map(|item| json!({"type":"workbench_bedrock_block","item":item}))
+                    .map(|item| json!({"type":"xylo_bedrock_block","item":item}))
                     .collect(),
             ),
             cache_control: None,

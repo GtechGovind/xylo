@@ -1,12 +1,12 @@
 use super::*;
 use hermes_core::{FunctionCall, ToolCall};
 use uuid::Uuid;
-use workbench_core::{Conversation, PermissionMode, now_ms};
-use workbench_services::ActionIntent;
+use xylo_core::{Conversation, PermissionMode, now_ms};
+use xylo_services::ActionIntent;
 
 fn fixture() -> (tempfile::TempDir, HermesEngine, TurnRequest) {
     let directory = tempfile::tempdir().unwrap();
-    let paths = AppPaths::at(directory.path().to_owned()).unwrap();
+    let paths = AppPaths::at(directory.path().join("profile")).unwrap();
     let store = Store::open(&paths.database).unwrap();
     let session = Uuid::new_v4();
     store
@@ -45,15 +45,14 @@ fn assistant_call(name: &str, args: Value) -> Message {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn image_checkpoint_resume_preserves_refs_without_duplicate_or_inline_image_data() {
-    use workbench_core::AttachmentSource;
+    use xylo_core::AttachmentSource;
     let (_directory, engine, mut request) = fixture();
     let mut png = std::io::Cursor::new(Vec::new());
     image::DynamicImage::new_rgb8(16, 16)
         .write_to(&mut png, image::ImageFormat::Png)
         .unwrap();
     let assets =
-        workbench_services::attachments::AttachmentStore::new(engine.paths.artifacts.clone())
-            .unwrap();
+        xylo_services::attachments::AttachmentStore::new(engine.paths.artifacts.clone()).unwrap();
     request.attachments = vec![
         assets
             .import_bytes(
@@ -692,4 +691,286 @@ async fn interrupted_generation_requires_durable_context_and_retains_unknown_wri
             .is_err()
     );
     assert!(received.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_admission_stops_before_provider_or_checkpoint_setup() {
+    let (_directory, engine, request) = fixture();
+    // Even an unconfigured provider must not turn an already stopped admission
+    // into a setup failure, nor create new checkpoint/tool effects.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let (events, mut receiver) = mpsc::channel(8);
+    engine.run(request.clone(), events, cancel).await.unwrap();
+    assert!(matches!(
+        receiver.recv().await,
+        Some(EngineEvent::Cancelled)
+    ));
+    assert!(receiver.try_recv().is_err());
+    assert!(
+        engine
+            .store
+            .checkpoint(request.session_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        engine
+            .store
+            .unresolved_actions(request.session_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn actual_delegation_inherits_parent_model_and_reasoning_on_wire() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let (_directory, engine, mut request) = fixture();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    request.provider = ProviderConfig {
+        family: xylo_core::ApiFamily::OpenAiResponses,
+        endpoint: format!("http://{}/v1", listener.local_addr().unwrap()),
+        model: "gpt-6.1-sol".into(),
+        context_tokens: 65536,
+        reasoning_options: Some(vec!["low".into(), "high".into()]),
+        reasoning_effort: Some("high".into()),
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        for index in 0..3 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut length = 0;
+            let mut first = String::new();
+            socket.read_line(&mut first).await.unwrap();
+            assert!(first.starts_with("POST /v1/responses "));
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut bytes = vec![0; length];
+            socket.read_exact(&mut bytes).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            seen.push(body.clone());
+            let output = if index == 0 {
+                json!([{"type":"function_call","id":"fc-delegate","call_id":"delegate-call","name":"agent_delegate","arguments":"{\"task\":\"Investigate independently and report\"}"}])
+            } else {
+                json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":if index==1 {"Child complete"} else {"Parent complete"}}]}])
+            };
+            let response = json!({"id":format!("response-{index}"),"status":"completed","model":"gpt-6.1-sol","output":output,"usage":{"input_tokens":10,"output_tokens":5}});
+            let (content_type, payload) = if body["stream"] == true {
+                (
+                    "text/event-stream",
+                    format!(
+                        "data: {}\n\n",
+                        json!({"type":"response.completed","response":response})
+                    ),
+                )
+            } else {
+                ("application/json", response.to_string())
+            };
+            socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",payload.len()).as_bytes()).await.unwrap();
+        }
+        seen
+    });
+    let (events, mut receiver) = mpsc::channel(1024);
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        engine.run(request, events, CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[1]["stream"], false);
+    for body in &seen {
+        assert_eq!(body["model"], "gpt-6.1-sol");
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+    let mut completed = false;
+    while let Ok(event) = receiver.try_recv() {
+        if let EngineEvent::Completed { text, .. } = event {
+            assert_eq!(text, "Parent complete");
+            completed = true;
+        }
+    }
+    assert!(completed);
+    let child_result = seen[2]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .unwrap();
+    let result: Value = serde_json::from_str(child_result["output"].as_str().unwrap()).unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["result"], "Child complete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_checkpoint_preserves_native_and_legacy_summaries() {
+    for summary in [
+        "# Summary of earlier work in this task\nKeep exact decisions",
+        "[Conversation summary] Earlier conversation compressed into key points:\nKeep exact decisions",
+    ] {
+        let (_directory, engine, request) = fixture();
+        let checkpoint = vec![
+            Message::system(format!("Old app policy\n\n{summary}")),
+            Message::user("Prior request"),
+        ];
+        engine
+            .store
+            .save_checkpoint(
+                request.session_id,
+                request.turn_id,
+                &serde_json::to_value(checkpoint).unwrap(),
+            )
+            .unwrap();
+        let (events, _) = mpsc::channel(32);
+        let restored = engine
+            .restored_messages(&request, events, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(restored[0].content.as_deref(), Some(summary));
+        assert!(restored.iter().all(|message| {
+            !message
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("Old app policy")
+        }));
+    }
+}
+
+#[test]
+fn memory_excerpt_bounds_unicode_without_modifying_original() {
+    let original = "界".repeat(5000);
+    let excerpt = bounded_memory_excerpt(&original, 2000);
+    assert!(excerpt.len() < 2040);
+    assert!(excerpt.ends_with("[excerpt; remainder omitted]"));
+    assert_eq!(original, "界".repeat(5000));
+}
+
+struct StalledChildToolProvider;
+#[async_trait]
+impl LlmProvider for StalledChildToolProvider {
+    async fn chat_completion(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: Option<f64>,
+        _: Option<&str>,
+        _: Option<&Value>,
+    ) -> Result<hermes_core::LlmResponse, AgentError> {
+        Ok(hermes_core::LlmResponse {
+            message: assistant_call(
+                "shell_command",
+                json!({"command":"printf started > child-started; sleep 30","timeout_seconds":60}),
+            ),
+            usage: None,
+            model: "fixture".into(),
+            finish_reason: Some("tool_calls".into()),
+        })
+    }
+    fn chat_completion_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: Option<f64>,
+        _: Option<&str>,
+        _: Option<&Value>,
+    ) -> futures_util::stream::BoxStream<'static, Result<hermes_core::StreamChunk, AgentError>>
+    {
+        Box::pin(futures_util::stream::empty())
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_timeout_cancels_stalled_host_process_without_cancelling_parent() {
+    let (_directory, engine, mut request) = fixture();
+    request.permissions = PermissionMode::Auto;
+    let (events, mut receiver) = mpsc::channel(256);
+    let parent_cancel = CancellationToken::new();
+    let broker = ToolBroker::new(
+        request.clone(),
+        engine.store.clone(),
+        engine.capability_config(&request).unwrap(),
+        ApprovalGate::default(),
+        events,
+        parent_cancel.clone(),
+    )
+    .unwrap();
+    let child = Arc::new(broker.scoped_child().unwrap());
+    let child_cancel = child.cancellation_token();
+    let child_cancel_for_timeout = child_cancel.clone();
+    let config = AgentConfig {
+        model: "fixture".into(),
+        allow_model_fallbacks: false,
+        native_product_finalization: true,
+        skip_memory: true,
+        skip_context_files: true,
+        max_turns: 2,
+        ..Default::default()
+    };
+    let orchestrator = Arc::new(
+        SubAgentOrchestrator::new(SubAgentOrchestratorConfig {
+            parent_config: config,
+            tool_registry: build_registry(child.clone(), Some("parent-call".into())).unwrap(),
+            llm_provider: Arc::new(StalledChildToolProvider),
+            parent_credential_pool: None,
+            parent_interrupt: InterruptController::new(),
+            hermes_home: engine.paths.data.clone(),
+            parent_session_id: Some(request.session_id.to_string()),
+            timeout: Duration::from_millis(600),
+            background_delegation_callback: None,
+        })
+        .with_child_cancellation(Arc::new(move || child_cancel_for_timeout.cancel())),
+    );
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        orchestrator.execute(hermes_agent::SubAgentRequest {
+            task: "Run the fixture tool".into(),
+            child_depth: 1,
+            max_depth: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&result).unwrap()["status"],
+        "timeout"
+    );
+    assert!(start.elapsed() < Duration::from_secs(4));
+    assert!(child_cancel.is_cancelled());
+    assert!(!parent_cancel.is_cancelled());
+    let mut tool_started = false;
+    while let Ok(event) = receiver.try_recv() {
+        if matches!(event, EngineEvent::ToolStarted { .. }) {
+            tool_started = true;
+        }
+    }
+    assert!(tool_started, "The timeout must exercise a real host tool");
+    assert!(
+        request.workspace.join("child-started").is_file(),
+        "The real child process must have started"
+    );
+    child.shutdown().await.unwrap();
+    let actions = engine.store.unresolved_actions(request.session_id).unwrap();
+    assert!(actions.iter().all(|action| action.state != "running"));
 }

@@ -5,7 +5,7 @@ text-report extension. It is separate from the desktop application dependency
 graph. Its developer tools require Rust; installed components run inside the
 native Wasmtime host and require no Python, Node, WASI or external guest process.
 
-The [WIT contract](wit/workbench.wit) describes the existing structural ABI:
+The [WIT contract](wit/xylo.wit) describes the existing structural ABI:
 three root host imports and `run(string) -> result<string,string>`. The package
 version identifies this contract; the host currently checks the structural
 signature and supported imports, rather than negotiating a protocol version.
@@ -55,7 +55,7 @@ Create a Rust `cdylib` with a path dependency on `guest/`, implement the generat
 `Guest` trait and export the implementation:
 
 ```rust
-use workbench_plugin_sdk::Guest;
+use xylo_plugin_sdk::Guest;
 
 struct MyPlugin;
 impl Guest for MyPlugin {
@@ -63,7 +63,7 @@ impl Guest for MyPlugin {
         Ok(input)
     }
 }
-workbench_plugin_sdk::export!(MyPlugin);
+xylo_plugin_sdk::export!(MyPlugin);
 ```
 
 Compile for `wasm32-unknown-unknown`. Avoid operating-system, socket, thread and
@@ -73,11 +73,11 @@ core module and embedded WIT metadata as a validated WebAssembly component:
 
 ```sh
 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="$PWD/target" cargo build --locked --release \
-  --manifest-path sdk/plugins/Cargo.toml -p workbench-text-report \
+  --manifest-path sdk/plugins/Cargo.toml -p xylo-text-report \
   --target wasm32-unknown-unknown
 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="$PWD/target" cargo run --locked \
-  --manifest-path sdk/plugins/Cargo.toml -p workbench-plugin-pack -- \
-  target/wasm32-unknown-unknown/release/workbench_text_report.wasm \
+  --manifest-path sdk/plugins/Cargo.toml -p xylo-plugin-pack -- \
+  target/wasm32-unknown-unknown/release/xylo_text_report.wasm \
   sdk/plugins/examples/text-report/package.json /absolute/new-package-directory
 ```
 

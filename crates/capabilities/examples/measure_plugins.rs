@@ -2,7 +2,7 @@
 //!
 //! Build with the pinned release graph, then run without a concurrent compiler:
 //! CARGO_TARGET_DIR="$PWD/target/performance" cargo build --locked --release \
-//!   -p workbench-capabilities --example measure_plugins
+//!   -p xylo-capabilities --example measure_plugins
 //! target/performance/release/examples/measure_plugins --output /absolute/run.json \
 //!   --source-fingerprint SHA256
 use anyhow::{Context, Result, ensure};
@@ -16,8 +16,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_capabilities::{CapabilityConfig, CapabilityService};
-use workbench_core::{
+use xylo_capabilities::{CapabilityConfig, CapabilityService};
+use xylo_core::{
     NativePluginManifest, PluginBudgets, PluginCatalog, PluginInspection, PluginManagementResult,
     now_ms,
 };

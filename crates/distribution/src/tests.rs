@@ -5,6 +5,21 @@ use std::io::Cursor;
 fn keys() -> KeyPair {
     KeyPair::generate_unencrypted_keypair().unwrap()
 }
+
+#[test]
+fn fresh_build_does_not_require_packaging_configuration_or_create_update_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("updates");
+    assert!(
+        Updater::for_application(data.clone(), directory.path().join("xylo"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(!data.exists());
+    let policy = UpdatePolicy::default();
+    assert_eq!(policy.application_id, "com.qurkos.xylo");
+    assert!(policy.validate().is_err());
+}
 fn signature(keys: &KeyPair, bytes: &[u8]) -> String {
     STANDARD.encode(
         minisign::sign(
@@ -37,8 +52,7 @@ fn fixture(keys: &KeyPair) -> (tempfile::TempDir, Updater) {
         "0.1.0".parse().unwrap(),
         native_target().unwrap(),
         dir.path().join("updates"),
-        dir.path()
-            .join("Current.app/Contents/MacOS/agent-workbench"),
+        dir.path().join("Current.app/Contents/MacOS/xylo"),
     )
     .unwrap();
     (dir, updater)
@@ -310,9 +324,9 @@ fn app_archive(link: Option<&str>) -> Vec<u8> {
     let mut archive = tar::Builder::new(encoder);
     for path in [
         "Contents/Info.plist",
-        "Contents/MacOS/agent-workbench",
-        "Contents/MacOS/workbench-worker",
-        "Contents/MacOS/workbench-helper",
+        "Contents/MacOS/xylo",
+        "Contents/MacOS/xylo-worker",
+        "Contents/MacOS/xylo-helper",
     ] {
         let bytes = b"fixture release";
         let mut header = tar::Header::new_gnu();
@@ -365,7 +379,7 @@ fn macos_transaction_preserves_old_bundle_on_verification_failure_and_replaces_a
     macos::replace(&archive, &destination, |_| Ok(())).unwrap();
     assert!(!destination.join("old").exists());
     assert_eq!(
-        fs::read(destination.join("Contents/MacOS/workbench-helper")).unwrap(),
+        fs::read(destination.join("Contents/MacOS/xylo-helper")).unwrap(),
         b"fixture release"
     );
 }

@@ -1,6 +1,6 @@
 use super::*;
 use image::{GenericImageView, ImageBuffer, Rgb};
-use workbench_core::{PermissionMode, ProviderConfig, TurnRequest};
+use xylo_core::{PermissionMode, ProviderConfig, TurnRequest};
 
 fn encoded(format: ImageFormat) -> Vec<u8> {
     let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(48, 32, |x, y| {
@@ -176,7 +176,7 @@ fn user_turn_reopen_preserves_refs_and_idempotency_rejects_changed_images() {
     turn.attachments.clear();
     assert!(reopened.register_user_turn(&turn).is_err());
     assert_eq!(reopened.messages(session, 10).unwrap().len(), 1);
-    let wire = serde_json::to_vec(&workbench_core::Envelope::new(
+    let wire = serde_json::to_vec(&xylo_core::Envelope::new(
         turn.turn_id,
         Some(session),
         0,

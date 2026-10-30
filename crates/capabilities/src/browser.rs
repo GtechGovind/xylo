@@ -26,7 +26,7 @@ use std::{
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ToolDefinition, ToolObservation};
+use xylo_core::{ToolDefinition, ToolObservation};
 
 struct Session {
     browser: Browser,
@@ -459,10 +459,10 @@ mod tests {
 
     /// Separate platform acceptance from the dependency-free offline suite.
     #[tokio::test]
-    #[ignore = "Requires an explicit local Chromium executable in WORKBENCH_CHROMIUM"]
+    #[ignore = "Requires an explicit local Chromium executable in XYLO_CHROMIUM"]
     async fn managed_chromium_performs_real_cdp_workflow_on_loopback() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let executable = std::env::var_os("WORKBENCH_CHROMIUM").expect("Set WORKBENCH_CHROMIUM");
+        let executable = std::env::var_os("XYLO_CHROMIUM").expect("Set XYLO_CHROMIUM");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let http = tokio::spawn(async move {

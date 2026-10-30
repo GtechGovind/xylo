@@ -1,6 +1,6 @@
 use super::*;
 use crate::{ActionResolutionOutcome, ActionReviewForm, ActionReviewFormWrite};
-use workbench_services::ActionIntent;
+use xylo_services::ActionIntent;
 
 fn seed(host: &HostState) -> (ActionReviewScope, Uuid) {
     let scope = ActionReviewScope {
@@ -55,7 +55,13 @@ fn request(host: &HostState, scope: ActionReviewScope, id: Uuid) -> ActionResolu
 }
 fn client() -> (HostClient, Receiver<HostCommand>) {
     let (commands, incoming) = async_channel::bounded(16);
-    (HostClient { commands }, incoming)
+    (
+        HostClient {
+            commands,
+            discovery: Default::default(),
+        },
+        incoming,
+    )
 }
 async fn dispatch(host: &Arc<HostState>, incoming: &Receiver<HostCommand>) {
     let command = incoming.recv().await.unwrap();

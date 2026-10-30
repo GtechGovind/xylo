@@ -132,15 +132,96 @@ fn maybe_nous_401_diagnostic(
     ))
 }
 
+// Native provider diagnostics retain code/type separately from explanatory text
+// and correlation metadata. Request IDs and reflected text cannot set policy.
+fn structured_stream_error_class(lower: &str) -> Option<ErrorClass> {
+    let fields = lower
+        .split_once("provider stream error (")?
+        .1
+        .split_once(')')?
+        .0;
+    let mut code = None;
+    let mut kind = None;
+    for field in fields.split(',').map(str::trim) {
+        if let Some(value) = field.strip_prefix("code=") {
+            code = Some(value);
+        }
+        if let Some(value) = field.strip_prefix("type=") {
+            kind = Some(value);
+        }
+    }
+    let is = |values: &[&str]| {
+        code.is_some_and(|value| values.contains(&value))
+            || kind.is_some_and(|value| values.contains(&value))
+    };
+    if is(&["context_length_exceeded", "context_window_exceeded", "413"]) {
+        Some(ErrorClass::ContextOverflow)
+    } else if is(&[
+        "invalid_request_error",
+        "invalid_request",
+        "invalid_argument",
+        "bad_request",
+        "model_not_found",
+        "invalid_model",
+        "400",
+        "404",
+        "422",
+    ]) {
+        Some(ErrorClass::Fatal)
+    } else if is(&[
+        "authentication_error",
+        "authentication_failed",
+        "invalid_api_key",
+        "permission_error",
+        "permission_denied",
+        "401",
+        "403",
+    ]) {
+        Some(ErrorClass::Auth)
+    } else if is(&[
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "too_many_requests",
+        "resource_exhausted",
+        "429",
+    ]) {
+        Some(ErrorClass::RateLimit)
+    } else if is(&[
+        "server_error",
+        "internal_server_error",
+        "api_error",
+        "overloaded_error",
+        "service_unavailable",
+        "timeout",
+        "500",
+        "502",
+        "503",
+        "504",
+    ]) {
+        Some(ErrorClass::Retryable)
+    } else {
+        // A typed but unrecognized rejection stays terminal. Its arbitrary
+        // request ID, field path or message must not imply a retryable status.
+        Some(ErrorClass::Fatal)
+    }
+}
+
 fn classify_error(err: &str) -> ErrorClass {
     let lower = err.to_lowercase();
-    let model_not_found = lower.contains("model not found")
+    if let Some(class) = structured_stream_error_class(&lower) {
+        return class;
+    }
+    let model_not_found = lower.contains("model_not_found")
+        || lower.contains("model not found")
         || lower.contains("invalid model")
         || lower.contains("no such model")
         || lower.contains("unknown model");
     let openrouter_privacy_guardrail =
         lower.contains("privacy guardrail") || lower.contains("openrouter privacy");
 
+    if model_not_found {
+        return ErrorClass::Fatal;
+    }
     if lower.contains("rate limit")
         || lower.contains("429")
         || lower.contains("too many")
@@ -247,8 +328,14 @@ fn preferred_tool_payload_fallback_model(provider_hint: &str, model_name: &str) 
 }
 
 fn is_transient_stream_error(err: &AgentError) -> bool {
+    if let Some((retryable, _)) = err.provider_retry_policy() {
+        return retryable;
+    }
     fn has_transient_phrase(msg: &str) -> bool {
         let lower = msg.to_lowercase();
+        if let Some(class) = structured_stream_error_class(&lower) {
+            return matches!(class, ErrorClass::Retryable | ErrorClass::RateLimit);
+        }
         lower.contains("timeout")
             || lower.contains("connection")
             || lower.contains("disconnected")
@@ -265,6 +352,7 @@ fn is_transient_stream_error(err: &AgentError) -> bool {
     }
 
     match err {
+        AgentError::ProviderHttp { .. } | AgentError::ProviderTransport { .. } => false, // handled above
         AgentError::Timeout(_) => true,
         AgentError::LlmApi(msg)
         | AgentError::Gateway(msg)
@@ -286,7 +374,7 @@ fn jittered_backoff(attempt: u32, base_ms: u64, max_ms: u64) -> Duration {
     let capped = exp.min(max_ms);
     let jitter = capped / 4;
     let delay = capped.saturating_sub(jitter / 2) + (rand_u64_range(0, jitter.max(1)));
-    Duration::from_millis(delay)
+    Duration::from_millis(delay.min(max_ms))
 }
 
 fn rand_u64_range(min: u64, max: u64) -> u64 {
@@ -515,11 +603,7 @@ fn redact_sensitive_text(value: &str) -> Option<String> {
             redacted = next;
         }
     }
-    if changed {
-        Some(redacted)
-    } else {
-        None
-    }
+    if changed { Some(redacted) } else { None }
 }
 
 fn truncate_hook_preview(text: &str, max_chars: usize) -> String {

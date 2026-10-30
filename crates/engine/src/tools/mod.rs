@@ -3,6 +3,7 @@
 mod builtin;
 mod code;
 mod image_generation;
+mod portable;
 use anyhow::{Context, Result, bail, ensure};
 pub(crate) use code::shell_name;
 use parking_lot::Mutex;
@@ -15,13 +16,13 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_capabilities::{CapabilityConfig, CapabilityService};
-use workbench_core::{
+use xylo_capabilities::{CapabilityConfig, CapabilityService};
+use xylo_core::{
     ConnectorConfig, EngineEvent, MemoryRecord, PermissionMode, ToolDefinition, TurnRequest,
 };
-use workbench_services::{
-    ActionDecision, ActionIntent, ConnectorBroker, CredentialVault, JournalAction, LearningService,
-    NativeConnectors, SqliteMemory, Store,
+use xylo_services::{
+    ActionDecision, ActionIntent, ConnectorBroker, ConnectorLaunchScope, CredentialVault,
+    JournalAction, LearningService, NativeConnectors, SqliteMemory, Store,
 };
 
 type Delegate = Arc<dyn Fn(&str, Value) -> Result<Value> + Send + Sync>;
@@ -110,13 +111,17 @@ pub struct ToolBroker {
     store: Store,
     memory: SqliteMemory,
     capabilities: CapabilityService,
+    capability_config: CapabilityConfig,
     definitions: Vec<ToolDefinition>,
+    /// Immutable turn-admission discovery snapshot; dispatch still authorizes live.
+    advertised: Vec<ToolDefinition>,
+    allowed_tools: Option<std::collections::HashSet<String>>,
     approvals: ApprovalGate,
     events: tokio::sync::mpsc::Sender<EngineEvent>,
     cancel: CancellationToken,
     artifacts: PathBuf,
     runtime: tokio::runtime::Handle,
-    resources: workbench_runtime::resources::ResourceManager,
+    resources: xylo_runtime::resources::ResourceManager,
     delegate: Mutex<Option<Delegate>>,
     connectors: ConnectorBroker,
     native: NativeConnectors,
@@ -132,12 +137,34 @@ impl ToolBroker {
         cancel: CancellationToken,
     ) -> Result<Self> {
         let artifacts = config.artifacts.clone();
-        let capabilities = CapabilityService::new(config)?;
+        let capabilities = CapabilityService::new(config.clone())?;
         let image_generation = image_generation::Configuration::load(&artifacts);
         let mut definitions = builtin::definitions();
+        definitions.extend(portable::definitions());
         definitions.push(image_generation.definition());
         definitions.extend(capabilities.tool_definitions());
-        let vault = CredentialVault::new(workbench_core::CREDENTIAL_SERVICE)?;
+        let has_connectors = !store.connectors()?.is_empty();
+        let advertised = definitions
+            .iter()
+            .filter(|definition| {
+                (request.permissions != PermissionMode::ReadOnly || !definition.writes)
+                    && (definition.name != "image_generate" || image_generation.is_configured())
+                    && (!matches!(
+                        definition.name.as_str(),
+                        "connector_call" | "connector_tools"
+                    ) || has_connectors)
+            })
+            .cloned()
+            .collect();
+        let vault = CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?;
+        let connector_scope = ConnectorLaunchScope {
+            workspace: request.workspace.clone(),
+            protected_paths: artifacts
+                .parent()
+                .map(|path| vec![path.to_owned()])
+                .unwrap_or_default(),
+            ..Default::default()
+        };
         Ok(Self {
             memory: SqliteMemory::configured(
                 store.clone(),
@@ -145,23 +172,83 @@ impl ToolBroker {
                     .parent()
                     .context("Artifacts directory has no application data parent")?
                     .join("embedding.json"),
-            )?,
+            )
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    "Optional embedding configuration unavailable; using lexical memory"
+                );
+                SqliteMemory::new(store.clone())
+            }),
             request,
-            connectors: ConnectorBroker::new(store.clone(), vault.clone()),
+            connectors: ConnectorBroker::new(store.clone(), vault.clone())
+                .with_local_scope(connector_scope),
             native: NativeConnectors::new(vault)?,
             image_generation,
             store,
             capabilities,
+            capability_config: config,
             definitions,
+            advertised,
+            allowed_tools: None,
             approvals,
             events,
             cancel,
             artifacts,
             runtime: tokio::runtime::Handle::current(),
-            resources: workbench_runtime::resources::ResourceManager::new(),
+            resources: xylo_runtime::resources::ResourceManager::new(),
             delegate: Mutex::new(None),
         })
     }
+    /// A child shares durable identity and admission but owns cancellation and
+    /// connector processes. Cancelling it never cancels its parent or siblings.
+    pub(crate) fn scoped_child(&self) -> Result<Self> {
+        let mut child = Self::new(
+            self.request.clone(),
+            self.store.clone(),
+            self.capability_config.clone(),
+            self.approvals.clone(),
+            self.events.clone(),
+            self.cancel.child_token(),
+        )?;
+        child.memory = self.memory.clone();
+        child.resources = self.resources.clone();
+        child.advertised = self.advertised.clone();
+        Ok(child)
+    }
+    pub(crate) fn restrict_tools(&mut self, requested: &[String]) -> Result<()> {
+        let mut allowed = std::collections::HashSet::new();
+        for name in requested {
+            let names: &[&str] = match name.as_str() {
+                "Read" => &["file_read", "extension_resource"],
+                "Write" => &["file_write"],
+                "Edit" => &["file_edit"],
+                "Glob" => &["find_files", "files_list"],
+                "Grep" => &["search_project"],
+                "Bash" => &["shell_command", "run_command"],
+                name if self
+                    .definitions
+                    .iter()
+                    .any(|definition| definition.name == name) =>
+                {
+                    &[name]
+                }
+                _ => bail!(
+                    "Unsupported child tool constraint: {name}. Use an exact host tool name or supported alias; parameter constraints are not widened."
+                ),
+            };
+            allowed.extend(names.iter().map(|name| name.to_string()));
+        }
+        self.definitions
+            .retain(|definition| allowed.contains(&definition.name));
+        self.advertised
+            .retain(|definition| allowed.contains(&definition.name));
+        self.allowed_tools = Some(allowed);
+        Ok(())
+    }
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
     pub fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
     }
@@ -221,6 +308,7 @@ impl ToolBroker {
         if !included.is_empty() {
             learning.record_retrieval(self.request.session_id, self.request.turn_id, &included)?;
         }
+        context.push_str(&portable::context(self)?);
         Ok(context)
     }
     pub fn set_delegate(&self, handler: Delegate) {
@@ -229,7 +317,9 @@ impl ToolBroker {
     /// Core coding tools are always offered directly; specialized capabilities
     /// stay discoverable through search_tools/call_tool to keep the prompt small.
     pub fn initial_definitions(&self) -> Vec<ToolDefinition> {
-        const CORE: [&str; 16] = [
+        const CORE: [&str; 18] = [
+            "extension_skill",
+            "extension_resource",
             "file_read",
             "file_edit",
             "file_write",
@@ -249,13 +339,13 @@ impl ToolBroker {
         ];
         let prompt = self.request.prompt.to_lowercase();
         let mut chosen: Vec<ToolDefinition> = self
-            .definitions
+            .advertised
             .iter()
             .filter(|d| CORE.contains(&d.name.as_str()))
             .cloned()
             .collect();
         chosen.extend(
-            self.definitions
+            self.advertised
                 .iter()
                 .filter(|d| {
                     !CORE.contains(&d.name.as_str())
@@ -371,6 +461,12 @@ impl ToolBroker {
                     .unwrap_or_else(|| json!({})),
             );
         }
+        ensure!(
+            self.allowed_tools
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(name)),
+            "This child is not authorized to call tool '{name}'"
+        );
         let key = Self::journal_key(namespace, call_id);
         if let Some(action) =
             self.store
@@ -417,7 +513,18 @@ impl ToolBroker {
             !self.cancel.is_cancelled(),
             "Task cancelled before tool dispatch"
         );
-        let definition = self.effective_definition(name, &arguments)?;
+        // Use one immutable skill snapshot for classification, approval and
+        // execution. A package update must not add executable commands after
+        // a read-only classification or replace code under an old approval.
+        let skill_snapshot = if name == "extension_skill" {
+            Some(portable::load(self, &arguments)?)
+        } else {
+            None
+        };
+        let mut definition = self.effective_definition(name, &arguments)?;
+        if let Some(skill) = &skill_snapshot {
+            definition.writes = !skill.dynamic_commands.is_empty();
+        }
         ensure!(
             self.request.permissions != PermissionMode::ReadOnly || !definition.writes,
             "{name} requires write permission; this task is read-only"
@@ -428,12 +535,31 @@ impl ToolBroker {
         if name == "environment_execute" {
             // Reject malformed fresh requests before an approval or running
             // intent exists. Cached identities above remain authoritative.
-            let _: workbench_core::EnvironmentExecuteRequest =
-                serde_json::from_value(arguments.clone())
-                    .context("Invalid environment command request")?;
+            let _: xylo_core::EnvironmentExecuteRequest = serde_json::from_value(arguments.clone())
+                .context("Invalid environment command request")?;
         }
+        let component_snapshot = if name == "extension_component" && definition.writes {
+            Some(
+                portable::service(self).component_status(
+                    arguments["id"].as_str().context("Extension id required")?,
+                    arguments["component"]
+                        .as_str()
+                        .context("Component required")?,
+                )?,
+            )
+        } else {
+            None
+        };
         let presentation = match name {
             "image_generate" => self.image_generation.approval(&arguments)?,
+            "extension_skill" => {
+                let snapshot = skill_snapshot.as_ref().context("Skill snapshot missing")?;
+                json!({"request":arguments,"package_root":snapshot.package_root,"dynamic_commands":snapshot.dynamic_commands,"fork":snapshot.fork,"agent":snapshot.agent,"requested_model":snapshot.model,"allowed_tools":snapshot.allowed_tools})
+            }
+            "extension_component" if component_snapshot.is_some() => {
+                let snapshot = component_snapshot.as_ref().unwrap();
+                json!({"request":arguments,"digest":snapshot.digest,"workspace":snapshot.setup.workspace,"allowed_domains":snapshot.setup.allowed_domains,"environment_names":snapshot.setup.environment.keys().chain(snapshot.setup.credential_refs.keys()).collect::<Vec<_>>(),"timeout_seconds":snapshot.setup.timeout_seconds})
+            }
             // Show the actual change, and reject an inapplicable edit before
             // any intent or approval exists.
             "file_write" | "file_edit" => {
@@ -453,7 +579,7 @@ impl ToolBroker {
             .transpose()?;
         let _action_scope = execution_lease
             .as_ref()
-            .map(|lease| workbench_runtime::resources::ActionLeaseScope::enter(lease.file()));
+            .map(|lease| xylo_runtime::resources::ActionLeaseScope::enter(lease.file()));
         let intent = ActionIntent {
             id,
             session_id: self.request.session_id,
@@ -476,6 +602,18 @@ impl ToolBroker {
             }
             ActionDecision::InFlight => bail!("Action is already executing"),
             ActionDecision::OutcomeUnknown => bail!("Action outcome is unknown"),
+        }
+        if let Some(snapshot) = &skill_snapshot {
+            self.store.record_extension_action_binding(
+                id,
+                &json!({"kind":"skill","snapshot":snapshot}),
+            )?;
+        }
+        if let Some(snapshot) = &component_snapshot {
+            self.store.record_extension_action_binding(
+                id,
+                &json!({"kind":"component","snapshot":snapshot}),
+            )?;
         }
         if let Err(error) = self.emit(EngineEvent::ToolStarted {
             action_id: id,
@@ -540,6 +678,14 @@ impl ToolBroker {
         // All fallible execution branches stay inside this closure, so no `?`
         // can strand a running action without recording failure/uncertainty.
         let execution = (|| -> Result<Value> {
+            if name != "extension_component" {
+                self.run_event_hooks(namespace, call_id, "PreToolUse", name, &arguments, None)
+                    .map_err(|error| {
+                        code::unapplied(format!(
+                            "Pre-tool hook prevented this operation: {error:#}"
+                        ))
+                    })?;
+            }
             let result = if name == "search_tools" {
                 let query = arguments
                     .get("query")
@@ -548,7 +694,7 @@ impl ToolBroker {
                     .to_lowercase();
                 let words: Vec<_> = query.split_whitespace().collect();
                 let matches: Vec<_> = self
-                    .definitions
+                    .advertised
                     .iter()
                     .filter(|d| {
                         (namespace.is_none() || d.name != "agent_delegate")
@@ -560,31 +706,41 @@ impl ToolBroker {
                     .collect();
                 json!({"status":"success","summary":matches,"next_actions":["Use call_tool with the selected tool name and documented arguments"],"artifacts":[]})
             } else if name == "agent_delegate" {
-                self.delegate
-                    .lock()
-                    .clone()
-                    .context("Subagent executor is unavailable")?(
-                    &key, arguments.clone()
-                )?
+                // End the registration guard before the blocking callback;
+                // admission and resource leases govern parallel child work.
+                let handler =
+                    { self.delegate.lock().clone() }.context("Subagent executor is unavailable")?;
+                handler(&key, arguments.clone())?
             } else if name.starts_with("connector_") {
                 self.execute_connector(name, &arguments)?
             } else if name == "image_generate" {
                 image_generation::execute(self, id, &arguments)?
+            } else if matches!(
+                name,
+                "extension_skill" | "extension_resource" | "extension_component"
+            ) {
+                portable::execute(
+                    self,
+                    name,
+                    &arguments,
+                    &key,
+                    component_snapshot.as_ref(),
+                    skill_snapshot.as_ref(),
+                )?
             } else if builtin::handles(name) {
                 builtin::execute(self, name, &arguments)?
             } else {
                 let operation = async {
-                    let _reservation = if let Some(demand) =
-                        workbench_runtime::resources::capability_demand(name)
-                    {
-                        Some(
-                            self.resources
-                                .acquire(demand, self.cancel.child_token())
-                                .await?,
-                        )
-                    } else {
-                        None
-                    };
+                    let _reservation =
+                        if let Some(demand) = xylo_runtime::resources::capability_demand(name) {
+                            Some(
+                                self.resources
+                                    .acquire(demand, self.cancel.child_token())
+                                    .await?,
+                            )
+                        } else {
+                            None
+                        };
                     // Capability execution owns the cross-process reservation;
                     // compiler and artifact closures retain it through cleanup.
                     self.capabilities
@@ -592,13 +748,10 @@ impl ToolBroker {
                         .await
                 };
                 let result = match &execution_lease {
-                    Some(lease) => {
-                        self.runtime
-                            .block_on(workbench_runtime::resources::scope_action(
-                                lease.file(),
-                                operation,
-                            ))
-                    }
+                    Some(lease) => self.runtime.block_on(xylo_runtime::resources::scope_action(
+                        lease.file(),
+                        operation,
+                    )),
                     None => self.runtime.block_on(operation),
                 }?;
                 serde_json::to_value(result)?
@@ -619,6 +772,24 @@ impl ToolBroker {
                     }
                     return Err(error)
                         .context("Tool completed but durable result could not be confirmed");
+                }
+                let mut result = result;
+                if name != "extension_component" {
+                    if let Err(error) = self.run_event_hooks(
+                        namespace,
+                        call_id,
+                        "PostToolUse",
+                        name,
+                        &arguments,
+                        Some(&result),
+                    ) {
+                        let message = format!("Tool completed; post-tool hook failed: {error:#}");
+                        if let Some(fields) = result.as_object_mut() {
+                            fields.insert("post_tool_hook_error".into(), json!(message));
+                        } else {
+                            result = json!({"status":"success","summary":result,"post_tool_hook_error":message});
+                        }
+                    }
                 }
                 let model = self.model_result(id, result.clone());
                 let presented = self.bound_result(id, result);
@@ -659,18 +830,18 @@ impl ToolBroker {
                 let message = format!("{error:#}");
                 let definitive_rejection = error.downcast_ref::<code::Unapplied>().is_some()
                     || error
-                        .downcast_ref::<workbench_runtime::process::NotStarted>()
+                        .downcast_ref::<xylo_runtime::process::NotStarted>()
                         .is_some()
                     || error
                         .downcast_ref::<image_generation::DefinitiveFailure>()
                         .is_some()
                     || (name == "connector_call"
                         && error
-                            .downcast_ref::<workbench_services::ConnectorNotDispatched>()
+                            .downcast_ref::<xylo_services::ConnectorNotDispatched>()
                             .is_some())
                     || (name == "environment_execute"
                         && error
-                            .downcast_ref::<workbench_capabilities::environments::CommandNotDispatched>()
+                            .downcast_ref::<xylo_capabilities::environments::CommandNotDispatched>()
                             .is_some());
                 if definition.writes && !definitive_rejection {
                     self.store.mark_action_unknown(id, &message)?
@@ -686,6 +857,87 @@ impl ToolBroker {
                 Err(error)
             }
         }
+    }
+    fn run_event_hooks(
+        &self,
+        namespace: Option<&str>,
+        call_id: &str,
+        event: &str,
+        tool_name: &str,
+        arguments: &Value,
+        result: Option<&Value>,
+    ) -> Result<()> {
+        let service = portable::service(self);
+        let input = json!({"event":event,"hook_event_name":event,"tool_name":tool_name,"tool_input":arguments,"tool_response":result,"session_id":self.request.session_id,"cwd":self.request.workspace});
+        let hooks = service.matching_hooks(event, &input, &self.request.workspace)?;
+        if hooks.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            !self
+                .store
+                .unresolved_actions(self.request.session_id)?
+                .iter()
+                .any(|action| action.state == "outcome_unknown"
+                    && action.intent.name == "extension_component"
+                    && action
+                        .intent
+                        .arguments
+                        .get("operation")
+                        .and_then(Value::as_str)
+                        == Some("event")),
+            "A previous hook outcome is unknown; reconcile its action before further hook execution"
+        );
+        for (index, hook) in hooks.into_iter().enumerate() {
+            let hook_id = format!("{call_id}:hook:{event}:{index}");
+            let args = json!({"id":hook.package,"component":hook.component,"operation":"event","input":input});
+            self.execute_scoped(namespace, &hook_id, "extension_component", args)?;
+            let actual = self
+                .store
+                .action_for_key(
+                    self.request.session_id,
+                    self.request.turn_id,
+                    &Self::journal_key(namespace, &hook_id),
+                )?
+                .and_then(|action| action.result)
+                .context("Hook outcome was not recorded")?;
+            for entry in actual
+                .get("results")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                ensure!(
+                    entry
+                        .pointer("/hook_control/blocked")
+                        .and_then(Value::as_bool)
+                        != Some(true),
+                    "Configured hook blocked this operation or requested separate approval"
+                );
+                let output = &entry["output"];
+                ensure!(
+                    output.pointer("/hookSpecificOutput/updatedInput").is_none()
+                        && output.get("updatedInput").is_none()
+                        && output
+                            .pointer("/hookSpecificOutput/updatedToolInput")
+                            .is_none()
+                        && output
+                            .pointer("/hookSpecificOutput/updatedMCPToolOutput")
+                            .is_none(),
+                    "Unsupported hook execution-changing directive; updatedInput/output replacement requires host validation and renewed approval"
+                );
+                let decision = output
+                    .pointer("/hookSpecificOutput/permissionDecision")
+                    .or_else(|| output.get("decision"))
+                    .and_then(Value::as_str);
+                ensure!(
+                    output.get("continue").and_then(Value::as_bool) != Some(false)
+                        && decision.is_none_or(|decision| matches!(decision, "allow" | "approve")),
+                    "Configured hook blocked this operation or requested separate approval"
+                );
+            }
+        }
+        Ok(())
     }
     fn connector(&self, args: &Value) -> Result<ConnectorConfig> {
         let id = Uuid::parse_str(
@@ -727,9 +979,11 @@ impl ToolBroker {
                     &args.get("arguments").cloned().unwrap_or_else(|| json!({})),
                 )?;
             }
-            definition.writes = target.writes;
+            definition.writes = is_mcp(&config) || target.writes;
         } else if name == "connector_tools" {
             definition.writes = self.connector(args)?.transport == "stdio";
+        } else if name == "extension_component" {
+            definition.writes = args.get("operation").and_then(Value::as_str) != Some("status");
         }
         Ok(definition)
     }
@@ -1024,7 +1278,7 @@ fn observation_failed(value: &Value) -> bool {
             .is_some_and(|status| {
                 matches!(
                     status,
-                    "error" | "failed" | "failure" | "cancelled" | "timeout" | "outcome_unknown"
+                    "error" | "failed" | "failure" | "incomplete" | "cancelled" | "timeout" | "outcome_unknown"
                 )
             })
 }

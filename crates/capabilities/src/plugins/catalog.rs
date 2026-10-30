@@ -17,7 +17,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::{
+use xylo_core::{
     InstalledPlugin, NativePluginManifest, PluginCatalog, PluginInspection, PluginManagementResult,
 };
 
@@ -276,7 +276,7 @@ pub(super) fn inspect(path: &str, cancel: &CancellationToken) -> Result<Package>
 }
 
 fn package_hash(manifest: &[u8], module: &[u8]) -> String {
-    let mut bytes = b"workbench-native-plugin-v1\0".to_vec();
+    let mut bytes = b"xylo-native-plugin-v1\0".to_vec();
     bytes.extend_from_slice(&(manifest.len() as u64).to_le_bytes());
     bytes.extend_from_slice(manifest);
     bytes.extend_from_slice(hash(module).as_bytes());

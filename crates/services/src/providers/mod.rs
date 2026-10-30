@@ -15,7 +15,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use url::Url;
-use workbench_core::{ApiFamily, ProviderConfig, now_ms};
+use xylo_core::{ApiFamily, ProviderConfig, now_ms};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -74,10 +74,10 @@ fn append(url: &Url, suffix: &str) -> Result<Url> {
     Ok(result)
 }
 
-/// Accept a service root, version root, or complete inference endpoint. Queries
-/// are preserved (legacy Azure api-version), credentials and fragments rejected.
-pub fn normalize_provider(config: &ProviderConfig) -> Result<NormalizedProvider> {
-    let mut base = Url::parse(config.endpoint.trim()).context("Invalid provider endpoint URL")?;
+/// Validate both inference and an explicitly supplied catalog destination.
+/// Never accept embedded credentials or a silent redirect destination.
+fn provider_url(endpoint: &str) -> Result<Url> {
+    let base = Url::parse(endpoint.trim()).context("Invalid provider endpoint URL")?;
     ensure!(
         base.username().is_empty() && base.password().is_none() && base.fragment().is_none(),
         "Provider endpoint must not contain credentials or a fragment"
@@ -123,6 +123,16 @@ pub fn normalize_provider(config: &ProviderConfig) -> Result<NormalizedProvider>
             && !base.path().contains("/backend-api"),
         "Use the official public API endpoint; ChatGPT backend-api endpoints are not supported"
     );
+    Ok(base)
+}
+
+/// Accept a service root, version root, or complete inference endpoint. Queries
+/// are preserved (legacy Azure api-version), credentials and fragments rejected.
+pub fn normalize_provider(config: &ProviderConfig) -> Result<NormalizedProvider> {
+    // Validate metadata before persisting a connection or updating its secret.
+    ProviderCredential::None.headers(&config.family, &config.headers)?;
+    let mut base = provider_url(&config.endpoint)?;
+    let loopback = matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     let path = base.path().trim_end_matches('/').to_owned();
     let protocol = protocol_capabilities(&config.family).protocol;
     let mut aws_region = None;
@@ -243,6 +253,20 @@ pub fn normalize_provider(config: &ProviderConfig) -> Result<NormalizedProvider>
                 });
             (inference, streaming, catalog)
         }
+    };
+    let models_url = if let Some(custom) = config
+        .discovery_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        ensure!(
+            !matches!(config.family, ApiFamily::Bedrock),
+            "Custom catalog URLs are not supported for signed Bedrock discovery"
+        );
+        Some(provider_url(custom)?)
+    } else {
+        models_url
     };
     Ok(NormalizedProvider {
         base_url: base,

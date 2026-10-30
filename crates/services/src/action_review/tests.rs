@@ -10,7 +10,7 @@ impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().canonicalize().unwrap();
-        let store = Store::open(workspace.join("workbench.db")).unwrap();
+        let store = Store::open(workspace.join("xylo.db")).unwrap();
         let scope = ActionReviewScope {
             session_id: Uuid::new_v4(),
             workspace,
@@ -108,7 +108,7 @@ fn explicit_outcomes_preserve_original_observation_audit_and_restart_replay() {
                 "failed"
             }
         );
-        let reopened = Store::open(f.directory.path().join("workbench.db")).unwrap();
+        let reopened = Store::open(f.directory.path().join("xylo.db")).unwrap();
         assert_eq!(
             reopened
                 .resolve_action(request.clone(), &CancellationToken::new())
@@ -403,7 +403,7 @@ fn durable_review_form_cas_retains_exact_pending_identity_after_restart() {
         })
         .unwrap();
     assert!(saved.saved);
-    let reopened = Store::open(f.directory.path().join("workbench.db")).unwrap();
+    let reopened = Store::open(f.directory.path().join("xylo.db")).unwrap();
     assert_eq!(
         reopened.action_review_form(f.scope.clone()).unwrap().form,
         form
@@ -471,7 +471,7 @@ fn durable_review_form_cas_retains_exact_pending_identity_after_restart() {
     assert!(after_receipt.snapshot.form.pending.is_none());
     assert_eq!(after_receipt.snapshot.form.evidence, newer_note.evidence);
     assert_eq!(
-        Store::open(f.directory.path().join("workbench.db"))
+        Store::open(f.directory.path().join("xylo.db"))
             .unwrap()
             .action_review_form(f.scope.clone())
             .unwrap(),
@@ -694,11 +694,11 @@ fn real_process_store_lease_blocks_review_until_owner_death_and_preserves_eviden
                 "--nocapture",
             ])
             .env(
-                "WORKBENCH_LEASE_TEST_DATABASE",
-                fixture.directory.path().join("workbench.db"),
+                "XYLO_LEASE_TEST_DATABASE",
+                fixture.directory.path().join("xylo.db"),
             )
-            .env("WORKBENCH_LEASE_TEST_ACTION", id.to_string())
-            .env("WORKBENCH_LEASE_TEST_READY", &ready)
+            .env("XYLO_LEASE_TEST_ACTION", id.to_string())
+            .env("XYLO_LEASE_TEST_READY", &ready)
             .env("RUST_BACKTRACE", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -718,7 +718,7 @@ fn real_process_store_lease_blocks_review_until_owner_death_and_preserves_eviden
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    let second = Store::open(fixture.directory.path().join("workbench.db")).unwrap();
+    let second = Store::open(fixture.directory.path().join("xylo.db")).unwrap();
     let detail = second.action_review(fixture.scope.clone(), id).unwrap();
     assert!(detail.action.busy);
     assert!(second.lock_action_execution(id).is_err());
@@ -776,12 +776,11 @@ fn real_process_store_lease_blocks_review_until_owner_death_and_preserves_eviden
 #[ignore = "Subprocess helper invoked only by the bounded owner-death regression"]
 fn child_process_holds_store_execution_lease() {
     let database =
-        PathBuf::from(std::env::var_os("WORKBENCH_LEASE_TEST_DATABASE").expect("Child database"));
-    let id = Uuid::parse_str(&std::env::var("WORKBENCH_LEASE_TEST_ACTION").expect("Child action"))
-        .unwrap();
-    let ready = PathBuf::from(
-        std::env::var_os("WORKBENCH_LEASE_TEST_READY").expect("Child readiness file"),
-    );
+        PathBuf::from(std::env::var_os("XYLO_LEASE_TEST_DATABASE").expect("Child database"));
+    let id =
+        Uuid::parse_str(&std::env::var("XYLO_LEASE_TEST_ACTION").expect("Child action")).unwrap();
+    let ready =
+        PathBuf::from(std::env::var_os("XYLO_LEASE_TEST_READY").expect("Child readiness file"));
     let store = Store::open(database).unwrap();
     let _lease = store.lock_action_execution(id).unwrap();
     std::fs::write(ready, b"lease held").unwrap();

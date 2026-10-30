@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/runtime", "crates/resources", "crates/worker", "crates/desktop", "crates/services", "crates/capabilities", "crates/engine", "crates/scheduler", "crates/helper-client", "crates/helper", "crates/distribution", "crates/notifications"]
-default-members = ["crates/desktop", "crates/worker", "crates/helper"]
-exclude = ["vendor/hermes-ultra"]
+default-members = ["crates/desktop"]
+exclude = ["vendor/hermes-ultra", "vendor/block"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,16 +20,16 @@ tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-core = { path = "crates/core" }
-runtime = { path = "crates/runtime" }
-resources = { path = "crates/resources" }
-services = { path = "crates/services" }
-capabilities = { path = "crates/capabilities" }
-engine = { path = "crates/engine" }
-scheduler = { path = "crates/scheduler" }
-helper-client = { path = "crates/helper-client" }
-distribution = { path = "crates/distribution" }
-notifications = { path = "crates/notifications" }
+xylo-core = { path = "crates/core" }
+xylo-runtime = { path = "crates/runtime" }
+xylo-resources = { path = "crates/resources" }
+xylo-services = { path = "crates/services" }
+xylo-capabilities = { path = "crates/capabilities" }
+xylo-engine = { path = "crates/engine" }
+xylo-scheduler = { path = "crates/scheduler" }
+xylo-helper-client = { path = "crates/helper-client" }
+xylo-distribution = { path = "crates/distribution" }
+xylo-notifications = { path = "crates/notifications" }
 
 [profile.release]
 lto = "thin"
@@ -38,3 +38,6 @@ codegen-units = 16
 
 [profile.dev]
 debug = 1
+
+[patch.crates-io]
+block = { path = "vendor/block" }

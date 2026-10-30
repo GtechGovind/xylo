@@ -2,17 +2,19 @@
   "productName": "Xylo",
   "version": "0.1.0",
   "identifier": "com.qurkos.xylo",
-  "description": "Native workspace for AI conversations, coding and tools",
+  "description": "Workspace for AI conversations, coding and tools",
   "authors": ["Govind Yadav <gtech.govind2000@gmail.com>"],
   "licenseFile": "LICENSE",
+  "beforePackagingCommand": "npm ci --prefix crates/services/sandbox-helper --ignore-scripts --no-audit --no-fund",
   "binariesDir": "target/release",
   "outDir": "dist",
   "binaries": [
     { "path": "xylo", "main": true },
-    { "path": "worker" },
-    { "path": "helper" }
+    { "path": "xylo-worker" },
+    { "path": "xylo-helper" }
   ],
   "resources": [
+    { "src": "crates/services/sandbox-helper", "target": "sandbox-helper" },
     { "src": "LICENSE", "target": "licenses/LICENSE" },
     { "src": "NOTICE", "target": "licenses/NOTICE" },
     { "src": "vendor/hermes-ultra/LICENSE", "target": "licenses/Hermes-Ultra-LICENSE" },

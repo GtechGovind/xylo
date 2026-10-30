@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, io::Read, path::Path};
 use tokio_util::sync::CancellationToken;
-use workbench_core::NativePluginManifest;
+use xylo_core::NativePluginManifest;
 
 #[cfg(windows)]
 #[path = "windows_read.rs"]

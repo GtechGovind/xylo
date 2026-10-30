@@ -7,7 +7,7 @@ use reqwest::{Client, Method, RequestBuilder};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ConnectorConfig, ToolDefinition};
+use xylo_core::{ConnectorConfig, ToolDefinition};
 
 /// A definitive local rejection: no HTTP execution future was polled.
 ///

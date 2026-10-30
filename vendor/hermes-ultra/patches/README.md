@@ -17,7 +17,7 @@ replay cancellation, tool identity, journal and interrupted-action tests.
    Streaming and nonstreaming application tests require one real file-read tool
    plus a natural answer to complete in exactly two provider requests.
 4. **Native content replay** — stream assembly retains the application provider's
-   `workbench_content_blocks` snapshot on the assistant message. This carries
+   `xylo_content_blocks` snapshot on the assistant message. This carries
    Anthropic thinking signatures, Gemini thought signatures, Responses encrypted
    reasoning and Bedrock native content through tool rounds and checkpoints.
 5. **Explicit Bedrock credentials and framing** — the Converse provider accepts

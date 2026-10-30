@@ -1,5 +1,5 @@
 use super::*;
-use workbench_core::{PermissionMode, ProviderConfig};
+use xylo_core::{PermissionMode, ProviderConfig};
 fn fixture() -> (tempfile::TempDir, Store, DraftKey) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("draft.db")).unwrap();
@@ -239,7 +239,7 @@ fn attachment_only_draft_survives_restart_and_cross_chat_refs_are_rejected() {
         bytes: 42,
         width: 8,
         height: 8,
-        source: workbench_core::AttachmentSource::Picker,
+        source: xylo_core::AttachmentSource::Picker,
         imported_at: 7,
     };
     let mut write = request(&key, 0, "");

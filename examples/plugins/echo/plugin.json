@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "id": "org.agentworkbench.echo",
+  "id": "com.qurkos.xylo.echo",
   "name": "Echo example",
   "version": "1.0.0",
   "entrypoint": "echo.wat",

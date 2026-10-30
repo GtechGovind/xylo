@@ -2,23 +2,21 @@
 use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
-use workbench_helper_client::HelperClient;
+use xylo_helper_client::HelperClient;
 
 #[tokio::test]
-#[ignore = "Explicit downloads: set WORKBENCH_ASSET_SMOKE_DATA and WORKBENCH_ASSET_SMOKE_IDS"]
+#[ignore = "Explicit downloads: set XYLO_ASSET_SMOKE_DATA and XYLO_ASSET_SMOKE_IDS"]
 async fn selected_reviewed_assets_install_activate_and_native_pdf_executes() {
-    let data = PathBuf::from(
-        std::env::var_os("WORKBENCH_ASSET_SMOKE_DATA").expect("Explicit smoke data root"),
-    );
-    let ids =
-        std::env::var("WORKBENCH_ASSET_SMOKE_IDS").expect("Explicit comma-separated selection");
+    let data =
+        PathBuf::from(std::env::var_os("XYLO_ASSET_SMOKE_DATA").expect("Explicit smoke data root"));
+    let ids = std::env::var("XYLO_ASSET_SMOKE_IDS").expect("Explicit comma-separated selection");
     assert!(data.is_absolute());
     std::fs::create_dir_all(&data).unwrap();
     let workspace = data.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    let executable = std::env::var_os("WORKBENCH_ASSET_SMOKE_HELPER")
+    let executable = std::env::var_os("XYLO_ASSET_SMOKE_HELPER")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_workbench-helper")));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_xylo-helper")));
     let client = HelperClient::spawn(executable, &data, &workspace)
         .await
         .unwrap();
@@ -117,8 +115,8 @@ async fn selected_reviewed_assets_install_activate_and_native_pdf_executes() {
             .find(|server| server["languages"] == json!(["rust"]))
         {
             let executable = PathBuf::from(server["executable"].as_str().unwrap());
-            let result = workbench_capabilities::process::run(
-                workbench_capabilities::process::ProcessSpec {
+            let result = xylo_capabilities::process::run(
+                xylo_capabilities::process::ProcessSpec {
                     executable: executable.clone(),
                     args: vec!["--version".into()],
                     cwd: workspace.clone(),

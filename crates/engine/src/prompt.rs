@@ -43,7 +43,7 @@ pub(crate) fn system_prompt(workspace: &Path, facts: &str, procedures: &str) -> 
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         shell = crate::tools::shell_name(),
-        date = utc_date(workbench_core::now_ms()),
+        date = utc_date(xylo_core::now_ms()),
     );
     let instructions = project_instructions(workspace, repository.as_deref());
     if !instructions.is_empty() {

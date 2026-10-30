@@ -15,5 +15,11 @@ Xylo uses its own name and does not include AionUi brand artwork.
 
 Other third-party dependencies retain their respective copyright and license
 notices. Cargo.lock identifies the Rust dependency versions used by this build.
+The native macOS dependency block 0.1.6 includes a local compatibility patch;
+its upstream attribution, MIT license and patch details are in vendor/block.
+The managed OS sandbox helper uses @anthropic-ai/sandbox-runtime 0.0.81;
+its dependency versions and integrity hashes are pinned in
+crates/services/sandbox-helper/package-lock.json. Distributed helper resources
+include each dependency's original license and notice files.
 Native asset distributors must also include the notices for every supplied
 browser, inference binary, document library, speech engine and model weight.

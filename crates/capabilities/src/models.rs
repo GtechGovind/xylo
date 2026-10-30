@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ToolDefinition, ToolObservation};
+use xylo_core::{ToolDefinition, ToolObservation};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]

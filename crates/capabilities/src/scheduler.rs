@@ -1,2 +1,2 @@
 //! Lightweight durable scheduler shared with the application host.
-pub use workbench_scheduler::*;
+pub use xylo_scheduler::*;

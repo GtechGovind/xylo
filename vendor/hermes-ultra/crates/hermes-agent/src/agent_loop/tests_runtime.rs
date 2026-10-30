@@ -745,9 +745,10 @@
             },
         ];
         let deduped = AgentLoop::deduplicate_tool_calls(&calls);
-        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped.len(), 3);
         assert_eq!(deduped[0].id, "1");
-        assert_eq!(deduped[1].id, "3");
+        assert_eq!(deduped[1].id, "2");
+        assert_eq!(deduped[2].id, "3");
     }
 
     #[test]
@@ -1044,3 +1045,167 @@
     include!("tests/runtime_provider_resolution.rs");
 
     include!("tests/governor_finalizer.rs");
+
+    struct ReliabilityProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for ReliabilityProvider {
+        async fn chat_completion(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: Option<f64>,
+            _: Option<&str>,
+            _: Option<&Value>,
+        ) -> Result<LlmResponse, AgentError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(AgentError::ProviderHttp {
+                status: 429,
+                retry_after_secs: Some(1),
+                message: "界".repeat(100),
+            })
+        }
+        fn chat_completion_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: Option<f64>,
+            _: Option<&str>,
+            _: Option<&Value>,
+        ) -> BoxStream<'static, Result<StreamChunk, AgentError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(futures::stream::iter(vec![
+                Ok(StreamChunk {
+                    delta: Some(hermes_core::StreamDelta {
+                        content: None,
+                        tool_calls: Some(vec![hermes_core::ToolCallDelta {
+                            index: 0,
+                            id: Some("original-call".into()),
+                            function: None,
+                        }]),
+                        extra: None,
+                    }),
+                    finish_reason: None,
+                    usage: None,
+                }),
+                Err(AgentError::LlmApi("connection reset".into())),
+            ]))
+        }
+    }
+    fn reliability_agent() -> (AgentLoop, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut config = AgentConfig::default();
+        config.allow_model_fallbacks = false;
+        config.retry.max_retries = 2;
+        config.stream_read_max_retries = 2;
+        (
+            AgentLoop::new(
+                config,
+                Arc::new(ToolRegistry::new()),
+                Arc::new(ReliabilityProvider {
+                    calls: calls.clone(),
+                }),
+            ),
+            calls,
+        )
+    }
+    #[tokio::test]
+    async fn partial_tool_stream_failure_is_never_replayed() {
+        let (agent, calls) = reliability_agent();
+        let result = agent
+            .collect_stream_llm_response(
+                &ContextManager::default_budget(),
+                &[],
+                None,
+                "fixture",
+                None,
+                &|_| {},
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn retry_after_wait_is_interruptible_without_replay() {
+        let (agent, calls) = reliability_agent();
+        let control = agent.interrupt.clone();
+        let interrupt = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            control.interrupt(None);
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            agent.call_llm_with_retry_inner(&ContextManager::default_budget(), &[], None, None),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(AgentError::Interrupted { .. })));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        interrupt.await.unwrap();
+    }
+    #[tokio::test]
+    async fn panicked_tool_retains_original_call_outcome() {
+        let (mut agent, _) = reliability_agent();
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            "panic_tool",
+            ToolSchema::new("panic_tool", "fixture", JsonSchema::new("object")),
+            Arc::new(|_| panic!("fixture panic")),
+        );
+        agent.tool_registry = Arc::new(registry);
+        let calls = vec![ToolCall {
+            id: "provider-original-id".into(),
+            function: hermes_core::FunctionCall {
+                name: "panic_tool".into(),
+                arguments: "{}".into(),
+            },
+            extra_content: None,
+        }];
+        let mut errors = Vec::new();
+        let results = agent
+            .execute_tool_calls(&calls, 1, 1, &[], false, None, &mut errors)
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_call_id, "provider-original-id");
+        assert!(results[0].is_error);
+        assert_eq!(errors.len(), 1);
+    }
+    #[test]
+    fn older_agent_configuration_defaults_to_internal_context_management() {
+        let mut json = serde_json::to_value(AgentConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("external_context_management");
+        assert!(
+            !serde_json::from_value::<AgentConfig>(json)
+                .unwrap()
+                .external_context_management
+        );
+    }
+
+    #[tokio::test]
+    async fn excessive_retry_after_returns_without_replaying_or_sleeping_forever() {
+        let (agent, _) = reliability_agent();
+        assert!(
+            agent
+                .wait_provider_retry(std::time::Duration::from_secs(u64::MAX))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unicode_provider_error_diagnostics_never_panic() {
+        let (mut agent, calls) = reliability_agent();
+        agent.config.retry.max_retries = 0;
+        assert!(
+            agent
+                .call_llm_with_retry_inner(&ContextManager::default_budget(), &[], None, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }

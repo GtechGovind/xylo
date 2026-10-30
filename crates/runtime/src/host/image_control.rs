@@ -1,7 +1,7 @@
 //! Native image operations. Provider secrets are resolved only inside the host;
 //! receipts preserve uncertain outcomes rather than retrying an external write.
 use super::*;
-use workbench_services::image_generation::ImageGenerationService;
+use xylo_services::image_generation::ImageGenerationService;
 
 pub(super) enum ImageCommand {
     Bytes(Uuid, Uuid, Vec<u8>, AttachmentSource),
@@ -9,7 +9,7 @@ pub(super) enum ImageCommand {
     Receipt(Uuid, Uuid),
     Provider(Uuid),
     History(Uuid),
-    SaveProvider(Uuid, ImageGenerationProvider),
+    SaveProvider(Uuid, ImageGenerationProvider, Option<String>),
 }
 impl ImageCommand {
     pub(super) fn cancellable_id(&self) -> Option<Uuid> {
@@ -73,7 +73,19 @@ impl HostClient {
         id: Uuid,
         provider: ImageGenerationProvider,
     ) -> Result<()> {
-        self.enqueue(HostCommand::Image(ImageCommand::SaveProvider(id, provider)))
+        self.save_image_generation_connection(id, provider, None)
+    }
+    /// Validate metadata, save its secret in the OS vault, then publish the
+    /// connection. The UI receives only the credential reference and receipt.
+    pub fn save_image_generation_connection(
+        &self,
+        id: Uuid,
+        provider: ImageGenerationProvider,
+        secret: Option<String>,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::Image(ImageCommand::SaveProvider(
+            id, provider, secret,
+        )))
     }
 }
 impl HostState {
@@ -163,12 +175,14 @@ impl HostState {
                 .map_err(|error: anyhow::Error| error.to_string());
                 HostEvent::ImageGenerationProvider { request_id, result }
             }
-            ImageCommand::SaveProvider(request_id, provider) => {
+            ImageCommand::SaveProvider(request_id, provider, secret) => {
+                let vault = self.vault.clone();
                 let result = async {
                     let service = self.image_service().await?;
                     tokio::task::spawn_blocking(move || {
-                        service.save_provider(&provider)?;
-                        Ok(Some(provider))
+                        save_connection(service, provider, secret, |reference, secret| {
+                            vault.set(reference, secret)
+                        })
                     })
                     .await?
                 }
@@ -207,7 +221,7 @@ impl HostState {
             .await?;
         let artifacts = self.paths.artifacts.clone();
         tokio::task::spawn_blocking(move || {
-            let images = workbench_services::attachments::AttachmentStore::new(artifacts)?;
+            let images = xylo_services::attachments::AttachmentStore::new(artifacts)?;
             let attachment = if source == AttachmentSource::Clipboard {
                 images.import_clipboard(session_id, &bytes, &cancel)?
             } else {
@@ -217,5 +231,95 @@ impl HostState {
             Ok((attachment, preview))
         })
         .await?
+    }
+}
+
+fn save_connection(
+    service: ImageGenerationService,
+    provider: ImageGenerationProvider,
+    secret: Option<String>,
+    save_secret: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<Option<ImageGenerationProvider>> {
+    xylo_services::image_generation::validate_provider(&provider)?;
+    if let Some(secret) = secret {
+        ensure!(
+            !secret.is_empty() && secret.len() <= 65536,
+            "Enter a valid image API key"
+        );
+        let reference = provider
+            .credential_ref
+            .as_deref()
+            .context("Image API key needs a credential reference")?;
+        save_secret(reference, &secret)?;
+    }
+    service.save_provider(&provider)?;
+    Ok(Some(provider))
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    fn provider() -> ImageGenerationProvider {
+        ImageGenerationProvider {
+            name: "Fixture image API".into(),
+            protocol: ImageGenerationProtocol::OpenAiImages,
+            endpoint: "http://127.0.0.1:8181/v1".into(),
+            model: "explicit-image-model".into(),
+            credential_ref: Some("image:fixture".into()),
+            headers: Default::default(),
+            timeout_seconds: 180,
+        }
+    }
+    #[test]
+    fn image_connection_validates_before_secret_and_publishes_only_after_secret_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ImageGenerationService::new(
+            directory.path().join("data"),
+            directory.path().join("artifacts"),
+        )
+        .unwrap();
+        let mut invalid = provider();
+        invalid.model.clear();
+        assert!(
+            save_connection(
+                service.clone(),
+                invalid,
+                Some("fixture-api-key".into()),
+                |_, _| panic!("Invalid metadata reached secret store")
+            )
+            .is_err()
+        );
+        assert!(
+            save_connection(
+                service.clone(),
+                provider(),
+                Some("fixture-api-key".into()),
+                |_, _| Err(anyhow::anyhow!("Fixture vault failure"))
+            )
+            .is_err()
+        );
+        assert!(service.configured_provider().unwrap().is_none());
+        let saved = save_connection(
+            service.clone(),
+            provider(),
+            Some("fixture-api-key".into()),
+            |reference, secret| {
+                assert_eq!(reference, "image:fixture");
+                assert_eq!(secret, "fixture-api-key");
+                assert!(
+                    service.configured_provider().unwrap().is_none(),
+                    "Connection published before its key was saved"
+                );
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(service.configured_provider().unwrap(), Some(saved.clone()));
+        assert!(
+            !serde_json::to_string(&saved)
+                .unwrap()
+                .contains("fixture-api-key")
+        );
     }
 }

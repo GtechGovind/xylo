@@ -9,20 +9,20 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
+mod xylo {
+    include!("../src/xylo.rs");
     mod document_tests {
         use super::{
             App, AppContext, AppSettings, Bounds, Context, DocumentCellValue, DocumentContent,
             DocumentEdit, DocumentKind, Entity, HostClient, TestAppContext, Uuid, WindowBounds,
-            WindowOptions, Workbench, px, size,
+            WindowOptions, Xylo, px, size,
         };
         use gpui_kit::test::TestWindowExt;
         use std::time::{Duration, Instant};
         fn wait(
             cx: &mut TestAppContext,
-            view: &Entity<Workbench>,
-            condition: impl Fn(&Workbench, &App) -> bool,
+            view: &Entity<Xylo>,
+            condition: impl Fn(&Xylo, &App) -> bool,
         ) {
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
@@ -88,8 +88,8 @@ mod workbench {
             };
             #[cfg(not(unix))]
             let imported_path = source.clone();
-            let paths = workbench_runtime::AppPaths::at(base.join("profile")).unwrap();
-            let store = workbench_services::Store::open(&paths.database).unwrap();
+            let paths = xylo_runtime::AppPaths::at(base.join("profile")).unwrap();
+            let store = xylo_services::Store::open(&paths.database).unwrap();
             store
                 .save_settings(&AppSettings {
                     last_workspace: Some(workspace.clone()),
@@ -109,7 +109,7 @@ mod workbench {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| Workbench::new(Ok(host), window, cx)),
+                    |window, cx| cx.new(|cx| Xylo::new(Ok(host), window, cx)),
                 )
                 .unwrap()
             });
@@ -137,7 +137,7 @@ mod workbench {
             cx.run_until_parked();
             cx.executor().advance_clock(Duration::from_millis(400));
             wait(cx, &view, |view, _| view.documents_validation_saved());
-            let key = workbench_runtime::DocumentDraftKey {
+            let key = xylo_runtime::DocumentDraftKey {
                 workspace: workspace.clone(),
                 source: source.clone(),
             };
@@ -177,7 +177,7 @@ mod workbench {
             // as a new process would. The actual helper receipt already exists.
             let stored = store.document_draft(key.clone()).unwrap();
             let mut recovered = stored.state.unwrap();
-            recovered.pending_copy = Some(workbench_runtime::DocumentCopyIntent {
+            recovered.pending_copy = Some(xylo_runtime::DocumentCopyIntent {
                 operation_id: operation,
                 generation: 1,
                 name: "edited-notes.txt".into(),
@@ -185,14 +185,14 @@ mod workbench {
             });
             assert!(matches!(
                 store
-                    .save_document_draft(workbench_runtime::DocumentDraftWrite {
+                    .save_document_draft(xylo_runtime::DocumentDraftWrite {
                         key: key.clone(),
                         expected_revision: stored.revision,
                         mutation_id: Uuid::new_v4(),
                         state: Some(recovered)
                     })
                     .unwrap(),
-                workbench_runtime::DocumentDraftSave::Saved(_)
+                xylo_runtime::DocumentDraftSave::Saved(_)
             ));
             std::fs::write(&source, "Externally changed after copy").unwrap();
             cx.update_window(window, |_, window, cx| {
@@ -286,8 +286,8 @@ mod workbench {
             let source = workspace.join("book.xlsx");
             workbook(&source);
             let original = std::fs::read(&source).unwrap();
-            let paths = workbench_runtime::AppPaths::at(base.join("profile")).unwrap();
-            let store = workbench_services::Store::open(&paths.database).unwrap();
+            let paths = xylo_runtime::AppPaths::at(base.join("profile")).unwrap();
+            let store = xylo_services::Store::open(&paths.database).unwrap();
             store
                 .save_settings(&AppSettings {
                     last_workspace: Some(workspace.clone()),
@@ -307,7 +307,7 @@ mod workbench {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| Workbench::new(Ok(host), window, cx)),
+                    |window, cx| cx.new(|cx| Xylo::new(Ok(host), window, cx)),
                 )
                 .unwrap()
             });
@@ -424,8 +424,8 @@ mod workbench {
             std::fs::create_dir(&other).unwrap();
             let source = workspace.join("draft.txt");
             std::fs::write(&source, "Original").unwrap();
-            let paths = workbench_runtime::AppPaths::at(base.join("profile")).unwrap();
-            let store = workbench_services::Store::open(&paths.database).unwrap();
+            let paths = xylo_runtime::AppPaths::at(base.join("profile")).unwrap();
+            let store = xylo_services::Store::open(&paths.database).unwrap();
             store
                 .save_settings(&AppSettings {
                     last_workspace: Some(workspace.clone()),
@@ -437,7 +437,7 @@ mod workbench {
             cx.update(gpui_kit::init);
             let (window, view) = cx.update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
-                    cx.new(|cx| Workbench::new(Ok(host), window, cx))
+                    cx.new(|cx| Xylo::new(Ok(host), window, cx))
                 })
                 .unwrap()
             });
@@ -494,7 +494,7 @@ mod workbench {
             cx.executor().advance_clock(Duration::from_millis(400));
             wait(cx, &view, |view, _| view.documents_validation_saved());
             let draft = store
-                .document_draft(workbench_runtime::DocumentDraftKey {
+                .document_draft(xylo_runtime::DocumentDraftKey {
                     workspace: workspace.clone(),
                     source: source.clone(),
                 })
@@ -541,7 +541,7 @@ mod workbench {
             wait(cx, &view, |view, _| view.documents_validation_conflicted());
             assert!(!cx.update(|cx| view.read(cx).documents_validation_ready()));
             let preserved = store
-                .document_draft(workbench_runtime::DocumentDraftKey {
+                .document_draft(xylo_runtime::DocumentDraftKey {
                     workspace: workspace.clone(),
                     source: source.clone(),
                 })
@@ -560,8 +560,8 @@ mod workbench {
             let base = directory.path().canonicalize().unwrap();
             let workspace = base.join("project");
             std::fs::create_dir(&workspace).unwrap();
-            let paths = workbench_runtime::AppPaths::at(base.join("profile")).unwrap();
-            let store = workbench_services::Store::open(&paths.database).unwrap();
+            let paths = xylo_runtime::AppPaths::at(base.join("profile")).unwrap();
+            let store = xylo_services::Store::open(&paths.database).unwrap();
             store
                 .save_settings(&AppSettings {
                     last_workspace: Some(workspace),
@@ -581,7 +581,7 @@ mod workbench {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| Workbench::new(Ok(host), window, cx)),
+                    |window, cx| cx.new(|cx| Xylo::new(Ok(host), window, cx)),
                 )
                 .unwrap()
             });
@@ -723,8 +723,8 @@ mod workbench {
                     .unwrap();
             }
             output.finish().unwrap();
-            let paths = workbench_runtime::AppPaths::at(base.join("profile")).unwrap();
-            let store = workbench_services::Store::open(&paths.database).unwrap();
+            let paths = xylo_runtime::AppPaths::at(base.join("profile")).unwrap();
+            let store = xylo_services::Store::open(&paths.database).unwrap();
             store
                 .save_settings(&AppSettings {
                     last_workspace: Some(workspace),
@@ -736,7 +736,7 @@ mod workbench {
             cx.update(gpui_kit::init);
             let (window, view) = cx.update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
-                    cx.new(|cx| Workbench::new(Ok(host), window, cx))
+                    cx.new(|cx| Xylo::new(Ok(host), window, cx))
                 })
                 .unwrap()
             });

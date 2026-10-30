@@ -3,8 +3,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-use workbench_services::{CorrectionInput, LearningService, Store};
-pub use workbench_services::{LearnedSkill, LearningStatus};
+use xylo_services::{CorrectionInput, LearningService, Store};
+pub use xylo_services::{LearnedSkill, LearningStatus};
 
 pub(crate) async fn execute(
     store: Store,

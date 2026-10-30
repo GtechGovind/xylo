@@ -11,9 +11,9 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
-    impl Workbench {
+mod xylo {
+    include!("../src/xylo.rs");
+    impl Xylo {
         pub(crate) fn performance_prepare(&mut self, cx: &mut Context<Self>) {
             self.error = None;
             cx.notify();
@@ -25,6 +25,21 @@ mod workbench {
             )).collect();
             self.error = None;
             self.sync_history_list(cx);
+            cx.notify();
+        }
+        pub(crate) fn performance_git_fixture(&mut self, count: usize, cx: &mut Context<Self>) {
+            use xylo_runtime::workspace::git::{GitStatus,GitChange,ChangeGroup};
+            let root = std::path::PathBuf::from("/synthetic-performance-project");
+            let changes = (0..count).map(|index| GitChange { path: format!("src/group-{}/file-{index}.rs",index%50).into(), original:None, index:'M', worktree:'M' }).collect();
+            self.git_panel = work_panel::GitPanel::prepare(root, GitStatus {branch:"main".into(), changes, truncated:false},Default::default());
+            self.git_panel.selected = Some(("src/group-0/file-0.rs".into(),ChangeGroup::Unstaged));
+            self.diff_lines = (0..count).map(|index|format!("+ added line {index}" )).collect();
+            self.settings.ui.work_panel_open=true;
+            self.settings.ui.work_panel="changes".into();
+            cx.notify();
+        }
+        pub(crate) fn performance_git_scroll(&mut self, index:usize,cx:&mut Context<Self>) {
+            self.diff_scroll.scroll_to_item(index,gpui_kit::ScrollStrategy::Top);
             cx.notify();
         }
         pub(crate) fn performance_scroll(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -46,6 +61,23 @@ mod workbench {
             }
             self.sync_history_list(cx);
             self.histories[&self.session].list.scroll_to_end();
+            cx.notify();
+        }
+        pub(crate) fn performance_long_stream(&mut self, cx: &mut Context<Self>) {
+            let turn = self.turns.entry(self.session).or_default();
+            turn.apply(EngineEvent::Started);
+            let mut text = "A long live response with **formatting** and Unicode αβ.\n\n".repeat(2048);
+            let mut end = 102400.min(text.len());
+            while !text.is_char_boundary(end) { end -= 1; }
+            text.truncate(end);
+            turn.apply(EngineEvent::Delta { text });
+            self.sync_history_list(cx);
+            self.histories[&self.session].list.scroll_to_end();
+            cx.notify();
+        }
+        pub(crate) fn performance_composer_edit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+            self.composer.update(cx, |input, cx| input.set_value(format!("Follow-up message {index} αβ"), window, cx));
+            self.sync_history_list(cx);
             cx.notify();
         }
     }
@@ -134,7 +166,7 @@ fn measure() -> Result<()> {
             cx,
             |window, cx| {
                 cx.new(|cx| {
-                    workbench::Workbench::new(
+                    xylo::Xylo::new(
                         Err(anyhow::anyhow!("Isolated rendering measurement")),
                         window,
                         cx,
@@ -147,7 +179,7 @@ fn measure() -> Result<()> {
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(
-            window.try_find_by_label("New Chat").is_some(),
+            window.try_find_by_label("Add context").is_some(),
             "Initial production UI did not render"
         );
     })?;
@@ -203,11 +235,34 @@ fn measure() -> Result<()> {
             record(&mut metrics, "stream_gpu_render_and_readback", start);
         }
     }
+    // Exercise composer renders with accumulated live output, beyond the short-stream baseline.
+    view.update(&mut cx, |view, cx| view.performance_long_stream(cx));
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+    for index in 0..(samples + 10) {
+        let start = Instant::now();
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.performance_composer_edit(index, window, cx);
+                view.performance_stream(cx);
+            });
+            window.render_frame(cx);
+        })?;
+        if index >= 10 {
+            record(&mut metrics, "long_stream_100k_composer_edit_and_cpu_frame", start);
+        }
+    }
+    // Additional current-design stress case; historical comparable metrics above stay unchanged.
+    view.update(&mut cx, |view,cx|view.performance_git_fixture(5000,cx));
+    for index in 0..(samples+10) {
+        let start=Instant::now();
+        cx.update_window(handle, |_,window,cx| { view.update(cx,|view,cx|view.performance_git_scroll((index*31)%5000,cx)); window.render_frame(cx); })?;
+        if index>=10 { record(&mut metrics,"git_5000_changes_scroll_and_cpu_frame",start); }
+    }
     let metrics: BTreeMap<_, _> = metrics
         .into_iter()
         .map(|(name, raw)| (name, statistics(&raw)))
         .collect();
-    let report = json!({"schema_version":1,"profile":if cfg!(debug_assertions){"debug"}else{"release"},"os":std::env::consts::OS,"architecture":std::env::consts::ARCH,"width":1380,"height":880,"history_messages":count,"warmup_samples":10,"native_text_and_gpu":true,"host_connected":false,"metrics":metrics,"limitations":["The production UI uses a deterministic test dispatcher and offscreen native renderer.","No real display presentation, physical keyboard/IME or WindowServer latency is measured.","CPU preparation and a fresh offscreen GPU render/texture allocation/wait/pixel readback are distinct metrics; neither proves 60Hz frame pacing or dropped-frame acceptance.","The initial sample is one process and excludes the host, workers, tray and native OS window creation.","Fixtures contain synthetic history and direct streaming state updates; there is no model or network timing."]});
+    let report = json!({"schema_version":1,"profile":if cfg!(debug_assertions){"debug"}else{"release"},"os":std::env::consts::OS,"architecture":std::env::consts::ARCH,"width":1380,"height":880,"history_messages":count,"warmup_samples":10,"native_text_and_gpu":true,"host_connected":false,"git_fixture_changes":5000,"live_stream_seed_bytes":102400,"metrics":metrics,"limitations":["The production UI uses a deterministic test dispatcher and offscreen native renderer.","No real display presentation, physical keyboard/IME or WindowServer latency is measured.","CPU preparation and a fresh offscreen GPU render/texture allocation/wait/pixel readback are distinct metrics; neither proves 60Hz frame pacing or dropped-frame acceptance.","The initial sample is one process and excludes the host, workers, tray and native OS window creation.","Fixtures contain synthetic history and direct streaming state updates; there is no model or network timing."]});
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }

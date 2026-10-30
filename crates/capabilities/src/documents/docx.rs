@@ -6,7 +6,7 @@ use super::{
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeMap, HashSet};
 use tokio_util::sync::CancellationToken;
-use workbench_core::{DocumentContent, DocumentEdit, DocumentOpenRequest, DocumentParagraph};
+use xylo_core::{DocumentContent, DocumentEdit, DocumentOpenRequest, DocumentParagraph};
 const PART: &str = "word/document.xml";
 fn paragraphs(root: &Element) -> Vec<(&Element, Option<String>)> {
     fn visit<'a>(

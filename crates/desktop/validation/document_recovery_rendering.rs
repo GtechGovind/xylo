@@ -11,9 +11,9 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
-mod workbench {
-    include!("../src/workbench.rs");
-    impl Workbench {
+mod xylo {
+    include!("../src/xylo.rs");
+    impl Xylo {
         pub(crate) fn capture_services_ready(&self) -> bool {
             self.settings_loaded && self.workspace_ready
         }
@@ -49,7 +49,7 @@ fn render() {
         sync::Arc,
         time::{Duration, Instant},
     };
-    let profile = document_recovery_fixture::seeded(workbench_core::DocumentKind::Spreadsheet);
+    let profile = document_recovery_fixture::seeded(xylo_core::DocumentKind::Spreadsheet);
     let delivery = Arc::new(document_recovery_fixture::Delivery::default());
     let host = document_recovery_fixture::host(&profile, delivery);
     let client = host.0.clone();
@@ -76,7 +76,7 @@ fn render() {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| workbench::Workbench::new(Ok(host), window, cx)),
+                |window, cx| cx.new(|cx| xylo::Xylo::new(Ok(host), window, cx)),
             )
         })
         .unwrap();
@@ -122,7 +122,7 @@ fn render() {
         );
     })
     .unwrap();
-    let output = std::env::var_os("WORKBENCH_RENDER_DIR")
+    let output = std::env::var_os("XYLO_RENDER_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -136,25 +136,22 @@ fn render() {
     let pixel_size = [screenshot.width(), screenshot.height()];
     screenshot.save(&image).unwrap();
     let compiled_sources = [
-        (
-            "workbench.rs",
-            include_bytes!("../src/workbench.rs").as_slice(),
-        ),
+        ("xylo.rs", include_bytes!("../src/xylo.rs").as_slice()),
         (
             "documents.rs",
-            include_bytes!("../src/workbench/documents.rs").as_slice(),
+            include_bytes!("../src/xylo/documents.rs").as_slice(),
         ),
         (
             "documents_drafts.rs",
-            include_bytes!("../src/workbench/documents_drafts.rs").as_slice(),
+            include_bytes!("../src/xylo/documents_drafts.rs").as_slice(),
         ),
         (
             "documents_missing.rs",
-            include_bytes!("../src/workbench/documents_missing.rs").as_slice(),
+            include_bytes!("../src/xylo/documents_missing.rs").as_slice(),
         ),
         (
             "documents_view.rs",
-            include_bytes!("../src/workbench/documents_view.rs").as_slice(),
+            include_bytes!("../src/xylo/documents_view.rs").as_slice(),
         ),
         (
             "document_drafts.rs",

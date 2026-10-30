@@ -7,9 +7,9 @@ This lightweight crate is shared by the desktop host, helper and task worker. It
 Acquire the shared reservation from the canonical app-owned `data/native-management/admission` directory. The host's local manager still accounts for its own concurrent work; the native service acquires this shared pool exactly once rather than each process independently spending the same available headroom:
 
 ```rust,ignore
-let lease = workbench_resources::shared::acquire(directory, demand, cancel).await?;
-workbench_resources::scope_shared(std::sync::Arc::new(lease), async {
-    workbench_resources::spawn_blocking(move || bounded_native_work()).await?
+let lease = xylo_resources::shared::acquire(directory, demand, cancel).await?;
+xylo_resources::scope_shared(std::sync::Arc::new(lease), async {
+    xylo_resources::spawn_blocking(move || bounded_native_work()).await?
 }).await
 ```
 
@@ -19,7 +19,7 @@ The pool maintains at most 128 active records of at most 1 KiB. Each UUID record
 
 Current memory availability, CPU usage, thread count and the existing automatic headroom calculation decide admission. There are no RAM tiers or fixed worker counts. Queued work rechecks every 500 ms and cancellation does not wait for filesystem operations. Snapshot, registry parsing, file IO and lock acquisition all run on blocking workers. A dropped lease only closes its OS handle on the calling thread; reaping performs later filesystem cleanup off the UI thread.
 
-Run `CARGO_INCREMENTAL=0 cargo test --locked --offline -p workbench-resources --all-targets`. Controlled snapshots exercise shared accounting, changing pressure, cancellation, liveness reaping, corrupt metadata, path refusal and preservation of a blocking reservation after cancellation of its outer async task, without allocating model-sized memory.
+Run `CARGO_INCREMENTAL=0 cargo test --locked --offline -p xylo-resources --all-targets`. Controlled snapshots exercise shared accounting, changing pressure, cancellation, liveness reaping, corrupt metadata, path refusal and preservation of a blocking reservation after cancellation of its outer async task, without allocating model-sized memory.
 
 ## macOS physical-page estimate
 
@@ -31,7 +31,7 @@ This is an admission estimate rather than a guarantee that inactive pages can al
 
 The implementation was checked against the local macOS 27.0 SDK's public `mach/vm_statistics.h`, `mach/host_info.h`, `mach/mach_init.h`, `mach/mach_host.h`, `mach/mach_port.h`, `sys/sysctl.h` and `dispatch/source.h`. Apple's [kernel pressure query implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_memorystatus_notify.c) converts its internal level to the public dispatch pressure flags before returning it. No private syscall, entitlement or memory-pressure simulation is required.
 
-A live comparison on macOS 27.0.1 arm64, with 34,359,738,368 bytes of installed memory, recorded the following in `/tmp/workbench-macos-memory-tests.log`. These are one observation, not a performance or capacity guarantee:
+A live comparison on macOS 27.0.1 arm64, with 34,359,738,368 bytes of installed memory, recorded the following in `/tmp/xylo-macos-memory-tests.log`. These are one observation, not a performance or capacity guarantee:
 
 | Counter or result | Value |
 | --- | ---: |
@@ -47,6 +47,6 @@ A live comparison on macOS 27.0.1 arm64, with 34,359,738,368 bytes of installed 
 | Free + inactive estimate, selected | 11,562,024,960 bytes |
 | Fallback used | `false` |
 
-The small difference between sysinfo's value and the same-counter old formula reflects separate live samples. Reproduce the comparison without allocating workload-sized memory using `CARGO_INCREMENTAL=0 cargo test --locked --offline -p workbench-resources macos_memory::tests::live_counter_comparison -- --exact --nocapture`. Arithmetic, overflow/clamping, missing counters, elevated/unknown pressure and retained headroom/reservation behavior have deterministic unit coverage.
+The small difference between sysinfo's value and the same-counter old formula reflects separate live samples. Reproduce the comparison without allocating workload-sized memory using `CARGO_INCREMENTAL=0 cargo test --locked --offline -p xylo-resources macos_memory::tests::live_counter_comparison -- --exact --nocapture`. Arithmetic, overflow/clamping, missing counters, elevated/unknown pressure and retained headroom/reservation behavior have deterministic unit coverage.
 
 This independently verified counter correction does not establish the cause of the earlier parallel engine-fixture timeout. That historical timeout had no phase checkpoints and did not reproduce in the isolated or full-engine diagnostic runs. Its 20-second bound and cancellation cleanup remain unchanged.

@@ -9,3 +9,11 @@ target/
 
 /.release-tools/
 __pycache__/
+
+# Local design references, experiments and temporary tooling.
+/design-demo/
+/experiments/
+/.scratch/
+/rea-evidence/
+/crates/services/sandbox-helper/node_modules/
+/vendor/hermes-ultra/Cargo.lock

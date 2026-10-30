@@ -2,6 +2,7 @@
 //! to stderr. One process executes one root task at a time.
 
 mod steering;
+mod credentials;
 use anyhow::{Context, Result, ensure};
 use std::{
     path::PathBuf,
@@ -16,10 +17,10 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
-use workbench_core::*;
-use workbench_engine::{HermesEngine, tools::ApprovalGate};
-use workbench_runtime::AppPaths;
-use workbench_services::Store;
+use xylo_core::*;
+use xylo_engine::{HermesEngine, tools::ApprovalGate};
+use xylo_runtime::AppPaths;
+use xylo_services::Store;
 
 struct ActiveTask {
     session_id: uuid::Uuid,
@@ -28,6 +29,7 @@ struct ActiveTask {
     engine: Arc<HermesEngine>,
     handle: tokio::task::JoinHandle<()>,
     busy: Arc<AtomicBool>,
+    credentials: Arc<credentials::CredentialBroker>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -139,6 +141,14 @@ async fn main() -> Result<()> {
         }
         let request_id = envelope.request_id;
         let session_id = envelope.session_id;
+        if let WorkerCommand::ProviderCredentialUpdated { request_id: renewal_id, result } = &envelope.payload {
+            if let Some(task) = &active
+                && !task.cancel.is_cancelled()
+            {
+                task.credentials.reply(request_id, session_id, *renewal_id, result.clone());
+            }
+            continue;
+        }
         let (command, credential) = match envelope.payload {
             WorkerCommand::RunAuthorized { turn, credential } => {
                 (WorkerCommand::Run { turn }, Some(credential))
@@ -146,7 +156,7 @@ async fn main() -> Result<()> {
             command => (command, None),
         };
         match command {
-            WorkerCommand::RunAuthorized { .. } => unreachable!(),
+            WorkerCommand::RunAuthorized { .. } | WorkerCommand::ProviderCredentialUpdated { .. } => unreachable!(),
             WorkerCommand::Hello => {
                 send(
                     &output,
@@ -178,12 +188,13 @@ async fn main() -> Result<()> {
                     .await?;
                     continue;
                 }
+                let cancel = CancellationToken::new();
+                let credentials = Arc::new(credentials::CredentialBroker::new(output.clone(), sequence.clone(), request_id, turn.session_id));
                 let engine = HermesEngine::new(store.clone(), paths.clone(), gate.clone());
                 let engine = Arc::new(match credential {
-                    Some(credential) => engine.with_provider_credential(credential),
+                    Some(credential) => engine.with_provider_credential(credential).with_provider_credential_resolver(credentials.clone()),
                     None => engine,
                 });
-                let cancel = CancellationToken::new();
                 let run_engine = engine.clone();
                 let run_cancel = cancel.clone();
                 let run_output = output.clone();
@@ -266,6 +277,7 @@ async fn main() -> Result<()> {
                     engine,
                     handle,
                     busy,
+                    credentials,
                 });
             }
             WorkerCommand::Cancel => {

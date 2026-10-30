@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
-use workbench_core::{DocumentEdit, DocumentSource, now_ms};
+use xylo_core::{DocumentEdit, DocumentSource, now_ms};
 
 mod relink;
 pub use relink::*;

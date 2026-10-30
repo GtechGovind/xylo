@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ToolDefinition, ToolObservation};
+use xylo_core::{ToolDefinition, ToolObservation};
 
 fn shell_quote(arg: &str) -> Result<String> {
     ensure!(

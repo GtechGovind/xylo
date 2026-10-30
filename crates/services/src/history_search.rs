@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use workbench_core::{ChatMessage, Conversation, ConversationCursor};
+use xylo_core::{ChatMessage, Conversation, ConversationCursor};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryMatch {
@@ -249,7 +249,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use workbench_core::now_ms;
+    use xylo_core::now_ms;
     fn setup() -> (tempfile::TempDir, Store, Uuid) {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path().join("history.db")).unwrap();

@@ -2,7 +2,7 @@ use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-const PNG: &[u8] = include_bytes!("../../../../packaging/icons/app.png");
+const PNG: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x02\x00\x00\x00\x02\x08\x06\x00\x00\x00\x72\xb6\x0d\x24\x00\x00\x00\x11\x49\x44\x41\x54\x78\x9c\x63\x50\x70\x48\xf8\x0f\xc2\x0c\x30\x06\x00\x39\x74\x06\xfd\x20\x19\xfd\xfb\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
 struct Recorded {
     line: String,
     headers: String,
@@ -473,7 +473,7 @@ async fn oversized_native_http_response_and_output_download_are_rejected_before_
                     .unwrap()
                     .unwrap();
                 socket = request(next).await.0;
-                oversized = workbench_core::MAX_IMAGE_BYTES as usize + 1;
+                oversized = xylo_core::MAX_IMAGE_BYTES as usize + 1;
             }
             socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {oversized}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         });

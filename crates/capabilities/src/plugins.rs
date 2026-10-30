@@ -9,7 +9,7 @@ use crate::{CapabilityConfig, definition, observation, required_str};
 use anyhow::{Result, bail, ensure};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ToolDefinition, ToolObservation};
+use xylo_core::{ToolDefinition, ToolObservation};
 
 /// Profile-wide native UI management. Never register these names as agent tools.
 pub async fn execute_management(
@@ -27,14 +27,13 @@ pub async fn execute_management(
         "helper_plugin_list" => {
             let config = config.clone();
             Ok(serde_json::to_value(
-                workbench_resources::spawn_blocking(move || catalog::list(&config, &cancel))
-                    .await??,
+                xylo_resources::spawn_blocking(move || catalog::list(&config, &cancel)).await??,
             )?)
         }
         "helper_plugin_inspect" => {
             let path = required_str(args, "manifest_path")?.to_owned();
             Ok(serde_json::to_value(
-                workbench_resources::spawn_blocking(move || {
+                xylo_resources::spawn_blocking(move || {
                     catalog::inspect(&path, &cancel).map(|package| package.inspection)
                 })
                 .await??,
@@ -50,7 +49,7 @@ pub async fn execute_management(
             let replay_name = name.to_owned();
             let replay_args = args.clone();
             let replay_cancel = child.clone();
-            if let Some(result) = workbench_resources::spawn_blocking(move || {
+            if let Some(result) = xylo_resources::spawn_blocking(move || {
                 catalog::replay(&replay_config, &replay_name, &replay_args, &replay_cancel)
             })
             .await??
@@ -60,7 +59,7 @@ pub async fn execute_management(
             let package = if name == "helper_plugin_install" {
                 let request: catalog::InstallArgs = serde_json::from_value(args.clone())?;
                 let inspect_cancel = child.clone();
-                let package = workbench_resources::spawn_blocking(move || {
+                let package = xylo_resources::spawn_blocking(move || {
                     catalog::inspect(&request.manifest_path, &inspect_cancel)
                 })
                 .await??;
@@ -70,8 +69,8 @@ pub async fn execute_management(
                     "Plugin package changed since inspection; review it again"
                 );
                 let root_config = config.clone();
-                let root = workbench_resources::spawn_blocking(move || catalog::root(&root_config))
-                    .await??;
+                let root =
+                    xylo_resources::spawn_blocking(move || catalog::root(&root_config)).await??;
                 let timeout = package.inspection.manifest.budgets.timeout_seconds;
                 tokio::select! {
                     result = runtime::compile(package.module.clone(), root, None, child.clone()) => { result?; }
@@ -88,7 +87,7 @@ pub async fn execute_management(
             // Cancellation is cooperative here. Await publication once admitted
             // so a generic cancelled response cannot hide a committed catalog.
             Ok(serde_json::to_value(
-                workbench_resources::spawn_blocking(move || {
+                xylo_resources::spawn_blocking(move || {
                     catalog::mutate(&config, &name, args, package, &child)
                 })
                 .await??,
@@ -108,8 +107,7 @@ pub async fn execute_tool(
         "plugin_list" => {
             let config = config.clone();
             let catalog =
-                workbench_resources::spawn_blocking(move || catalog::list(&config, &cancel))
-                    .await??;
+                xylo_resources::spawn_blocking(move || catalog::list(&config, &cancel)).await??;
             Ok(observation(serde_json::to_value(catalog)?, vec![]))
         }
         "plugin_run_installed" => {
@@ -123,7 +121,7 @@ pub async fn execute_tool(
             let pin = required_str(args, "package_sha256")?.to_owned();
             let config_owned = config.clone();
             let read_cancel = cancel.clone();
-            let loaded = workbench_resources::spawn_blocking(move || {
+            let loaded = xylo_resources::spawn_blocking(move || {
                 catalog::load(&config_owned, &id, &pin, &read_cancel)
             })
             .await??;

@@ -137,6 +137,11 @@ impl PendingChatGptSignIn {
                 &URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
             );
         if let Some(previous) = previous {
+            // This returning registration has no plan grant. The settings action
+            // explicitly asks to enable it; do not force ordinary authorized logins.
+            if !previous.plan_usage_authorized() {
+                query.append_pair("prompt", "consent");
+            }
             ensure!(
                 previous.ext_agent_host_id == host_id
                     && previous.client_id != DYNAMIC_CLIENT
@@ -383,12 +388,8 @@ fn credential(
         .split_whitespace()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    ensure!(
-        scopes
-            .iter()
-            .any(|scope| scope == "chatgpt.tokens.use.direct"),
-        "ChatGPT plan usage was not authorized; reconnect and allow plan usage"
-    );
+    // A validated identity may be retained without plan consent. Inference and
+    // discovery enforce the granted plan scope at the credential-use boundary.
     let expires = tokens["expires_in"]
         .as_i64()
         .filter(|value| *value > 0 && *value <= 86400)
@@ -409,7 +410,7 @@ fn credential(
         id_token: required(&tokens, "id_token")?,
         access_token: required(&tokens, "access_token")?,
         refresh_token: tokens["refresh_token"].as_str().map(str::to_owned),
-        expires_at_ms: workbench_core::now_ms() + expires * 1000,
+        expires_at_ms: xylo_core::now_ms() + expires * 1000,
         scopes,
     })
 }
@@ -505,11 +506,11 @@ mod tests {
             .step_by(2)
             .map(|index| u8::from_str_radix(&modulus[index..index + 2], 16).unwrap())
             .collect::<Vec<_>>();
-        serde_json::from_value(json!({"keys":[{"kty":"RSA","kid":"workbench-test-only","use":"sig","alg":"RS256","n":URL_SAFE_NO_PAD.encode(bytes),"e":"AQAB"}]})).unwrap()
+        serde_json::from_value(json!({"keys":[{"kty":"RSA","kid":"xylo-test-only","use":"sig","alg":"RS256","n":URL_SAFE_NO_PAD.encode(bytes),"e":"AQAB"}]})).unwrap()
     }
     fn signed(claims: &Value) -> String {
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some("workbench-test-only".into());
+        header.kid = Some("xylo-test-only".into());
         encode(
             &header,
             claims,
@@ -520,7 +521,7 @@ mod tests {
 
     #[test]
     fn signed_identity_requires_published_key_issuer_audience_expiry_and_nonce() {
-        let claims = json!({"iss":AUTHORITY,"sub":"fixture-account","aud":"oaiapp_fixture","exp":workbench_core::now_ms()/1000+3600,"nonce":"attempt-nonce","email":"fixture@example.invalid"});
+        let claims = json!({"iss":AUTHORITY,"sub":"fixture-account","aud":"oaiapp_fixture","exp":xylo_core::now_ms()/1000+3600,"nonce":"attempt-nonce","email":"fixture@example.invalid"});
         let identity = validate_identity(
             &signed(&claims),
             "oaiapp_fixture",
@@ -634,6 +635,37 @@ mod tests {
             email: None,
         };
         let tokens = json!({"id_token":"fixture-id","access_token":"fixture-access","token_type":"Bearer","scope":"openid profile email","expires_in":3600});
-        assert!(credential(tokens, "oaiapp_issued".into(), "host".into(), identity).is_err());
+        let retained = credential(tokens, "oaiapp_issued".into(), "host".into(), identity).unwrap();
+        assert!(!retained.plan_usage_authorized());
+        assert_eq!(retained.subject, "account");
+    }
+    #[test]
+    fn enabling_previously_declined_plan_usage_requests_consent_without_forcing_ordinary_sign_in() {
+        let host = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+        for authorized in [false, true] {
+            let scope = if authorized {
+                "openid profile email chatgpt.tokens.use.direct"
+            } else {
+                "openid profile email"
+            };
+            let previous = credential(json!({"id_token":"fixture-id","access_token":"fixture-access","token_type":"Bearer","scope":scope,"expires_in":3600}), "oaiapp_issued".into(), host.clone(), Identity { sub:"account".into(), iss:AUTHORITY.into(), nonce:None, email:None }).unwrap();
+            let pending = PendingChatGptSignIn::begin(
+                &host,
+                "http://127.0.0.1:44321/auth/callback",
+                Some(&previous),
+            )
+            .unwrap();
+            let fields = Url::parse(&pending.authorization_url)
+                .unwrap()
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(fields["client_id"], "oaiapp_issued");
+            assert_eq!(
+                fields.get("prompt").map(String::as_str),
+                if authorized { None } else { Some("consent") }
+            );
+            assert!(fields["scope"].contains("chatgpt.tokens.use.direct"));
+        }
     }
 }

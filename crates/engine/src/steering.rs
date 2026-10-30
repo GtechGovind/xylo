@@ -8,8 +8,8 @@ use std::sync::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::EngineEvent;
-use workbench_services::Store;
+use xylo_core::EngineEvent;
+use xylo_services::Store;
 #[derive(Clone)]
 pub(crate) struct SteeringControl {
     store: Store,

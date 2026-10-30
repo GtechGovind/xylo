@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use workbench_plugin_sdk::Guest;
+use xylo_plugin_sdk::Guest;
 
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_UNIQUE_WORDS: usize = 4096;
@@ -16,7 +16,7 @@ impl Guest for TextReport {
     }
 }
 
-workbench_plugin_sdk::export!(TextReport);
+xylo_plugin_sdk::export!(TextReport);
 
 /// A local abstraction allows algorithm tests without granting or faking host
 /// authority. The installed-component test exercises the actual Wasmtime host.
@@ -28,10 +28,10 @@ trait Host {
 struct NativeHost;
 impl Host for NativeHost {
     fn read(&self, path: &str) -> Result<String, String> {
-        workbench_plugin_sdk::read_text(path)
+        xylo_plugin_sdk::read_text(path)
     }
     fn write(&self, name: &str, text: &str) -> Result<String, String> {
-        workbench_plugin_sdk::write_text(name, text)
+        xylo_plugin_sdk::write_text(name, text)
     }
 }
 

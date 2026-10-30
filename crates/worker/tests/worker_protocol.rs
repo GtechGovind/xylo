@@ -14,7 +14,7 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout},
 };
 use uuid::Uuid;
-use workbench_core::*;
+use xylo_core::*;
 
 struct Worker {
     child: Child,
@@ -28,7 +28,7 @@ impl Worker {
         Self::with_profile(tempfile::tempdir().unwrap()).await
     }
     async fn with_profile(profile: tempfile::TempDir) -> Self {
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_workbench-worker"))
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_xylo-worker"))
             .arg("--data-dir")
             .arg(profile.path())
             .stdin(Stdio::piped())
@@ -341,5 +341,154 @@ async fn denied_write_never_changes_the_workspace() {
     }
     assert!(denied);
     assert!(!workspace.path().join("sample.txt").exists());
+    worker.stop().await;
+}
+
+#[tokio::test]
+async fn sse_validation_failure_is_correlated_once_and_retains_checkpointed_tool_progress() {
+    use tokio::io::AsyncReadExt;
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("sample.txt"),
+        "durable fixture contents",
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut recorded = Vec::new();
+        for index in 0..2 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("POST /v1/responses "));
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut bytes = vec![0; length];
+            socket.read_exact(&mut bytes).await.unwrap();
+            recorded.push(serde_json::from_slice::<Value>(&bytes).unwrap());
+            let event = if index == 0 {
+                json!({"type":"response.completed","response":{"status":"completed","model":"fixture","output":[{"type":"reasoning","id":"rs_fixture","encrypted_content":"opaque-encrypted-fixture"},{"type":"function_call","id":"fc_fixture","call_id":"call_fixture","name":"file_read","arguments":"{\"path\":\"sample.txt\"}"}],"usage":{"input_tokens":10,"output_tokens":2}}})
+            } else {
+                json!({"type":"error","request_id":"req_worker_fixture","error":{"type":"invalid_request_error","code":"invalid_tool_output","param":"input[3].call_id","message":"No tool output found for function call 'call_private'. Reflected Bearer fixture-private-secret at https://user:password@provider.invalid/?token=private-query"}})
+            };
+            let payload = format!("data: {event}\n\n");
+            socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",payload.len()).as_bytes()).await.unwrap();
+        }
+        recorded
+    });
+    let mut worker = Worker::start().await;
+    let session = Uuid::new_v4();
+    let mut request = turn(session, workspace.path(), endpoint);
+    request.provider.family = ApiFamily::OpenAiResponses;
+    request.provider.context_tokens = 65536;
+    request.provider.credential_ref = Some("fixture-authorized".into());
+    let request_id = Uuid::new_v4();
+    let envelope = Envelope::new(
+        request_id,
+        Some(session),
+        0,
+        WorkerCommand::RunAuthorized {
+            turn: request.clone(),
+            credential: WorkerCredential(Some("fixture-private-secret".into())),
+        },
+    );
+    let mut encoded = serde_json::to_vec(&envelope).unwrap();
+    encoded.push(b'\n');
+    worker.input.write_all(&encoded).await.unwrap();
+    worker.input.flush().await.unwrap();
+    let mut terminal = 0;
+    let mut tool_completed = false;
+    loop {
+        let event = worker.event().await;
+        assert_eq!(event.request_id, request_id);
+        assert_eq!(event.session_id, Some(session));
+        assert!(
+            !serde_json::to_string(&event)
+                .unwrap()
+                .contains("fixture-private-secret")
+        );
+        match event.payload {
+            EngineEvent::ToolFinished { success, .. } => {
+                assert!(success);
+                tool_completed = true;
+            }
+            EngineEvent::Completed { .. } | EngineEvent::Cancelled => {
+                panic!("Provider rejection must not become a completed or cancelled turn")
+            }
+            EngineEvent::Error { message, .. } => {
+                terminal += 1;
+                assert!(message.contains("No tool output found"), "{message}");
+                assert!(message.contains("input[3].call_id"));
+                assert!(message.contains("req_worker_fixture"));
+                assert!(!message.contains("https://"));
+                assert!(!message.contains("private-query"));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(tool_completed);
+    worker.send(session, WorkerCommand::Hello).await;
+    loop {
+        let event = worker.event().await;
+        match event.payload {
+            EngineEvent::Ready { .. } => break,
+            EngineEvent::Error { .. } | EngineEvent::Completed { .. } | EngineEvent::Cancelled => {
+                terminal += 1
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(terminal, 1);
+    let recorded = server.await.unwrap();
+    assert_eq!(recorded.len(), 2);
+    let input = recorded[1]["input"].as_array().unwrap();
+    assert_eq!(
+        input
+            .iter()
+            .filter(|item| item["type"] == "function_call" && item["call_id"] == "call_fixture")
+            .count(),
+        1
+    );
+    assert_eq!(
+        input
+            .iter()
+            .filter(
+                |item| item["type"] == "function_call_output" && item["call_id"] == "call_fixture"
+            )
+            .count(),
+        1
+    );
+    assert!(input.iter().any(|item| item["type"] == "reasoning"
+        && item["id"] == "rs_fixture"
+        && item["encrypted_content"] == "opaque-encrypted-fixture"));
+    let store = xylo_services::Store::open(&worker._profile.path().join("xylo.db")).unwrap();
+    let checkpoint = store.checkpoint(session).unwrap().unwrap();
+    assert_eq!(checkpoint.turn_id, request.turn_id);
+    assert!(
+        checkpoint
+            .messages
+            .to_string()
+            .contains("durable fixture contents")
+    );
+    assert!(
+        store
+            .completed_turn(session, request.turn_id)
+            .unwrap()
+            .is_none()
+    );
     worker.stop().await;
 }

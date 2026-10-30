@@ -6,7 +6,7 @@ use anyhow::{Result, ensure};
 use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ToolDefinition, ToolObservation};
+use xylo_core::{ToolDefinition, ToolObservation};
 
 pub fn availability() -> Value {
     let wayland = cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some();

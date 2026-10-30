@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
-use workbench_core::{MemoryBackend, MemoryRecord};
+use xylo_core::{MemoryBackend, MemoryRecord};
 
 /// Pooling is part of model compatibility, not an interchangeable tuning choice.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -333,14 +333,22 @@ impl SqliteMemory {
         if exists {
             return Ok(());
         }
-        let vector = self.vector(&record.content)?;
+        let vector = self.vector(&record.content).unwrap_or_else(|_| {
+            tracing::warn!("Optional memory embedding unavailable; saving lexical memory");
+            None
+        });
         self.store.call(move|conn|{let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             crate::memory_facts::reject_deleted(&tx,record.id)?;
             if same_record(&tx, &record)? { tx.commit()?; return Ok(()); }
             ensure!(crate::memory_facts::generation(&tx,&record.scope)?==generation,"Project facts changed during this save; refresh and retry");
             if let Some(previous)=record.supersedes {let previous_state:Option<(String,bool)>=tx.query_row("SELECT scope,active FROM memories WHERE id=?1",[previous.to_string()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;ensure!(previous_state.as_ref().is_some_and(|(scope,active)|scope==&record.scope&&*active),"Correct the current memory in the same project");tx.execute("UPDATE memories SET active=0 WHERE id=?1",[previous.to_string()])?; delete_vectors(&tx, &previous.to_string())?;}
-            let (model,embedding)=match vector{Some((m,v))=>(Some(m),Some(v)),None=>(None,None)};
-            if let (Some(model), Some(embedding)) = (&model, &embedding) { let table = ensure_vector_table(&tx, model, embedding.len()/4)?; tx.execute(&format!("INSERT INTO {table}(id,scope,embedding) VALUES(?1,?2,?3)"),params![record.id.to_string(),record.scope,embedding])?; }
+            let (mut model,mut embedding)=match vector{Some((m,v))=>(Some(m),Some(v)),None=>(None,None)};
+            if let (Some(vector_model), Some(vector_embedding)) = (&model, &embedding) {
+                tx.execute_batch("SAVEPOINT optional_memory_vector")?;
+                let indexed = (|| -> Result<()> { let table = ensure_vector_table(&tx, vector_model, vector_embedding.len()/4)?; tx.execute(&format!("INSERT INTO {table}(id,scope,embedding) VALUES(?1,?2,?3)"),params![record.id.to_string(),record.scope,vector_embedding])?; Ok(()) })();
+                if indexed.is_err() { tx.execute_batch("ROLLBACK TO optional_memory_vector")?; model = None; embedding = None; tracing::warn!("Optional semantic index unavailable; saving lexical memory"); }
+                tx.execute_batch("RELEASE optional_memory_vector")?;
+            }
             tx.execute("INSERT INTO memories(id,scope,content,json,embedding,embedding_model) VALUES(?1,?2,?3,?4,?5,?6)",params![record.id.to_string(),record.scope,record.content,serde_json::to_string(&record)?,embedding,model])?;
             tx.execute("INSERT INTO memories_fts(id,scope,content) VALUES(?1,?2,?3)",params![record.id.to_string(),record.scope,record.content])?;
             crate::memory_facts::inserted(&tx,&record)?;tx.commit()?;Ok(())})
@@ -357,7 +365,10 @@ impl SqliteMemory {
             .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
             .collect();
         let fts = terms.join(" OR ");
-        let vector = self.vector(query)?;
+        let vector = self.vector(query).unwrap_or_else(|_| {
+            tracing::warn!("Optional memory embedding unavailable; using lexical recall");
+            None
+        });
         self.store.call(move|conn|{
             let mut lexical=conn.prepare("SELECT m.json FROM memories_fts f JOIN memories m ON m.id=f.id WHERE memories_fts MATCH ?1 AND m.scope=?2 AND m.active=1 ORDER BY bm25(memories_fts) LIMIT ?3")?;
             let lexical=lexical.query_map(params![fts,scope,(limit*4) as i64],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -365,9 +376,13 @@ impl SqliteMemory {
             let mut add=|items:Vec<String>|->Result<()>{for (rank,json) in items.into_iter().enumerate(){let record:MemoryRecord=serde_json::from_str(&json)?;ranked.entry(record.id).and_modify(|(score,_)|*score+=1.0/(60.0+rank as f64)).or_insert((1.0/(60.0+rank as f64),record));}Ok(())};
             add(lexical)?;
             if let Some((model,embedding))=vector {
-                let table = ensure_vector_table(conn, &model, embedding.len()/4)?;
-                let mut semantic=conn.prepare(&format!("SELECT m.json FROM {table} v JOIN memories m ON m.id=v.id WHERE v.embedding MATCH ?1 AND k=?2 AND v.scope=?3 AND m.active=1 ORDER BY v.distance"))?;
-                let items=semantic.query_map(params![embedding,(limit*4).min(4096) as i64,scope],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;add(items)?;
+                let semantic_result = (|| -> Result<Vec<String>> {
+                    let table = ensure_vector_table(conn, &model, embedding.len()/4)?;
+                    let mut semantic=conn.prepare(&format!("SELECT m.json FROM {table} v JOIN memories m ON m.id=v.id WHERE v.embedding MATCH ?1 AND k=?2 AND v.scope=?3 AND m.active=1 ORDER BY v.distance"))?;
+                    Ok(semantic.query_map(params![embedding,(limit*4).min(4096) as i64,scope],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+                })();
+                match semantic_result { Ok(items) => add(items.into_iter().filter(|json| serde_json::from_str::<MemoryRecord>(json).is_ok()).collect())?, Err(_) => tracing::warn!("Optional semantic index unavailable; using lexical recall") }
+
             }
             let mut ranked:Vec<_>=ranked.into_values().collect();ranked.sort_by(|a,b|b.0.total_cmp(&a.0).then_with(||b.1.created_at.cmp(&a.1.created_at)));Ok(ranked.into_iter().take(limit).map(|(_,record)|record).collect())})
     }
@@ -608,6 +623,34 @@ mod vector_tests {
                 .is_empty()
         );
         assert!(!memory.unload_if_idle(Duration::ZERO).unwrap());
+    }
+
+    #[test]
+    fn broken_optional_runtime_keeps_lexical_save_and_recall_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let assets_directory = directory.path().join("assets");
+        write_metadata_fixture(&assets_directory);
+        let config = directory.path().join("embedding.json");
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&metadata_assets(&assets_directory)).unwrap(),
+        )
+        .unwrap();
+        let store = Store::open(directory.path().join("fallback.db")).unwrap();
+        let memory = SqliteMemory::configured(store, &config).unwrap();
+        let record = xylo_core::MemoryRecord {
+            id: Uuid::new_v4(),
+            scope: "project-a".into(),
+            content: "Prefer violet accent".into(),
+            source: "Explicit user choice".into(),
+            created_at: 7,
+            supersedes: None,
+        };
+        memory.remember_sync(record.clone()).unwrap();
+        assert_eq!(
+            memory.recall_sync("project-a", "violet", 3).unwrap()[0].id,
+            record.id
+        );
     }
 
     #[test]

@@ -8,9 +8,9 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-pub(super) const OWNER: &str = "io.agent-workbench.installation";
-pub(super) const PROFILE: &str = "io.agent-workbench.environment";
-pub(super) const CREATED: &str = "io.agent-workbench.create-operation";
+pub(super) const OWNER: &str = "com.qurkos.xylo.installation";
+pub(super) const PROFILE: &str = "com.qurkos.xylo.environment";
+pub(super) const CREATED: &str = "com.qurkos.xylo.create-operation";
 type Sessions = HashMap<(PathBuf, Uuid), ManagedProcess>;
 fn sessions() -> &'static Mutex<Sessions> {
     static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
@@ -121,7 +121,7 @@ pub(super) async fn socket(
         Sha256::digest(format!("{}:{installation}", manager.root.display()))
     );
     let root = PathBuf::from("/tmp").join(format!(
-        "workbench-{}-{}",
+        "xylo-{}-{}",
         unsafe { libc::geteuid() },
         &suffix[..12]
     ));
@@ -410,11 +410,12 @@ pub(super) async fn inspect(
 }
 pub(super) fn container_name(installation: Uuid, id: Uuid) -> String {
     format!(
-        "workbench-{}-{}",
+        "xylo-{}-{}",
         &installation.simple().to_string()[..8],
         id.simple()
     )
 }
+
 pub(super) fn owned(inspection: &Inspection, installation: Uuid, id: Uuid) -> Result<()> {
     ensure!(
         inspection.labels.get(OWNER) == Some(&installation.to_string())

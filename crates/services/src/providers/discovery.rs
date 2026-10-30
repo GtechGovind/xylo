@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use workbench_core::{ApiFamily, ProviderConfig};
+use xylo_core::{ApiFamily, ProviderConfig};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderModel {
@@ -12,6 +12,10 @@ pub struct ProviderModel {
     pub display_name: String,
     #[serde(default)]
     pub context_tokens: Option<u32>,
+    #[serde(default)]
+    pub reasoning_options: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_reasoning_effort: Option<String>,
 }
 
 /// Account-specific catalog, bounded to eight pages / 2,000 models. Discovery is
@@ -86,7 +90,8 @@ pub(crate) async fn discover_with_credential(
         ensure!(
             matches!(config.family, ApiFamily::OpenAiResponses)
                 && normalized.base_url.as_str().trim_end_matches('/')
-                    == "https://api.openai.com/v1",
+                    == "https://api.openai.com/v1"
+                && url.origin() == normalized.base_url.origin(),
             "ChatGPT catalog requires the public Responses API endpoint"
         );
     }
@@ -167,13 +172,10 @@ pub(crate) async fn discover_with_credential(
             {
                 continue;
             }
-            let Some(id) = row
-                .get("id")
-                .or_else(|| row.get("slug"))
-                .or_else(|| row.get("name"))
-                .or_else(|| row.get("modelId"))
-                .and_then(Value::as_str)
-            else {
+            let Some(id) = model_identifier(
+                row,
+                matches!(credential, ProviderCredential::ChatGpt { .. }),
+            ) else {
                 continue;
             };
             let id = id.trim_start_matches("models/").to_owned();
@@ -195,7 +197,10 @@ pub(crate) async fn discover_with_credential(
                 .find_map(|path| row.pointer(path).and_then(Value::as_u64))
                 .and_then(|n| u32::try_from(n).ok())
                 .filter(|n| *n >= 1024);
+                let (reasoning_options, default_reasoning_effort) = catalog_reasoning(row);
                 output.push(ProviderModel {
+                    reasoning_options,
+                    default_reasoning_effort,
                     id,
                     display_name,
                     context_tokens,
@@ -302,6 +307,8 @@ async fn bedrock_catalog(
                 if seen.insert(id.to_owned()) {
                     output.push(ProviderModel {
                         context_tokens: None,
+                        reasoning_options: None,
+                        default_reasoning_effort: None,
                         id: id.into(),
                         display_name: row[if profiles {
                             "inferenceProfileName"
@@ -332,4 +339,49 @@ async fn bedrock_catalog(
         }
     }
     Ok(output)
+}
+
+/// Provider-native model identifiers must survive discovery unchanged.
+pub(super) fn model_identifier(row: &Value, chatgpt_plan: bool) -> Option<&str> {
+    if chatgpt_plan {
+        return row.get("slug").and_then(Value::as_str);
+    }
+    row.get("id")
+        .or_else(|| row.get("slug"))
+        .or_else(|| row.get("name"))
+        .or_else(|| row.get("modelId"))
+        .and_then(Value::as_str)
+}
+
+/// Preserve explicit catalog capability (including an empty list), without
+/// inferring support from a model name or from a default field alone.
+pub(super) fn catalog_reasoning(row: &Value) -> (Option<Vec<String>>, Option<String>) {
+    let options = row
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .map(|levels| {
+            let mut options = Vec::new();
+            for level in levels.iter().take(16) {
+                if let Some(effort) = level
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .filter(|v| xylo_core::valid_reasoning_option(v))
+                {
+                    if !options.iter().any(|v| v == effort) {
+                        options.push(effort.to_owned());
+                    }
+                }
+            }
+            options
+        });
+    let default = row
+        .get("default_reasoning_level")
+        .and_then(Value::as_str)
+        .filter(|effort| {
+            options
+                .as_ref()
+                .is_some_and(|options| options.iter().any(|v| v == effort))
+        })
+        .map(str::to_owned);
+    (options, default)
 }

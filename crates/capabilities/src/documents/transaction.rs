@@ -12,7 +12,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::*;
+use xylo_core::*;
 #[derive(Serialize, Deserialize)]
 struct Operation {
     digest: String,

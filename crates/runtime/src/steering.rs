@@ -2,9 +2,9 @@
 //! abandoning a commit on cancellation could misreport application to a task.
 use anyhow::Result;
 use uuid::Uuid;
-use workbench_core::SteeringRequest;
-use workbench_services::{DraftSubmission, Store};
-pub use workbench_services::{SteeringApplication, SteeringOutcome};
+use xylo_core::SteeringRequest;
+use xylo_services::{DraftSubmission, Store};
+pub use xylo_services::{SteeringApplication, SteeringOutcome};
 pub async fn queue(
     store: Store,
     request: SteeringRequest,

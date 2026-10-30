@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
-use workbench_core::{MemoryRecord, ToolDefinition, now_ms};
+use xylo_core::{MemoryRecord, ToolDefinition, now_ms};
 
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![
@@ -239,18 +239,22 @@ fn readable_path(broker: &ToolBroker, requested: &str) -> Result<PathBuf> {
 
 /// A writing path that is invalid is rejected before anything is changed.
 pub(super) fn write_target(root: &Path, requested: &str) -> Result<PathBuf> {
-    workspace_path(root, requested, true).map_err(|error| code::unapplied(format!("{error:#}")))
+    let target = workspace_path(root, requested, true)
+        .map_err(|error| code::unapplied(format!("{error:#}")))?;
+    xylo_services::sandbox::ensure_writable_target(&target)
+        .map_err(|e| code::unapplied(e.to_string()))?;
+    Ok(target)
 }
 
-/// Approval presentation for file changes: the path and an actual diff rather
-/// than the full payload. Invalid edits are rejected before an intent exists.
+/// Approval presentation retains the complete diff and original request for
+/// inspection. Invalid edits are rejected before an intent exists.
 pub(super) fn change_preview(root: &Path, name: &str, args: &Value) -> Result<Value> {
     let path = write_target(root, text(args, "path")?)?;
     let shown = code::display(root, &path);
     let mut preview = match name {
         "file_edit" => {
             let plan = code::plan_edit(&path, &shown, args)?;
-            let mut preview = code::diff(&shown, &plan.original, &plan.updated);
+            let mut preview = code::approval_diff(&shown, &plan.original, &plan.updated);
             preview["replacements"] = json!(plan.replacements);
             preview
         }
@@ -258,12 +262,13 @@ pub(super) fn change_preview(root: &Path, name: &str, args: &Value) -> Result<Va
             let content = text(args, "content")?;
             ensure!(content.len() <= 2 * 1024 * 1024, "Write exceeds 2 MiB");
             let existing = code::existing_text(&path);
-            let mut preview = code::diff(&shown, existing.as_deref().unwrap_or(""), content);
+            let mut preview = code::approval_diff(&shown, existing.as_deref().unwrap_or(""), content);
             preview["created"] = json!(!path.exists());
             preview
         }
     };
     preview["path"] = json!(shown);
+    preview["request"] = args.clone();
     Ok(preview)
 }
 
@@ -368,16 +373,16 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
             json!(record)
         }
         "skill_list" => {
-            let skills = workbench_services::LearningService::new(broker.store.clone())
+            let skills = xylo_services::LearningService::new(broker.store.clone())
                 .skills(&root.to_string_lossy(), 100)?;
             json!({"promoted":skills.iter().filter(|skill|skill.state=="promoted").collect::<Vec<_>>(),"candidates":skills.iter().filter(|skill|skill.state!="promoted").collect::<Vec<_>>()})
         }
         "skill_read" => json!(
-            workbench_services::LearningService::new(broker.store.clone())
+            xylo_services::LearningService::new(broker.store.clone())
                 .active_skill(&root.to_string_lossy(), text(args, "name")?)?
         ),
         "skill_propose" => {
-            json!({"queued_turn_id":workbench_services::LearningService::new(broker.store.clone()).queue_latest_completed(broker.request.session_id)?,"state":"background_evaluation"})
+            json!({"queued_turn_id":xylo_services::LearningService::new(broker.store.clone()).queue_latest_completed(broker.request.session_id)?,"state":"background_evaluation"})
         }
         "git_status" | "git_diff" => {
             let mut argv: Vec<String> = if name == "git_status" {
@@ -399,14 +404,14 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
                     argv.push(path.to_string_lossy().into_owned());
                 }
             }
-            let git = code::resolve_program("git", root)?;
-            let result = broker.runtime.block_on(workbench_runtime::process::run(
-                &git.to_string_lossy(),
-                &argv,
-                root,
-                Duration::from_secs(30),
-                broker.cancel.child_token(),
-            ))?;
+            let result = broker
+                .runtime
+                .block_on(xylo_runtime::workspace::git::run_read(
+                    root,
+                    &argv,
+                    Duration::from_secs(30),
+                    broker.cancel.child_token(),
+                ))?;
             ensure!(
                 result.code == Some(0),
                 "git exited {:?}: {}",
@@ -439,13 +444,22 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
                 .and_then(Value::as_u64)
                 .unwrap_or(120)
                 .clamp(1, 1200);
-            let result = broker.runtime.block_on(workbench_runtime::process::run(
-                &program.to_string_lossy(),
-                &argv,
-                root,
-                Duration::from_secs(timeout),
-                broker.cancel.child_token(),
-            ))?;
+            let protected = broker
+                .artifacts
+                .parent()
+                .map(|p| vec![p.to_path_buf()])
+                .unwrap_or_default();
+            let result = broker
+                .runtime
+                .block_on(xylo_runtime::process::run_sandboxed(
+                    &program.to_string_lossy(),
+                    &argv,
+                    root,
+                    &[],
+                    &protected,
+                    Duration::from_secs(timeout),
+                    broker.cancel.child_token(),
+                ))?;
             let output = json!({
                 "exit_code": result.code,
                 "stdout": result.stdout,
@@ -473,6 +487,17 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn approval_preserves_full_change_and_original_arguments() {
+        let workspace = tempfile::tempdir().unwrap();
+        let content = format!("{}\nFINAL_ACTION_SENTINEL\n", "long change line\n".repeat(3000));
+        let args = json!({"path":"new.txt", "content":content});
+        let preview = change_preview(workspace.path(), "file_write", &args).unwrap();
+        assert!(preview["diff"].as_str().unwrap().contains("+FINAL_ACTION_SENTINEL"));
+        assert_eq!(preview["diff_truncated"], false);
+        assert_eq!(preview["request"], args);
+        assert!(!workspace.path().join("new.txt").exists());
+    }
     #[test]
     fn paths_cannot_escape_through_parent_or_symlink() {
         let workspace = tempfile::tempdir().unwrap();

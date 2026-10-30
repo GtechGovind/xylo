@@ -63,11 +63,11 @@ case "$verb" in
   owner=''; profile=''; operation=''; previous=''
   for arg in "$@"; do
     if [ "$previous" = '--label' ]; then
-      case "$arg" in io.agent-workbench.installation=*) owner=${arg#*=};; io.agent-workbench.environment=*) profile=${arg#*=};; io.agent-workbench.create-operation=*) operation=${arg#*=};; esac
+      case "$arg" in com.qurkos.xylo.installation=*) owner=${arg#*=};; com.qurkos.xylo.environment=*) profile=${arg#*=};; com.qurkos.xylo.create-operation=*) operation=${arg#*=};; esac
     fi
     previous=$arg
   done
-  printf '{"io.agent-workbench.installation":"%s","io.agent-workbench.environment":"%s","io.agent-workbench.create-operation":"%s"}' "$owner" "$profile" "$operation" > "$root/labels"
+  printf '{"com.qurkos.xylo.installation":"%s","com.qurkos.xylo.environment":"%s","com.qurkos.xylo.create-operation":"%s"}' "$owner" "$profile" "$operation" > "$root/labels"
   touch "$root/exists"
   printf aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   ;;

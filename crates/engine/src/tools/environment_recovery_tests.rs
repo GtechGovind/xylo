@@ -4,8 +4,8 @@
 
 use super::*;
 use std::{fs, os::unix::fs::PermissionsExt};
-use workbench_capabilities::environments::execute_management;
-use workbench_core::{
+use xylo_capabilities::environments::execute_management;
+use xylo_core::{
     ContainerRuntime, ContainerTarget, Conversation, EngineBackend, EnvironmentOperationState,
     EnvironmentProfile, EnvironmentReceipt, EnvironmentRecord, EnvironmentTarget, ProviderConfig,
     now_ms,
@@ -85,7 +85,7 @@ esac
         let environment = connected.environment.unwrap();
         assert!(environment.connected);
 
-        let store = Store::open(root.join("workbench.db")).unwrap();
+        let store = Store::open(root.join("xylo.db")).unwrap();
         let session_id = Uuid::new_v4();
         store
             .upsert_conversation(&Conversation {
@@ -276,7 +276,7 @@ esac
                 .await;
                 assert_eq!(current.operation_id, operation_id);
                 assert_eq!(current.environment_id, self.environment.profile.id);
-                assert_eq!(current.action, workbench_core::EnvironmentAction::Execute);
+                assert_eq!(current.action, xylo_core::EnvironmentAction::Execute);
                 if current.output.is_some() {
                     return current;
                 }
@@ -793,7 +793,7 @@ async fn assert_engine_can_continue(fixture: &Fixture) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_preflight_rejections_are_failed_and_allow_actual_engine_to_continue() {
-    use workbench_capabilities::environments::CommandNotDispatched;
+    use xylo_capabilities::environments::CommandNotDispatched;
     for case in ["revision", "disconnected", "command", "budget"] {
         let mut fixture = Fixture::new().await;
         let mut arguments = fixture.arguments("__success__");
@@ -881,7 +881,7 @@ async fn malformed_fresh_environment_requests_have_no_journal_approval_or_dispat
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn existing_uncertain_receipt_is_not_classified_as_a_fresh_preflight_rejection() {
-    use workbench_capabilities::environments::CommandNotDispatched;
+    use xylo_capabilities::environments::CommandNotDispatched;
     let mut fixture = Fixture::new().await;
     let arguments = fixture.arguments("__uncertain__");
     let unknown = fixture
@@ -912,7 +912,7 @@ async fn existing_uncertain_receipt_is_not_classified_as_a_fresh_preflight_rejec
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_original_operation_lease_cancellation_remains_unknown_without_reexecution() {
-    use workbench_capabilities::environments::CommandNotDispatched;
+    use xylo_capabilities::environments::CommandNotDispatched;
     let mut fixture = Fixture::new().await;
     let arguments = fixture.arguments("__hang__");
     let service = CapabilityService::new(fixture.config.clone()).unwrap();

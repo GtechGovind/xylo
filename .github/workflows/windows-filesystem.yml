@@ -14,8 +14,6 @@ on:
       - "crates/resources/**"
       - "crates/services/src/learning/sanitize.rs"
       - "crates/notifications/**"
-      - "scripts/release*.py"
-      - "scripts/test_release*.py"
       - ".github/workflows/windows-filesystem.yml"
   pull_request:
     paths:
@@ -28,8 +26,6 @@ on:
       - "crates/resources/**"
       - "crates/services/src/learning/sanitize.rs"
       - "crates/notifications/**"
-      - "scripts/release*.py"
-      - "scripts/test_release*.py"
       - ".github/workflows/windows-filesystem.yml"
 
 permissions:
@@ -72,8 +68,6 @@ jobs:
           rustup toolchain install 1.98.0 --profile minimal --component clippy
           host=$(rustc --version --verbose | sed -n 's/^host: //p')
           test "$host" = '${{ matrix.target }}'
-      - name: UTF-8 release protocols and actual Cargo metadata
-        run: python -m unittest discover -s scripts -p test_release_common.py -v
       # These import the production modules and execute their real NT handle
       # operations without first compiling the desktop/browser/inference graph.
       - name: Plugin and capture filesystem authority tests
@@ -83,14 +77,14 @@ jobs:
         run: cargo test --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}'
       - name: Native resource admission tests
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p workbench-resources --lib --target '${{ matrix.target }}'
+        run: cargo test --locked -p xylo-resources --lib --target '${{ matrix.target }}'
       - name: Native notification regressions
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p workbench-notifications --lib --target '${{ matrix.target }}'
+        run: cargo test --locked -p xylo-notifications --lib --target '${{ matrix.target }}'
       - name: Strict platform-module Clippy
         if: ${{ !cancelled() }}
         run: |
           cargo clippy --locked --manifest-path crates/capabilities/validation/windows-read/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
           cargo clippy --locked --manifest-path crates/runtime/validation/windows-workspace/Cargo.toml --target '${{ matrix.target }}' --all-targets -- -D warnings
-          cargo clippy --locked -p workbench-resources --lib --tests --target '${{ matrix.target }}' -- -D warnings
-          cargo clippy --locked -p workbench-notifications --all-targets --target '${{ matrix.target }}' -- -D warnings
+          cargo clippy --locked -p xylo-resources --lib --tests --target '${{ matrix.target }}' -- -D warnings
+          cargo clippy --locked -p xylo-notifications --all-targets --target '${{ matrix.target }}' -- -D warnings

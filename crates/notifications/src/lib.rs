@@ -332,7 +332,7 @@ impl Service {
         );
         ensure!(!cancel.is_cancelled(), "Notification test cancelled");
         let epoch = self.policy_epoch.load(Ordering::Acquire);
-        let tag = format!("workbench-test-{}", Uuid::new_v4().simple());
+        let tag = format!("xylo-test-{}", Uuid::new_v4().simple());
         let result = self
             .adapter
             .post(

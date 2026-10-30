@@ -9,10 +9,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_core::TurnRequest;
-use workbench_services::attachments::AttachmentStore;
+use xylo_core::TurnRequest;
+use xylo_services::attachments::AttachmentStore;
 
-pub(crate) const IMAGE_MARKER: &str = "workbench_image_attachment";
+pub(crate) const IMAGE_MARKER: &str = "xylo_image_attachment";
 const MAX_REQUEST_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) fn user_message(request: &TurnRequest) -> Result<Message, AgentError> {

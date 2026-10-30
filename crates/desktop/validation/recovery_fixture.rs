@@ -8,12 +8,12 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
-use workbench_core::{AppSettings, TurnRequest};
-use workbench_runtime::{
+use xylo_core::{AppSettings, TurnRequest};
+use xylo_runtime::{
     AppPaths,
     host::{HostClient, HostEvent},
 };
-use workbench_services::{ActionIntent, Store};
+use xylo_services::{ActionIntent, Store};
 
 #[derive(Default)]
 pub struct Delivery {

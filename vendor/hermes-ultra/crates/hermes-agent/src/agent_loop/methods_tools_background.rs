@@ -3,12 +3,12 @@ impl AgentLoop {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Remove duplicate tool calls that share the same function name and arguments.
+    /// Remove repeated wire IDs while preserving distinct provider call IDs.
     fn deduplicate_tool_calls(calls: &[ToolCall]) -> Vec<ToolCall> {
         let mut seen = HashSet::new();
         let mut deduped = Vec::new();
         for tc in calls {
-            let key = format!("{}:{}", tc.function.name, tc.function.arguments);
+            let key = tc.id.clone();
             if seen.insert(key) {
                 deduped.push(tc.clone());
             } else {
@@ -464,6 +464,9 @@ impl AgentLoop {
     /// Resolve the model used for automatic degradation when nearing
     /// `max_cost_usd`.
     fn resolve_cost_degrade_model(&self) -> Option<String> {
+        if !self.config.allow_model_fallbacks {
+            return None;
+        }
         if let Some(ref m) = self.config.cost_guard_degrade_model {
             if !m.trim().is_empty() {
                 return Some(m.trim().to_string());
@@ -485,6 +488,9 @@ impl AgentLoop {
         active_model: &str,
         route: Option<&TurnRuntimeRoute>,
     ) -> Option<String> {
+        if !self.config.allow_model_fallbacks {
+            return None;
+        }
         if let Some(ref fallback) = self.config.retry.fallback_model {
             if !fallback.trim().is_empty() && !fallback.eq_ignore_ascii_case(active_model) {
                 return Some(fallback.trim().to_string());
@@ -514,6 +520,9 @@ impl AgentLoop {
     }
 
     fn resolve_retry_failover_chain(&self, active_model: &str) -> Vec<String> {
+        if !self.config.allow_model_fallbacks {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let active_lc = active_model.trim().to_ascii_lowercase();
@@ -898,6 +907,19 @@ impl AgentLoop {
             }
         }
 
+        // A worker panic or cancellation is still an outcome for the original
+        // provider call. Never leave a dangling assistant tool-call in history.
+        for tc in tool_calls {
+            if !results.iter().any(|result| result.tool_call_id == tc.id) {
+                let error = "Tool execution stopped before returning a result; its effects may be incomplete. Inspect state before repeating a mutation.";
+                tool_errors.push(hermes_core::ToolErrorRecord {
+                    tool_name: tc.function.name.clone(),
+                    error: error.into(),
+                    turn,
+                });
+                results.push(ToolResult::err(&tc.id, error));
+            }
+        }
         results
     }
 

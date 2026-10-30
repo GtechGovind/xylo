@@ -1,5 +1,5 @@
 use super::*;
-use workbench_core::MemoryRecord;
+use xylo_core::MemoryRecord;
 fn record(scope: &str, text: &str) -> MemoryRecord {
     MemoryRecord {
         id: Uuid::new_v4(),

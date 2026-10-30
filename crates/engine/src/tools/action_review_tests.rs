@@ -1,8 +1,8 @@
 //! Real engine continuation after an explicit observation; no effect is replayed.
 use super::*;
 use hermes_core::{FunctionCall, Message, ToolCall};
-use workbench_core::{Conversation, EngineBackend, ProviderConfig, now_ms};
-use workbench_services::{ActionResolutionOutcome, ActionResolutionRequest, ActionReviewScope};
+use xylo_core::{Conversation, EngineBackend, ProviderConfig, now_ms};
+use xylo_services::{ActionResolutionOutcome, ActionResolutionRequest, ActionReviewScope};
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -327,8 +327,8 @@ async fn late_blocking_work_retains_real_lease_after_async_scope_and_handle_are_
     let target = f.request.workspace.join("late.txt");
     // Deliberately return the handle without awaiting the actual blocking work:
     // it must retain ownership after this async lease scope is gone.
-    let (job,) = workbench_runtime::resources::scope_action(file, async {
-        (workbench_runtime::resources::spawn_blocking(move || {
+    let (job,) = xylo_runtime::resources::scope_action(file, async {
+        (xylo_runtime::resources::spawn_blocking(move || {
             entered.send(()).unwrap();
             wait.recv().unwrap();
             std::fs::write(target, "actual late work completed").unwrap();

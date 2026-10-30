@@ -3,20 +3,20 @@
 use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
-use workbench_helper_client::HelperClient;
+use xylo_helper_client::HelperClient;
 
 #[tokio::test]
-#[ignore = "Explicit model downloads: set WORKBENCH_SPEECH_SMOKE_DATA to an isolated absolute test data directory"]
+#[ignore = "Explicit model downloads: set XYLO_SPEECH_SMOKE_DATA to an isolated absolute test data directory"]
 async fn selected_native_voice_synthesizes_and_whisper_transcribes_without_devices() {
     let data = PathBuf::from(
-        std::env::var_os("WORKBENCH_SPEECH_SMOKE_DATA")
+        std::env::var_os("XYLO_SPEECH_SMOKE_DATA")
             .expect("Explicit isolated speech test data root"),
     );
     assert!(data.is_absolute());
     std::fs::create_dir_all(&data).unwrap();
     let workspace = data.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    let client = HelperClient::spawn(env!("CARGO_BIN_EXE_workbench-helper"), &data, &workspace)
+    let client = HelperClient::spawn(env!("CARGO_BIN_EXE_xylo-helper"), &data, &workspace)
         .await
         .unwrap();
     for id in ["vits-ljs-int8", "whisper-tiny-en"] {

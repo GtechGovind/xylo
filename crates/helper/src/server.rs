@@ -14,10 +14,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workbench_capabilities::{
+use xylo_capabilities::{
     CapabilityConfig, CapabilityService, assets::AssetManager, audio::AudioService,
 };
-use workbench_helper_client::protocol::{
+use xylo_helper_client::protocol::{
     self, Command, PROTOCOL_VERSION, QUEUE_CAPACITY, Request, Response,
 };
 
@@ -47,7 +47,7 @@ impl State {
         }
         match name {
             "helper_version" => Ok(
-                json!({"name":"workbench-helper","version":env!("CARGO_PKG_VERSION"),"protocol_version":PROTOCOL_VERSION}),
+                json!({"name":"xylo-helper","version":env!("CARGO_PKG_VERSION"),"protocol_version":PROTOCOL_VERSION}),
             ),
             "helper_status" => Ok(
                 json!({"workspace":self.workspace,"data_dir":self.data,"artifacts":self.data.join("artifacts"),"models":self.data.join("models"),"capabilities":self.service.read().await.status().await}),
@@ -368,13 +368,13 @@ pub async fn serve(data: PathBuf, workspace: PathBuf) -> Result<()> {
                 let mut response = tokio::select! {
                     response=pending.recv()=>match response{Some(response)=>response,None=>break},
                     _=interval.tick()=>{
-                        if assets.active_jobs()+audio.active_jobs()+workbench_capabilities::environments::active_sessions(&session_config)==last_jobs{continue;}
+                        if assets.active_jobs()+audio.active_jobs()+xylo_capabilities::environments::active_sessions(&session_config)==last_jobs{continue;}
                         Response::completed(Uuid::nil(),json!({"event":"background_jobs_changed"}))
                     }
                 };
                 response.background_jobs = assets.active_jobs()
                     + audio.active_jobs()
-                    + workbench_capabilities::environments::active_sessions(&session_config);
+                    + xylo_capabilities::environments::active_sessions(&session_config);
                 last_jobs = response.background_jobs;
                 tokio::time::timeout(
                     Duration::from_secs(10),

@@ -730,12 +730,12 @@ fn regex_escape(s: &str) -> String {
 fn color(c: Color, background: bool) -> u32 {
     match c {
         Color::Spec(rgb) => ((rgb.r as u32) << 16) | ((rgb.g as u32) << 8) | rgb.b as u32,
-        Color::Named(NamedColor::Foreground) => 0xdde2ee,
-        Color::Named(NamedColor::Background) => 0x11151d,
+        Color::Named(NamedColor::Foreground) => 0xe4e7ee,
+        Color::Named(NamedColor::Background) => 0x0f1117,
         Color::Named(c) => indexed(c as usize),
         Color::Indexed(i) => {
             if i == 0 && background {
-                0x11151d
+                0x0f1117
             } else {
                 indexed(i as usize)
             }
@@ -744,7 +744,7 @@ fn color(c: Color, background: bool) -> u32 {
 }
 fn indexed(i: usize) -> u32 {
     const BASE: [u32; 16] = [
-        0x1d2330, 0xf07178, 0xa3be8c, 0xebcb8b, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5, 0x565f89,
+        0x1c2029, 0xf07178, 0xa3be8c, 0xebcb8b, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5, 0x6b7380,
         0xff8990, 0xb9f27c, 0xffdc9a, 0x99b6ff, 0xd6b5ff, 0xa4e8ff, 0xffffff,
     ];
     if i < 16 {

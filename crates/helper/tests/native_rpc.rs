@@ -3,13 +3,13 @@
 
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
-use workbench_helper_client::HelperClient;
+use xylo_helper_client::HelperClient;
 
 #[tokio::test]
 async fn priority_cancel_that_overtakes_execute_prevents_dispatch() {
-    use workbench_helper_client::protocol::{self, Command, Outcome, Request, Response};
+    use xylo_helper_client::protocol::{self, Command, Outcome, Request, Response};
     let root = tempfile::tempdir().unwrap();
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_workbench-helper"))
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_xylo-helper"))
         .arg("--data-dir")
         .arg(root.path().join("data"))
         .arg("--workspace")
@@ -53,7 +53,7 @@ async fn persistent_helper_exports_documents_and_correlates_concurrent_requests(
     let data = root.path().join("data");
     let workspace = root.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let client = HelperClient::spawn(env!("CARGO_BIN_EXE_workbench-helper"), &data, &workspace)
+    let client = HelperClient::spawn(env!("CARGO_BIN_EXE_xylo-helper"), &data, &workspace)
         .await
         .unwrap();
     let version = client
@@ -170,7 +170,7 @@ async fn persistent_helper_exports_documents_and_correlates_concurrent_requests(
                 .await
                 .unwrap();
             if index % 2 == 0 {
-                assert_eq!(result["name"], "workbench-helper");
+                assert_eq!(result["name"], "xylo-helper");
             } else {
                 assert!(result.get("capabilities").is_some());
             }
@@ -218,7 +218,7 @@ async fn persistent_helper_exports_documents_and_correlates_concurrent_requests(
         .execute("helper_reload_config", &json!({}), CancellationToken::new())
         .await
         .unwrap();
-    let second = HelperClient::spawn(env!("CARGO_BIN_EXE_workbench-helper"), &data, &workspace)
+    let second = HelperClient::spawn(env!("CARGO_BIN_EXE_xylo-helper"), &data, &workspace)
         .await
         .unwrap();
     let native_path = workspace.join("native-llama");
@@ -302,7 +302,7 @@ async fn persistent_helper_exports_documents_and_correlates_concurrent_requests(
             .await
             .is_ok()
     );
-    let oversized = "x".repeat(workbench_helper_client::protocol::MAX_FRAME_BYTES);
+    let oversized = "x".repeat(xylo_helper_client::protocol::MAX_FRAME_BYTES);
     assert!(
         client
             .execute(
@@ -333,7 +333,7 @@ async fn cancellation_reaches_the_native_child_and_helper_remains_available() {
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     let client = HelperClient::spawn(
-        env!("CARGO_BIN_EXE_workbench-helper"),
+        env!("CARGO_BIN_EXE_xylo-helper"),
         root.path().join("data"),
         root.path(),
     )

@@ -35,6 +35,24 @@ use crate::agent_loop::{AgentConfig, AgentLoop, ToolRegistry};
 use crate::credential_pool::CredentialPool;
 use crate::interrupt::InterruptController;
 
+/// Tokio detaches on JoinHandle drop. Child work must instead remain owned by
+/// its awaiting parent, including early errors and cancelled parent futures.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct ChildCancellationGuard(Option<Arc<dyn Fn() + Send + Sync>>);
+impl Drop for ChildCancellationGuard {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.0 {
+            cancel();
+        }
+    }
+}
+
 /// Boxed `Send` future type alias used to short-circuit async-recursion
 /// between parent and child [`AgentLoop::execute_tool_calls`] futures.
 type BoxSendFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -77,6 +95,10 @@ pub struct SubAgentLineage {
     #[serde(default)]
     pub total_turns: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_naturally: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u64>,
@@ -92,6 +114,7 @@ pub struct SubAgentLineage {
 pub enum SubAgentStatus {
     Started,
     Completed,
+    Incomplete,
     Failed,
     Cancelled,
     Timeout,
@@ -134,11 +157,25 @@ pub struct SubAgentOrchestratorConfig {
 /// In-process executor for `delegate_task` tool calls.
 pub struct SubAgentOrchestrator {
     cfg: SubAgentOrchestratorConfig,
+    admission: tokio::sync::Semaphore,
+    child_cancellation: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SubAgentOrchestrator {
     pub fn new(cfg: SubAgentOrchestratorConfig) -> Self {
-        Self { cfg }
+        let admission =
+            tokio::sync::Semaphore::new(cfg.parent_config.max_concurrent_delegates.max(1) as usize);
+        Self {
+            cfg,
+            admission,
+            child_cancellation: None,
+        }
+    }
+
+    /// Link child-local timeout and parent-future drop to the host tool scope.
+    pub fn with_child_cancellation(mut self, cancel: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.child_cancellation = Some(cancel);
+        self
     }
 
     /// Default orchestrator that mirrors the current `AgentLoop`'s wiring.
@@ -148,6 +185,10 @@ impl SubAgentOrchestrator {
     /// actively running child.
     pub fn from_parent(parent: &AgentLoop, hermes_home: PathBuf) -> Self {
         Self {
+            child_cancellation: None,
+            admission: tokio::sync::Semaphore::new(
+                parent.config.max_concurrent_delegates.max(1) as usize
+            ),
             cfg: SubAgentOrchestratorConfig {
                 parent_config: parent.config.clone(),
                 tool_registry: parent.tool_registry.clone(),
@@ -227,15 +268,14 @@ impl SubAgentOrchestrator {
     async fn execute_inner(self: Arc<Self>, req: SubAgentRequest, sub_agent_id: String) -> String {
         let started_at = Utc::now();
 
+        let effective_config = self.build_child_config(&req, &sub_agent_id);
         let mut lineage = SubAgentLineage {
             sub_agent_id: sub_agent_id.clone(),
             parent_session_id: self.cfg.parent_session_id.clone(),
             task: req.task.clone(),
             context: req.context.clone(),
             toolset: req.toolset.clone(),
-            model: clean_config_string(req.model.as_deref())
-                .or_else(|| clean_config_string(self.cfg.parent_config.delegation_model.as_deref()))
-                .map(str::to_string),
+            model: Some(diagnostic_model(&effective_config.model)),
             provider: self.effective_delegation_provider(),
             depth: req.child_depth,
             max_depth: req.max_depth,
@@ -244,6 +284,8 @@ impl SubAgentOrchestrator {
             started_at,
             ended_at: None,
             total_turns: 0,
+            finished_naturally: None,
+            stopped_reason: None,
             prompt_tokens: None,
             completion_tokens: None,
             estimated_cost_usd: None,
@@ -258,7 +300,25 @@ impl SubAgentOrchestrator {
 
         match outcome {
             Ok(result) => {
-                lineage.status = SubAgentStatus::Completed;
+                lineage.status = if result.finished_naturally {
+                    SubAgentStatus::Completed
+                } else {
+                    SubAgentStatus::Incomplete
+                };
+                lineage.finished_naturally = Some(result.finished_naturally);
+                lineage.stopped_reason = if result.finished_naturally {
+                    None
+                } else {
+                    let turn_limit = effective_config.max_turns;
+                    Some(
+                        if result.total_turns >= turn_limit {
+                            "Assigned conversation turn limit reached; work may remain."
+                        } else {
+                            "Execution stopped before natural completion; work may remain."
+                        }
+                        .to_string(),
+                    )
+                };
                 lineage.total_turns = result.total_turns;
                 if let Some(usage) = result.usage.as_ref() {
                     lineage.prompt_tokens = Some(usage.prompt_tokens);
@@ -271,11 +331,12 @@ impl SubAgentOrchestrator {
                 let final_text = extract_final_assistant_text(&result.messages);
                 json!({
                     "sub_agent_id": sub_agent_id,
-                    "status": "completed",
+                    "status": lineage.status,
                     "background": req.background,
                     "task": req.task,
                     "total_turns": result.total_turns,
                     "finished_naturally": result.finished_naturally,
+                    "stopped_reason": lineage.stopped_reason,
                     "result": final_text,
                     "usage": result.usage.as_ref().map(|u| json!({
                         "prompt_tokens": u.prompt_tokens,
@@ -323,6 +384,17 @@ impl SubAgentOrchestrator {
         req: &SubAgentRequest,
         sub_agent_id: &str,
     ) -> Result<hermes_core::AgentResult, SubAgentError> {
+        let _permit = loop {
+            self.cfg
+                .parent_interrupt
+                .check_interrupt()
+                .map_err(SubAgentError::Agent)?;
+            tokio::select! {
+                permit = self.admission.acquire() => break permit.map_err(|_| SubAgentError::Cancelled)?,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        };
+        let _host_scope = ChildCancellationGuard(self.child_cancellation.clone());
         let child_interrupt = InterruptController::new();
 
         // Forward parent cancellation to child via a light watcher task.
@@ -330,7 +402,7 @@ impl SubAgentOrchestrator {
         let child_ctrl = child_interrupt.clone();
         let watcher_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let watcher_stop_clone = watcher_stop.clone();
-        let watcher = tokio::spawn(async move {
+        let mut watcher = AbortOnDrop(tokio::spawn(async move {
             while !watcher_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                 if parent_ctrl.is_interrupted() {
                     child_ctrl.interrupt(Some("parent cancelled".to_string()));
@@ -338,7 +410,7 @@ impl SubAgentOrchestrator {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        });
+        }));
 
         let child_config = self.build_child_config(req, sub_agent_id);
         let child_provider = self.child_llm_provider(&child_config)?;
@@ -358,7 +430,7 @@ impl SubAgentOrchestrator {
         // call). `tokio::spawn` requires `Send + 'static`, which forces child
         // `AgentLoop::run` to already be Send — this is also what the existing
         // `spawn_background_review` relies on.
-        let join = tokio::spawn(async move {
+        let mut join = AbortOnDrop(tokio::spawn(async move {
             let child_agent = AgentLoop::with_interrupt(
                 child_config,
                 tool_registry,
@@ -367,9 +439,9 @@ impl SubAgentOrchestrator {
             )
             .with_delegate_depth(child_depth);
             child_agent.run(initial, inherited_tools).await
-        });
+        }));
 
-        let result = match timeout(self.cfg.timeout, join).await {
+        let result = match timeout(self.cfg.timeout, &mut join.0).await {
             Ok(Ok(Ok(result))) if result.interrupted => Err(SubAgentError::Cancelled),
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(AgentError::Interrupted { .. }))) => Err(SubAgentError::Cancelled),
@@ -382,12 +454,17 @@ impl SubAgentOrchestrator {
                 // Cooperative cancel on timeout — next `check_interrupt()`
                 // boundary in the child unwinds.
                 child_interrupt.interrupt(Some("timeout".to_string()));
+                if let Some(cancel) = &self.child_cancellation {
+                    cancel();
+                }
+                join.0.abort();
+                let _ = timeout(Duration::from_secs(5), &mut join.0).await;
                 Err(SubAgentError::Timeout)
             }
         };
 
         watcher_stop.store(true, std::sync::atomic::Ordering::Release);
-        let _ = watcher.await;
+        let _ = (&mut watcher.0).await;
         result
     }
 
@@ -578,8 +655,13 @@ fn format_background_delegation_notification(output: &str) -> String {
         .get("sub_agent_id")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
+    let heading = if status == "completed" {
+        "ASYNC DELEGATION COMPLETE"
+    } else {
+        "ASYNC DELEGATION STOPPED"
+    };
     let mut out = format!(
-        "ASYNC DELEGATION COMPLETE\n\nTask: {task}\nSub-agent: {sub_agent_id}\nStatus: {status}"
+        "{heading}\n\nTask: {task}\nSub-agent: {sub_agent_id}\nStatus: {status}"
     );
     if let Some(result) = value
         .get("result")
@@ -589,6 +671,10 @@ fn format_background_delegation_notification(output: &str) -> String {
     {
         out.push_str("\n\nResult:\n");
         out.push_str(result);
+    }
+    if let Some(reason) = value.get("stopped_reason").and_then(|v| v.as_str()) {
+        out.push_str("\n\nStopped: ");
+        out.push_str(reason);
     }
     if let Some(error) = value
         .get("error")
@@ -642,6 +728,112 @@ mod tests {
         ) -> BoxStream<'static, Result<StreamChunk, AgentError>> {
             futures::stream::empty().boxed()
         }
+    }
+
+    #[tokio::test]
+    async fn exhausted_child_preserves_partial_result_and_reports_incomplete() {
+        struct LoopProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for LoopProvider {
+            async fn chat_completion(
+                &self,
+                messages: &[Message],
+                tools: &[ToolSchema],
+                _max_tokens: Option<u32>,
+                _temperature: Option<f64>,
+                _model: Option<&str>,
+                _extra_body: Option<&serde_json::Value>,
+            ) -> Result<LlmResponse, AgentError> {
+                let message = if tools.is_empty() {
+                    Message::assistant("Partial result; work remains.")
+                } else {
+                    Message::assistant_with_tool_calls(
+                        None,
+                        vec![hermes_core::ToolCall {
+                            id: format!("inspect-{}", messages.len()),
+                            function: hermes_core::FunctionCall {
+                                name: "inspect".into(),
+                                arguments: "{}".into(),
+                            },
+                            extra_content: None,
+                        }],
+                    )
+                };
+                Ok(LlmResponse {
+                    message,
+                    usage: None,
+                    model: "loop".into(),
+                    finish_reason: None,
+                })
+            }
+            fn chat_completion_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSchema],
+                _max_tokens: Option<u32>,
+                _temperature: Option<f64>,
+                _model: Option<&str>,
+                _extra_body: Option<&serde_json::Value>,
+            ) -> BoxStream<'static, Result<StreamChunk, AgentError>> {
+                futures::stream::empty().boxed()
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            "inspect",
+            ToolSchema::new("inspect", "Inspect", JsonSchema::new("object")),
+            Arc::new(|_| Ok("{}".into())),
+        );
+        let orch = Arc::new(SubAgentOrchestrator::new(SubAgentOrchestratorConfig {
+            parent_config: AgentConfig {
+                max_turns: 2,
+                ..AgentConfig::default()
+            },
+            tool_registry: Arc::new(registry),
+            llm_provider: Arc::new(LoopProvider),
+            parent_credential_pool: None,
+            parent_interrupt: InterruptController::new(),
+            hermes_home: tmp.path().to_path_buf(),
+            parent_session_id: Some("parent".into()),
+            timeout: Duration::from_secs(5),
+            background_delegation_callback: None,
+        }));
+        let output = orch
+            .execute(SubAgentRequest {
+                task: "Inspect repeatedly".into(),
+                child_depth: 1,
+                max_depth: 4,
+                inherited_tool_schemas: vec![ToolSchema::new(
+                    "inspect",
+                    "Inspect",
+                    JsonSchema::new("object"),
+                )],
+                ..Default::default()
+            })
+            .await;
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["status"], "incomplete");
+        assert_eq!(value["finished_naturally"], false);
+        assert_eq!(value["result"], "Partial result; work remains.");
+        assert_eq!(
+            value["stopped_reason"],
+            "Assigned conversation turn limit reached; work may remain."
+        );
+        let lineage_path = tmp
+            .path()
+            .join("subagents")
+            .join(format!("{}.json", value["sub_agent_id"].as_str().unwrap()));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(lineage_path).expect("persisted lineage"))
+                .unwrap();
+        assert_eq!(saved["status"], "incomplete");
+        assert_eq!(saved["finished_naturally"], false);
+        assert_eq!(saved["stopped_reason"], value["stopped_reason"]);
+        let notification = format_background_delegation_notification(&output);
+        assert!(notification.starts_with("ASYNC DELEGATION STOPPED"));
+        assert!(notification.contains("Assigned conversation turn limit reached"));
+        assert!(notification.contains("Partial result; work remains."));
     }
 
     #[tokio::test]
@@ -727,7 +919,13 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_timeout_path_produces_timeout_json() {
-        struct SlowProvider;
+        struct SlowProvider(Arc<std::sync::atomic::AtomicBool>);
+        struct Stopped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         #[async_trait::async_trait]
         impl LlmProvider for SlowProvider {
             async fn chat_completion(
@@ -739,6 +937,7 @@ mod tests {
                 _model: Option<&str>,
                 _extra_body: Option<&serde_json::Value>,
             ) -> Result<LlmResponse, AgentError> {
+                let _stopped = Stopped(self.0.clone());
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 Ok(LlmResponse {
                     message: Message::assistant("late"),
@@ -760,8 +959,11 @@ mod tests {
             }
         }
 
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let parent_cfg = AgentConfig {
             max_turns: 2,
+            skip_memory: true,
+            skip_context_files: true,
             model: "slow".into(),
             ..AgentConfig::default()
         };
@@ -769,12 +971,12 @@ mod tests {
         let orch = Arc::new(SubAgentOrchestrator::new(SubAgentOrchestratorConfig {
             parent_config: parent_cfg,
             tool_registry: Arc::new(ToolRegistry::new()),
-            llm_provider: Arc::new(SlowProvider),
+            llm_provider: Arc::new(SlowProvider(stopped.clone())),
             parent_credential_pool: None,
             parent_interrupt: InterruptController::new(),
             hermes_home: tmp.path().to_path_buf(),
             parent_session_id: Some("parent".into()),
-            timeout: Duration::from_millis(50),
+            timeout: Duration::from_millis(500),
             background_delegation_callback: None,
         }));
         let out = orch
@@ -787,6 +989,7 @@ mod tests {
             .await;
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["status"], "timeout");
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(parsed["sub_agent_id"]
             .as_str()
             .unwrap()
@@ -1096,5 +1299,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("definitely-missing-provider"));
+    }
+}
+
+fn diagnostic_model(model: &str) -> String {
+    if model.len() <= 160
+        && !model.contains("://")
+        && !model.is_empty()
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/'))
+    {
+        model.to_owned()
+    } else {
+        "<configured model>".into()
     }
 }

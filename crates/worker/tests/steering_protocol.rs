@@ -14,8 +14,8 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout},
 };
 use uuid::Uuid;
-use workbench_core::*;
-use workbench_services::{DraftKey, DraftSave, DraftSubmission, DraftWrite, Store};
+use xylo_core::*;
+use xylo_services::{DraftKey, DraftSave, DraftSubmission, DraftWrite, Store};
 struct Worker {
     child: Child,
     input: ChildStdin,
@@ -23,7 +23,7 @@ struct Worker {
 }
 impl Worker {
     async fn start(profile: &Path) -> Self {
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_workbench-worker"))
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_xylo-worker"))
             .arg("--data-dir")
             .arg(profile)
             .stdin(Stdio::piped())
@@ -227,7 +227,7 @@ fn occurrences(body: &Value, guidance: &SteeringRequest) -> usize {
 async fn guidance_during_final_stream_requires_another_provider_call_and_exact_receipt() {
     let workspace = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
-    let paths = workbench_runtime::AppPaths::at(profile.path().into()).unwrap();
+    let paths = xylo_runtime::AppPaths::at(profile.path().into()).unwrap();
     let store = Store::open(&paths.database).unwrap();
     let (endpoint, mut calls) = provider(2);
     let turn = turn(workspace.path(), endpoint);
@@ -286,7 +286,7 @@ async fn actual_process_interruptions_recover_queued_and_applied_context_without
  {
     let workspace = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
-    let paths = workbench_runtime::AppPaths::at(profile.path().into()).unwrap();
+    let paths = xylo_runtime::AppPaths::at(profile.path().into()).unwrap();
     let store = Store::open(&paths.database).unwrap();
     let (endpoint, mut calls) = provider(4);
     let turn = turn(workspace.path(), endpoint);
@@ -384,7 +384,7 @@ async fn actual_process_interruptions_recover_queued_and_applied_context_without
 async fn cancellation_before_application_reports_cancelled_and_preserves_draft() {
     let workspace = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
-    let paths = workbench_runtime::AppPaths::at(profile.path().into()).unwrap();
+    let paths = xylo_runtime::AppPaths::at(profile.path().into()).unwrap();
     let store = Store::open(&paths.database).unwrap();
     let (endpoint, mut calls) = provider(1);
     let turn = turn(workspace.path(), endpoint);

@@ -247,6 +247,15 @@ pub(crate) fn existing_text(path: &Path) -> Option<String> {
 
 /// Unified diff for approval and results, bounded for events and context.
 pub(crate) fn diff(shown: &str, before: &str, after: &str) -> Value {
+    diff_with_limit(shown, before, after, Some(DIFF_BYTES))
+}
+
+/// Approval inspection must retain the complete planned change.
+pub(crate) fn approval_diff(shown: &str, before: &str, after: &str) -> Value {
+    diff_with_limit(shown, before, after, None)
+}
+
+fn diff_with_limit(shown: &str, before: &str, after: &str, limit: Option<usize>) -> Value {
     use similar::{Algorithm, ChangeTag, TextDiff};
     let changes = TextDiff::configure()
         .algorithm(Algorithm::Patience)
@@ -265,9 +274,9 @@ pub(crate) fn diff(shown: &str, before: &str, after: &str) -> Value {
         .context_radius(3)
         .header(&format!("a/{shown}"), &format!("b/{shown}"))
         .to_string();
-    let truncated = unified.len() > DIFF_BYTES;
+    let truncated = limit.is_some_and(|limit| unified.len() > limit);
     if truncated {
-        let mut cut = DIFF_BYTES;
+        let mut cut = limit.unwrap();
         while !unified.is_char_boundary(cut) {
             cut -= 1;
         }
@@ -280,7 +289,7 @@ pub(crate) fn diff(shown: &str, before: &str, after: &str) -> Value {
 /// Atomic replacement that keeps an existing file's permissions.
 pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<()> {
     use std::io::Write;
-    let temp = path.with_file_name(format!(".workbench-{}.tmp", uuid::Uuid::new_v4()));
+    let temp = path.with_file_name(format!(".xylo-{}.tmp", uuid::Uuid::new_v4()));
     let permissions = std::fs::metadata(path).ok().map(|m| m.permissions());
     let result = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()

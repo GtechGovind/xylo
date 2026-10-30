@@ -2,7 +2,7 @@ use super::*;
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, time::Duration};
 use uuid::Uuid;
-use workbench_core::{
+use xylo_core::{
     NativePluginManifest, PluginBudgets, PluginCatalog, PluginInspection, PluginManagementResult,
 };
 

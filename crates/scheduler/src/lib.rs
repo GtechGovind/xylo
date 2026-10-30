@@ -13,7 +13,7 @@ use std::{
     str::FromStr,
 };
 use uuid::Uuid;
-use workbench_core::{ToolDefinition, ToolObservation};
+use xylo_core::{ToolDefinition, ToolObservation};
 
 const MAX_TASKS: usize = 128;
 const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024;
@@ -362,7 +362,7 @@ mod tests {
     /// Invoked in a fresh test executable by the process-race test below.
     #[test]
     fn cross_process_writer_fixture() {
-        let Some(path) = std::env::var_os("WORKBENCH_SCHEDULER_FIXTURE_FILE") else {
+        let Some(path) = std::env::var_os("XYLO_SCHEDULER_FIXTURE_FILE") else {
             return;
         };
         let path = PathBuf::from(path);
@@ -391,7 +391,7 @@ mod tests {
                     "tests::cross_process_writer_fixture",
                     "--nocapture",
                 ])
-                .env("WORKBENCH_SCHEDULER_FIXTURE_FILE", &path)
+                .env("XYLO_SCHEDULER_FIXTURE_FILE", &path)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .spawn()

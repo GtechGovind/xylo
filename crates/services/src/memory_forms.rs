@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use workbench_core::{MemoryRecord, now_ms};
+use xylo_core::{MemoryRecord, now_ms};
 
 const MAX_FORM_BYTES: usize = 6 * 1024 * 1024;
 const MAX_TOTAL_BYTES: i64 = 64 * 1024 * 1024;

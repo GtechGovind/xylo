@@ -1,12 +1,13 @@
 //! Native terminal rendering. No webview: PTY parsing is in runtime::terminal,
 //! glyph shaping, selection and IME are handled by GPUI.
-use crate::ui::{accent, border, button, muted, panel, sidebar, text};
+use crate::ui::{accent_text as accent, border, button, muted, panel, sidebar, text};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::{prelude::*, *};
 use std::ops::Range;
-use workbench_runtime::terminal::{TerminalSession, TerminalSnapshot};
+use xylo_runtime::terminal::{TerminalSession, TerminalSnapshot};
 
-const SURFACE: u32 = 0x11151d;
+/// Terminal canvas: the same warm charcoal as the dark workspace.
+const SURFACE: u32 = 0x0f1117;
 const MAX_ASSIST_CONTEXT: usize = 12 * 1024;
 
 /// A reviewed terminal question. The application opens a separate saved chat;
@@ -401,7 +402,7 @@ impl Render for TerminalView {
                     .p(px(10.))
                     .overflow_hidden()
                     .track_focus(&self.focus)
-                    .key_context("WorkbenchTerminal")
+                    .key_context("XyloTerminal")
                     .cursor(CursorStyle::IBeam)
                     .on_key_down(cx.listener(Self::key))
                     .on_mouse_down(
@@ -720,7 +721,7 @@ impl Element for TerminalElement {
             .shape_line(
                 "M".into(),
                 font_size,
-                &[terminal_run(&font, 1, 0xdde2ee, false, false, false)],
+                &[terminal_run(&font, 1, 0xe4e7ee, false, false, false)],
                 None,
             )
             .width
@@ -865,7 +866,7 @@ impl Element for TerminalElement {
                 && let Some((row, col)) = snapshot.cursor
             {
                 let origin = bounds.origin + point(cw * col as f32, ch * row as f32);
-                window.paint_quad(fill(Bounds::new(origin, size(px(2.), ch)), rgb(0xa7edb2)));
+                window.paint_quad(fill(Bounds::new(origin, size(px(2.), ch)), rgb(0x8b88ff)));
                 if !preedit.is_empty() {
                     let line = window.text_system().shape_line(
                         preedit.clone().into(),
@@ -897,8 +898,8 @@ pub(crate) mod tests {
         terminal_run,
     };
     use gpui_kit::{App, Bounds, Element, Entity, Font, Window, point, px, size};
-    use workbench_runtime::terminal::TerminalCell;
-    use workbench_runtime::terminal::TerminalSnapshot;
+    use xylo_runtime::terminal::TerminalCell;
+    use xylo_runtime::terminal::TerminalSnapshot;
 
     #[test]
     fn assistance_context_is_bounded_and_prefers_the_explicit_selection() {
@@ -919,7 +920,7 @@ pub(crate) mod tests {
         let columns = 110;
         let blank = TerminalCell {
             text: " ".into(),
-            foreground: 0xdde2ee,
+            foreground: 0xe4e7ee,
             background: SURFACE,
             bold: false,
             italic: false,
