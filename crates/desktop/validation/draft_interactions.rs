@@ -17,7 +17,7 @@ mod xylo {
         use super::{DraftFlushAction, Page, Xylo};
         use gpui_kit::{
             AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size,
-            test::TestWindowExt,
+            test::{TestQueryExt, TestWindowExt},
         };
         use std::time::{Duration, Instant};
         use uuid::Uuid;
@@ -36,7 +36,8 @@ mod xylo {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 // Drive the native receiver's bounded-backlog yield timer.
-                cx.executor().advance_clock(std::time::Duration::from_millis(2));
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 if cx.update(|cx| condition(view.read(cx), cx)) {
                     return;
@@ -506,45 +507,169 @@ mod xylo {
         }
 
         #[gpui_kit::test]
-        fn second_native_message_dispatches_guidance_during_long_running_response(cx: &mut TestAppContext) {
+        fn native_queue_and_remove_roundtrip_preserves_newer_composer(cx: &mut TestAppContext) {
             use gpui_kit::EntityInputHandler;
             cx.executor().allow_parking();
-            let directory=tempfile::tempdir().unwrap();
-            let base=directory.path().canonicalize().unwrap();
-            let workspace=base.join("project");std::fs::create_dir(&workspace).unwrap();
-            let paths=AppPaths::at(base.join("profile")).unwrap();
-            let store=Store::open(&paths.database).unwrap();
-            let host=HostClient::spawn_at(paths).unwrap();let client=host.0.clone();
-            let (window,view)=open(cx,Ok(host));
-            wait(cx,&view,"settings",|view,_|view.settings_loaded);
-            cx.update_window(window,|_,window,cx|view.update(cx,|view,cx|view.set_workspace(workspace.clone(),window,cx))).unwrap();
-            let session=cx.update(|cx|view.read(cx).session);
-            let key=DraftKey {session_id:session,workspace:Some(workspace.clone())};
-            wait(cx,&view,"initial draft",|view,_|view.drafts.validation_revision(&key).is_some());
-            let turn=Uuid::new_v4();
-            store.upsert_conversation(&xylo_core::Conversation {id:session,title:"Live task".into(),workspace,updated_at:1}).unwrap();
-            store.save_checkpoint(session,turn,&serde_json::json!([{"role":"user","content":"Original task"}])).unwrap();
-            cx.update_window(window,|_,window,cx|{
-                view.update(cx,|view,cx|{
-                    let state=view.turns.entry(session).or_default();state.apply(xylo_core::EngineEvent::Started);
-                    state.apply(xylo_core::EngineEvent::Delta {text:"Long reasoning paragraph with Unicode αβ.\n\n".repeat(2000)});
-                    view.error=None;cx.notify();
+            let directory = tempfile::tempdir().unwrap();
+            let base = directory.path().canonicalize().unwrap();
+            let workspace = base.join("project");
+            std::fs::create_dir(&workspace).unwrap();
+            let paths = AppPaths::at(base.join("profile")).unwrap();
+            let store = Store::open(&paths.database).unwrap();
+            let host = HostClient::spawn_at(paths).unwrap();
+            let client = host.0.clone();
+            let (window, view) = open(cx, Ok(host));
+            wait(cx, &view, "settings", |view, _| view.settings_loaded);
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| view.set_workspace(workspace.clone(), window, cx));
+            }).unwrap();
+            let key = cx.update(|cx| view.read(cx).current_draft_key());
+            wait(cx, &view, "initial draft", |view, _| view.drafts.validation_revision(&key).is_some());
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.settings.provider.model = "isolated-queue-fixture".into();
+                    view.turns.entry(key.session_id).or_default().apply(xylo_core::EngineEvent::Started);
+                    view.error = None;
+                    cx.notify();
+                });
+                let composer = view.read(cx).composer.clone();
+                composer.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                    input.replace_text_in_range(None, "Queue this exact saved instruction αβ", window, cx);
+                });
+                view.update(cx, |view, cx| view.draft_changed(cx));
+                window.render_frame(cx);
+                window.click("send-prompt", cx);
+            }).unwrap();
+            wait(cx, &view, "real queue acknowledgement", |view, cx| {
+                !view.draft_send_pending() && view.composer.read(cx).value().is_empty()
+                    && view.turn_queue.items.get(&key.session_id).is_some_and(|items| items.len() == 1)
+            });
+            let rows = store.turn_queue(key.session_id).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].turn.prompt, "Queue this exact saved instruction αβ");
+            assert!(rows[0].paused, "Idle real host must retain the queued item without starting a worker");
+            assert!(store.draft(&key).unwrap().text.is_empty());
+            cx.update_window(window, |_, window, cx| {
+                let composer = view.read(cx).composer.clone();
+                composer.update(cx, |input, cx| input.replace_text_in_range(None, "Keep my newer draft", window, cx));
+                view.update(cx, |view, cx| view.draft_changed(cx));
+                window.render_frame(cx);
+                assert!(window.try_find("composer-pending").is_some());
+                assert!(window.find(("remove-queued", 0usize)).bounds().origin.y < window.find("image-drop-target").bounds().origin.y);
+                window.click(("remove-queued", 0usize), cx);
+            }).unwrap();
+            wait(cx, &view, "real queue removal", |view, _| view.turn_queue.items.get(&key.session_id).is_none_or(|items| items.is_empty()));
+            assert!(store.turn_queue(key.session_id).unwrap().is_empty());
+            cx.update_window(window, |_, window, cx| {
+                assert_eq!(view.read(cx).composer.read(cx).value().as_ref(), "Keep my newer draft");
+                window.render_frame(cx);
+                assert!(window.try_find(("remove-queued", 0usize)).is_none());
+            }).unwrap();
+            client.shutdown().unwrap();
+        }
+
+        #[gpui_kit::test]
+        fn second_native_message_dispatches_guidance_during_long_running_response(
+            cx: &mut TestAppContext,
+        ) {
+            use gpui_kit::EntityInputHandler;
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let base = directory.path().canonicalize().unwrap();
+            let workspace = base.join("project");
+            std::fs::create_dir(&workspace).unwrap();
+            let paths = AppPaths::at(base.join("profile")).unwrap();
+            let store = Store::open(&paths.database).unwrap();
+            let host = HostClient::spawn_at(paths).unwrap();
+            let client = host.0.clone();
+            let (window, view) = open(cx, Ok(host));
+            wait(cx, &view, "settings", |view, _| view.settings_loaded);
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.set_workspace(workspace.clone(), window, cx)
+                })
+            })
+            .unwrap();
+            let session = cx.update(|cx| view.read(cx).session);
+            let key = DraftKey {
+                session_id: session,
+                workspace: Some(workspace.clone()),
+            };
+            wait(cx, &view, "initial draft", |view, _| {
+                view.drafts.validation_revision(&key).is_some()
+            });
+            let turn = Uuid::new_v4();
+            store
+                .upsert_conversation(&xylo_core::Conversation {
+                    id: session,
+                    title: "Live task".into(),
+                    workspace,
+                    updated_at: 1,
+                })
+                .unwrap();
+            store
+                .save_checkpoint(
+                    session,
+                    turn,
+                    &serde_json::json!([{"role":"user","content":"Original task"}]),
+                )
+                .unwrap();
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    let state = view.turns.entry(session).or_default();
+                    state.apply(xylo_core::EngineEvent::Started);
+                    state.apply(xylo_core::EngineEvent::Delta {
+                        text: "Long reasoning paragraph with Unicode αβ.\n\n".repeat(2000),
+                    });
+                    view.error = None;
+                    cx.notify();
                 });
                 window.render_frame(cx);
-                let composer=view.read(cx).composer.clone();
-                composer.update(cx,|input,cx|{input.focus(window,cx);input.replace_text_in_range(None,"Use the second instruction while reasoning αβ",window,cx);});
-                view.update(cx,|view,cx|view.draft_changed(cx));
-                window.render_frame(cx);window.click("send-prompt",cx);
-                assert!(view.read(cx).turns[&session].running,"Sending guidance must not cancel the active turn");
-                assert!(view.read(cx).drafts.validation_guidance_pending(&key),"Busy Send must capture guidance rather than start another run");
-            }).unwrap();
+                let composer = view.read(cx).composer.clone();
+                composer.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                    input.replace_text_in_range(
+                        None,
+                        "Use the second instruction while reasoning αβ",
+                        window,
+                        cx,
+                    );
+                });
+                view.update(cx, |view, cx| view.draft_changed(cx));
+                window.render_frame(cx);
+                window.click("steer-prompt", cx);
+                assert!(
+                    view.read(cx).turns[&session].running,
+                    "Sending guidance must not cancel the active turn"
+                );
+                assert!(
+                    view.read(cx).drafts.validation_guidance_pending(&key),
+                    "Steer must capture guidance without starting another run"
+                );
+            })
+            .unwrap();
             // The native fixture controls EngineEvents, without a paid/live
             // worker. The real Host must therefore refuse dispatch safely;
             // backend host tests separately exercise queue -> worker -> receipt.
-            wait(cx,&view,"guidance refusal from the real host",|view,_|view.error.as_deref()==Some("Guidance could not be added. Your draft is still here."));
-            assert_eq!(store.draft(&key).unwrap().text,"Use the second instruction while reasoning αβ");
+            wait(
+                cx,
+                &view,
+                "guidance refusal from the real host",
+                |view, _| {
+                    view.error.as_deref()
+                        == Some("Guidance could not be added. Your draft is still here.")
+                },
+            );
+            assert_eq!(
+                store.draft(&key).unwrap().text,
+                "Use the second instruction while reasoning αβ"
+            );
             cx.update(|cx| {
-                assert_eq!(view.read(cx).composer.read(cx).value().as_ref(),"Use the second instruction while reasoning αβ");
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_ref(),
+                    "Use the second instruction while reasoning αβ"
+                );
                 assert!(view.read(cx).turns[&session].running);
                 assert!(!view.read(cx).drafts.validation_guidance_pending(&key));
             });
@@ -818,6 +943,19 @@ mod xylo {
                 });
                 window.render_frame(cx);
                 assert!(window.try_find("draft-keep-current").is_some());
+                assert!(
+                    window.try_find("draft-compare-current").is_some(),
+                    "Current draft must be inspectable before replacement"
+                );
+                assert!(
+                    window.try_find("draft-compare-saved").is_some(),
+                    "Saved draft must be inspectable before replacement"
+                );
+                window.click("draft-copy-saved", cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().unwrap(),
+                    "Another window's saved draft"
+                );
                 assert!(window.try_find("draft-use-saved").is_some());
             })
             .unwrap();
@@ -825,6 +963,95 @@ mod xylo {
             cx.run_until_parked();
             assert_eq!(store.draft(&key).unwrap(), external);
             client.shutdown().unwrap();
+        }
+        #[gpui_kit::test]
+        fn conflict_comparison_and_message_stay_inside_a_narrow_chat(cx: &mut TestAppContext) {
+            let (handle, view) = open(cx, Err(anyhow::anyhow!("No external services")));
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.error = None;
+                    view.settings.ui.sidebar_visible = true;
+                    view.settings.ui.sidebar_width = 222.;
+                    view.settings.ui.work_panel_open = true;
+                    view.settings.ui.work_panel_width = 600.;
+                    view.page = Page::Chat;
+                    view.settings_open = false;
+                    view.validation_draft_surface(Some("A saved draft that remains available for review before choosing a version.".into()), false, window, cx);
+                });
+                window.resize(size(px(1000.), px(680.)));
+                window.bounds_changed(cx);
+                window.render_frame(cx);
+                let chat = window.find("native-chat-pane").bounds();
+                for id in ["draft-status-message", "draft-compare-current", "draft-compare-saved", "draft-keep-current", "draft-use-saved"] {
+                    let bounds = window.find(id).bounds();
+                    assert!(bounds.left() >= chat.left() && bounds.right() <= chat.right(), "{id} overflows chat: {bounds:?} vs {chat:?}");
+                    assert!(bounds.bottom() <= window.viewport_size().height, "{id} is unreachable below the viewport");
+                }
+            }).unwrap();
+        }
+        #[gpui_kit::test]
+        fn draft_conflict_distinguishes_same_named_images_and_copies_complete_references(
+            cx: &mut TestAppContext,
+        ) {
+            let (handle, view) = open(cx, Err(anyhow::anyhow!("No live image service")));
+            cx.update_window(handle, |_, window, cx| {
+                let (current, saved) = view.update(cx, |view, cx| {
+                    view.error = None;
+                    view.validation_draft_surface(
+                        Some("Saved image draft".into()),
+                        false,
+                        window,
+                        cx,
+                    );
+                    let current = xylo_core::ImageAttachment {
+                        id: Uuid::new_v4(),
+                        session_id: view.session,
+                        name: "screenshot.png".into(),
+                        media_type: "image/png".into(),
+                        sha256: "a".repeat(64),
+                        bytes: 1024,
+                        width: 640,
+                        height: 480,
+                        source: xylo_core::AttachmentSource::Picker,
+                        imported_at: 1,
+                    };
+                    let mut saved = current.clone();
+                    saved.id = Uuid::new_v4();
+                    saved.sha256 = "b".repeat(64);
+                    view.validation_draft_images(vec![current.clone()], vec![saved.clone()]);
+                    (current, saved)
+                });
+                window.render_frame(cx);
+                assert!(
+                    window
+                        .find_by_label("640 × 480 · 1 KiB · aaaaaaaaaaaa")
+                        .visible()
+                );
+                assert!(
+                    window
+                        .find_by_label("640 × 480 · 1 KiB · bbbbbbbbbbbb")
+                        .visible()
+                );
+                for (id, expected) in [
+                    ("draft-copy-current-details", current),
+                    ("draft-copy-saved-details", saved),
+                ] {
+                    window.click(id, cx);
+                    let details: serde_json::Value =
+                        serde_json::from_str(&cx.read_from_clipboard().unwrap().text().unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        details["attachments"][0],
+                        serde_json::to_value(expected).unwrap()
+                    );
+                    assert!(
+                        details["text"]
+                            .as_str()
+                            .is_some_and(|text| !text.is_empty())
+                    );
+                }
+            })
+            .unwrap();
         }
     }
 }

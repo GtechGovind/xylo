@@ -91,7 +91,8 @@ pub(super) fn fixture(
     tokio::sync::mpsc::Receiver<EngineEvent>,
 ) {
     let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path().join("xylo.db")).unwrap();
+    std::fs::create_dir_all(directory.path().join("profile")).unwrap();
+    let store = Store::open(directory.path().join("profile/xylo.db")).unwrap();
     let session = Uuid::new_v4();
     store
         .upsert_conversation(&Conversation {
@@ -116,8 +117,8 @@ pub(super) fn fixture(
         store,
         CapabilityConfig {
             workspace: directory.path().into(),
-            artifacts: directory.path().join("artifacts"),
-            management_root: Some(directory.path().join("native-management")),
+            artifacts: directory.path().join("profile/artifacts"),
+            management_root: Some(directory.path().join("profile/native-management")),
             ..Default::default()
         },
         ApprovalGate::default(),
@@ -566,6 +567,17 @@ async fn failed_observation_is_not_journaled_as_success() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_delegate_is_failed_with_partial_result_preserved() {
+    let (_directory, broker, _events) = fixture(PermissionMode::AskForWrites);
+    broker.set_delegate(Arc::new(|_, _| Ok(json!({"status":"incomplete","result":"partial findings","stopped_reason":"Assigned turn limit reached"}))));
+    let task = broker.clone();
+    assert!(tokio::task::spawn_blocking(move || task.execute("incomplete-child", "agent_delegate", json!({"task":"fixture"}))).await.unwrap().is_err());
+    let action = broker.journaled("incomplete-child").unwrap().unwrap();
+    assert_eq!(action.state,"failed");
+    assert_eq!(action.result.unwrap()["result"],"partial findings");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uncertain_observation_is_retained_and_never_replayed_as_success() {
     let (_directory, broker, mut events) = fixture(PermissionMode::AskForWrites);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -969,5 +981,646 @@ async fn independent_delegates_enter_callbacks_before_either_finishes() {
     assert!(
         both_entered,
         "A delegate callback held the registration mutex and serialized independent work"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_tool_allowlist_is_enforced_through_dynamic_dispatch() {
+    let (_directory, parent, _events) = fixture(PermissionMode::Auto);
+    let mut child = parent.scoped_child().unwrap();
+    child.restrict_tools(&["Read".into()]).unwrap();
+    assert!(
+        child.definitions().iter().all(|definition| matches!(
+            definition.name.as_str(),
+            "file_read" | "extension_resource"
+        ))
+    );
+    let denied = tokio::task::block_in_place(|| {
+        child.execute_child(
+            "parent",
+            "child",
+            "call_tool",
+            json!({"name":"shell_command","arguments":{"command":"touch forbidden"}}),
+        )
+    })
+    .unwrap_err();
+    assert!(denied.to_string().contains("not authorized"));
+    assert!(!parent.cancellation_token().is_cancelled());
+    let mut constrained = parent.scoped_child().unwrap();
+    assert!(constrained.restrict_tools(&["Bash(git:*)".into()]).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_empty_child_tool_allowlist_denies_every_tool() {
+    let (_directory, parent, _events) = fixture(PermissionMode::Auto);
+    let mut child = parent.scoped_child().unwrap();
+    child.restrict_tools(&[]).unwrap();
+    assert!(child.definitions().is_empty());
+    let direct = tokio::task::block_in_place(|| {
+        child.execute_child("parent", "read", "file_read", json!({"path":"README.md"}))
+    });
+    assert!(direct.unwrap_err().to_string().contains("not authorized"));
+    let dynamic = tokio::task::block_in_place(|| {
+        child.execute_child(
+            "parent",
+            "dynamic",
+            "call_tool",
+            json!({"name":"file_read","arguments":{"path":"README.md"}}),
+        )
+    });
+    assert!(dynamic.unwrap_err().to_string().contains("not authorized"));
+}
+
+fn install_portable_test_skill(broker: &ToolBroker, name: &str, body: &str) -> String {
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(
+        source.path().join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: Permission regression fixture\n---\n{body}"),
+    )
+    .unwrap();
+    let service = super::portable::service(broker);
+    let package = service.install_local(source.path()).unwrap();
+    service.set_enabled(&package.id, true).unwrap();
+    format!("{}:{name}", package.id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn portable_dynamic_context_is_denied_in_read_only_tasks_while_plain_skill_loads() {
+    let (directory, broker, mut events) = fixture(PermissionMode::ReadOnly);
+    let plain =
+        install_portable_test_skill(&broker, "plain", "Inspect the files without changing them.");
+    let dynamic =
+        install_portable_test_skill(&broker, "dynamic", "!`printf executed > dynamic-marker`");
+    let task = broker.clone();
+    tokio::task::spawn_blocking(move || {
+        let loaded = task
+            .execute("plain", "extension_skill", json!({"id": plain}))
+            .unwrap();
+        assert!(loaded.contains("Inspect the files"));
+        let error = task
+            .execute("dynamic", "extension_skill", json!({"id": dynamic}))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("requires write permission"),
+            "{error}"
+        );
+        assert!(task.journaled("dynamic").unwrap().is_none());
+    })
+    .await
+    .unwrap();
+    assert!(!directory.path().join("dynamic-marker").exists());
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, EngineEvent::ApprovalRequired { .. }));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn portable_dynamic_context_waits_for_broker_approval_and_denial_never_executes() {
+    let (directory, broker, mut events) = fixture(PermissionMode::AskForWrites);
+    let id = install_portable_test_skill(&broker, "dynamic", "!`printf executed > dynamic-marker`");
+    let task = broker.clone();
+    let execution = tokio::task::spawn_blocking(move || {
+        task.execute("dynamic-approval", "extension_skill", json!({"id": id}))
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(event) = events.recv().await {
+            if let EngineEvent::ApprovalRequired { action_id, .. } = event {
+                assert!(!directory.path().join("dynamic-marker").exists());
+                broker.approvals.decide(action_id, false).unwrap();
+                return;
+            }
+        }
+        panic!("Dynamic context must request approval");
+    })
+    .await
+    .unwrap();
+    assert!(
+        execution
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("denied")
+    );
+    assert!(!directory.path().join("dynamic-marker").exists());
+    assert_eq!(
+        broker.journaled("dynamic-approval").unwrap().unwrap().state,
+        "denied"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn portable_dynamic_context_reads_bundled_root_script_and_keeps_argument_commands_literal() {
+    let (directory, mut broker, mut events) = fixture(PermissionMode::Auto);
+    let profile = tempfile::tempdir().unwrap();
+    Arc::get_mut(&mut broker).unwrap().artifacts =
+        profile.path().join("data with spaces/artifacts");
+    let source = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(source.path().join("references")).unwrap();
+    std::fs::create_dir_all(source.path().join("scripts")).unwrap();
+    std::fs::write(source.path().join("references/info.txt"), "bundled context").unwrap();
+    std::fs::write(
+        source.path().join("scripts/context.sh"),
+        "#!/bin/sh\ncat \"$(dirname \"$0\")/../references/info.txt\"\n",
+    )
+    .unwrap();
+    std::fs::write(source.path().join("SKILL.md"),
+        "---\nname: bundled\ndescription: Bundled script fixture\n---\nResult:\n!`/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/context.sh\"`\nArguments:$ARGUMENTS").unwrap();
+    let service = super::portable::service(&broker);
+    let package = service.install_local(source.path()).unwrap();
+    service.set_enabled(&package.id, true).unwrap();
+    let id = format!("{}:bundled", package.id);
+    let arguments = "!`printf forbidden > injected-marker`";
+    let task = broker.clone();
+    let execution = tokio::task::spawn_blocking(move || {
+        task.execute(
+            "bundled-context",
+            "extension_skill",
+            json!({"id": id, "arguments": arguments}),
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if let EngineEvent::ApprovalRequired { action_id, .. } = event {
+                broker.approvals.decide(action_id, true).unwrap();
+                return;
+            }
+        }
+        panic!("Executable portable skill must request approval");
+    })
+    .await
+    .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(20), execution)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let result: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        result["instructions"],
+        format!("Result:\nbundled context\nArguments:{arguments}")
+    );
+    assert!(!directory.path().join("injected-marker").exists());
+}
+
+fn installed_tool_hooks(broker: &ToolBroker, pre: &str, post: &str) {
+    let source = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(source.path().join("hooks")).unwrap();
+    let mut hooks = serde_json::Map::new();
+    for (event, command) in [("PreToolUse", pre), ("PostToolUse", post)] {
+        if !command.is_empty() {
+            hooks.insert(
+                event.into(),
+                json!([{"matcher":"Write|Read","hooks":[{"type":"command","command":command}]}]),
+            );
+        }
+    }
+    std::fs::write(
+        source.path().join("hooks/hooks.json"),
+        json!({"hooks":hooks}).to_string(),
+    )
+    .unwrap();
+    let service = super::portable::service(broker);
+    let package = service.install_local(source.path()).unwrap();
+    service.set_enabled(&package.id, true).unwrap();
+    service
+        .component_setup(
+            &package.id,
+            "hooks",
+            xylo_services::extensions::ComponentSetup {
+                workspace: broker.request.workspace.clone(),
+                enabled_events: vec!["PreToolUse".into(), "PostToolUse".into()],
+                timeout_seconds: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn automatic_tool_hooks_share_approval_journal_and_never_recurse_or_replay() {
+    let (directory, broker, mut events) = fixture(PermissionMode::Auto);
+    installed_tool_hooks(
+        &broker,
+        "printf pre >> hook-order; printf '{}'",
+        "printf post >> hook-order; printf '{}'",
+    );
+    let task = broker.clone();
+    let execute = tokio::task::spawn_blocking(move || {
+        task.execute(
+            "hooked-write",
+            "file_write",
+            json!({"path":"result.txt","content":"actual write"}),
+        )
+    });
+    let approvals = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut count = 0;
+        while count < 2 {
+            match events.recv().await.unwrap() {
+                EngineEvent::ApprovalRequired {
+                    action_id, name, ..
+                } => {
+                    assert_eq!(name, "extension_component");
+                    broker.approvals.decide(action_id, true).unwrap();
+                    count += 1
+                }
+                _ => {}
+            }
+        }
+        count
+    })
+    .await
+    .unwrap();
+    assert_eq!(approvals, 2);
+    let output = tokio::time::timeout(Duration::from_secs(5), execute)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(output.contains("result.txt"));
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("result.txt")).unwrap(),
+        "actual write"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("hook-order")).unwrap(),
+        "prepost"
+    );
+    let actions = broker
+        .store
+        .actions_by_name("extension_component", 20)
+        .unwrap();
+    assert_eq!(actions.len(), 2);
+    assert!(actions.iter().all(|action| action.state == "succeeded"));
+    assert!(
+        actions
+            .iter()
+            .all(|action| action.intent.arguments["input"]["tool_name"] == "file_write")
+    );
+    let replay = run(
+        &broker,
+        "hooked-write",
+        "file_write",
+        json!({"path":"result.txt","content":"actual write"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay, output);
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("hook-order")).unwrap(),
+        "prepost"
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hook_denial_blocks_original_mutation_and_read_only_never_executes_hook_code() {
+    let (directory, broker, mut events) = fixture(PermissionMode::Auto);
+    installed_tool_hooks(
+        &broker,
+        "printf hook > hook-marker; printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\"}}'",
+        "",
+    );
+    let task = broker.clone();
+    let execute = tokio::task::spawn_blocking(move || {
+        task.execute(
+            "blocked-write",
+            "file_write",
+            json!({"path":"should-not-exist.txt","content":"blocked"}),
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if let EngineEvent::ApprovalRequired { action_id, .. } = event {
+                broker.approvals.decide(action_id, true).unwrap();
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let error = execute.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("Pre-tool hook prevented"));
+    assert!(!directory.path().join("should-not-exist.txt").exists());
+    assert_eq!(
+        broker.journaled("blocked-write").unwrap().unwrap().state,
+        "failed"
+    );
+    let (directory, broker, _events) = fixture(PermissionMode::ReadOnly);
+    std::fs::write(directory.path().join("sample.txt"), "readable").unwrap();
+    installed_tool_hooks(&broker, "printf escaped > hook-marker; printf '{}'", "");
+    let error = run(
+        &broker,
+        "readonly-hook",
+        "file_read",
+        json!({"path":"sample.txt"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("requires write permission"));
+    assert!(!directory.path().join("hook-marker").exists());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn post_hook_failure_preserves_completed_tool_receipt_and_blocks_uncertain_hook_replay() {
+    let (directory, broker, mut events) = fixture(PermissionMode::Auto);
+    installed_tool_hooks(&broker, "", "printf once >> post-marker; exit 1");
+    let task = broker.clone();
+    let execute = tokio::task::spawn_blocking(move || {
+        task.execute(
+            "post-write",
+            "file_write",
+            json!({"path":"written.txt","content":"durable"}),
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if let EngineEvent::ApprovalRequired { action_id, .. } = event {
+                broker.approvals.decide(action_id, true).unwrap();
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let result: Value = serde_json::from_str(&execute.await.unwrap().unwrap()).unwrap();
+    assert!(
+        result["post_tool_hook_error"]
+            .as_str()
+            .unwrap()
+            .contains("Tool completed")
+    );
+    assert_eq!(
+        broker.journaled("post-write").unwrap().unwrap().state,
+        "succeeded"
+    );
+    assert_eq!(
+        broker
+            .store
+            .actions_by_name("extension_component", 5)
+            .unwrap()[0]
+            .state,
+        "outcome_unknown"
+    );
+    run(
+        &broker,
+        "post-write",
+        "file_write",
+        json!({"path":"written.txt","content":"durable"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("post-marker")).unwrap(),
+        "once"
+    );
+    let next = run(
+        &broker,
+        "next-read",
+        "file_read",
+        json!({"path":"written.txt"}),
+    )
+    .await
+    .unwrap();
+    let next: Value = serde_json::from_str(&next).unwrap();
+    assert!(
+        next["post_tool_hook_error"]
+            .as_str()
+            .unwrap()
+            .contains("previous hook outcome is unknown")
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("post-marker")).unwrap(),
+        "once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hook_updated_input_is_rejected_before_original_mutation() {
+    let (directory, broker, mut events) = fixture(PermissionMode::Auto);
+    installed_tool_hooks(
+        &broker,
+        "printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"allow\",\"updatedInput\":{\"path\":\"changed.txt\"}}}'",
+        "",
+    );
+    let task = broker.clone();
+    let execute = tokio::task::spawn_blocking(move || {
+        task.execute(
+            "updated-input",
+            "file_write",
+            json!({"path":"original.txt","content":"blocked"}),
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if let EngineEvent::ApprovalRequired { action_id, .. } = event {
+                broker.approvals.decide(action_id, true).unwrap();
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let error = execute.await.unwrap().unwrap_err();
+    assert!(format!("{error:#}").contains("Unsupported hook execution-changing directive"));
+    assert!(!directory.path().join("original.txt").exists());
+    assert!(!directory.path().join("changed.txt").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn skill_update_during_approval_never_executes_replacement_commands() {
+    let (directory, broker, mut events) = fixture(PermissionMode::Auto);
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(
+        source.path().join("SKILL.md"),
+        "---\nname: pinned\ndescription: Version fixture\n---\n!`printf old > old-marker`\n",
+    )
+    .unwrap();
+    let service = super::portable::service(&broker);
+    let package = service.install_local(source.path()).unwrap();
+    service.set_enabled(&package.id, true).unwrap();
+    let id = format!("{}:pinned", package.id);
+    let task = broker.clone();
+    let execute = tokio::task::spawn_blocking(move || {
+        task.execute("pinned-skill", "extension_skill", json!({"id":id}))
+    });
+    tokio::time::timeout(Duration::from_secs(5),async{while let Some(event)=events.recv().await{if let EngineEvent::ApprovalRequired{action_id,..}=event{
+        let binding=broker.store.extension_action_binding(action_id).unwrap().unwrap();assert_eq!(binding["kind"],"skill");assert!(binding["snapshot"]["dynamic_commands"][0].as_str().unwrap().contains("old-marker"));
+        std::fs::write(source.path().join("SKILL.md"),"---\nname: pinned\ndescription: Version fixture\n---\n!`printf new > new-marker`\n").unwrap();let updated=service.install_local(source.path()).unwrap();assert_ne!(updated.digest,package.digest);broker.approvals.decide(action_id,true).unwrap();return;
+    }}}).await.unwrap();
+    let error = execute.await.unwrap().unwrap_err();
+    assert!(format!("{error:#}").contains("Skill changed since approval"));
+    assert!(!directory.path().join("old-marker").exists());
+    assert!(!directory.path().join("new-marker").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approved_sandbox_rust_toolchain_builds_std_fixture_without_home_credentials() {
+    let (directory, broker, mut events) = fixture(PermissionMode::AskForWrites);
+    std::fs::create_dir_all(directory.path().join("src")).unwrap();
+    std::fs::write(directory.path().join("Cargo.toml"),"[package]\nname = \"xylo-sandbox-rust-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(directory.path().join("src/lib.rs"),"#[test]\nfn standard_library_works() { assert_eq!(std::path::Path::new(\"src/lib.rs\").file_name().unwrap(), \"lib.rs\"); }\n").unwrap();
+    let home_probe = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+    let home_secret = home_probe.path().join("generated-provider-credential");
+    std::fs::write(&home_secret, "xylo-home-denial-sentinel").unwrap();
+    let profile_secret = broker
+        .artifacts
+        .parent()
+        .unwrap()
+        .join("generated-provider-credential");
+    std::fs::write(&profile_secret, "xylo-profile-denial-sentinel").unwrap();
+    let approval_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = approval_count.clone();
+    let real_cargo = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cargo"));
+    let cargo_probe = tempfile::tempdir_in(&real_cargo).unwrap();
+    let cargo_secret = cargo_probe.path().join("generated-credential");
+    std::fs::write(&cargo_secret, "xylo-cargo-credential-sentinel").unwrap();
+    let cache = std::fs::read_dir(real_cargo.join("registry/cache"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("index.crates.io-")
+        })
+        .unwrap()
+        .path();
+    let cache_probe = tempfile::NamedTempFile::new_in(cache).unwrap();
+    std::fs::write(cache_probe.path(), "xylo-cache-immutable-sentinel").unwrap();
+    let approvals = broker.clone();
+    let approver = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let EngineEvent::ApprovalRequired {
+                action_id, name, ..
+            } = event
+            {
+                assert!(matches!(name.as_str(), "run_command" | "shell_command"));
+                approvals.approvals.decide(action_id, true).unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    let version = tokio::time::timeout(
+        Duration::from_secs(15),
+        run(
+            &broker,
+            "rust-version",
+            "run_command",
+            json!({"program":"cargo","args":["--version"]}),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(version.contains("cargo "), "{version}");
+    let tests=tokio::time::timeout(Duration::from_secs(45),run(&broker,"rust-build-test","shell_command",json!({"command":"rustc --version && cargo test --offline --quiet","timeout_seconds":40}))).await.unwrap().unwrap();
+    assert!(tests.contains("1 passed"), "{tests}");
+    std::fs::write(directory.path().join("Cargo.toml"),"[package]\nname = \"xylo-sandbox-rust-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nserde_json = \"1\"\n".replace("\\\"", "\"")).unwrap();
+    std::fs::write(directory.path().join("src/lib.rs"),"#[test]\nfn cached_public_dependency_works() { let value: serde_json::Value = serde_json::from_str(r#\"{\"cached\":true}\"#).unwrap(); assert_eq!(value[\"cached\"], true); }\n".replace("\\\"", "\"")).unwrap();
+    let cached = tokio::time::timeout(
+        Duration::from_secs(60),
+        run(
+            &broker,
+            "rust-cached-test",
+            "shell_command",
+            json!({"command":"cargo test --offline --quiet","timeout_seconds":55}),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(cached.contains("1 passed"), "{cached}");
+    let command = format!(
+        "if cat {} > home-leak; then exit 91; fi; if cat {} > profile-leak; then exit 92; fi; if cat {} > cargo-credential-leak; then exit 93; fi; if printf changed > {}; then exit 94; fi; printf denied",
+        shell_words::quote(&home_secret.to_string_lossy()),
+        shell_words::quote(&profile_secret.to_string_lossy()),
+        shell_words::quote(&cargo_secret.to_string_lossy()),
+        shell_words::quote(&cache_probe.path().to_string_lossy())
+    );
+    let denied = run(
+        &broker,
+        "rust-credentials-denied",
+        "shell_command",
+        json!({"command":command}),
+    )
+    .await
+    .unwrap();
+    assert!(denied.contains("denied"));
+    assert!(
+        !std::fs::read_to_string(directory.path().join("home-leak"))
+            .unwrap()
+            .contains("xylo-home-denial-sentinel")
+    );
+    assert!(
+        !std::fs::read_to_string(directory.path().join("profile-leak"))
+            .unwrap()
+            .contains("xylo-profile-denial-sentinel")
+    );
+    assert!(
+        !std::fs::read_to_string(directory.path().join("cargo-credential-leak"))
+            .unwrap()
+            .contains("xylo-cargo-credential-sentinel")
+    );
+    assert_eq!(
+        std::fs::read_to_string(cache_probe.path()).unwrap(),
+        "xylo-cache-immutable-sentinel"
+    );
+    assert_eq!(approval_count.load(std::sync::atomic::Ordering::SeqCst), 4);
+    approver.abort();
+    let _ = approver.await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_git_read_tools_never_execute_repository_fsmonitor_hooks() {
+    use std::os::unix::fs::PermissionsExt;
+    let (directory, broker, _events) = fixture(PermissionMode::ReadOnly);
+    let git = code::resolve_program("git", directory.path()).unwrap();
+    for arguments in [vec!["init", "--quiet"], vec!["add", "tracked.txt"]] {
+        if arguments[0] == "add" {
+            std::fs::write(directory.path().join("tracked.txt"), "fixture\n").unwrap();
+        }
+        let status = std::process::Command::new(&git)
+            .args(arguments)
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let marker = directory.path().join("fsmonitor-executed");
+    let hook = directory.path().join("fsmonitor.sh");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nprintf invoked > {}\nprintf 'token\\0'\n",
+            shell_words::quote(&marker.to_string_lossy()),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        std::process::Command::new(&git)
+            .args(["config", "core.fsmonitor", hook.to_str().unwrap()])
+            .current_dir(directory.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let task = broker.clone();
+    let observed = tokio::task::spawn_blocking(move || {
+        let mut observed = Vec::new();
+        for tool in ["git_status", "git_diff"] {
+            task.execute(tool, tool, json!({})).unwrap();
+            observed.push((tool, marker.exists()));
+            if marker.exists() {
+                std::fs::remove_file(&marker).unwrap();
+            }
+        }
+        observed
+    })
+    .await
+    .unwrap();
+    assert!(
+        observed.iter().all(|(_, ran)| !ran),
+        "Read tools ran repository code: {observed:?}"
     );
 }

@@ -11,6 +11,7 @@ impl AgentLoop {
         tools: Option<Vec<ToolSchema>>,
     ) -> Result<AgentResult, AgentError> {
         let mut ctx = ContextManager::default_budget();
+        ctx.set_external_context_management(self.config.external_context_management);
         let mut tool_errors: Vec<hermes_core::ToolErrorRecord> = Vec::new();
         let session_id = self.config.session_id.as_deref().unwrap_or("");
         let mut messages = messages;

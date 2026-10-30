@@ -502,7 +502,7 @@ impl Render for TerminalWorkspace {
                     format!("Opened in {project}")
                 }),
         );
-        let mut body = div().flex().flex_1().min_h_0().min_w_0().bg(rgb(0x11151d));
+        let mut body = div().flex().flex_1().min_h_0().min_w_0().bg(rgb(0x0f1117));
         if let Some(id) = self.layout.left {
             body = body.child(self.pane(id, cx));
         }
@@ -524,7 +524,7 @@ impl Render for TerminalWorkspace {
                     .px_3()
                     .py_1()
                     .text_xs()
-                    .text_color(rgb(0xb43b48))
+                    .text_color(rgb(crate::ui::danger()))
                     .child(error.clone()),
             );
         }

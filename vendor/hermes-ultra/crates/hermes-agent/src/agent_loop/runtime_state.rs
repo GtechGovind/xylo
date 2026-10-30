@@ -328,6 +328,9 @@ fn preferred_tool_payload_fallback_model(provider_hint: &str, model_name: &str) 
 }
 
 fn is_transient_stream_error(err: &AgentError) -> bool {
+    if let Some((retryable, _)) = err.provider_retry_policy() {
+        return retryable;
+    }
     fn has_transient_phrase(msg: &str) -> bool {
         let lower = msg.to_lowercase();
         if let Some(class) = structured_stream_error_class(&lower) {
@@ -349,6 +352,7 @@ fn is_transient_stream_error(err: &AgentError) -> bool {
     }
 
     match err {
+        AgentError::ProviderHttp { .. } | AgentError::ProviderTransport { .. } => false, // handled above
         AgentError::Timeout(_) => true,
         AgentError::LlmApi(msg)
         | AgentError::Gateway(msg)
@@ -370,7 +374,7 @@ fn jittered_backoff(attempt: u32, base_ms: u64, max_ms: u64) -> Duration {
     let capped = exp.min(max_ms);
     let jitter = capped / 4;
     let delay = capped.saturating_sub(jitter / 2) + (rand_u64_range(0, jitter.max(1)));
-    Duration::from_millis(delay)
+    Duration::from_millis(delay.min(max_ms))
 }
 
 fn rand_u64_range(min: u64, max: u64) -> u64 {

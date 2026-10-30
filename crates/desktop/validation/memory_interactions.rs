@@ -27,7 +27,8 @@ mod xylo {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 // Drive the native receiver's bounded-backlog yield timer.
-                cx.executor().advance_clock(std::time::Duration::from_millis(2));
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 if cx.update(|cx| condition(view.read(cx), cx)) {
                     return;
@@ -103,6 +104,16 @@ mod xylo {
                 view.validation_fact_ready() && view.memory_form_ready()
             });
             cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("memory-edit", cx);
+                view.update(cx, |view, cx| {
+                    view.memory_content.update(cx, |input, cx| input.set_value("Discard this correction", window, cx));
+                });
+                window.render_frame(cx);
+                window.click("memory-cancel-edit", cx);
+                view.update(cx, |view, cx| {
+                    assert!(view.memory_content.read(cx).value().is_empty(), "Cancel correction must discard correction text, never turn it into a new fact");
+                });
                 window.render_frame(cx);
                 window.click("memory-edit", cx);
                 view.update(cx, |view, cx| {
@@ -196,6 +207,150 @@ mod xylo {
                     .len(),
                 2
             );
+            client.shutdown().unwrap();
+        }
+
+        #[gpui_kit::test]
+        fn native_connection_multiline_save_is_correlated_and_repeat_click_does_not_duplicate(
+            cx: &mut TestAppContext,
+        ) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let paths = xylo_runtime::AppPaths::at(directory.path().join("profile")).unwrap();
+            let store = xylo_services::Store::open(&paths.database).unwrap();
+            let (window, view, client) = launch(cx, paths.clone());
+            let lock = rusqlite::Connection::open(&paths.database).unwrap();
+            lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.connector_name
+                        .update(cx, |i, cx| i.set_value("Local fixture", window, cx));
+                    view.connector_command
+                        .update(cx, |i, cx| i.set_value("/usr/bin/true", window, cx));
+                    view.connector_args.update(cx, |i, cx| {
+                        i.set_value("-y\npackage name\n--readonly", window, cx)
+                    });
+                    view.save_connector(cx);
+                    assert!(view.connector_pending.is_some());
+                    view.save_connector(cx);
+                });
+            })
+            .unwrap();
+            lock.execute_batch("COMMIT").unwrap();
+            wait(cx, &view, |view, _| {
+                view.connector_pending.is_none() && view.connectors.len() == 1
+            });
+            let rows = store.connectors().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].args, vec!["-y", "package name", "--readonly"]);
+            cx.update(|cx| assert!(view.read(cx).connector_args.read(cx).value().is_empty()));
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| view.navigate(Page::Connectors, cx));
+                window.render_frame(cx);
+                window.click(("connector-edit", 0usize), cx);
+                assert!(view.read(cx).connector_editing.is_some());
+                window.render_frame(cx);
+                window.click(("connector-remove", 0usize), cx);
+            })
+            .unwrap();
+            wait(cx, &view, |view, _| {
+                view.connector_pending.is_none() && view.connectors.is_empty()
+            });
+            cx.update(|cx| {
+                assert!(
+                    view.read(cx).connector_editing.is_none(),
+                    "Removing edited connection must exit edit identity"
+                );
+                assert_eq!(
+                    view.read(cx).connector_name.read(cx).value().as_ref(),
+                    "Local fixture"
+                );
+            });
+            client.shutdown().unwrap();
+        }
+
+        #[gpui_kit::test]
+        fn component_secret_blocks_navigation_and_stale_folder_picker_cannot_change_new_setup(
+            cx: &mut TestAppContext,
+        ) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let paths = xylo_runtime::AppPaths::at(directory.path().join("profile")).unwrap();
+            let (window, view, client) = launch(cx, paths);
+            let package = xylo_runtime::extensions::ExtensionPackage {
+                id: "fixture".into(),
+                name: "Fixture".into(),
+                version: "1".into(),
+                source: "local".into(),
+                revision: None,
+                digest: "fixture-digest".into(),
+                enabled: true,
+                components: vec![],
+            };
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.extension_open_setup(
+                        &package,
+                        "one",
+                        xylo_runtime::extensions::ComponentKind::Mcp,
+                        window,
+                        cx,
+                    );
+                    let old = view.validation_setup_secret("do-not-store", window, cx);
+                    assert!(view.management_dirty(cx));
+                    assert!(!view.management_before_switch(cx));
+                    view.extension_leave_setup(None, window, cx);
+                    view.extension_open_setup(
+                        &package,
+                        "two",
+                        xylo_runtime::extensions::ComponentKind::Mcp,
+                        window,
+                        cx,
+                    );
+                    let before = view.validation_setup_workspace();
+                    view.validation_setup_stale_picker(old, directory.path().join("wrong-folder"));
+                    assert_eq!(view.validation_setup_workspace(), before);
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert!(cx.has_pending_prompt());
+            cx.simulate_prompt_answer("Discard changes");
+            cx.run_until_parked();
+            assert!(
+                cx.update(|cx| view.read(cx).extensions.setup.is_some()),
+                "Stale confirmation must retain replacement setup"
+            );
+            client.shutdown().unwrap();
+        }
+
+        #[gpui_kit::test]
+        fn pending_learning_history_keeps_selection_until_correlated_result(
+            cx: &mut TestAppContext,
+        ) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let paths = xylo_runtime::AppPaths::at(directory.path().join("profile")).unwrap();
+            let (_, view, client) = launch(cx, paths);
+            view.update(cx, |view, cx| {
+                let id = view.validation_learning_pending_selection("procedure-a");
+                view.select_learning("procedure-b".into(), 1, cx);
+                assert_eq!(
+                    view.validation_learning_selection().as_deref(),
+                    Some("procedure-a")
+                );
+                assert!(view.learning_result(
+                    id,
+                    "learning_versions",
+                    &serde_json::json!({"name":"procedure-a","versions":[]}),
+                    cx
+                ));
+                view.select_learning("procedure-b".into(), 1, cx);
+                assert_eq!(
+                    view.validation_learning_selection().as_deref(),
+                    Some("procedure-b")
+                );
+            });
             client.shutdown().unwrap();
         }
 

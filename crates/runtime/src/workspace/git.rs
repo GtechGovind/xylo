@@ -1,5 +1,5 @@
 //! Read-only Git inspection for the native workspace; never runs on the UI thread.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -105,17 +105,209 @@ fn parse_status(raw: &str) -> Result<Vec<GitChange>> {
     }
     Ok(changes)
 }
-async fn run(root: &Path, args: &[&str]) -> Result<crate::process::ProcessResult> {
-    let mut arguments = vec![
-        "--literal-pathspecs".to_owned(),
-        "-c".to_owned(),
-        "core.quotePath=false".to_owned(),
+fn trusted_git(root: &Path) -> Result<PathBuf> {
+    let root = root.canonicalize()?;
+    #[cfg(unix)]
+    let candidates = [
+        PathBuf::from("/usr/bin/git"),
+        PathBuf::from("/opt/homebrew/bin/git"),
+        PathBuf::from("/usr/local/bin/git"),
     ];
-    arguments.extend(args.iter().map(|arg| (*arg).to_owned()));
-    crate::process::run(
-        "git",
-        &arguments,
+    #[cfg(windows)]
+    let candidates = [
+        PathBuf::from(r"C:\Program Files\Git\cmd\git.exe"),
+        PathBuf::from(r"C:\Program Files\Git\bin\git.exe"),
+    ];
+    for candidate in candidates {
+        if let Ok(candidate) = candidate.canonicalize() {
+            if candidate.is_file() && !candidate.starts_with(&root) {
+                return Ok(candidate);
+            }
+        }
+    }
+    anyhow::bail!(
+        "Install a trusted system Git outside the selected project to enable native inspection"
+    )
+}
+fn bounded_text(path: &Path, limit: usize) -> Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= limit,
+        "Git metadata exceeds inspection budget"
+    );
+    Ok(String::from_utf8(bytes).context("Git metadata is not UTF-8")?)
+}
+fn resolve_git_directory(root: &Path) -> Result<(PathBuf, PathBuf)> {
+    for parent in root.ancestors() {
+        let entry = parent.join(".git");
+        if entry.is_dir() {
+            return Ok((parent.to_owned(), entry.canonicalize()?));
+        }
+        if entry.is_file() {
+            let value = bounded_text(&entry, 4096)?;
+            let value = value
+                .strip_prefix("gitdir:")
+                .context("Invalid Git directory pointer")?
+                .trim();
+            return Ok((parent.to_owned(), parent.join(value).canonicalize()?));
+        }
+    }
+    anyhow::bail!("Selected project is not a Git worktree")
+}
+fn metadata_link(source: &Path, target: &Path) -> Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(source, target)?;
+    #[cfg(windows)]
+    if source.is_dir() {
+        std::os::windows::fs::symlink_dir(source, target)?
+    } else {
+        std::os::windows::fs::symlink_file(source, target)?
+    }
+    Ok(())
+}
+/// A native read view never loads repository executable configuration. Merely
+/// disabling external diff/textconv is insufficient: clean/process filters and
+/// info/attributes can execute commands too. Only Git data is linked into this
+/// neutral metadata snapshot; global/user config and environment are absent.
+pub async fn run_read(
+    root: &Path,
+    args: &[String],
+    timeout: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<crate::process::ProcessResult> {
+    ensure!(
+        matches!(
+            args.first().map(String::as_str),
+            Some("status" | "diff" | "branch" | "rev-parse")
+        ),
+        "Unsupported native Git read command"
+    );
+    let root = root.canonicalize()?;
+    let git = trusted_git(&root)?;
+    let (worktree, directory) = resolve_git_directory(&root)?;
+    let common = if directory.join("commondir").is_file() {
+        directory
+            .join(bounded_text(&directory.join("commondir"), 4096)?.trim())
+            .canonicalize()?
+    } else {
+        directory.clone()
+    };
+    let overlay = tempfile::tempdir()?;
+    std::fs::write(
+        overlay.path().join("HEAD"),
+        bounded_text(&directory.join("HEAD"), 4096)?,
+    )?;
+    metadata_link(&directory.join("index"), &overlay.path().join("index"))?;
+    for name in ["objects", "refs", "packed-refs", "shallow"] {
+        metadata_link(&common.join(name), &overlay.path().join(name))?;
+    }
+    let original = bounded_text(&common.join("config"), 1024 * 1024)?;
+    let mut section = String::new();
+    let mut object_format = "sha1";
+    let mut options = Vec::new();
+    for line in original.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            section = line.to_ascii_lowercase();
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim().to_ascii_lowercase();
+            let value = value.trim().trim_matches('"');
+            if section == "[extensions]" && key == "objectformat" {
+                ensure!(
+                    matches!(value, "sha1" | "sha256"),
+                    "Unsupported Git object format"
+                );
+                object_format = value;
+            }
+            if section == "[core]"
+                && matches!(
+                    key.as_str(),
+                    "ignorecase" | "filemode" | "precomposeunicode" | "symlinks"
+                )
+                && matches!(value, "true" | "false")
+            {
+                options.push(format!("\t{key} = {value}\n"));
+            }
+        }
+    }
+    let mut config = format!(
+        "[core]\nrepositoryformatversion = {}\nbare = false\nfsmonitor = false\n",
+        if object_format == "sha256" { 1 } else { 0 }
+    );
+    for option in options {
+        config.push_str(&option)
+    }
+    if object_format == "sha256" {
+        config.push_str("[extensions]\nobjectformat = sha256\n");
+    }
+    std::fs::write(overlay.path().join("config"), config)?;
+    // Ignore patterns are data; do not import info/attributes or hook programs.
+    if common.join("info/exclude").is_file()
+        && !std::fs::symlink_metadata(common.join("info/exclude"))?
+            .file_type()
+            .is_symlink()
+    {
+        std::fs::create_dir(overlay.path().join("info"))?;
+        std::fs::write(
+            overlay.path().join("info/exclude"),
+            bounded_text(&common.join("info/exclude"), 1024 * 1024)?,
+        )?;
+    }
+    let mut command = tokio::process::Command::new(git);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", overlay.path())
+        .env("GIT_DIR", overlay.path())
+        .env("GIT_COMMON_DIR", overlay.path())
+        .env("GIT_WORK_TREE", worktree)
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_LAZY_FETCH", "1");
+    #[cfg(windows)]
+    for name in ["SYSTEMROOT", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.args([
+        "--no-pager",
+        "--no-optional-locks",
+        "--literal-pathspecs",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.quotePath=false",
+    ]);
+    if matches!(args.first().map(String::as_str), Some("status" | "diff")) {
+        command
+            .arg(&args[0])
+            .arg("--ignore-submodules=all")
+            .args(&args[1..]);
+    } else {
+        command.args(args);
+    }
+
+    crate::process::run_prepared(command, &root, timeout, cancel).await
+}
+async fn run(root: &Path, args: &[&str]) -> Result<crate::process::ProcessResult> {
+    run_read(
         root,
+        &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
         Duration::from_secs(15),
         Default::default(),
     )
@@ -506,6 +698,92 @@ mod repository_tests {
                     .await
                     .is_err()
             );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod executable_config_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    fn fixture_git(root: &Path, args: &[&str]) {
+        let result = std::process::Command::new(trusted_git(root).unwrap())
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    #[tokio::test]
+    async fn native_views_never_run_clean_or_process_filters_from_any_attribute_source() {
+        for process in [false, true] {
+            for info in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path();
+                fixture_git(root, &["init", "--quiet"]);
+                std::fs::write(root.join("tracked.txt"), "old\n").unwrap();
+                fixture_git(root, &["add", "tracked.txt"]);
+                fixture_git(
+                    root,
+                    &[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "-qm",
+                        "base",
+                    ],
+                );
+                let marker = root.join("filter-executed");
+                let script = root.join("filter.sh");
+                std::fs::write(
+                    &script,
+                    format!(
+                        "#!/bin/sh\nprintf invoked > '{}'\n{}\n",
+                        marker.display(),
+                        if process { "exit 1" } else { "cat" }
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                fixture_git(
+                    root,
+                    &[
+                        "config",
+                        if process {
+                            "filter.fixture.process"
+                        } else {
+                            "filter.fixture.clean"
+                        },
+                        script.to_str().unwrap(),
+                    ],
+                );
+                std::fs::write(
+                    root.join(if info {
+                        ".git/info/attributes"
+                    } else {
+                        ".gitattributes"
+                    }),
+                    "tracked.txt filter=fixture\n",
+                )
+                .unwrap();
+                std::fs::write(root.join("tracked.txt"), "new\n").unwrap();
+                status(root).await.unwrap();
+                let diff = diff(root, Path::new("tracked.txt"), None, ChangeGroup::Unstaged)
+                    .await
+                    .unwrap();
+                assert!(diff.contains("+new"));
+                assert!(
+                    !marker.exists(),
+                    "Native Git executed process={process}, info-attributes={info}"
+                );
+            }
         }
     }
 }

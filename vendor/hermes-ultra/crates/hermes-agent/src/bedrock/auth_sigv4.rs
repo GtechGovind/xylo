@@ -27,25 +27,34 @@ pub fn classify_bedrock_error(message: &str) -> BedrockErrorClass {
 }
 
 fn map_bedrock_error(status: u16, body: &str) -> AgentError {
-    let lower = body.to_ascii_lowercase();
-    if status == 401
-        || status == 403
-        || lower.contains("unauthorized")
-        || lower.contains("accessdenied")
-        || lower.contains("invalidsignature")
+    let payload = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+    let code = payload
+        .get("__type")
+        .or_else(|| payload.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .rsplit('#')
+        .next()
+        .unwrap_or("");
+    if matches!(status, 401 | 403)
+        || matches!(
+            code,
+            "AccessDeniedException" | "UnrecognizedClientException" | "InvalidSignatureException"
+        )
     {
         AgentError::AuthFailed(format!("Bedrock authorization failed (HTTP {status})"))
+    } else if status == 400
+        && matches!(
+            classify_bedrock_error(body),
+            BedrockErrorClass::ContextOverflow
+        )
+    {
+        AgentError::ContextTooLong
     } else {
-        match classify_bedrock_error(body) {
-            BedrockErrorClass::ContextOverflow => AgentError::ContextTooLong,
-            BedrockErrorClass::RateLimit => AgentError::RateLimited {
-                retry_after_secs: None,
-            },
-            BedrockErrorClass::Overloaded => AgentError::LlmApi("Bedrock model overloaded".into()),
-            BedrockErrorClass::Unknown if status == 429 => AgentError::RateLimited {
-                retry_after_secs: None,
-            },
-            BedrockErrorClass::Unknown => AgentError::LlmApi(format!("Bedrock API error {status}")),
+        AgentError::ProviderHttp {
+            status,
+            retry_after_secs: None,
+            message: format!("Bedrock API error HTTP {status}"),
         }
     }
 }

@@ -28,8 +28,15 @@ mod history_search;
 pub mod image_generation;
 mod learning;
 pub mod providers;
+pub mod extensions;
+pub mod sandbox;
 pub use history_search::*;
 pub use learning::*;
 
 #[cfg(test)]
 mod tests;
+
+mod extension_receipts;
+
+mod turn_queue;
+pub use turn_queue::*;

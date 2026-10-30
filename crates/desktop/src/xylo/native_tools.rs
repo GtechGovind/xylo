@@ -8,7 +8,6 @@ pub(super) enum Asset {
 }
 pub(super) struct NativeUi {
     pub select_local_model: bool,
-    pub url: Entity<InputState>,
     pending: BTreeMap<Uuid, (String, Option<(String, Value)>)>,
     pub message: String,
     pub text: String,
@@ -16,16 +15,16 @@ pub(super) struct NativeUi {
     pub output: Option<PathBuf>,
 }
 impl NativeUi {
+    #[cfg(test)]
     pub(super) fn pending_id(&self, label: &str) -> Option<Uuid> {
         self.pending
             .iter()
             .find(|(_, pending)| pending.0 == label)
             .map(|(id, _)| *id)
     }
-    pub fn new(window: &mut Window, cx: &mut Context<Xylo>) -> Self {
+    pub fn new() -> Self {
         Self {
             select_local_model: false,
-            url: cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com")),
             pending: BTreeMap::new(),
             message: String::new(),
             text: String::new(),
@@ -56,6 +55,9 @@ impl Xylo {
             }
             self.error = None;
         }
+        if let Err(error) = &result {
+            if self.asset_error(name, &error.to_string(), cx) { return; }
+        }
         self.result(result, cx);
     }
     pub(super) fn capability_result(
@@ -66,6 +68,10 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if name.starts_with("extension_") {
+            self.extension_result(id, result, window, cx);
+            return;
+        }
         if self.account_capability_result(id, name, &result, window, cx) {
             return;
         }
@@ -113,6 +119,7 @@ impl Xylo {
                 if self.update_error(id, &error, cx) {
                     return;
                 }
+                if self.asset_error(name, &error, cx) { return; }
                 self.native.message = format!("{label} could not finish.");
                 self.error = Some(error);
                 return;
@@ -245,78 +252,6 @@ impl Xylo {
             }
         })
         .detach();
-    }
-    pub(super) fn local_models_card(&self, cx: &mut Context<Self>) -> AnyElement {
-        card().max_w(px(820.))
-            .child(div().font_weight(FontWeight::MEDIUM).child("Local models"))
-            .child(subtitle("Download a model to use on this computer, or connect an existing local provider above."))
-            .child(div().flex().gap_2()
-                .child(button("browse-local-models","Browse local models").on_click(cx.listener(|view, _, _, cx| view.open_assets(1,cx))))
-                .child(primary("start-local-model","Start selected model").on_click(cx.listener(|view, _, _, cx| {
-                    view.capability("local_inference_start",json!({}),"Starting local model",None,cx);
-                })))
-                .child(button("stop-local-model","Stop model").on_click(cx.listener(|view, _, _, cx| {
-                    view.capability("local_inference_stop",json!({}),"Stopping local model",None,cx);
-                }))))
-            .into_any_element()
-    }
-    pub(super) fn native_tools_card(&self, cx: &mut Context<Self>) -> AnyElement {
-        let browser = card()
-            .child(div().font_weight(FontWeight::MEDIUM).child("Browser"))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&self.native.url).aria_label("Page URL")),
-                    )
-                    .child(primary("open-web-page", "Open page").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            let url = this.native.url.read(cx).value().to_string();
-                            this.capability(
-                                "browser_navigate",
-                                json!({"url":url}),
-                                "Opening page",
-                                None,
-                                cx,
-                            );
-                        },
-                    ))),
-            );
-        let voice = self.speech_card(cx);
-        let screen = card()
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("Screen capture"),
-            )
-            .child(subtitle(
-                "Your computer may ask for permission to record the screen.",
-            ))
-            .child(
-                button("capture-screen", "Capture screen").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.capability(
-                            "desktop_screenshot",
-                            json!({}),
-                            "Capturing screen",
-                            None,
-                            cx,
-                        )
-                    },
-                )),
-            );
-        div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .max_w(px(820.))
-            .child(browser)
-            .child(voice)
-            .child(screen)
-            .into_any_element()
     }
     pub(super) fn native_result_card(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut result = div().flex().flex_col().gap_3().max_w(px(820.));

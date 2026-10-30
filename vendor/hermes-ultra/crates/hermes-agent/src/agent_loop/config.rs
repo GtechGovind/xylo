@@ -293,6 +293,9 @@ pub struct AgentConfig {
     /// False preserves the upstream CLI's finalization behavior.
     #[serde(default)]
     pub native_product_finalization: bool,
+    /// The host owns token budgeting; retain complete durable history.
+    #[serde(default)]
+    pub external_context_management: bool,
 
     /// Whether to use streaming mode by default.
     #[serde(default)]
@@ -700,6 +703,7 @@ impl Default for AgentConfig {
             personality: None,
             extra_body: None,
             native_product_finalization: false,
+            external_context_management: false,
             stream: false,
             quiet_mode: false,
             temperature: None,

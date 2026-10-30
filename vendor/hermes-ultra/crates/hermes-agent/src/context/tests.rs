@@ -565,3 +565,18 @@ mod tests {
         assert!(coder_prompt.contains("correctness"));
     }
 }
+
+#[test]
+fn external_context_management_preserves_complete_tool_history() {
+    let mut context = ContextManager::new(1);
+    context.set_external_context_management(true);
+    context.add_message(Message::user("A long original request"));
+    context.add_message(Message::assistant("A complete observation"));
+    let original = serde_json::to_value(context.get_messages()).unwrap();
+    context.truncate_to_budget(&BudgetConfig::default());
+    context.compress();
+    assert_eq!(
+        serde_json::to_value(context.get_messages()).unwrap(),
+        original
+    );
+}

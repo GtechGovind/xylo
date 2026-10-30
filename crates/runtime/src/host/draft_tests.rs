@@ -166,7 +166,7 @@ fn input(host: &HostState) -> (TurnRequest, DraftSubmission) {
     };
     (turn, draft)
 }
-async fn mock_worker(
+pub(super) async fn mock_worker(
     host: &HostState,
     session: Uuid,
     capacity: usize,
@@ -179,8 +179,11 @@ async fn mock_worker(
     host.workers.lock().await.insert(
         session,
         WorkerHandle {
+            credentials: Arc::new(parking_lot::Mutex::new(None)),
             commands,
             active: Arc::new(AtomicBool::new(false)),
+            queue_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            queue_stopped: Arc::new(AtomicBool::new(false)),
             lease: Arc::new(Mutex::new(None)),
             stop: CancellationToken::new(),
             exited,
@@ -189,6 +192,12 @@ async fn mock_worker(
             model_activity: Arc::new(Mutex::new(None)),
         },
     );
+    {
+        let workers = host.workers.lock().await;
+        let worker = &workers[&session];
+        host.turn_queue
+            .register(session, &worker.queue_stopped, &worker.queue_epoch);
+    }
     (incoming, exited_tx)
 }
 #[tokio::test]
@@ -257,10 +266,11 @@ async fn successful_dispatch_returns_admission_even_when_postcommit_metadata_rec
     let (mut incoming, _exit) = mock_worker(&host, turn.session_id, 4).await;
     events.close();
     let receipt = host
-        .worker_command_with_draft(
+        .worker_command_with_draft_and_receipt(
             Some(turn.session_id),
             WorkerCommand::Run { turn: turn.clone() },
             Some(draft.clone()),
+            Some(Uuid::new_v4()),
         )
         .await
         .unwrap()
@@ -383,4 +393,151 @@ async fn cancellation_during_commit_reaches_a_full_single_slot_worker_after_rese
         .unwrap();
     assert!(matches!(cancellation.payload, WorkerCommand::Cancel));
     assert!(task.await.unwrap().unwrap().unwrap().cleared);
+    assert!(
+        host.workers.lock().await[&session]
+            .queue_stopped
+            .load(Ordering::Acquire),
+        "Durable admission must not erase Stop before a fast Completed receipt"
+    );
+}
+
+#[tokio::test]
+async fn completed_replay_publishes_admission_before_the_answer() {
+    let (_directory, host, events) = super::tests::state();
+    let (turn, draft) = input(&host);
+    host.store.admit_draft_turn(&turn, &draft).unwrap();
+    host.store
+        .complete_turn(
+            turn.session_id,
+            turn.turn_id,
+            &serde_json::json!([]),
+            "Completed",
+            &Usage::default(),
+        )
+        .unwrap();
+    let request_id = Uuid::new_v4();
+    host.handle(HostCommand::DraftSubmit(request_id, turn, draft))
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.recv().await.unwrap(), HostEvent::DraftAdmitted { request_id: id, result: Ok(_) } if id == request_id),
+        "Durable user admission must precede an answer, including completed-turn replay"
+    );
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        HostEvent::Engine(Envelope {
+            payload: EngineEvent::Completed { .. },
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires cargo build --workspace --bins; real local worker qualification"]
+async fn real_worker_loopback_send_admits_before_answer_and_preserves_durable_order() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let (_directory, host, events) = super::tests::state();
+    let (mut turn, draft) = input(&host);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    turn.provider.family = xylo_core::ApiFamily::OpenAiChat;
+    turn.provider.endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    turn.provider.credential_ref = None;
+    turn.provider.timeout_seconds = 10;
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let observed = observed.clone();
+            tokio::spawn(async move {
+                let mut socket = BufReader::new(socket);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    assert!(
+                        !line.to_ascii_lowercase().starts_with("authorization:"),
+                        "Loopback fixture must receive no account credential"
+                    );
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                assert!(length < 8 * 1024 * 1024);
+                socket.read_exact(&mut vec![0; length]).await.unwrap();
+                observed.fetch_add(1, Ordering::SeqCst);
+                let body = concat!(
+                    "data: {\"id\":\"local-fixture\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"loopback-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Local fixture answer.\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"local-fixture\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"loopback-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+        }
+    });
+    let request_id = Uuid::new_v4();
+    let session = turn.session_id;
+    let turn_id = turn.turn_id;
+    let command = HostCommand::DraftSubmit(request_id, turn, draft.clone());
+    assert!(host.prepare_command(&command).await.unwrap());
+    let running = host.clone();
+    let handler = tokio::spawn(async move { running.handle(command).await });
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut admitted = false;
+        loop {
+            match events.recv().await.unwrap() {
+                HostEvent::DraftAdmitted {
+                    request_id: id,
+                    result,
+                } if id == request_id => {
+                    if result.is_err() {
+                        return Err("Real worker admission failed");
+                    }
+                    assert!(!admitted, "Admission must publish exactly once");
+                    admitted = true;
+                }
+                HostEvent::Engine(Envelope {
+                    payload: EngineEvent::Delta { .. },
+                    ..
+                }) => assert!(admitted, "User admission precedes streamed answer"),
+                HostEvent::Engine(Envelope {
+                    payload: EngineEvent::Completed { text, .. },
+                    ..
+                }) => {
+                    assert!(admitted, "User admission precedes completed answer");
+                    assert!(text.contains("Local fixture answer."));
+                    return Ok(());
+                }
+                HostEvent::Engine(Envelope {
+                    payload: EngineEvent::Error { .. },
+                    ..
+                }) => return Err("Real worker reported a task failure"),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    host.shutdown().await;
+    handler.abort();
+    server.abort();
+    outcome.expect("Real worker fixture timed out").unwrap();
+    assert!(requests.load(Ordering::SeqCst) > 0);
+    let messages = host.store.messages(session, 10).unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>(),
+        vec!["user", "assistant"]
+    );
+    assert!(host.store.draft(&draft.key).unwrap().is_empty());
+    assert!(
+        host.store
+            .completed_turn(session, turn_id)
+            .unwrap()
+            .is_some()
+    );
 }

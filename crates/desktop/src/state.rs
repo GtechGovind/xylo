@@ -112,7 +112,9 @@ impl TurnState {
                 self.error = Some(message);
                 self.settle_tools();
             }
-            EngineEvent::Ready { .. } | EngineEvent::Steering { .. } => {}
+            EngineEvent::Ready { .. }
+            | EngineEvent::Steering { .. }
+            | EngineEvent::ProviderCredentialRequested { .. } => {}
         }
     }
     fn card(

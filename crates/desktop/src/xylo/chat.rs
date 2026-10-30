@@ -9,6 +9,133 @@ use gpui_kit::component::{
     menu::{DropdownMenu, PopupMenuItem},
 };
 
+/// Assistant turns are prefixed by the product mark in the left gutter, the
+/// way a reply reads in a modern assistant: no name label, no bubble.
+fn assistant_row(body: AnyElement) -> AnyElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_start()
+        .gap(px(12.))
+        .child(
+            div()
+                .flex_shrink_0()
+                .w(px(20.))
+                .pt(px(6.))
+                .child(brand_glyph(16.)),
+        )
+        .child(div().flex_1().min_w_0().child(body))
+        .into_any_element()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivityPosition {
+    Standalone,
+    Start,
+    Continuation,
+}
+
+fn activity_eligible(tool: &crate::state::ToolCard) -> bool {
+    !tool.approval
+        && tool.success != Some(false)
+        && tool.presentation.error.is_none()
+        && !matches!(tool.name.as_str(), "todo_write" | "image_generate")
+}
+
+/// O(1), immediate neighbors only; never projects, filters, or mutates list rows.
+fn adjacent_activity(tools: &[crate::state::ToolCard], i: usize) -> ActivityPosition {
+    let Some(tool) = tools.get(i).filter(|tool| activity_eligible(tool)) else {
+        return ActivityPosition::Standalone;
+    };
+    let _ = tool;
+    if i.checked_sub(1)
+        .and_then(|i| tools.get(i))
+        .is_some_and(activity_eligible)
+    {
+        ActivityPosition::Continuation
+    } else if i
+        .checked_add(1)
+        .and_then(|i| tools.get(i))
+        .is_some_and(activity_eligible)
+    {
+        ActivityPosition::Start
+    } else {
+        ActivityPosition::Standalone
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::{ActivityPosition, adjacent_activity};
+    use uuid::Uuid;
+
+    fn tool(name: &str) -> crate::state::ToolCard {
+        crate::state::ToolCard {
+            id: Uuid::nil(),
+            name: name.into(),
+            input: serde_json::json!({}),
+            result: None,
+            presentation: Default::default(),
+            approval: false,
+            rule: None,
+            success: None,
+            started_at: 0,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn adjacent_activity_boundaries_and_runs() {
+        assert_eq!(adjacent_activity(&[], 0), ActivityPosition::Standalone);
+        assert_eq!(
+            adjacent_activity(&[tool("file_read")], 0),
+            ActivityPosition::Standalone
+        );
+        let tools = [
+            tool("file_read"),
+            tool("search_project"),
+            tool("run_command"),
+        ];
+        assert_eq!(adjacent_activity(&tools, 0), ActivityPosition::Start);
+        assert_eq!(adjacent_activity(&tools, 1), ActivityPosition::Continuation);
+        assert_eq!(adjacent_activity(&tools, 2), ActivityPosition::Continuation);
+        assert_eq!(adjacent_activity(&tools, 3), ActivityPosition::Standalone);
+        assert_eq!(
+            adjacent_activity(&tools, usize::MAX),
+            ActivityPosition::Standalone
+        );
+    }
+
+    #[test]
+    fn adjacent_activity_exclusions_break_runs() {
+        let mut approval = tool("file_edit");
+        approval.approval = true;
+        let mut failure = tool("run_command");
+        failure.success = Some(false);
+        let mut error = tool("file_read");
+        error.presentation.error = Some("failed".into());
+        for excluded in [
+            approval,
+            failure,
+            error,
+            tool("todo_write"),
+            tool("image_generate"),
+        ] {
+            let tools = [
+                tool("file_read"),
+                excluded,
+                tool("search_project"),
+                tool("git_status"),
+            ];
+            assert_eq!(adjacent_activity(&tools, 0), ActivityPosition::Standalone);
+            assert_eq!(adjacent_activity(&tools, 1), ActivityPosition::Standalone);
+            assert_eq!(adjacent_activity(&tools, 2), ActivityPosition::Start);
+            assert_eq!(adjacent_activity(&tools, 3), ActivityPosition::Continuation);
+        }
+    }
+}
+
 #[derive(Default)]
 struct ComposerModelPicker {
     choosing: bool,
@@ -56,8 +183,9 @@ impl Xylo {
                     .w_full()
                     .flex()
                     .justify_center()
-                    .px_6()
-                    .pb_6()
+                    .px(px(28.))
+                    .pt(px(6.))
+                    .pb(px(20.))
                     .flex_shrink_0()
                     .child(self.prompt_box(cx)),
             )
@@ -73,7 +201,10 @@ impl Xylo {
                 .child(if history.loading {
                     subtitle("Loading conversation…").into_any_element()
                 } else if history.has_more {
-                    button("older-messages", "Load earlier messages")
+                    secondary("older-messages", "Load earlier messages")
+                        .h(px(30.))
+                        .rounded_full()
+                        .text_size(px(12.5))
                         .on_click(cx.listener(|view, _, _, cx| view.load_older(cx)))
                         .into_any_element()
                 } else {
@@ -84,60 +215,156 @@ impl Xylo {
             let user = message.role == "user";
             let content = message.content.clone();
             let body = div()
+                .id(("message-body", index))
+                .test_support()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap_2()
-                .text_size(px(12.)).line_height(relative(if user {1.75} else {1.85}))
+                .text_size(px(15.))
+                .line_height(relative(if user { 1.5 } else { 1.7 }))
+                .text_color(rgb(text()))
                 .when(user, |row| {
-                    row.max_w(px(695.))
-                        .px(px(15.))
-                        .py(px(13.))
-                        .rounded(px(12.))
-                        .border_1()
-                        .border_color(rgb(border()))
-                        .bg(rgb(sidebar()))
+                    row.max_w(px(640.))
+                        .px(px(16.))
+                        .py(px(10.))
+                        .rounded(px(18.))
+                        .bg(rgb(brand_soft()))
                 })
-                .when(!user, |row| row.w_full().py_2())
+                .when(!user, |row| row.w_full())
                 .when(self.history_message_highlight(message.id), |row| {
-                    row.border_1().border_color(rgb(accent()))
+                    row.border_1().border_color(rgb(brand()))
                 })
-                .child(
-                    TextView::markdown(
-                        SharedString::from(message.id.to_string()),
-                        message.content.clone(),
+                .when(!message.content.is_empty(), |row| {
+                    row.child(
+                        TextView::markdown(
+                            SharedString::from(message.id.to_string()),
+                            message.content.clone(),
+                        )
+                        .selectable(true),
                     )
-                    .selectable(true),
+                })
+                .when(!message.attachments.is_empty(), |row| {
+                    row.child(self.message_images(message, cx))
+                });
+            let copy = focus_ring(gpui_kit::base::Button::new(("copy-message", index)))
+                .accessibility_label("Copy message")
+                .tooltip(|_, cx| cx.new(|_| XyloTooltip("Copy".into())).into())
+                .opacity(0.)
+                .group_hover("chat-message", |style| style.opacity(1.))
+                .focus(|style| style.opacity(1.))
+                .size(px(26.))
+                .rounded(px(7.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(muted()))
+                .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
+                .child(icon(IconName::Copy).size(px(13.)))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(content.clone()))
+                });
+            let body = if user {
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(4.))
+                    .child(body)
+                    .child(div().pr(px(4.)).child(copy))
+                    .into_any_element()
+            } else {
+                assistant_row(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(body)
+                        .child(div().flex().child(copy))
+                        .into_any_element(),
                 )
-                .child(self.message_images(message, cx));
-            div().id(("chat-message", index)).test_support()
+            };
+            div()
+                .id(("chat-message", index))
+                .test_support()
                 .w_full()
+                .min_w_0()
                 .flex()
                 .flex_col()
-                .gap_1()
                 .group("chat-message")
-                .when(user, |row| row.items_end())
                 .child(body)
-                .child(
-                    gpui_kit::base::Button::new(("copy-message", index))
-                        .accessibility_label("Copy message")
-                        .opacity(0.).group_hover("chat-message",|style|style.opacity(1.)).focus(|style|style.opacity(1.))
-                        .size(px(22.)).rounded_md().flex().items_center().justify_center()
-                        .child(icon(IconName::Copy).size(px(11.)).text_color(rgb(muted())))
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(content.clone()))
-                        }),
-                )
                 .into_any_element()
         } else if let Some(turn) = self.turns.get(&self.session) {
             let offset = index - self.messages.len() - 1;
             let latest_plan = turn.tools.iter().rposition(|t| t.name == "todo_write");
             let streamed = !turn.text.is_empty() && (turn.running || turn.status == "Cancelled");
             if let Some(tool) = turn.tools.get(offset) {
-                self.tool_row(offset, tool, latest_plan == Some(offset), cx)
-            } else if offset == turn.tools.len() && streamed {
-                TextView::markdown("streamed-answer", turn.text.clone())
-                    .selectable(true)
+                // Presentation only: keep the direct list-index mapping and every tool row.
+                let activity = adjacent_activity(&turn.tools, offset);
+                // Runs of quiet activity are grouped under one caption and a
+                // hairline; standalone or attention-worthy cards stand alone.
+                let grouped = activity != ActivityPosition::Standalone;
+                div()
+                    .w_full()
+                    .pl(px(32.))
+                    .when(grouped, |section| {
+                        section.child(
+                            div()
+                                .w_full()
+                                .when(activity == ActivityPosition::Start, |run| {
+                                    run.child(
+                                        div()
+                                            .pb(px(6.))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .child(
+                                                icon(Glyph::ListChecks)
+                                                    .size(px(13.))
+                                                    .text_color(rgb(faint())),
+                                            )
+                                            .child(eyebrow("Working through the task")),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .border_l_2()
+                                        .border_color(rgb(border()))
+                                        .pl(px(10.))
+                                        .child(self.tool_row(
+                                            offset,
+                                            tool,
+                                            latest_plan == Some(offset),
+                                            cx,
+                                        )),
+                                ),
+                        )
+                    })
+                    .when(!grouped, |section| {
+                        section.py(px(4.)).child(self.tool_row(
+                            offset,
+                            tool,
+                            latest_plan == Some(offset),
+                            cx,
+                        ))
+                    })
                     .into_any_element()
+            } else if offset == turn.tools.len() && streamed {
+                assistant_row(
+                    div()
+                        .w_full()
+                        .pt(px(4.))
+                        .text_size(px(15.))
+                        .line_height(relative(1.7))
+                        .text_color(rgb(text()))
+                        .child(
+                            TextView::markdown("streamed-answer", turn.text.clone())
+                                .selectable(true),
+                        )
+                        .into_any_element(),
+                )
             } else if turn.running {
                 turn_status(turn)
             } else if let Some(error) = &turn.error {
@@ -152,10 +379,12 @@ impl Xylo {
             .w_full()
             .flex()
             .justify_center()
-            .px_6()
-            .py_1()
-            .when(index > 0 && index <= self.messages.len(), |row| row.py_3())
-            .child(div().w_full().max_w(px(740.)).child(content))
+            .px(px(28.))
+            .py(px(2.))
+            .when(index > 0 && index <= self.messages.len(), |row| {
+                row.py(px(14.))
+            })
+            .child(div().w_full().max_w(px(760.)).child(content))
             .into_any_element()
     }
     /// Records the decision immediately so the card responds before the worker
@@ -172,6 +401,11 @@ impl Xylo {
             .get_mut(&self.session)
             .and_then(|turn| turn.tools.iter_mut().find(|t| t.id == id))
         {
+            // A restored legacy preview may have already lost its tail upstream.
+            // Neither pointer nor keyboard approval can bypass full inspection.
+            if allow && card.input.get("diff_truncated").and_then(Value::as_bool) == Some(true) {
+                return;
+            }
             card.approval = false;
             if !allow {
                 card.success = Some(false);
@@ -226,10 +460,16 @@ impl Xylo {
         let id = tool.id;
         let expanded = self.expanded_tools.contains(&id);
         let cached = &tool.presentation;
-        let summary = ActionSummary {verb:cached.verb.clone(),target:cached.target.clone(),meta:cached.meta.clone().map(|text|(text,Tone::Muted)),question:cached.question.clone()};
+        let summary = ActionSummary {
+            verb: cached.verb.clone(),
+            target: cached.target.clone(),
+            meta: cached.meta.clone().map(|text| (text, Tone::Muted)),
+            question: cached.question.clone(),
+        };
         let (state, state_word): (AnyElement, &str) = if tool.approval {
             (
-                icon(IconName::TriangleAlert).size(px(11.))
+                icon(IconName::TriangleAlert)
+                    .size(px(13.))
                     .text_color(rgb(warning()))
                     .into_any_element(),
                 "needs approval",
@@ -237,23 +477,29 @@ impl Xylo {
         } else {
             match tool.success {
                 None => (
-                    div().size(px(5.)).rounded_full().bg(rgb(muted())).into_any_element(),
+                    Spinner::new()
+                        .small()
+                        .color(rgb(muted()).into())
+                        .into_any_element(),
                     "in progress",
                 ),
                 Some(true) => (
-                    icon(IconName::CircleCheck).size(px(11.))
+                    icon(Glyph::Check)
+                        .size(px(13.))
                         .text_color(rgb(success()))
                         .into_any_element(),
                     "done",
                 ),
                 Some(false) => (
-                    icon(IconName::CircleX).size(px(11.))
+                    icon(IconName::CircleX)
+                        .size(px(13.))
                         .text_color(rgb(danger()))
                         .into_any_element(),
                     "failed",
                 ),
             }
         };
+        let glyph = tool_glyph(&tool.name);
         let header = focus_ring(gpui_kit::base::Button::new(("tool-detail", i)))
             .accessibility_label(format!(
                 "{} {}, {state_word}. {}",
@@ -269,18 +515,25 @@ impl Xylo {
             .min_w_0()
             .flex()
             .items_center()
-            .gap_2()
-            .px(px(9.))
-            .py(px(7.))
-            .rounded(px(7.))
+            .justify_start()
+            .gap(px(8.))
+            .px(px(8.))
+            .h(px(30.))
+            .rounded(px(8.))
             .cursor_pointer()
             .hover(|style| style.bg(rgb(hover())))
-            .child(div().flex_shrink_0().child(state))
+            .child(
+                icon(glyph)
+                    .size(px(14.))
+                    .flex_shrink_0()
+                    .text_color(rgb(if tool.approval { warning() } else { muted() })),
+            )
             .child(
                 div()
                     .flex_shrink_0()
-                    .text_size(px(11.))
+                    .text_size(px(13.))
                     .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(text_secondary()))
                     .child(summary.verb.clone()),
             )
             .child(
@@ -290,8 +543,8 @@ impl Xylo {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .text_size(px(11.))
-                    .font_family(gpui_kit::component::Theme::global(cx).mono_font_family.clone())
+                    .text_size(px(12.5))
+                    .font_family(mono(cx))
                     .text_color(rgb(muted()))
                     .child(summary.target.clone()),
             )
@@ -299,19 +552,20 @@ impl Xylo {
                 row.child(
                     div()
                         .flex_shrink_0()
-                        .text_size(px(10.))
+                        .text_size(px(11.5))
                         .text_color(rgb(tone.color()))
                         .child(meta),
                 )
             })
+            .child(div().flex_shrink_0().child(state))
             .child(
                 icon(if expanded {
                     IconName::ChevronDown
                 } else {
                     IconName::ChevronRight
                 })
-                .size(px(11.))
-                .text_color(rgb(muted())),
+                .size(px(12.))
+                .text_color(rgb(faint())),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.expanded_tools.remove(&id) {
@@ -321,18 +575,30 @@ impl Xylo {
                 this.sync_history_list(cx);
                 cx.notify();
             }));
+        let framed = tool.approval
+            || expanded
+            || cached.error.is_some()
+            || (tool.name == "image_generate" && tool.success == Some(true));
         let mut card = div()
             .w_full()
             .flex()
             .flex_col()
             .gap_0()
-            .border_1().border_color(rgb(border())).rounded(px(7.))
+            .rounded(px(10.))
+            .when(framed, |card| {
+                card.border_1()
+                    .border_color(rgb(border()))
+                    .bg(rgb(panel()))
+                    .p(px(4.))
+            })
             .when(tool.approval, |card| {
-                card.p_3()
-                    .rounded_lg()
-                    .bg(rgb(warning_bg()))
+                card.p(px(14.))
+                    .gap_3()
+                    .rounded(px(14.))
+                    .bg(rgb(panel()))
                     .border_1()
-                    .border_color(rgb(warning()))
+                    .border_color(rgb(border_strong()))
+                    .shadow_sm()
             })
             .child(header);
         if tool.name == "image_generate" && tool.success == Some(true) {
@@ -343,10 +609,81 @@ impl Xylo {
         } else if expanded {
             card = card.child(self.structured_tool_details(i, tool, cx));
         }
-        if let Some(error)=&cached.error {
-            card=card.child(div().px_3().pb_2().text_size(px(11.)).text_color(rgb(danger())).child(error.clone()));
+        if let Some(error) = &cached.error {
+            card = card.child(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(danger()))
+                    .child(error.clone()),
+            );
         }
         card.into_any_element()
+    }
+    fn full_action_inspector(
+        &self,
+        i: usize,
+        tool: &crate::state::ToolCard,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = tool.id;
+        let expanded = self.raw_tool_details.contains(&id);
+        let full = serde_json::to_string_pretty(&tool.input).unwrap_or_default();
+        let diff = tool
+            .input
+            .get("diff")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let copy = full.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        button(
+                            ("approval-inspect", i),
+                            if expanded {
+                                "Hide full action"
+                            } else {
+                                "Inspect full action"
+                            },
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            if !view.raw_tool_details.remove(&id) {
+                                view.raw_tool_details.insert(id);
+                            }
+                            view.invalidate_live_history();
+                            view.sync_history_list(cx);
+                            cx.notify();
+                        })),
+                    )
+                    .child(button(("approval-copy", i), "Copy full action").on_click(
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+                        },
+                    )),
+            )
+            .when(expanded, |body| {
+                body.when_some(diff, |body, diff| {
+                    let copy = diff.clone();
+                    body.child(
+                        button(("approval-copy-diff", i), "Copy full diff").on_click(
+                            move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+                            },
+                        ),
+                    )
+                    .child(full_code_block(("approval-full-diff", i), &diff))
+                })
+                .child(full_code_block(("approval-full", i), &full))
+            })
+            .into_any_element()
     }
     fn approval_panel(
         &self,
@@ -356,6 +693,7 @@ impl Xylo {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = tool.id;
+        let incomplete = tool.input.get("diff_truncated").and_then(Value::as_bool) == Some(true);
         let shortcut = if cfg!(target_os = "macos") {
             "⌘⇧↩ allow · Esc deny"
         } else {
@@ -367,78 +705,199 @@ impl Xylo {
             .gap_3()
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(summary.question.clone()),
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(icon(Glyph::ShieldCheck).size(px(16.)).mt(px(1.)).text_color(rgb(accent_text())))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(14.))
+                            .line_height(relative(1.45))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(text()))
+                            .child(summary.question.clone()),
+                    ),
             )
             .child(approval_preview(i, tool))
+            .child(self.full_action_inspector(i, tool, cx))
+            .when(incomplete, |panel| panel.child(subtitle("This saved change was shortened before inspection. Deny it and ask for a fresh action to review the complete change.")))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .child(primary(("allow", i), "Allow").on_click(
+                    .child(primary(("allow", i), "Allow once").disabled(incomplete).on_click(
                         cx.listener(move |this, _, _, cx| this.decide_action(id, true, false, cx)),
                     ))
-                    .when_some(tool.rule.clone(), |row, rule| {
-                        row.child(
-                            button(("allow-always", i), format!("Always allow {rule}"))
-                                .border_color(rgb(border()))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.decide_action(id, true, true, cx)
-                                })),
-                        )
-                    })
-                    .child(button(("deny", i), "Deny").on_click(
+                    .child(secondary(("deny", i), "Deny").on_click(
                         cx.listener(move |this, _, _, cx| this.decide_action(id, false, false, cx)),
                     ))
                     .child(div().flex_1())
                     .child(subtitle(shortcut)),
             )
+            .child(subtitle("Allow once approves only this action."))
+            .when_some(tool.rule.clone(), |panel, rule| {
+                panel.child(
+                    div().flex().flex_col().gap_2().pt_3()
+                        .border_t_1().border_color(rgb(border()))
+                        .child(subtitle(format!("Persistent permission for this chat session: {rule}. Allows this action and future matching actions without asking again. Resets when the worker session ends; does not apply to other chats or override read-only mode.")))
+                        .child(secondary(("allow-always", i), format!("Always allow {rule}"))
+                            .self_start()
+                            .disabled(incomplete)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.decide_action(id, true, true, cx)
+                            }))),
+                )
+            })
             .into_any_element()
     }
     fn turn_error(&self, error: &str, _cx: &mut Context<Self>) -> AnyElement {
         let details = error.to_owned();
         div()
             .w_full()
-            .flex()
-            .items_start()
-            .gap_2()
-            .p_3()
-            .rounded_lg()
-            .bg(rgb(danger_bg()))
-            .border_1()
-            .border_color(rgb(danger()))
-            .child(icon(IconName::CircleAlert).text_color(rgb(danger())))
+            .pl(px(32.))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .w_full()
                     .flex()
-                    .flex_col()
-                    .gap_1()
+                    .items_start()
+                    .gap_3()
+                    .p(px(14.))
+                    .rounded(px(12.))
+                    .bg(rgb(danger_bg()))
+                    .child(icon(IconName::CircleAlert).size(px(16.)).mt(px(2.)).text_color(rgb(danger())))
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("The task stopped with an error"),
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(text()))
+                                    .child("The task stopped with an error"),
+                            )
+                            .child(body_text(product_error(error)))
+                            .child(subtitle(
+                                "Progress so far is saved. Send a message to continue or adjust the request.",
+                            )),
                     )
-                    .child(div().text_sm().child(product_error(error)))
-                    .child(subtitle(
-                        "Progress so far is saved. Send a message to continue or adjust the request.",
-                    )),
-            )
-            .child(
-                button("copy-turn-error", "Copy details")
-                    .text_xs()
-                    .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(details.clone()))
-                    }),
+                    .child(
+                        button("copy-turn-error", "Copy details")
+                            .text_size(px(12.))
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(details.clone()))
+                            }),
+                    ),
             )
             .into_any_element()
     }
+    fn can_populate_chat_starter(&self, cx: &Context<Self>) -> bool {
+        self.messages.is_empty()
+            && !self.running()
+            && !self.history_loading()
+            && !self.recovery.open
+            && !self.recovery_blocks_submit()
+            && !self.draft_flush_pending()
+            && !self.draft_needs_attention()
+            && self.composer.read(cx).value().is_empty()
+            && self.workspace.is_some()
+            && self.settings.provider.validate().is_ok()
+    }
+
+    pub(super) fn populate_chat_starter(
+        &mut self,
+        prompt: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Recheck at click time: a rendered suggestion must never overwrite a draft.
+        if !self.can_populate_chat_starter(cx) {
+            return;
+        }
+        self.composer.update(cx, |input, cx| {
+            input.set_value(prompt, window, cx);
+            input.focus(window, cx);
+        });
+        self.draft_changed(cx);
+        cx.notify();
+    }
+
     fn chat_home(&self, cx: &mut Context<Self>) -> AnyElement {
+        let configured = self.settings.provider.validate().is_ok();
+        let project_name = self.workspace.as_ref().map(|path| {
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        });
+        // Context line under the composer: where we are and which model answers.
+        let mut context = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_center()
+            .gap(px(6.))
+            .text_size(px(12.5))
+            .text_color(rgb(muted()));
+        match (&project_name, self.workspace_ready) {
+            (None, _) => {
+                context = context.child("No project open");
+            }
+            (Some(name), false) => {
+                context = context
+                    .child(
+                        icon(IconName::Folder)
+                            .size(px(13.))
+                            .text_color(rgb(faint())),
+                    )
+                    .child(name.clone())
+                    .child("· loading project…");
+            }
+            (Some(name), true) => {
+                context = context
+                    .child(
+                        icon(IconName::Folder)
+                            .size(px(13.))
+                            .text_color(rgb(faint())),
+                    )
+                    .child(name.clone());
+            }
+        }
+        context = context.child("·").child(if configured {
+            self.settings.provider.model.clone()
+        } else {
+            "No model set up".to_owned()
+        });
+        if self.workspace.is_none() || !configured {
+            context = context.child(
+                button(
+                    "chat-home-setup",
+                    if self.workspace.is_none() {
+                        "Choose project"
+                    } else {
+                        "Set up model"
+                    },
+                )
+                .h(px(26.))
+                .px(px(8.))
+                .text_size(px(12.5))
+                .text_color(rgb(accent_text()))
+                .on_click(cx.listener(|view, _, window, cx| {
+                    if view.workspace.is_none() {
+                        view.pick_workspace(window, cx);
+                    } else if view.settings.provider.validate().is_err() {
+                        view.navigate(Page::Providers, cx);
+                    }
+                })),
+            );
+        }
         div()
             .size_full()
             .min_h_0()
@@ -446,23 +905,46 @@ impl Xylo {
             .flex_col()
             .items_center()
             .justify_center()
-            .px_6()
-            .pb(px(110.))
+            .px(px(28.))
+            .pb(px(96.))
             .child(
                 div()
                     .w_full()
-                    .max_w(px(740.))
+                    .max_w(px(760.))
                     .flex()
                     .flex_col()
-                    .gap_6()
+                    .items_center()
+                    .gap(px(22.))
                     .child(
                         div()
-                            .text_2xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_center()
-                            .child("What are we working on?"),
+                            .flex()
+                            .items_center()
+                            .gap(px(14.))
+                            .child(brand_glyph(30.))
+                            .child(display(greeting())),
                     )
-                    .child(self.prompt_box(cx)),
+                    .child(self.prompt_box(cx))
+                    .child(context)
+                    .when(self.can_populate_chat_starter(cx), |body| {
+                        body.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .justify_center()
+                                .gap_2()
+                                .pt(px(6.))
+                                .children([
+                                    (Glyph::Lightbulb, "Explain this project", "Explain this project using read-only inspection. Summarize its architecture, key entry points, and how to run its tests. Do not edit files."),
+                                    (Glyph::Eye, "Review my changes", "Review the current project changes using read-only inspection. Look for bugs, regressions, and missing tests. Do not edit files."),
+                                    (Glyph::ListChecks, "Plan before editing", "Inspect this project and help me plan a change before making any edits. Ask what I want to change, then propose a plan and wait for my approval before editing files."),
+                                ].into_iter().enumerate().map(|(index, (glyph, label, prompt))| {
+                                    chip_with(("chat-home-starter", index), Some(icon(glyph)), label)
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.populate_chat_starter(prompt, window, cx);
+                                        }))
+                                })),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -589,7 +1071,7 @@ impl Xylo {
             .ghost()
             .icon(IconName::Plus)
             .tooltip("Add context")
-            .disabled(self.attachments.importing())
+            .disabled(self.attachments.importing_for(self.session))
             .dropdown_menu(move |menu, _, _| {
                 let attach = weak.clone();
                 let paste = weak.clone();
@@ -629,16 +1111,21 @@ impl Xylo {
         let weak = cx.entity().downgrade();
         let mut trigger_layout = div().min_w_0().max_w(px(250.)).flex_shrink(1.);
         Popover::new("composer-model-popover")
-            .bg(rgb(panel())).border_1().border_color(rgb(border())).rounded(px(16.))
+            .bg(rgb(panel()))
+            .border_1()
+            .border_color(rgb(border()))
+            .rounded(px(16.))
             .trigger_style(trigger_layout.style().clone())
             .anchor(Anchor::BottomRight)
             .offset(px(8.))
             .trigger(
                 MenuButton::new("composer-model")
                     .ghost()
-                    .bg(rgb(panel()))
                     .label(label)
                     .h(px(30.))
+                    .rounded_full()
+                    .text_size(px(12.5))
+                    .text_color(rgb(text_secondary()))
                     .max_w(px(250.))
                     .w_full()
                     .min_w_0()
@@ -648,7 +1135,7 @@ impl Xylo {
                         div()
                             .flex_shrink_0()
                             .whitespace_nowrap()
-                            .text_color(rgb(muted()))
+                            .text_color(rgb(accent_text()))
                             .child(effort_label),
                     )
                     .child(icon(IconName::ChevronDown).size(px(12.)))
@@ -712,7 +1199,8 @@ impl Xylo {
             .p_2()
             .child(
                 div()
-                    .relative().h(px(32.))
+                    .relative()
+                    .h(px(32.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -722,13 +1210,15 @@ impl Xylo {
                             .flex_1()
                             .text_center()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(accent()))
+                            .text_color(rgb(accent_text()))
                             .child(title),
                     )
                     .when(!efforts.is_empty(), |row| {
                         row.child(
                             MenuButton::new("composer-effort-default")
-                                .absolute().right_0().top_0()
+                                .absolute()
+                                .right_0()
+                                .top_0()
                                 .ghost()
                                 .icon(IconName::RefreshCw)
                                 .accessibility_label("Use provider default reasoning")
@@ -780,7 +1270,13 @@ impl Xylo {
                         .tooltip(caption.clone())
                         .selected(selected)
                         .bg(rgb(hover()))
-                        .child(div().flex_shrink_0().size(px(if selected {22.} else {4.})).rounded_full().bg(rgb(if selected {text()} else {muted()})))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .size(px(if selected { 22. } else { 4. }))
+                                .rounded_full()
+                                .bg(rgb(if selected { text() } else { muted() })),
+                        )
                         .on_click(cx.listener(move |view, _, _, cx| {
                             if view.settings.provider.model != source.model
                                 || !providers::same_connection(&view.settings.provider, &source)
@@ -816,10 +1312,12 @@ impl Xylo {
         MenuButton::new("composer-permissions")
             .ghost()
             .label(caption)
-            .max_w(px(144.))
+            .icon(Glyph::SlidersHorizontal)
+            .max_w(px(170.))
             .h(px(30.))
-            .text_xs()
-            .text_color(rgb(muted()))
+            .rounded_full()
+            .text_size(px(12.5))
+            .text_color(rgb(text_secondary()))
             .tooltip(format!(
                 "{} · Applies to new tasks",
                 self.settings.permissions.description()
@@ -875,7 +1373,8 @@ impl Xylo {
             .accessibility_label("Context window")
             .ghost()
             .h(px(30.))
-            .w(px(28.)).px_0()
+            .w(px(28.))
+            .px_0()
             .child(if let Some(used) = reported.filter(|_| capacity > 0) {
                 gpui_kit::component::progress::ProgressCircle::new("composer-context-usage")
                     .value((used as f32 / capacity as f32 * 100.).clamp(0., 100.))
@@ -938,39 +1437,51 @@ impl Xylo {
             .into_any_element()
     }
     fn prompt_box(&self, cx: &mut Context<Self>) -> AnyElement {
+        let paste = cx.entity().downgrade();
         let model = if self.settings.provider.model.is_empty() {
             "Select model".to_string()
         } else {
             self.settings.provider.model.clone()
         };
+        let draft_empty = self.composer.read(cx).value().trim().is_empty();
+        let has_attachments = !self.draft_attachments().is_empty();
+        let running = self.running();
         div()
             .w_full()
-            .max_w(px(740.))
+            .max_w(px(760.))
+            .child(self.pending_messages(cx))
             .when(!self.speech.transcript.is_empty(), |panel| {
                 panel.child(
                     button("review-voice-transcript", "Review voice transcript")
-                        .text_xs()
+                        .text_size(px(12.))
                         .on_click(cx.listener(|view, _, _, cx| view.navigate(Page::Voice, cx))),
                 )
             })
             .child(
                 div()
                     .id("image-drop-target")
+                    .test_support()
                     .w_full()
-                    .rounded(px(22.))
+                    .rounded(px(20.))
                     .bg(rgb(panel()))
                     .border_1()
-                    .border_color(rgb(border()))
+                    .border_color(rgb(border_strong()))
+                    .shadow_sm()
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .p_3()
+                    .gap(px(6.))
+                    .px(px(14.))
+                    .pt(px(12.))
+                    .pb(px(10.))
                     .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
                         view.attach_image_paths(paths.paths().to_vec(), AttachmentSource::Drop, cx)
                     }))
                     .child(
-                        div().min_h(px(62.)).px_1().py_1().child(
+                        div().min_h(px(44.)).text_size(px(15.)).child(
                             Textarea::new(&self.composer)
+                                .on_paste(move |item, _, cx| {
+                                    paste.update(cx, |view, cx| view.attachment_paste_item(item, cx)).unwrap_or(false)
+                                })
                                 .aria_label("Message")
                                 .appearance(false)
                                 .bordered(false)
@@ -978,7 +1489,7 @@ impl Xylo {
                         ),
                     )
                     .when(
-                        !self.draft_attachments().is_empty() || self.attachments.importing(),
+                        has_attachments || self.attachments.importing_for(self.session),
                         |surface| surface.child(self.attachment_strip(cx)),
                     )
                     .when(!self.attachments.notice.is_empty(), |surface| {
@@ -988,7 +1499,8 @@ impl Xylo {
                         div()
                             .flex()
                             .items_center()
-                            .gap_1()
+                            .gap(px(4.))
+                            .when(running && (!draft_empty || has_attachments), |row| row.flex_wrap())
                             .min_h(px(32.))
                             .child(self.composer_context_actions(cx))
                             .child(self.composer_permissions(cx))
@@ -996,58 +1508,69 @@ impl Xylo {
                             .child(self.composer_context(cx))
                             .child(self.unified_model_control(model, cx))
                             .child(self.speech_capture_button(cx))
-                            .child({
-                                let stop = self.running()
-                                    && self.composer.read(cx).value().trim().is_empty()
-                                    && self.draft_attachments().is_empty();
-                                gpui_kit::base::Button::new(if stop {
-                                    "cancel-task"
-                                } else {
-                                    "send-prompt"
-                                })
-                                .accessibility_label(if stop {
-                                    "Stop the task (Esc)"
-                                } else if self.running() {
-                                    "Send guidance"
-                                } else {
-                                    "Send message"
-                                })
-                                .size(px(32.))
-                                .rounded_full()
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .bg(rgb(text()))
-                                .text_color(rgb(panel()))
-                                .cursor_pointer()
-                                .disabled(
-                                    !stop
-                                        && (self.attachments.importing()
-                                            || self.draft_flush_pending()),
-                                )
-                                .child(
-                                    icon(if stop {
-                                        IconName::Square
-                                    } else {
-                                        IconName::ArrowUp
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .flex_shrink_0()
+                                    .ml(px(4.))
+                                    .when(running && !draft_empty, |row| {
+                                        row.child(pill("steer-prompt", "Steer")
+                                            .accessibility_label("Steer current task")
+                                            .border_color(rgb(border_strong()))
+                                            .disabled(self.pending_guidance_text().is_some() || self.draft_send_pending() || has_attachments || self.attachments.importing_for(self.session) || self.draft_flush_pending())
+                                            .tooltip(|_,cx| cx.new(|_| XyloTooltip("Update the active task at its next safe step. Images can be queued for the next turn.".into())).into())
+                                            .on_click(cx.listener(|view,_,window,cx| view.steer_composer(window,cx))))
                                     })
-                                    .size(px(if stop {
-                                        12.
-                                    } else {
-                                        18.
-                                    })),
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        if stop {
-                                            this.engine_command(WorkerCommand::Cancel, cx)
-                                        } else {
-                                            this.submit(window, cx)
-                                        }
-                                    },
-                                ))
-                            }),
+                                    .when(running, |row| {
+                                        row.child(
+                                            stop_button("cancel-task", "Stop the task")
+                                                .tooltip(|_, cx| cx.new(|_| XyloTooltip("Stop".into())).into())
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.engine_command(WorkerCommand::Cancel, cx)
+                                                })),
+                                        )
+                                    })
+                                    .when(!running || !draft_empty || has_attachments, |row| {
+                                        row.child({
+                                            let pending = self.draft_send_pending();
+                                            let disabled = pending
+                                                || self.attachments.importing_for(self.session)
+                                                || self.draft_flush_pending()
+                                                || self.pending_guidance_text().is_some_and(|text| text == self.composer.read(cx).value().as_str())
+                                                || (!running && draft_empty && !has_attachments);
+                                            send_button(
+                                                "send-prompt",
+                                                if pending {
+                                                    "Sending message"
+                                                } else if running {
+                                                    "Queue message"
+                                                } else {
+                                                    "Send message"
+                                                },
+                                                disabled,
+                                            )
+                                            .when(running, |button| button.w(px(66.)).rounded_full())
+                                            .tooltip({ let queued = running; move |_, cx| cx.new(|_| XyloTooltip(if queued { "Queue for after this task finishes" } else { "Send message" }.into())).into() })
+                                            .child(if pending {
+                                                Spinner::new()
+                                                    .small()
+                                                    .color(rgb(brand_foreground()).into())
+                                                    .into_any_element()
+                                            } else if running {
+                                                div().text_size(px(12.5)).font_weight(FontWeight::MEDIUM).child("Queue").into_any_element()
+                                            } else {
+                                                icon(IconName::ArrowUp)
+                                                    .size(px(18.))
+                                                    .into_any_element()
+                                            })
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.submit(window, cx)
+                                            }))
+                                        })
+                                    }),
+                            ),
                     ),
             )
             .when(self.draft_needs_attention(), |surface| {
@@ -1057,19 +1580,51 @@ impl Xylo {
     }
 }
 use crate::state::{ToolCard, TurnState};
-use gpui_kit::component::{Sizable, spinner::Spinner};
+use gpui_kit::component::{Icon, Sizable, spinner::Spinner};
 use serde_json::Value;
+
+/// Time-of-day greeting addressed to the person, as the home screen title.
+fn greeting() -> String {
+    use chrono::Timelike;
+    let hour = chrono::Local::now().hour();
+    let salutation = match hour {
+        5..=11 => "Good morning",
+        12..=16 => "Good afternoon",
+        17..=21 => "Good evening",
+        _ => "Hello",
+    };
+    let name = super::sidebar::person_name();
+    if name == "You" {
+        salutation.to_owned()
+    } else {
+        format!("{salutation}, {name}")
+    }
+}
+
+/// A glyph for each kind of action so a run of tool calls scans at a glance.
+fn tool_glyph(name: &str) -> Glyph {
+    match name {
+        "file_read" | "read_file" => Glyph::FileSearch,
+        "file_write" | "file_edit" | "write_file" | "edit_file" => Glyph::FilePen,
+        "run_command" | "shell_command" | "terminal" => Glyph::Terminal,
+        "search_project" | "grep" | "glob" | "find" => Glyph::Search,
+        "git_status" | "git_diff" | "git_log" | "git_commit" => Glyph::GitBranch,
+        "web_fetch" | "web_search" | "browser" => Glyph::Globe,
+        "todo_write" => Glyph::ListChecks,
+        "image_generate" => Glyph::Image,
+        "memory" | "memory_write" | "memory_read" => Glyph::Brain,
+        _ => Glyph::Wrench,
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Tone {
     Muted,
-    Bad,
 }
 impl Tone {
     fn color(self) -> u32 {
         match self {
             Tone::Muted => muted(),
-            Tone::Bad => danger(),
         }
     }
 }
@@ -1108,207 +1663,6 @@ fn command_line(tool: &ToolCard) -> String {
         }
     }
 }
-fn summary_field<'a>(output: &'a Option<Value>, key: &str) -> Option<&'a Value> {
-    output.as_ref()?.get("summary")?.get(key)
-}
-fn elapsed(tool: &ToolCard) -> Option<(String, Tone)> {
-    let ms = tool.finished_at? - tool.started_at;
-    (ms >= 1000).then(|| (format!("{:.1} s", ms as f64 / 1000.0), Tone::Muted))
-}
-fn describe(tool: &ToolCard) -> ActionSummary {
-    let input = &tool.input;
-    let output = tool.output();
-    let path = text_arg(input, "path").to_owned();
-    let count = |key: &str, unit: &str| {
-        summary_field(&output, key)
-            .and_then(Value::as_u64)
-            .map(|n| {
-                (
-                    format!("{n} {unit}{}", if n == 1 { "" } else { "s" }),
-                    Tone::Muted,
-                )
-            })
-    };
-    let changes = || {
-        let added = input.get("added").and_then(Value::as_u64)?;
-        let removed = input.get("removed").and_then(Value::as_u64)?;
-        Some((format!("+{added} −{removed}"), Tone::Muted))
-    };
-    let (verb, target, meta, question): (&str, String, Option<(String, Tone)>, String) = match tool
-        .name
-        .as_str()
-    {
-        "file_read" => {
-            let lines = match (
-                summary_field(&output, "start_line").and_then(Value::as_u64),
-                summary_field(&output, "end_line").and_then(Value::as_u64),
-                summary_field(&output, "total_lines").and_then(Value::as_u64),
-            ) {
-                (Some(start), Some(end), Some(total)) if end > 0 && (start > 1 || end < total) => {
-                    Some((format!("lines {start}–{end} of {total}"), Tone::Muted))
-                }
-                (_, _, Some(total)) => Some((format!("{total} lines"), Tone::Muted)),
-                _ => None,
-            };
-            ("Read", path.clone(), lines, format!("Read {path}?"))
-        }
-        "file_edit" => (
-            "Edit",
-            path.clone(),
-            changes(),
-            format!("Allow Xylo to edit {path}?"),
-        ),
-        "file_write" => {
-            let created = input.get("created").and_then(Value::as_bool) == Some(true);
-            (
-                if created { "Create" } else { "Write" },
-                path.clone(),
-                changes(),
-                format!(
-                    "Allow Xylo to {} {path}?",
-                    if created { "create" } else { "overwrite" }
-                ),
-            )
-        }
-        "files_list" => (
-            "List",
-            if path.is_empty() {
-                ".".into()
-            } else {
-                path.clone()
-            },
-            None,
-            "List this folder?".into(),
-        ),
-        "find_files" => (
-            "Find files",
-            text_arg(input, "pattern").to_owned(),
-            count("count", "file"),
-            "Find files?".into(),
-        ),
-        "search_project" => {
-            let mut target = format!("“{}”", text_arg(input, "query"));
-            if let Some(glob) = input.get("glob").and_then(Value::as_str) {
-                target.push_str(&format!(" in {glob}"));
-            }
-            (
-                "Search",
-                target,
-                count("matches", "match"),
-                "Search the project?".into(),
-            )
-        }
-        "git_status" => (
-            "Git status",
-            String::new(),
-            None,
-            "Check Git status?".into(),
-        ),
-        "git_diff" => (
-            "Git diff",
-            if input.get("staged").and_then(Value::as_bool) == Some(true) {
-                "staged".into()
-            } else {
-                path.clone()
-            },
-            None,
-            "Read the Git diff?".into(),
-        ),
-        "run_command" | "shell_command" => {
-            let exit = output
-                .as_ref()
-                .and_then(|o| {
-                    o.get("exit_code")
-                        .or_else(|| o.pointer("/summary/exit_code"))
-                })
-                .and_then(Value::as_i64);
-            let meta = match (exit, tool.success) {
-                (Some(code), _) if code != 0 => Some((format!("exit {code}"), Tone::Bad)),
-                _ => elapsed(tool),
-            };
-            (
-                "Run",
-                command_line(tool),
-                meta,
-                "Allow Xylo to run this command in your project?".into(),
-            )
-        }
-        "agent_delegate" => (
-            "Delegate",
-            text_arg(input, "task").to_owned(),
-            elapsed(tool),
-            "Start a helper agent?".into(),
-        ),
-        "memory_search" => (
-            "Recall",
-            text_arg(input, "query").to_owned(),
-            None,
-            "Search project memory?".into(),
-        ),
-        "memory_remember" => (
-            "Remember",
-            text_arg(input, "content").to_owned(),
-            None,
-            "Allow Xylo to remember this fact for the project?".into(),
-        ),
-        "search_tools" => (
-            "Find tools",
-            text_arg(input, "query").to_owned(),
-            None,
-            "Look up tools?".into(),
-        ),
-        "connector_call" => (
-            "Use connector",
-            text_arg(input, "tool").to_owned(),
-            None,
-            "Allow Xylo to use this connected service?".into(),
-        ),
-        "connector_tools" => (
-            "Connect",
-            text_arg(input, "connector_id").to_owned(),
-            None,
-            "Allow Xylo to start this connector?".into(),
-        ),
-        "call_tool" => (
-            "Use",
-            text_arg(input, "name").replace('_', " "),
-            None,
-            "Allow this action?".into(),
-        ),
-        name => {
-            let target = ["command", "path", "query", "url", "task", "name"]
-                .iter()
-                .find_map(|key| input.get(*key).and_then(Value::as_str))
-                .unwrap_or_default()
-                .to_owned();
-            let verb = name.replace('_', " ");
-            let question = format!("Allow Xylo to {verb}?");
-            return ActionSummary {
-                verb: capitalize(&verb),
-                target,
-                meta: elapsed(tool),
-                question,
-            };
-        }
-    };
-    ActionSummary {
-        verb: verb.into(),
-        target,
-        meta: if tool.success == Some(false) && meta.is_none() {
-            Some(("failed".into(), Tone::Bad))
-        } else {
-            meta
-        },
-        question,
-    }
-}
-fn capitalize(text: &str) -> String {
-    let mut chars = text.chars();
-    chars
-        .next()
-        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-        .unwrap_or_default()
-}
 fn elapsed_label(turn: &TurnState) -> String {
     let seconds = turn
         .started_at
@@ -1326,6 +1680,7 @@ fn turn_status(turn: &TurnState) -> AnyElement {
     let (indicator, label): (AnyElement, String) = if waiting > 0 {
         (
             icon(IconName::TriangleAlert)
+                .size(px(15.))
                 .text_color(rgb(warning()))
                 .into_any_element(),
             if waiting == 1 {
@@ -1336,10 +1691,7 @@ fn turn_status(turn: &TurnState) -> AnyElement {
         )
     } else {
         (
-            Spinner::new()
-                .small()
-                .color(rgb(accent()).into())
-                .into_any_element(),
+            brand_glyph(16.).into_any_element(),
             if turn.status.is_empty() || turn.status == "Working" {
                 "Working…".into()
             } else {
@@ -1348,15 +1700,45 @@ fn turn_status(turn: &TurnState) -> AnyElement {
         )
     };
     div()
+        .w_full()
         .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_2()
-        .py_2()
-        .text_sm()
-        .child(indicator)
-        .child(div().text_color(rgb(text())).child(label))
-        .child(subtitle(format!("{} · Esc to stop", elapsed_label(turn))))
+        .items_start()
+        .gap(px(12.))
+        .py(px(6.))
+        .child(
+            div()
+                .flex_shrink_0()
+                .w(px(20.))
+                .pt(px(2.))
+                .flex()
+                .justify_center()
+                .child(indicator),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(rgb(text_secondary()))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_size(px(12.))
+                        .text_color(rgb(faint()))
+                        .child(elapsed_label(turn))
+                        .child("·")
+                        .child(kbd("Esc"))
+                        .child(if waiting > 0 { "to deny" } else { "to stop" }),
+                ),
+        )
         .into_any_element()
 }
 /// The agent's checklist; only the newest version is shown in full.
@@ -1378,38 +1760,54 @@ fn plan_card(i: usize, tool: &ToolCard, latest: bool) -> AnyElement {
     let heading = div()
         .flex()
         .items_center()
-        .gap_2()
-        .text_sm()
-        .child(icon(IconName::BookOpen).text_color(rgb(muted())))
-        .child(div().font_weight(FontWeight::MEDIUM).child(if latest {
-            "Plan"
-        } else {
-            "Updated plan"
-        }))
-        .child(subtitle(format!("{done} of {} done", items.len())));
+        .gap(px(8.))
+        .child(
+            icon(Glyph::ListChecks)
+                .size(px(15.))
+                .text_color(rgb(accent_text())),
+        )
+        .child(
+            div()
+                .text_size(px(13.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(text()))
+                .child(if latest { "Plan" } else { "Updated plan" }),
+        )
+        .child(div().flex_1())
+        .child(badge(
+            format!("{done} of {} done", items.len()),
+            if done == items.len() && !items.is_empty() {
+                BadgeTone::Success
+            } else {
+                BadgeTone::Neutral
+            },
+        ));
     if !latest {
         return div()
             .id(("plan", i))
-            .px_2()
-            .py_1()
-            .child(heading)
+            .px(px(8.))
+            .h(px(30.))
+            .flex()
+            .items_center()
+            .child(heading.opacity(0.7))
             .into_any_element();
     }
-    let mut list = div().flex().flex_col().gap_1();
+    let mut list = div().flex().flex_col().gap(px(6.));
     for (index, (content, status)) in items.into_iter().enumerate() {
-        let (glyph, tone, weight) = match status.as_str() {
-            "completed" => (IconName::CircleCheck, success(), FontWeight::NORMAL),
-            "in_progress" => (IconName::ChevronRight, accent(), FontWeight::MEDIUM),
-            _ => (IconName::Square, muted(), FontWeight::NORMAL),
+        let (glyph, tone, weight): (Icon, u32, FontWeight) = match status.as_str() {
+            "completed" => (icon(IconName::CircleCheck), success(), FontWeight::NORMAL),
+            "in_progress" => (icon(Glyph::LoaderCircle), accent_text(), FontWeight::MEDIUM),
+            _ => (icon(Glyph::CircleDashed), faint(), FontWeight::NORMAL),
         };
         list = list.child(
             div()
                 .id(("plan-item", i * 1000 + index))
                 .flex()
                 .items_start()
-                .gap_2()
-                .text_sm()
-                .child(icon(glyph).size(px(14.)).mt(px(2.)).text_color(rgb(tone)))
+                .gap(px(10.))
+                .text_size(px(13.5))
+                .line_height(relative(1.5))
+                .child(glyph.size(px(15.)).mt(px(2.)).text_color(rgb(tone)))
                 .child(
                     div()
                         .flex_1()
@@ -1428,9 +1826,9 @@ fn plan_card(i: usize, tool: &ToolCard, latest: bool) -> AnyElement {
         .w_full()
         .flex()
         .flex_col()
-        .gap_2()
-        .p_3()
-        .rounded_lg()
+        .gap(px(12.))
+        .p(px(14.))
+        .rounded(px(12.))
         .bg(rgb(panel()))
         .border_1()
         .border_color(rgb(border()))
@@ -1474,7 +1872,7 @@ fn diff_view(id: impl Into<ElementId>, diff: &str) -> AnyElement {
             div()
                 .px_2()
                 .text_color(rgb(muted()))
-                .child("… more lines in the full diff"),
+                .child("… diff preview shortened; use full inspection or copy controls"),
         );
     }
     div()
@@ -1483,30 +1881,42 @@ fn diff_view(id: impl Into<ElementId>, diff: &str) -> AnyElement {
         .max_h(px(360.))
         .overflow_scroll()
         .py_1()
-        .rounded_md()
+        .rounded(px(10.))
         .bg(rgb(code_bg()))
         .border_1()
         .border_color(rgb(border()))
         .font_family("monospace")
-        .text_size(px(12.))
+        .text_size(px(12.5))
+        .line_height(relative(1.55))
         .child(body)
         .into_any_element()
 }
-/// Selectable monospace text (commands, output, search results).
+/// Selectable, scrollable preview; full action inspection is explicit.
 fn code_block(id: impl Into<ElementId>, text: &str) -> AnyElement {
-    let fence = if text.contains("```") { "````" } else { "```" };
+    full_code_block(id, &truncate(text, 6000))
+}
+fn full_code_block(id: impl Into<ElementId>, text: &str) -> AnyElement {
+    let id: ElementId = id.into();
+    let mut run = 0;
+    let mut longest = 2;
+    for ch in text.chars() {
+        run = if ch == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest + 1);
+    // Markdown parses asynchronously; reserve the inspection viewport before
+    // its first measured frame, and never shrink it to zero in a flex card.
+    let height = (text.lines().count().max(1) as f32 * 20. + 24.).min(360.);
     div()
         .w_full()
+        .h(px(height))
+        .flex_shrink_0()
         .max_h(px(360.))
-        .overflow_hidden()
+        .id(id.clone())
+        .test_support()
+        .overflow_scroll()
         .rounded_md()
-        .child(
-            TextView::markdown(
-                id,
-                format!("{fence}text\n{}\n{fence}", truncate(text, 6000)),
-            )
-            .selectable(true),
-        )
+        .child(TextView::markdown(id, format!("{fence}\n{text}\n{fence}")).selectable(true))
         .into_any_element()
 }
 fn approval_preview(i: usize, tool: &ToolCard) -> AnyElement {
@@ -1527,85 +1937,5 @@ fn approval_preview(i: usize, tool: &ToolCard) -> AnyElement {
             ("approval-input", i),
             &serde_json::to_string_pretty(&tool.input).unwrap_or_default(),
         ),
-    }
-}
-fn tool_detail(i: usize, tool: &ToolCard) -> AnyElement {
-    let output = tool.output();
-    let summary = output.as_ref().and_then(|o| o.get("summary"));
-    let field = |key: &str| summary.and_then(|s| s.get(key)).and_then(Value::as_str);
-    let raw = tool.result.clone().unwrap_or_default();
-    let mut detail = div().flex().flex_col().gap_2();
-    match tool.name.as_str() {
-        "file_write" | "file_edit" => {
-            let diff = field("diff").unwrap_or_else(|| text_arg(&tool.input, "diff"));
-            if !diff.trim().is_empty() {
-                detail = detail.child(diff_view(("tool-diff", i), diff));
-            }
-        }
-        "run_command" | "shell_command" => {
-            let mut text = format!("$ {}\n", command_line(tool));
-            match (field("stdout"), field("stderr")) {
-                (None, None) if !raw.is_empty() && output.is_none() => text.push_str(&raw),
-                (stdout, stderr) => {
-                    text.push_str(stdout.unwrap_or_default());
-                    if let Some(stderr) = stderr.filter(|s| !s.trim().is_empty()) {
-                        text.push_str("\n[stderr]\n");
-                        text.push_str(stderr);
-                    }
-                }
-            }
-            detail = detail.child(code_block(("tool-output", i), &text));
-        }
-        "file_read" => {
-            if let Some(content) = field("content") {
-                detail = detail.child(code_block(("tool-output", i), content));
-            }
-        }
-        "search_project" => {
-            if let Some(results) = field("results") {
-                detail = detail.child(code_block(("tool-output", i), results));
-            }
-        }
-        "find_files" => {
-            let files: Vec<&str> = summary
-                .and_then(|s| s.get("files"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect();
-            detail = detail.child(code_block(("tool-output", i), &files.join("\n")));
-        }
-        _ => {
-            detail = detail.child(code_block(
-                ("tool-input", i),
-                &serde_json::to_string_pretty(&tool.input).unwrap_or_default(),
-            ));
-        }
-    }
-    let handled = detail_handled(tool.name.as_str(), &output);
-    if !handled && !raw.is_empty() {
-        let shown = output
-            .as_ref()
-            .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
-            .unwrap_or(raw);
-        detail = detail.child(code_block(("tool-result", i), &shown));
-    }
-    detail.into_any_element()
-}
-/// Whether the structured view above already shows the useful part of the result.
-fn detail_handled(name: &str, output: &Option<Value>) -> bool {
-    let Some(summary) = output.as_ref().and_then(|o| o.get("summary")) else {
-        return matches!(name, "run_command" | "shell_command");
-    };
-    match name {
-        "file_write" | "file_edit" => summary.get("diff").is_some(),
-        "run_command" | "shell_command" => {
-            summary.get("stdout").is_some() || summary.get("stderr").is_some()
-        }
-        "file_read" => summary.get("content").is_some(),
-        "search_project" => summary.get("results").is_some(),
-        "find_files" => summary.get("files").is_some(),
-        _ => false,
     }
 }

@@ -1,7 +1,6 @@
 //! Product notification preferences. Only deliberate controls enqueue permission
 //! or test actions; rendering/status refreshes cannot request OS authorization.
 use super::*;
-use gpui_kit::component::{Disableable, switch::Switch};
 use serde_json::{Value, json};
 use xylo_runtime::notifications::Preferences;
 
@@ -211,7 +210,7 @@ impl Xylo {
         let mut general = card()
             .max_w(px(820.))
             .child(
-                Switch::new("notifications-enabled")
+                crate::ui::XyloSwitch::new("notifications-enabled")
                     .label("Enable desktop notifications")
                     .checked(preferences.enabled)
                     .disabled(!loaded || self.notifications.saving())
@@ -227,7 +226,11 @@ impl Xylo {
                 "Notifications are silent and contain no conversation text.",
             ));
         general = general.child(subtitle(if !loaded {
-            "Loading notification preferences…"
+            if self.notifications.pending.is_empty() {
+                "Notification preferences unavailable. Retry below."
+            } else {
+                "Loading notification preferences…"
+            }
         } else {
             permission_text(permission)
         }));
@@ -245,11 +248,26 @@ impl Xylo {
         }
         actions = actions
             .child(
-                button("notifications-refresh", "Refresh permission")
-                    .disabled(busy || !loaded)
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.notification_request("notifications_refresh", json!({}), cx)
-                    })),
+                button(
+                    "notifications-refresh",
+                    if loaded {
+                        "Refresh permission"
+                    } else {
+                        "Retry preferences"
+                    },
+                )
+                .disabled(busy)
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.notification_request(
+                        if view.notifications.status.get("preferences").is_some() {
+                            "notifications_refresh"
+                        } else {
+                            "notifications_status"
+                        },
+                        json!({}),
+                        cx,
+                    )
+                })),
             )
             .child(
                 button("notifications-test", "Send test notification")
@@ -320,7 +338,7 @@ impl Xylo {
                     .gap_1()
                     .py_1()
                     .child(
-                        Switch::new(id)
+                        crate::ui::XyloSwitch::new(id)
                             .label(label)
                             .checked(checked)
                             .disabled(

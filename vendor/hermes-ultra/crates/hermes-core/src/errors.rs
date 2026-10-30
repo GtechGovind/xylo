@@ -4,6 +4,17 @@ pub enum AgentError {
     #[error("LLM API error: {0}")]
     LlmApi(String),
 
+    #[error("{message}")]
+    ProviderTransport { retryable: bool, message: String },
+
+    /// HTTP status and server delay are kept separate from untrusted diagnostics.
+    #[error("{message}")]
+    ProviderHttp {
+        status: u16,
+        retry_after_secs: Option<u64>,
+        message: String,
+    },
+
     #[error("Tool execution error: {0}")]
     ToolExecution(String),
 
@@ -36,6 +47,26 @@ pub enum AgentError {
 
     #[error("Interrupted{0}", message.as_ref().map(|m| format!(": {}", m)).unwrap_or_default())]
     Interrupted { message: Option<String> },
+}
+
+impl AgentError {
+    /// None means a legacy adapter; typed failures never inspect diagnostic text.
+    pub fn provider_retry_policy(&self) -> Option<(bool, Option<u64>)> {
+        match self {
+            Self::ProviderTransport { retryable, .. } => Some((*retryable, None)),
+            Self::ProviderHttp {
+                status,
+                retry_after_secs,
+                ..
+            } => Some((
+                matches!(status, 408 | 429 | 500 | 502 | 503 | 504),
+                *retry_after_secs,
+            )),
+            Self::AuthFailed(_) | Self::Config(_) => Some((false, None)),
+            Self::RateLimited { retry_after_secs } => Some((true, *retry_after_secs)),
+            _ => None,
+        }
+    }
 }
 
 /// Error type for tool execution failures.
@@ -400,8 +431,10 @@ mod tests {
             GatewayError::ConnectionFailed("dial failed".into()).send_error_kind(),
             SendErrorKind::Transient
         );
-        assert!(GatewayError::SendFailed("message_id_invalid".into())
-            .is_send_error_kind(SendErrorKind::NotFound));
+        assert!(
+            GatewayError::SendFailed("message_id_invalid".into())
+                .is_send_error_kind(SendErrorKind::NotFound)
+        );
     }
 
     #[test]
@@ -422,5 +455,25 @@ mod tests {
             AgentError::Io(msg) => assert!(msg.contains("file missing")),
             _ => panic!("expected Io variant"),
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_retry_tests {
+    use super::*;
+    #[test]
+    fn provider_retry_policy_is_typed_and_preserves_retry_after() {
+        let terminal = AgentError::ProviderHttp {
+            status: 400,
+            retry_after_secs: Some(9),
+            message: "connection 503 req_429".into(),
+        };
+        assert_eq!(terminal.provider_retry_policy(), Some((false, Some(9))));
+        let limited = AgentError::ProviderHttp {
+            status: 429,
+            retry_after_secs: Some(9),
+            message: "limited".into(),
+        };
+        assert_eq!(limited.provider_retry_policy(), Some((true, Some(9))));
     }
 }

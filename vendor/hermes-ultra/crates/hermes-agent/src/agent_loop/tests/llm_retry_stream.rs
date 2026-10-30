@@ -1010,7 +1010,7 @@
     }
 
     #[tokio::test]
-    async fn stream_mid_tool_call_silent_retry_recovers_tool_call() {
+    async fn stream_mid_tool_call_never_replays_partial_output() {
         let provider = Arc::new(StreamRetryProvider::new(
             StreamRetryScenario::RecoverOnSecondAttempt,
         ));
@@ -1035,25 +1035,22 @@
             })
             .await;
 
-        let StreamCollectOutcome::Complete(resp) = out.expect("stream should recover") else {
-            panic!("expected complete response");
-        };
-        let tc = resp
-            .message
-            .tool_calls
-            .as_ref()
-            .and_then(|calls| calls.first())
-            .expect("missing tool call");
-        assert_eq!(tc.function.name, "write_file");
-        assert_eq!(*provider.calls.lock().expect("calls lock"), 2);
-        assert!(seen.lock().expect("seen lock").iter().any(|text| {
-            text.to_lowercase()
-                .contains("connection dropped mid tool-call; reconnecting")
-        }));
+        assert!(
+            out.is_err(),
+            "Partial tool-call output must never be replayed"
+        );
+        assert_eq!(*provider.calls.lock().expect("calls lock"), 1);
+        assert!(
+            !seen
+                .lock()
+                .expect("seen lock")
+                .iter()
+                .any(|text| text.contains("reconnecting"))
+        );
     }
 
     #[tokio::test]
-    async fn stream_mid_tool_call_exhausted_retries_returns_error() {
+    async fn stream_mid_tool_call_returns_error_without_spending_retry_budget() {
         let provider = Arc::new(StreamRetryProvider::new(
             StreamRetryScenario::AlwaysFailMidToolCall,
         ));
@@ -1083,11 +1080,14 @@
             Ok(_) => panic!("should fail after retries"),
         };
         assert!(err.to_string().contains("Stream read error"));
-        assert_eq!(*provider.calls.lock().expect("calls lock"), 2);
-        assert!(seen.lock().expect("seen lock").iter().any(|text| {
-            text.to_lowercase()
-                .contains("connection dropped mid tool-call; reconnecting")
-        }));
+        assert_eq!(*provider.calls.lock().expect("calls lock"), 1);
+        assert!(
+            !seen
+                .lock()
+                .expect("seen lock")
+                .iter()
+                .any(|text| text.contains("reconnecting"))
+        );
     }
 
     #[tokio::test]

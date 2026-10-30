@@ -6,7 +6,7 @@ use xylo_services::ActionIntent;
 
 fn fixture() -> (tempfile::TempDir, HermesEngine, TurnRequest) {
     let directory = tempfile::tempdir().unwrap();
-    let paths = AppPaths::at(directory.path().to_owned()).unwrap();
+    let paths = AppPaths::at(directory.path().join("profile")).unwrap();
     let store = Store::open(&paths.database).unwrap();
     let session = Uuid::new_v4();
     store
@@ -818,4 +818,159 @@ async fn actual_delegation_inherits_parent_model_and_reasoning_on_wire() {
     let result: Value = serde_json::from_str(child_result["output"].as_str().unwrap()).unwrap();
     assert_eq!(result["status"], "completed");
     assert_eq!(result["result"], "Child complete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_checkpoint_preserves_native_and_legacy_summaries() {
+    for summary in [
+        "# Summary of earlier work in this task\nKeep exact decisions",
+        "[Conversation summary] Earlier conversation compressed into key points:\nKeep exact decisions",
+    ] {
+        let (_directory, engine, request) = fixture();
+        let checkpoint = vec![
+            Message::system(format!("Old app policy\n\n{summary}")),
+            Message::user("Prior request"),
+        ];
+        engine
+            .store
+            .save_checkpoint(
+                request.session_id,
+                request.turn_id,
+                &serde_json::to_value(checkpoint).unwrap(),
+            )
+            .unwrap();
+        let (events, _) = mpsc::channel(32);
+        let restored = engine
+            .restored_messages(&request, events, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(restored[0].content.as_deref(), Some(summary));
+        assert!(restored.iter().all(|message| {
+            !message
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("Old app policy")
+        }));
+    }
+}
+
+#[test]
+fn memory_excerpt_bounds_unicode_without_modifying_original() {
+    let original = "界".repeat(5000);
+    let excerpt = bounded_memory_excerpt(&original, 2000);
+    assert!(excerpt.len() < 2040);
+    assert!(excerpt.ends_with("[excerpt; remainder omitted]"));
+    assert_eq!(original, "界".repeat(5000));
+}
+
+struct StalledChildToolProvider;
+#[async_trait]
+impl LlmProvider for StalledChildToolProvider {
+    async fn chat_completion(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: Option<f64>,
+        _: Option<&str>,
+        _: Option<&Value>,
+    ) -> Result<hermes_core::LlmResponse, AgentError> {
+        Ok(hermes_core::LlmResponse {
+            message: assistant_call(
+                "shell_command",
+                json!({"command":"printf started > child-started; sleep 30","timeout_seconds":60}),
+            ),
+            usage: None,
+            model: "fixture".into(),
+            finish_reason: Some("tool_calls".into()),
+        })
+    }
+    fn chat_completion_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: Option<f64>,
+        _: Option<&str>,
+        _: Option<&Value>,
+    ) -> futures_util::stream::BoxStream<'static, Result<hermes_core::StreamChunk, AgentError>>
+    {
+        Box::pin(futures_util::stream::empty())
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_timeout_cancels_stalled_host_process_without_cancelling_parent() {
+    let (_directory, engine, mut request) = fixture();
+    request.permissions = PermissionMode::Auto;
+    let (events, mut receiver) = mpsc::channel(256);
+    let parent_cancel = CancellationToken::new();
+    let broker = ToolBroker::new(
+        request.clone(),
+        engine.store.clone(),
+        engine.capability_config(&request).unwrap(),
+        ApprovalGate::default(),
+        events,
+        parent_cancel.clone(),
+    )
+    .unwrap();
+    let child = Arc::new(broker.scoped_child().unwrap());
+    let child_cancel = child.cancellation_token();
+    let child_cancel_for_timeout = child_cancel.clone();
+    let config = AgentConfig {
+        model: "fixture".into(),
+        allow_model_fallbacks: false,
+        native_product_finalization: true,
+        skip_memory: true,
+        skip_context_files: true,
+        max_turns: 2,
+        ..Default::default()
+    };
+    let orchestrator = Arc::new(
+        SubAgentOrchestrator::new(SubAgentOrchestratorConfig {
+            parent_config: config,
+            tool_registry: build_registry(child.clone(), Some("parent-call".into())).unwrap(),
+            llm_provider: Arc::new(StalledChildToolProvider),
+            parent_credential_pool: None,
+            parent_interrupt: InterruptController::new(),
+            hermes_home: engine.paths.data.clone(),
+            parent_session_id: Some(request.session_id.to_string()),
+            timeout: Duration::from_millis(600),
+            background_delegation_callback: None,
+        })
+        .with_child_cancellation(Arc::new(move || child_cancel_for_timeout.cancel())),
+    );
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        orchestrator.execute(hermes_agent::SubAgentRequest {
+            task: "Run the fixture tool".into(),
+            child_depth: 1,
+            max_depth: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&result).unwrap()["status"],
+        "timeout"
+    );
+    assert!(start.elapsed() < Duration::from_secs(4));
+    assert!(child_cancel.is_cancelled());
+    assert!(!parent_cancel.is_cancelled());
+    let mut tool_started = false;
+    while let Ok(event) = receiver.try_recv() {
+        if matches!(event, EngineEvent::ToolStarted { .. }) {
+            tool_started = true;
+        }
+    }
+    assert!(tool_started, "The timeout must exercise a real host tool");
+    assert!(
+        request.workspace.join("child-started").is_file(),
+        "The real child process must have started"
+    );
+    child.shutdown().await.unwrap();
+    let actions = engine.store.unresolved_actions(request.session_id).unwrap();
+    assert!(actions.iter().all(|action| action.state != "running"));
 }

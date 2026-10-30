@@ -1,20 +1,23 @@
 //! Product settings for reviewed packages, grants and explicit plugin runs.
 use super::*;
-use gpui_kit::component::{Disableable, switch::Switch};
 impl Xylo {
-    pub(in super::super) fn plugins_page(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(in super::super) fn native_plugins_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.plugins.busy();
         let settings_blocked = busy || self.plugins.retry.is_some();
         let mut page = div()
             .id("plugins-page")
-            .size_full()
-            .overflow_y_scroll()
-            .p_6()
+            .w_full()
+            .max_w(px(760.))
             .flex()
             .flex_col()
             .gap_4()
-            .child(heading(
-                "Plugins",
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Native modules"),
+            )
+            .child(subtitle(
                 "Install reviewed tools and choose what they can access.",
             ))
             .child(
@@ -76,7 +79,7 @@ impl Xylo {
             for (index, permission) in review.manifest.capabilities.iter().enumerate() {
                 let permission = permission.clone();
                 card = card.child(
-                    Switch::new(("plugin-review-grant", index))
+                    crate::ui::XyloSwitch::new(("plugin-review-grant", index))
                         .label(permission_label(&permission))
                         .checked(self.plugins.review_grants.contains(&permission))
                         .disabled(busy)
@@ -94,7 +97,7 @@ impl Xylo {
             }
             card = card
                 .child(
-                    Switch::new("plugin-enable-install")
+                    crate::ui::XyloSwitch::new("plugin-enable-install")
                         .label("Enable after installing")
                         .checked(self.plugins.enable_install)
                         .disabled(busy)
@@ -153,7 +156,11 @@ impl Xylo {
             .gap_2()
             .child(div().text_lg().child("Installed plugins"));
         if self.plugins.catalog.is_none() {
-            installed = installed.child(subtitle("Loading installed plugins…"));
+            installed = installed.child(subtitle(if busy {
+                "Loading installed plugins…"
+            } else {
+                "Could not load native modules. Refresh to try again."
+            }));
         } else if rows.is_empty() {
             installed = installed.child(subtitle(
                 "No plugins installed. Choose a package to review it.",
@@ -210,7 +217,7 @@ impl Xylo {
                 .gap_3()
                 .child(div().text_lg().child(plugin.manifest.name.clone()))
                 .child(
-                    Switch::new("plugin-enabled")
+                    crate::ui::XyloSwitch::new("plugin-enabled")
                         .label("Enabled")
                         .checked(plugin.enabled)
                         .disabled(settings_blocked || changed || self.plugins.grants_dirty())
@@ -228,7 +235,7 @@ impl Xylo {
             for (index, permission) in plugin.manifest.capabilities.iter().enumerate() {
                 let permission = permission.clone();
                 settings = settings.child(
-                    Switch::new(("plugin-grant", index))
+                    crate::ui::XyloSwitch::new(("plugin-grant", index))
                         .label(permission_label(&permission))
                         .checked(self.plugins.grants.contains(&permission))
                         .disabled(settings_blocked || changed)
@@ -314,6 +321,8 @@ impl Xylo {
                     .on_click(move |_, _, cx| cx.open_with_system(&path)),
             );
         }
-        page.into_any_element()
+        super::settings::settings_content("native-modules-settings")
+            .child(page)
+            .into_any_element()
     }
 }

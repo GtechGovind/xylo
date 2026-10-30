@@ -5,12 +5,7 @@
   "description": "Workspace for AI conversations, coding and tools",
   "authors": ["Govind Yadav <gtech.govind2000@gmail.com>"],
   "licenseFile": "LICENSE",
-  "icons": [
-    "assets/icons/xylo.icns",
-    "assets/icons/xylo.ico",
-    "assets/icons/xylo-256.png",
-    "assets/icons/xylo-512.png"
-  ],
+  "beforePackagingCommand": "npm ci --prefix crates/services/sandbox-helper --ignore-scripts --no-audit --no-fund",
   "binariesDir": "target/release",
   "outDir": "dist",
   "binaries": [
@@ -19,6 +14,7 @@
     { "path": "xylo-helper" }
   ],
   "resources": [
+    { "src": "crates/services/sandbox-helper", "target": "sandbox-helper" },
     { "src": "LICENSE", "target": "licenses/LICENSE" },
     { "src": "NOTICE", "target": "licenses/NOTICE" },
     { "src": "vendor/hermes-ultra/LICENSE", "target": "licenses/Hermes-Ultra-LICENSE" },

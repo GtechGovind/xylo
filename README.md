@@ -40,10 +40,28 @@ Choose the provider and model under **Settings → Model**. Credentials use the 
 
 ```sh
 cargo build --locked --workspace --bins
+npm ci --prefix crates/services/sandbox-helper --ignore-scripts --no-audit --no-fund
 cargo run --locked
 ```
 
 The pinned Rust toolchain is selected by `rust-toolchain.toml`. Application builds do not require packaging scripts, icon files, or updater configuration. Automatic updates are disabled until a trusted release feed is configured.
+
+Local executable tools use a pinned OS sandbox helper and require Node.js 22.12 or later. Install its locked dependencies with the command above. Missing sandbox dependencies fail closed; Xylo does not fall back to unrestricted execution. The native UI and Rust backend do not run in Node.js. macOS sandbox execution has local regression coverage; Linux packaging and Windows execution remain unqualified.
+
+Portable skills and plugins are managed in **Settings → Plugins**. Installation preserves package contents without executing them. Enable packages explicitly; configure a project, credentials and network access before running executable components. Readiness and verification belong to each component and installed version, not the entire plugin ecosystem.
+
+Current extension qualification uses isolated local fixtures:
+
+| Component | Current execution coverage |
+|-----------|----------------------------|
+| Skills and commands | Explicit/automatic invocation, arguments, package resources, Codex invocation policy and approved dynamic context |
+| Agent definitions | Named roles, supervised forks, restricted tools, inherited provider/model and cancellation |
+| Hooks | Approved before/after-tool events; session lifecycle events are not automatically delivered |
+| Local MCP | Initialization, tool discovery/calls, configured credentials, cancellation and failure recovery |
+| Language servers | Initialization, bounded read requests and shutdown; automatic editor integration is not qualified |
+| WASM modules | Existing Wasmtime execution and permission boundary retained |
+
+Unbound hosted dependencies, unsupported host directives and command-pattern tool restrictions are reported explicitly. Live account integrations, arbitrary Git-host federation and packaged cross-platform runtimes still require qualification. Post-tool events currently have a narrow crash window between saving the tool result and creating the hook action; they are not guaranteed to be delivered across that interruption. Never infer ecosystem-wide compatibility from a successful import or one verified component.
 
 | Platform | Target architectures     | Planned preview formats |
 |----------|--------------------------|-------------------------|

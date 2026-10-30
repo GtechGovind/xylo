@@ -715,7 +715,7 @@ async fn mcp_discovery_call_and_metadata_cache_use_real_protocol() {
         "tools/call"=>json!({"content":[{"type":"text","text":request["params"]["arguments"]["value"]}]}),
         _=>return(404,json!({})),};(200,json!({"jsonrpc":"2.0","id":id,"result":result}))})).await;
     let (_directory, store, _) = database();
-    let broker = ConnectorBroker::new(store, vault());
+    let broker = ConnectorBroker::new(store.clone(), vault());
     let config = ConnectorConfig {
         id: Uuid::new_v4(),
         name: "Fixture MCP".into(),
@@ -728,8 +728,10 @@ async fn mcp_discovery_call_and_metadata_cache_use_real_protocol() {
     assert!(broker.cached_tools(&config).unwrap().is_empty());
     let tools = broker.tools(&config, &Default::default()).await.unwrap();
     assert_eq!(tools[0].name, "echo");
-    assert!(!tools[0].writes);
+    assert!(tools[0].writes, "Untrusted MCP readOnlyHint cannot authorize read-only execution");
     assert_eq!(broker.cached_tools(&config).unwrap().len(), 1);
+    store.call(|connection| { connection.execute("UPDATE connector_tools SET json=replace(json, '\"writes\":true', '\"writes\":false')", [])?; Ok(()) }).unwrap();
+    assert!(broker.cached_tools(&config).unwrap()[0].writes, "Old cached annotations cannot bypass the host write gate");
     let result = broker
         .call(
             &config,
@@ -803,4 +805,82 @@ fn schema_one_database_migrates_without_losing_history() {
         .call(|conn| Ok(conn.pragma_query_value(None, "user_version", |r| r.get(0))?))
         .unwrap();
     assert_eq!(version, 3);
+}
+
+#[tokio::test]
+async fn authenticated_http_mcp_uses_isolated_vault_and_rejects_missing_token() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    let (url, server) = mock_server(Arc::new(move |request, headers| {
+        if !headers.to_ascii_lowercase().contains("authorization: bearer isolated-mcp-token") {
+            return (401, json!({"error":"Authentication required"}));
+        }
+        counter.fetch_add(1, Ordering::SeqCst);
+        let id = request.get("id").cloned();
+        let result = match request["method"].as_str().unwrap_or_default() {
+            "initialize" => json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"tools":{}},"serverInfo":{"name":"authenticated-fixture","version":"1"}}),
+            "notifications/initialized" => return (204, Value::Null),
+            "tools/list" => json!({"tools":[{"name":"secured_tool","inputSchema":{"type":"object"}}]}),
+            _ => return (404,json!({})),
+        };
+        (200,json!({"jsonrpc":"2.0","id":id,"result":result}))
+    })).await;
+    let (_directory, store, _) = database();
+    let vault = vault(); // isolated keyring mock; never opens the platform keychain
+    let broker = ConnectorBroker::new(store, vault.clone());
+    let mut config = ConnectorConfig { id:Uuid::new_v4(),name:"Authenticated fixture".into(),transport:"http".into(),endpoint:url,command:None,args:vec![],credential_ref:None };
+    assert!(broker.tools(&config,&Default::default()).await.is_err());
+    assert_eq!(accepted.load(Ordering::SeqCst),0);
+    vault.set("isolated-mcp-reference","isolated-mcp-token").unwrap();
+    config.credential_ref = Some("isolated-mcp-reference".into());
+    let tools = broker.tools(&config,&Default::default()).await.unwrap();
+    assert_eq!(tools[0].name,"secured_tool");
+    assert!(accepted.load(Ordering::SeqCst) >= 3);
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scoped_mcp_reuses_only_matching_workspace_and_environment() {
+    use std::os::unix::fs::PermissionsExt;
+    let (directory,store,_) = database();
+    let first=directory.path().join("first");
+    let second=directory.path().join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let script=directory.path().join("scoped-mcp");
+    std::fs::write(&script,r#"#!/usr/bin/python3
+import json,sys,pathlib,os
+marker=pathlib.Path('launches.txt')
+marker.write_text(str(int(marker.read_text())+1 if marker.exists() else 1))
+for line in sys.stdin:
+    request=json.loads(line)
+    if 'id' not in request: continue
+    if request['method']=='initialize': result={'protocolVersion':request['params']['protocolVersion'],'capabilities':{'tools':{}},'serverInfo':{'name':'scoped-fixture','version':'1'}}
+    elif request['method']=='tools/list': result={'tools':[{'name':pathlib.Path.cwd().name+'_'+os.environ['FIXTURE_SCOPE'],'inputSchema':{'type':'object'}}]}
+    else: result={}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+"#).unwrap();
+    std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o755)).unwrap();
+    let broker=ConnectorBroker::new(store.clone(),vault());
+    let config=ConnectorConfig { id:Uuid::new_v4(),name:"Scoped fixture".into(),transport:"stdio".into(),endpoint:String::new(),command:Some(script.clone()),args:vec![],credential_ref:None };
+    let mut scope=crate::ConnectorLaunchScope { workspace:first.clone(),read_roots:vec![script],environment:std::collections::BTreeMap::from([("FIXTURE_SCOPE".into(),"one".into())]),..Default::default() };
+    assert_eq!(broker.tools_scoped(&config,&scope,&Default::default()).await.unwrap()[0].name,"first_one");
+    let first_broker=ConnectorBroker::new(store.clone(),vault()).with_local_scope(scope.clone());
+    assert_eq!(first_broker.cached_tools(&config).unwrap()[0].name,"first_one","Matching local scope must retain useful cached metadata");
+    assert_eq!(broker.tools_scoped(&config,&scope,&Default::default()).await.unwrap()[0].name,"first_one");
+    assert_eq!(std::fs::read_to_string(first.join("launches.txt")).unwrap(),"1","Matching scope should reuse its process");
+    scope.workspace=second.clone();
+    let second_broker=ConnectorBroker::new(store.clone(),vault()).with_local_scope(scope.clone());
+    assert!(second_broker.cached_tools(&config).unwrap().is_empty(),"A catalog from workspace A must not be exposed in workspace B");
+    assert_eq!(broker.tools_scoped(&config,&scope,&Default::default()).await.unwrap()[0].name,"second_one");
+    assert_eq!(second_broker.cached_tools(&config).unwrap()[0].name,"second_one");
+    assert!(first_broker.cached_tools(&config).unwrap().is_empty());
+    assert_eq!(std::fs::read_to_string(second.join("launches.txt")).unwrap(),"1");
+    scope.environment.insert("FIXTURE_SCOPE".into(),"two".into());
+    assert_eq!(broker.tools_scoped(&config,&scope,&Default::default()).await.unwrap()[0].name,"second_two");
+    assert!(second_broker.cached_tools(&config).unwrap().is_empty(),"Old environment must not read new policy catalog");
+    assert_eq!(std::fs::read_to_string(second.join("launches.txt")).unwrap(),"2","Changed environment must reconnect");
+    broker.disconnect(config.id).await.unwrap();
 }

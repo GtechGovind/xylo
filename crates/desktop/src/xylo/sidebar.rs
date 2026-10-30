@@ -77,26 +77,32 @@ impl Xylo {
             .border_color(rgb(border()))
             .flex()
             .flex_col()
-            .px_2()
-            .pb_2()
-            .gap_1()
+            .px(px(10.))
+            .pb(px(10.))
             .child(self.resize_edge(Panel::Sidebar));
         if self.settings_open {
             sidebar = sidebar
-                .child(
-                    nav_button("back-to-chat", "Workspace", IconName::ArrowLeft)
-                        .h(px(40.))
-                        .mb_4()
-                        .on_click(cx.listener(|this, _, _, cx| {
+                .child(div().h(px(52.)).flex().items_center().child(
+                    nav_button("back-to-chat", "Back to workspace", IconName::ArrowLeft).on_click(
+                        cx.listener(|this, _, _, cx| {
                             this.reset_provider_discovery(cx);
                             this.cancel_account_command(cx);
                             this.settings_open = false;
                             this.page = Page::Chat;
                             this.persist_ui(cx);
                             cx.notify();
-                        })),
+                        }),
+                    ),
+                ))
+                .child(
+                    div()
+                        .px(px(10.))
+                        .pt(px(6.))
+                        .pb(px(14.))
+                        .child(title("Settings").text_size(px(20.))),
                 )
-                .child(sidebar_section("Settings"));
+                .child(sidebar_label("General"));
+            // Keep every destination reachable in short windows.
             for (id, page, label, name) in [
                 (
                     "nav-general",
@@ -114,62 +120,153 @@ impl Xylo {
             ] {
                 sidebar = sidebar.child(self.settings_nav(id, page, label, name, cx));
             }
-            sidebar = sidebar.child(sidebar_section("Connections").mt_4());
+            sidebar = sidebar
+                .child(sidebar_label("Models & accounts").mt_3())
+                .child(self.settings_nav(
+                    "nav-providers",
+                    Page::Providers,
+                    "Providers",
+                    IconName::Bot,
+                    cx,
+                ))
+                .child(sidebar_label("Tools & integrations").mt_3());
             for (id, page, label, name) in [
-                ("nav-providers", Page::Providers, "Providers", IconName::Bot),
+                (
+                    "nav-connections",
+                    Page::Connectors,
+                    "Connections",
+                    IconName::Folder,
+                ),
+                ("nav-plugins", Page::Plugins, "Plugins", IconName::BookOpen),
+                (
+                    "nav-environments",
+                    Page::Environments,
+                    "Environments",
+                    IconName::Folder,
+                ),
+            ] {
+                sidebar = sidebar.child(self.settings_nav(id, page, label, name, cx));
+            }
+            sidebar = sidebar.child(sidebar_label("Knowledge & context").mt_3());
+            for (id, page, label, name) in [
                 ("nav-skills", Page::Skills, "Skills", IconName::BookOpen),
                 ("nav-memory", Page::Memory, "Memory", IconName::BookOpen),
                 ("nav-context", Page::Context, "Context", IconName::Folder),
             ] {
                 sidebar = sidebar.child(self.settings_nav(id, page, label, name, cx));
             }
-            return sidebar.into_any_element();
+            return sidebar
+                .id("settings-navigation")
+                .overflow_y_scroll()
+                .into_any_element();
         }
+        // Brand row: mark, wordmark and the collapse control.
         sidebar = sidebar
             .child(
                 div()
-                    .h(px(49.))
-                    .px_2()
+                    .h(px(52.))
+                    .flex_shrink_0()
+                    .px(px(6.))
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
                             .id("xylo-brand-mark")
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(15.))
-                            .child("Xylo")
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(brand_mark(22.))
+                            .child(
+                                div()
+                                    .text_size(px(17.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(text()))
+                                    .child("Xylo"),
+                            )
                             .test_support(),
                     )
                     .child(
-                        icon_button("search-chats", "Search chats", IconName::Search).on_click(
-                            cx.listener(|this, _, window, cx| {
+                        icon_button("collapse-sidebar", "Hide sidebar", IconName::PanelLeft)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.settings.ui.sidebar_visible = false;
+                                view.persist_ui(cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            // Primary actions.
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .pb(px(6.))
+                    .child(
+                        nav_button("sidebar-new-chat", "New chat", IconName::Plus)
+                            .text_color(rgb(text()))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(faint()))
+                                    .child(if cfg!(target_os = "macos") {
+                                        "⌘N"
+                                    } else {
+                                        "Ctrl N"
+                                    }),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| view.new_chat(cx))),
+                    )
+                    .child(
+                        nav_button("search-chats", "Search chats", IconName::Search)
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(faint()))
+                                    .child(if cfg!(target_os = "macos") {
+                                        "⌘K"
+                                    } else {
+                                        "Ctrl K"
+                                    }),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.search_open = true;
                                 this.page = Page::HistorySearch;
                                 this.conversation_query
                                     .update(cx, |s, cx| s.focus(window, cx));
                                 cx.notify();
-                            }),
+                            })),
+                    )
+                    .child(
+                        nav_button("open-project", "Open project", Glyph::FolderOpen).on_click(
+                            cx.listener(|view, _, window, cx| view.pick_workspace(window, cx)),
                         ),
                     ),
             )
             .child(
                 div()
-                    .h(px(36.))
-                    .px_2()
+                    .h(px(30.))
+                    .mt(px(8.))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_size(px(10.)).text_color(rgb(muted())).child("Projects"))
+                    .child(sidebar_label("Projects"))
                     .child(
-                        icon_button("open-project", "Add project", IconName::Plus).on_click(
-                            cx.listener(|view, _, window, cx| view.pick_workspace(window, cx)),
-                        ),
+                        icon_button("add-project", "Add project", IconName::Plus)
+                            .size(px(24.))
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.pick_workspace(window, cx)),
+                            ),
                     ),
             );
         if self.search_open {
-            sidebar = sidebar
-                .child(Input::new(&self.conversation_query).aria_label("Search conversations"));
+            sidebar =
+                sidebar.child(div().px(px(2.)).pb(px(6.)).child(
+                    Input::new(&self.conversation_query).aria_label("Search conversations"),
+                ));
         }
         if self.sidebar_state.dirty {
             self.sidebar_state.dirty = false;
@@ -197,6 +294,7 @@ impl Xylo {
                             let path = path.clone();
                             let new_path = path.clone();
                             let expanded = !view.sidebar_state.collapsed.contains(&path);
+                            let current = view.workspace.as_ref() == Some(&path);
                             let label = path
                                 .file_name()
                                 .unwrap_or(path.as_os_str())
@@ -204,34 +302,55 @@ impl Xylo {
                                 .into_owned();
                             Some(
                                 div()
-                                    .h(px(34.))
+                                    .w_full()
+                                    .min_w_0()
+                                    .h(px(32.))
+                                    .group("sidebar-project")
                                     .flex()
                                     .items_center()
-                                    .gap_1()
+                                    .gap(px(2.))
                                     .child(
-                                        nav_button(
-                                            ("project", i),
-                                            "",
-                                            if expanded {
-                                                IconName::ChevronDown
+                                        focus_ring(gpui_kit::base::Button::new(("project", i)))
+                                            .w(px(0.))
+                                            .flex_1()
+                                            .min_w_0()
+                                            .h(px(30.))
+                                            .px(px(8.))
+                                            .rounded(px(8.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_start()
+                                            .gap(px(6.))
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(if current {
+                                                text()
                                             } else {
-                                                IconName::ChevronRight
-                                            },
-                                        )
-                                        .flex_1()
-                                        .min_w_0()
-                                        .gap_2()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(muted()))
-                                        .child(icon(IconName::Folder))
-                                        .child(div().flex_1().min_w_0().truncate().child(label))
-                                        .accessibility_label(format!(
-                                            "{} project {}",
-                                            if expanded { "Collapse" } else { "Expand" },
-                                            path.display()
-                                        ))
-                                        .on_click(
-                                            cx.listener(move |view, _, _, cx| {
+                                                text_secondary()
+                                            }))
+                                            .cursor_pointer()
+                                            .hover(|style| {
+                                                style.bg(rgb(hover())).text_color(rgb(text()))
+                                            })
+                                            .child(
+                                                icon(if expanded {
+                                                    IconName::ChevronDown
+                                                } else {
+                                                    IconName::ChevronRight
+                                                })
+                                                .size(px(13.))
+                                                .text_color(rgb(faint())),
+                                            )
+                                            .child(icon(IconName::Folder).size(px(15.)).text_color(
+                                                rgb(if current { accent_text() } else { muted() }),
+                                            ))
+                                            .child(div().flex_1().min_w_0().truncate().child(label))
+                                            .accessibility_label(format!(
+                                                "{} project {}",
+                                                if expanded { "Collapse" } else { "Expand" },
+                                                path.display()
+                                            ))
+                                            .on_click(cx.listener(move |view, _, _, cx| {
                                                 if !view.sidebar_state.collapsed.remove(&path) {
                                                     view.sidebar_state
                                                         .collapsed
@@ -246,15 +365,18 @@ impl Xylo {
                                                 view.sidebar_state.dirty = true;
                                                 view.persist_ui(cx);
                                                 cx.notify();
-                                            }),
-                                        ),
+                                            })),
                                     )
                                     .child(
                                         icon_button(
                                             ("project-new-chat", i),
                                             format!("New chat in {}", new_path.display()),
-                                            IconName::Plus,
+                                            Glyph::SquarePen,
                                         )
+                                        .size(px(26.))
+                                        .opacity(0.)
+                                        .group_hover("sidebar-project", |style| style.opacity(1.))
+                                        .focus(|style| style.opacity(1.))
                                         .on_click(
                                             cx.listener(move |view, _, window, cx| {
                                                 view.sidebar_state.collapsed.remove(&new_path);
@@ -282,90 +404,63 @@ impl Xylo {
                             )
                         }
                         SidebarRow::DraftChat => Some(
-                            div()
-                                .h(px(34.))
-                                .pl(px(15.))
-                                .border_l_1()
-                                .border_color(rgb(border()))
-                                .child(
-                                    button("unsaved-chat", "New chat")
-                                        .w_full()
-                                        .h(px(34.))
-                                        .text_size(px(11.))
-                                        .bg(rgb(selected()))
-                                        .text_color(rgb(text()))
-                                        .justify_start()
-                                        .on_click(cx.listener(|view, _, _, cx| {
-                                            view.page = Page::Chat;
-                                            view.settings_open = false;
-                                            cx.notify();
-                                        })),
-                                )
-                                .into_any_element(),
+                            sidebar_child_row(
+                                sidebar_chat_button("unsaved-chat", "New chat".into(), true, false)
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.page = Page::Chat;
+                                        view.settings_open = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .into_any_element(),
                         ),
                         SidebarRow::Conversation(index) => {
                             let conversation = view.conversations.get(*index)?;
                             let id = conversation.id;
                             let path = conversation.workspace.clone();
                             let running = view.turns.get(&id).is_some_and(|turn| turn.running);
-                            let title = conversation.title.clone();
                             Some(
-                                div()
-                                    .h(px(34.))
-                                    .pl(px(15.))
-                                    .border_l_1()
-                                    .border_color(rgb(border()))
-                                    .child(
-                                        focus_ring(gpui_kit::base::Button::new((
-                                            "conversation",
-                                            i,
-                                        )))
-                                        .accessibility_label(if running { format!("{}, running", title) } else { title.clone() })
-                                        .h(px(34.))
-                                        .w_full()
-                                        .px(px(9.))
-                                        .rounded_md()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(if view.session == id {
-                                            text()
-                                        } else {
-                                            muted()
-                                        }))
-                                        .bg(rgb(if view.session == id {
-                                            selected()
-                                        } else {
-                                            crate::ui::sidebar()
-                                        }))
-                                        .hover(|style| style.bg(rgb(hover())))
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .justify_start()
-                                        .min_w_0()
-                                        .when(running, |button| button.child(div().size(px(5.)).rounded_full().bg(rgb(accent()))))
-                                        .child(div().flex_1().min_w_0().truncate().child(title))
-                                        .on_click(
-                                            cx.listener(move |view, _, window, cx| {
-                                                view.open_conversation(id, path.clone(), window, cx)
-                                            }),
-                                        ),
+                                sidebar_child_row(
+                                    sidebar_chat_button(
+                                        ("conversation", i),
+                                        conversation.title.clone(),
+                                        view.session == id,
+                                        running,
                                     )
-                                    .into_any_element(),
+                                    .on_click(cx.listener(
+                                        move |view, _, window, cx| {
+                                            view.open_conversation(id, path.clone(), window, cx)
+                                        },
+                                    )),
+                                )
+                                .into_any_element(),
                             )
                         }
                         SidebarRow::More => Some(
-                            nav_button(
-                                "more-conversations",
-                                if view.conversations_loading_more {
-                                    "Loading…"
-                                } else {
-                                    "Load more chats"
-                                },
-                                IconName::Plus,
-                            )
-                            .disabled(view.conversations_loading_more)
-                            .on_click(cx.listener(|view, _, _, cx| view.more_conversations(cx)))
-                            .into_any_element(),
+                            div()
+                                .h(px(32.))
+                                .pl(px(26.))
+                                .flex()
+                                .items_center()
+                                .child(
+                                    button(
+                                        "more-conversations",
+                                        if view.conversations_loading_more {
+                                            "Loading…"
+                                        } else {
+                                            "Load more"
+                                        },
+                                    )
+                                    .h(px(28.))
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(rgb(muted()))
+                                    .disabled(view.conversations_loading_more)
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.more_conversations(cx)),
+                                    ),
+                                )
+                                .into_any_element(),
                         ),
                     })
                     .collect()
@@ -375,15 +470,63 @@ impl Xylo {
         .track_scroll(&self.conversation_scroll)
         .flex_1()
         .min_h_0();
+        let person = person_name();
+        let initial = person
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "X".into());
         sidebar
             .child(content)
+            .child(divider().my(px(8.)))
             .child(
-                nav_button("settings", "Settings", IconName::Settings).on_click(cx.listener(
-                    |this, _, _, cx| {
+                focus_ring(gpui_kit::base::Button::new("settings"))
+                    .accessibility_label("Settings")
+                    .w_full()
+                    .h(px(44.))
+                    .px(px(8.))
+                    .rounded(px(10.))
+                    .flex()
+                    .items_center()
+                    .justify_start()
+                    .gap(px(10.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(hover())))
+                    .child(avatar(initial, 28.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap(px(1.))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(text()))
+                                    .child(person),
+                            )
+                            .child(div().text_size(px(11.5)).text_color(rgb(muted())).child(
+                                if self.settings.provider.model.is_empty() {
+                                    "No model selected".to_owned()
+                                } else {
+                                    self.settings.provider.model.clone()
+                                },
+                            )),
+                    )
+                    .child(
+                        icon(IconName::Settings)
+                            .size(px(15.))
+                            .text_color(rgb(muted())),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.settings_open = true;
                         this.navigate(Page::Appearance, cx);
-                    },
-                )),
+                    })),
             )
             .into_any_element()
     }
@@ -395,29 +538,59 @@ impl Xylo {
         name: IconName,
         cx: &Context<Self>,
     ) -> gpui_kit::base::Button {
-        nav_button(id, label, name)
-            .bg(rgb(
-                if self.page == page
-                    || (page == Page::Context && self.page == Page::Connectors)
-                    || (page == Page::Providers && self.page == Page::Images)
-                {
-                    selected()
-                } else {
-                    crate::ui::sidebar()
-                },
-            ))
+        let active = self.page == page || (page == Page::Providers && self.page == Page::Images);
+        nav_item(id, label, name, active)
             .on_click(cx.listener(move |this, _, _, cx| this.navigate(page, cx)))
     }
 }
-fn sidebar_section(label: &'static str) -> Div {
+/// The person's name as the operating system knows it, for the account row.
+pub(super) fn person_name() -> String {
+    let raw = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return "You".into();
+    }
+    let mut chars = raw.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "You".into(),
+    }
+}
+/// All virtual rows share a 32px stride; chat rows are inset under their project.
+fn sidebar_child_row(button: gpui_kit::base::Button) -> Div {
     div()
-        .px_2()
-        .h(px(30.))
+        .w_full()
+        .min_w_0()
+        .h(px(32.))
+        .pl(px(22.))
         .flex()
         .items_center()
-        .text_size(px(10.))
-        .text_color(rgb(muted()))
-        .child(label)
+        .child(button)
+}
+fn sidebar_chat_button(
+    id: impl Into<ElementId>,
+    title: String,
+    active: bool,
+    running: bool,
+) -> gpui_kit::base::Button {
+    recent_item(id, title.clone(), active)
+        .accessibility_label(if running {
+            format!("{title}, running")
+        } else {
+            title
+        })
+        .h(px(30.))
+        .when(running, |button| {
+            button.child(
+                div()
+                    .size(px(6.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(rgb(brand())),
+            )
+        })
 }
 
 #[cfg(test)]

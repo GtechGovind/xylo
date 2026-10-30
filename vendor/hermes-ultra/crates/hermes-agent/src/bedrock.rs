@@ -5,12 +5,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use hermes_core::{
@@ -149,7 +149,8 @@ impl BedrockProvider {
             Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(seconds.clamp(1, 3600)))
+                .read_timeout(std::time::Duration::from_secs(seconds.clamp(1, 3600)))
+                .retry(reqwest::retry::never())
                 .build(),
             self.client.lock(),
         ) {
@@ -226,11 +227,18 @@ impl LlmProvider for BedrockProvider {
         let response = request
             .send()
             .await
-            .map_err(|err| AgentError::LlmApi(format!("Bedrock Converse request failed: {err}")))?;
+            .map_err(|err| AgentError::ProviderTransport {
+                retryable: err.is_connect(),
+                message: format!("Bedrock Converse request failed: {}", err.without_url()),
+            })?;
         let status = response.status();
+        let retry_after = bedrock_retry_after(&response);
         let payload = read_bounded_bedrock_response(response).await?;
         if !status.is_success() {
-            return Err(map_bedrock_error(status.as_u16(), &payload));
+            return Err(bedrock_attach_retry_after(
+                map_bedrock_error(status.as_u16(), &payload),
+                retry_after,
+            ));
         }
         let json: Value = serde_json::from_str(&payload).map_err(|err| {
             AgentError::LlmApi(format!("Bedrock response JSON parse failed: {err}"))
@@ -322,17 +330,18 @@ impl LlmProvider for BedrockProvider {
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(err) => {
-                    yield Err(AgentError::LlmApi(format!("Bedrock ConverseStream request failed: {err}")));
+                    yield Err(AgentError::ProviderTransport { retryable: err.is_connect(), message: format!("Bedrock ConverseStream request failed: {}", err.without_url()) });
                     return;
                 }
             };
             let status = response.status();
+            let retry_after = bedrock_retry_after(&response);
             if !status.is_success() {
                 let payload = match read_bounded_bedrock_response(response).await {
                     Ok(payload) => payload,
                     Err(error) => { yield Err(error); return; }
                 };
-                yield Err(map_bedrock_error(status.as_u16(), &payload));
+                yield Err(bedrock_attach_retry_after(map_bedrock_error(status.as_u16(), &payload), retry_after));
                 return;
             }
 
@@ -347,7 +356,7 @@ impl LlmProvider for BedrockProvider {
                 let bytes = match chunk_result {
                     Ok(bytes) => bytes,
                     Err(err) => {
-                        yield Err(AgentError::LlmApi(format!("Bedrock ConverseStream read failed: {err}")));
+                        yield Err(AgentError::ProviderTransport { retryable: false, message: format!("Bedrock ConverseStream read failed: {}", err.without_url()) });
                         return;
                     }
                 };
@@ -453,12 +462,15 @@ async fn read_bounded_bedrock_response(
     {
         return Err(AgentError::LlmApi("Bedrock response exceeds 8 MiB".into()));
     }
-    while let Some(chunk) = response.chunk().await.map_err(|error| {
-        AgentError::LlmApi(format!(
-            "Bedrock response read failed: {}",
-            error.without_url()
-        ))
-    })? {
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| AgentError::ProviderTransport {
+                retryable: false,
+                message: format!("Bedrock response read failed: {}", error.without_url()),
+            })?
+    {
         if bytes.len() + chunk.len() > 8 * 1024 * 1024 {
             return Err(AgentError::LlmApi("Bedrock response exceeds 8 MiB".into()));
         }
@@ -687,6 +699,33 @@ fn dedup_model_ids(ids: Vec<String>) -> Vec<String> {
     global
 }
 
+fn bedrock_retry_after(response: &reqwest::Response) -> Option<u64> {
+    let value = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    value.trim().parse().ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|date| {
+                date.timestamp()
+                    .saturating_sub(Utc::now().timestamp())
+                    .max(0) as u64
+            })
+    })
+}
+fn bedrock_attach_retry_after(mut error: AgentError, delay: Option<u64>) -> AgentError {
+    match &mut error {
+        AgentError::ProviderHttp {
+            retry_after_secs, ..
+        }
+        | AgentError::RateLimited { retry_after_secs } => *retry_after_secs = delay,
+        _ => {}
+    }
+    error
+}
+
 pub fn build_converse_body(
     model: &str,
     messages: &[Message],
@@ -712,7 +751,7 @@ pub fn build_converse_body(
     if !inference.is_empty() {
         body["inferenceConfig"] = Value::Object(inference);
     }
-    if !tools.is_empty() {
+    if !tools.is_empty() && model_supports_bedrock_tool_use(model) {
         body["toolConfig"] = json!({
             "tools": convert_tools_to_bedrock(tools),
         });

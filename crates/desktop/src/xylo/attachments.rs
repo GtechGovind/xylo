@@ -1,9 +1,10 @@
 //! Native user image attachment controls. The draft owns durable references;
 //! this state holds only bounded preview paths and in-flight request correlation.
 use super::*;
+use xylo_runtime::drafts::DraftKey;
 
 enum PendingImage {
-    Import { session: Uuid },
+    Import { key: DraftKey },
     Preview { session: Uuid, image: Uuid },
 }
 pub(super) struct AttachmentUi {
@@ -19,6 +20,17 @@ impl AttachmentUi {
             notice: String::new(),
         }
     }
+    pub(super) fn has_import_for(&self, key: &DraftKey) -> bool {
+        self.pending
+            .values()
+            .any(|pending| matches!(pending, PendingImage::Import { key: owned } if owned == key))
+    }
+    pub(super) fn importing_for(&self, session: Uuid) -> bool {
+        self.pending.values().any(
+            |pending| matches!(pending, PendingImage::Import { key } if key.session_id == session),
+        )
+    }
+    #[cfg(test)]
     pub(super) fn importing(&self) -> bool {
         self.pending
             .values()
@@ -59,7 +71,7 @@ impl Xylo {
             .pending
             .values()
             .filter(
-                |pending| matches!(pending,PendingImage::Import{session}if *session==self.session),
+                |pending| matches!(pending,PendingImage::Import{key}if key.session_id==self.session),
             )
             .count();
         if paths.is_empty() {
@@ -83,7 +95,7 @@ impl Xylo {
                 self.attachments.pending.insert(
                     id,
                     PendingImage::Import {
-                        session: self.session,
+                        key: self.current_draft_key(),
                     },
                 );
                 self.attachments.notice = "Preparing image…".into();
@@ -93,40 +105,62 @@ impl Xylo {
         cx.notify();
     }
     pub(super) fn attachment_paste_files(&mut self, cx: &mut Context<Self>) {
+        if let Some(item) = cx.read_from_clipboard()
+            && self.attachment_paste_item(&item, cx)
+        {
+            return;
+        }
+        self.attachments.notice =
+            "Copy an image or image files, then paste into the message.".into();
+        cx.notify();
+    }
+    /// The native input owns text insertion/selection/undo. Consume only image
+    /// and file payloads; image bytes are copied only after validating the bound.
+    pub(super) fn attachment_paste_item(
+        &mut self,
+        item: &ClipboardItem,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let mut paths = Vec::new();
         let mut images = Vec::new();
-        if let Some(item) = cx.read_from_clipboard() {
-            for entry in item.into_entries() {
-                match entry {
-                    ClipboardEntry::ExternalPaths(selected) => paths.extend(selected.0.into_vec()),
-                    ClipboardEntry::Image(image) => images.push(image),
-                    _ => {}
-                }
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::ExternalPaths(selected) => paths.extend(
+                    selected
+                        .0
+                        .iter()
+                        .take((MAX_ATTACHMENTS_PER_TURN + 1).saturating_sub(paths.len()))
+                        .cloned(),
+                ),
+                ClipboardEntry::Image(image) if images.len() < 2 => images.push(image),
+                _ => {}
             }
         }
         if !paths.is_empty() {
             self.attach_image_paths(paths, AttachmentSource::PastedFile, cx);
-            return;
+            return true;
+        }
+        if images.is_empty() {
+            return false;
         }
         if images.len() != 1 {
-            self.attachments.notice =
-                "Copy an image or image files, then choose Paste image.".into();
+            self.attachments.notice = "Paste one copied image or image files.".into();
             cx.notify();
-            return;
+            return true;
         }
-        if self.attachments.importing()
+        if self.attachments.importing_for(self.session)
             || self.draft_attachments().len() >= MAX_ATTACHMENTS_PER_TURN
         {
             self.attachments.notice =
                 "Wait for the current import or remove an image before adding another.".into();
             cx.notify();
-            return;
+            return true;
         }
         let image = images.pop().unwrap();
         if image.bytes.len() as u64 > MAX_IMAGE_BYTES {
             self.attachments.notice = "Clipboard image exceeds the 8 MiB import limit.".into();
             cx.notify();
-            return;
+            return true;
         }
         let id = Uuid::new_v4();
         let result = self
@@ -134,19 +168,25 @@ impl Xylo {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
             .and_then(|host| {
-                host.import_image_bytes(id, self.session, image.bytes, AttachmentSource::Clipboard)
+                host.import_image_bytes(
+                    id,
+                    self.session,
+                    image.bytes.clone(),
+                    AttachmentSource::Clipboard,
+                )
             });
         if result.is_ok() {
             self.attachments.pending.insert(
                 id,
                 PendingImage::Import {
-                    session: self.session,
+                    key: self.current_draft_key(),
                 },
             );
             self.attachments.notice = "Preparing clipboard image…".into();
         }
         self.result(result, cx);
         cx.notify();
+        true
     }
     pub(super) fn image_imported(
         &mut self,
@@ -155,27 +195,30 @@ impl Xylo {
         result: Result<(ImageAttachment, PathBuf), String>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(PendingImage::Import { session: expected }) = self.attachments.pending.remove(&id)
-        else {
+        let Some(PendingImage::Import { key }) = self.attachments.pending.remove(&id) else {
             return false;
         };
-        if expected != session || session != self.session {
+        if key.session_id != session {
             return true;
         }
         match result {
             Ok((image, path)) if image.session_id == session => {
                 let image_id = image.id;
-                if self.add_draft_attachment(image, cx) {
+                if self.add_draft_attachment_to(&key, image, cx) {
                     self.attachments.previews.insert(image_id, path);
-                    self.attachments.notice =
-                        "Image attached. The selected model must support image input.".into();
+                    self.draft_attachment_notice(
+                        &key,
+                        "Image attached. The selected model must support image input.".into(),
+                        cx,
+                    );
                 }
             }
-            Ok(_) => {
-                self.attachments.notice =
-                    "Image belongs to another conversation. Attach it again in this chat.".into()
-            }
-            Err(error) => self.attachments.notice = error,
+            Ok(_) => self.draft_attachment_notice(
+                &key,
+                "Image belongs to another conversation. Attach it again in this chat.".into(),
+                cx,
+            ),
+            Err(error) => self.draft_attachment_notice(&key, error, cx),
         }
         cx.notify();
         true
@@ -205,7 +248,24 @@ impl Xylo {
                 }
                 self.attachments.previews.insert(image, path);
             }
-            Err(error) => self.attachments.notice = error,
+            Err(error) if session == self.session => self.attachments.notice = error,
+            Err(_) => {}
+        }
+        if session == self.session {
+            if let Some(history) = self.histories.get_mut(&session) {
+                for (index, message) in self.messages.iter().enumerate() {
+                    if message
+                        .attachments
+                        .iter()
+                        .any(|attachment| attachment.id == image)
+                    {
+                        let row = index + 1;
+                        if row < history.list.item_count() {
+                            history.list.remeasure_items(row..row + 1);
+                        }
+                    }
+                }
+            }
         }
         cx.notify();
         true
@@ -245,33 +305,6 @@ impl Xylo {
             }
         }
     }
-    /// Drop target and explicit user import actions; no images import on render.
-    pub(super) fn attachment_controls(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(
-                icon_button(
-                    "attach-images",
-                    "Attach images",
-                    gpui_kit::component::IconName::Plus,
-                )
-                .disabled(self.attachments.importing())
-                .on_click(cx.listener(|view, _, window, cx| view.attachment_picker(window, cx))),
-            )
-            .child(
-                icon_button(
-                    "paste-image-files",
-                    "Paste image",
-                    gpui_kit::component::IconName::Copy,
-                )
-                .disabled(self.attachments.importing())
-                .on_click(cx.listener(|view, _, _, cx| view.attachment_paste_files(cx))),
-            )
-            .into_any_element()
-    }
-
     pub(super) fn attachment_strip(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut strip = div().flex().flex_wrap().gap_2();
         for image in self.draft_attachments() {
@@ -313,7 +346,7 @@ impl Xylo {
                 );
             strip = strip.child(card);
         }
-        if self.attachments.importing() {
+        if self.attachments.importing_for(self.session) {
             strip = strip.child(subtitle("Preparing image…"));
         }
         strip.into_any_element()
@@ -364,8 +397,8 @@ impl AttachmentUi {
     }
     pub(super) fn validation_import(&self) -> Option<(Uuid, Uuid)> {
         self.pending.iter().find_map(|(id, pending)| {
-            if let PendingImage::Import { session } = pending {
-                Some((*id, *session))
+            if let PendingImage::Import { key } = pending {
+                Some((*id, key.session_id))
             } else {
                 None
             }

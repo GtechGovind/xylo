@@ -138,6 +138,62 @@ mod xylo {
             }
         }
 
+        pub(crate) fn queued_capture(&mut self, active: bool, cx: &mut Context<Self>) {
+            self.settings_open = false;
+            self.page = Page::Chat;
+            self.settings.ui.work_panel_open = false;
+            self.messages = vec![
+                message(
+                    self.session,
+                    "user",
+                    "Review the project and check the current changes.".into(),
+                ),
+                message(
+                    self.session,
+                    "assistant",
+                    "I’m reviewing the changed files and checking the affected tests.".into(),
+                ),
+            ];
+            if active {
+                self.turns
+                    .entry(self.session)
+                    .or_default()
+                    .apply(EngineEvent::Started);
+            } else {
+                self.turns.remove(&self.session);
+            }
+            let items = [
+                "Then run the affected tests and report any failures.",
+                "Summarize the changes and anything that still needs attention.",
+            ]
+            .into_iter()
+            .map(|prompt| {
+                let turn = TurnRequest {
+                    session_id: self.session,
+                    turn_id: Uuid::new_v4(),
+                    workspace: self.workspace.clone().unwrap(),
+                    prompt: prompt.into(),
+                    provider: self.settings.provider.clone(),
+                    permissions: self.settings.permissions,
+                    attachments: vec![],
+                };
+                xylo_runtime::turn_queue::QueuedTurn {
+                    id: turn.turn_id,
+                    turn,
+                    paused: !active,
+                    reason: None,
+                }
+            })
+            .collect();
+            self.turn_queue.items.insert(self.session, items);
+            cx.notify();
+        }
+        pub(crate) fn reset_queued_capture(&mut self, cx: &mut Context<Self>) {
+            self.turns.remove(&self.session);
+            self.turn_queue.items.remove(&self.session);
+            self.messages.clear();
+            cx.notify();
+        }
         pub(crate) fn composer_capture_healthy(&self) {
             assert!(self.error.is_none(), "Actual Host error: {:?}", self.error);
             assert!(self.host.is_some(), "A real temporary Host is required");
@@ -190,7 +246,12 @@ fn render() {
     };
     // This is a persisted display configuration, not an available/live model.
     settings.provider.model = "fixture-local-coder-model".into();
-    settings.provider.reasoning_options = Some(vec!["low".into(),"medium".into(),"high".into(),"xhigh".into()]);
+    settings.provider.reasoning_options = Some(vec![
+        "low".into(),
+        "medium".into(),
+        "high".into(),
+        "xhigh".into(),
+    ]);
     settings.provider.reasoning_effort = Some("high".into());
     settings.remember_model(settings.provider.clone());
     store.save_settings(&settings).unwrap();
@@ -354,16 +415,24 @@ fn render() {
             );
             screenshot.save(&destination).unwrap();
             cx.update_window(handle, |_, window, cx| {
-                window.click("composer-model",cx);
-                let model=window.find("composer-model-options").bounds();
-                let reset=window.find("composer-effort-default").bounds();
-                let effort=window.find(("composer-effort",2usize)).bounds();
-                assert!(model.size.width <= px(260.) && effort.bottom()-reset.top() <= px(200.),"Model and effort controls must stay compact");
-                assert!(window.try_find(("composer-effort",2usize)).is_some());
-            }).unwrap();
-            let popup_image=format!("composer-{theme}-{width}-model-popover.png");
-            cx.capture_screenshot(handle).unwrap().save(output.join(&popup_image)).unwrap();
-            cx.update_window(handle,|_,window,cx|window.click("composer-model",cx)).unwrap();
+                window.click("composer-model", cx);
+                let model = window.find("composer-model-options").bounds();
+                let reset = window.find("composer-effort-default").bounds();
+                let effort = window.find(("composer-effort", 2usize)).bounds();
+                assert!(
+                    model.size.width <= px(260.) && effort.bottom() - reset.top() <= px(200.),
+                    "Model and effort controls must stay compact"
+                );
+                assert!(window.try_find(("composer-effort", 2usize)).is_some());
+            })
+            .unwrap();
+            let popup_image = format!("composer-{theme}-{width}-model-popover.png");
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(&popup_image))
+                .unwrap();
+            cx.update_window(handle, |_, window, cx| window.click("composer-model", cx))
+                .unwrap();
             // A long, virtualized conversation scrolls above the composer;
             // the existing-chat composer must stay at the viewport bottom.
             let anchor = cx.update_window(handle, |_, window, cx| {
@@ -384,6 +453,46 @@ fn render() {
                 "pixels":[screenshot.width(),screenshot.height()],
                 "sha256":format!("{:x}",Sha256::digest(std::fs::read(destination).unwrap())),
             }));
+        }
+    }
+    let mut queue_cases = Vec::new();
+    for theme in ["light", "dark"] {
+        settings.theme = theme.into();
+        client.save_settings(settings.clone()).unwrap();
+        wait(&mut cx, theme);
+        for (width, height) in [(1000_u32, 680_u32), (1380, 880), (1720, 1040)] {
+            for active in [true, false] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.resize(size(px(width as f32), px(height as f32)));
+                    window.bounds_changed(cx);
+                    view.update(cx, |view, cx| view.queued_capture(active, cx));
+                    window.render_frame(cx);
+                    let pending = window.find("composer-pending").bounds();
+                    let composer = window.find("image-drop-target").bounds();
+                    assert!(pending.bottom() <= composer.top());
+                    assert!(
+                        composer.bottom() >= px(height as f32 - 35.)
+                            && composer.bottom() <= px(height as f32)
+                    );
+                    assert_eq!(window.try_find("steer-prompt").is_some(), active);
+                    assert_eq!(window.try_find(("send-queued", 0usize)).is_some(), !active);
+                    assert!(window.find(("remove-queued", 0usize)).visible());
+                })
+                .unwrap();
+                let filename = format!(
+                    "queue-{theme}-{width}-{}.png",
+                    if active { "active" } else { "paused" }
+                );
+                cx.capture_screenshot(handle)
+                    .unwrap()
+                    .save(output.join(&filename))
+                    .unwrap();
+                queue_cases.push(serde_json::json!({"theme":theme,"viewport":[width,height],"active":active,"image":filename}));
+                cx.update_window(handle, |_, _, cx| {
+                    view.update(cx, |view, cx| view.reset_queued_capture(cx))
+                })
+                .unwrap();
+            }
         }
     }
     let mut provider_cases = Vec::new();
@@ -492,7 +601,7 @@ fn render() {
     let metadata = serde_json::json!({
         "schema":1,
         "scope":"Controlled offscreen production Xylo capture with real temporary Host/Store, native platform fonts and GPU. Synthetic persisted model label, no inference/accounts/microphone or physical desktop acceptance.",
-        "cases":cases,"provider_cases":provider_cases,"account_cases":account_cases,"compiled_sources":compiled_sources,
+        "queue_cases":queue_cases,"cases":cases,"provider_cases":provider_cases,"account_cases":account_cases,"compiled_sources":compiled_sources,
         "source_errors_suppressed":false,
         "controls_clicked":true,"execution_actions_submitted":false,
     });

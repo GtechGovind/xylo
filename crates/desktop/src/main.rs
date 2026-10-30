@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 extern crate gpui_kit as gpui;
+mod assets;
 mod startup;
 mod state;
 mod terminal_view;
@@ -63,7 +64,7 @@ fn main() -> anyhow::Result<()> {
         None => HostClient::spawn(),
     };
     let application = gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(assets::AppAssets)
         .with_quit_mode(QuitMode::Explicit);
     application.on_reopen(show);
     application.run(move |cx| {

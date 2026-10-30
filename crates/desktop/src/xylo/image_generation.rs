@@ -45,14 +45,12 @@ pub(super) struct ImageGenerationUi {
     pub(super) name: Entity<InputState>,
     pub(super) endpoint: Entity<InputState>,
     pub(super) model: Entity<InputState>,
-    pub(super) prompt: Entity<TextareaState>,
     secret: Entity<InputState>,
     connection_source: Option<(ImageGenerationProtocol, String)>,
     load_error: bool,
     save_error: bool,
     provider_latest: Option<Uuid>,
     protocol: ImageGenerationProtocol,
-    size: String,
     credential_ref: Option<String>,
     headers: BTreeMap<String, String>,
     timeout_seconds: u64,
@@ -85,13 +83,7 @@ impl ImageGenerationUi {
             load_error: false,
             save_error: false,
             provider_latest: None,
-            prompt: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .placeholder("Describe one image to generate")
-                    .rows(4)
-            }),
             protocol: ImageGenerationProtocol::OpenAiImages,
-            size: "1024x1024".into(),
             credential_ref: None,
             headers: BTreeMap::new(),
             timeout_seconds: 180,
@@ -180,21 +172,6 @@ impl Xylo {
             self.image_generation.notice = error.to_string();
         }
         cx.notify();
-    }
-    fn refresh_image_generation_history(&mut self, cx: &mut Context<Self>) {
-        if self.image_generation.history_request.is_some() {
-            return;
-        }
-        let id = Uuid::new_v4();
-        let result = self
-            .host
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
-            .and_then(|host| host.image_generation_history(id));
-        if result.is_ok() {
-            self.image_generation.history_request = Some(id);
-        }
-        self.result(result, cx);
     }
     pub(super) fn image_generation_history_received(
         &mut self,
@@ -324,74 +301,6 @@ impl Xylo {
         }
         cx.notify();
         true
-    }
-    fn start_image_generation(&mut self, cx: &mut Context<Self>) {
-        if self.image_generation.busy() || self.image_generation.needs_reconciliation {
-            return;
-        }
-        let id = Uuid::new_v4();
-        let provider = self.image_generation.provider(cx);
-        let prompt = self.image_generation.prompt.read(cx).value().to_string();
-        if provider.name.trim().is_empty()
-            || provider.endpoint.trim().is_empty()
-            || provider.model.trim().is_empty()
-            || prompt.trim().is_empty()
-        {
-            self.image_generation.notice =
-                "Choose an image provider, endpoint, model, and prompt before generating.".into();
-            cx.notify();
-            return;
-        }
-        let request = ImageGenerationRequest {
-            id,
-            session_id: self.session,
-            provider,
-            prompt,
-            size: self.image_generation.size.clone(),
-        };
-        let result = self
-            .host
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
-            .and_then(|host| host.generate_image(id, request));
-        if result.is_ok() {
-            self.image_generation.active = Some((id, self.session));
-            self.image_generation.latest = Some((id, self.session));
-            self.image_generation.pending.insert(id, (id, self.session));
-            self.image_generation.receipt = None;
-            self.image_generation.needs_reconciliation = true;
-            self.image_generation.notice = "Generating with your selected provider…".into();
-        }
-        self.result(result, cx);
-        cx.notify();
-    }
-    fn cancel_image_generation(&mut self, cx: &mut Context<Self>) {
-        if let Some((id, _)) = self.image_generation.active {
-            if let Some(host) = &self.host {
-                let result = host.cancel_capability(id);
-                self.result(result, cx);
-            }
-            self.image_generation.notice="Cancellation requested. A submitted image request may still complete or be charged by the provider.".into();
-        }
-        cx.notify();
-    }
-    fn refresh_image_generation(&mut self, cx: &mut Context<Self>) {
-        if self.image_generation.pending.len() >= 8 {
-            return;
-        }
-        let target = self.image_generation.latest;
-        if let Some((job, session)) = target {
-            let id = Uuid::new_v4();
-            let result = self
-                .host
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
-                .and_then(|host| host.image_generation_receipt(id, job));
-            if result.is_ok() {
-                self.image_generation.pending.insert(id, (job, session));
-            }
-            self.result(result, cx);
-        }
     }
     pub(super) fn image_generation_received(
         &mut self,

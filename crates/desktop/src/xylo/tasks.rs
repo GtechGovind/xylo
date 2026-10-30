@@ -62,13 +62,27 @@ impl Xylo {
                                 ),
                         )
                     })
-                    .child(primary("create-schedule", "Create task").on_click(
-                        cx.listener(|this, _, window, cx| this.create_schedule(window, cx)),
-                    )),
+                    .child(
+                        primary(
+                            "create-schedule",
+                            if self.schedule_pending.is_some() {
+                                "Saving…"
+                            } else {
+                                "Create task"
+                            },
+                        )
+                        .disabled(self.schedule_pending.is_some())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.create_schedule(window, cx)),
+                        ),
+                    ),
             )
             .child(button("refresh-schedules", "Refresh").on_click(
                 cx.listener(|this, _, _, cx| this.host_call(cx, |h| h.list_schedules())),
             ));
+        if !self.schedule_notice.is_empty() {
+            page = page.child(subtitle(self.schedule_notice.clone()));
+        }
         if self.schedules.is_empty() {
             page = page.child(subtitle("No scheduled tasks yet."));
         }
@@ -76,46 +90,51 @@ impl Xylo {
             let mut paused = task.clone();
             paused.enabled = !paused.enabled;
             let id = task.id;
-            page =
-                page.child(
-                    card()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(task.prompt.clone()),
-                        )
-                        .child(subtitle(format!(
-                            "{} · Next run {} UTC",
-                            if task.enabled { "Enabled" } else { "Paused" },
-                            task.next_run.format("%b %d, %H:%M")
-                        )))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    button(
-                                        ("pause-schedule", i),
-                                        if task.enabled { "Pause" } else { "Resume" },
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.host_call(cx, |h| h.save_schedule(paused.clone()))
-                                        },
-                                    )),
+            page = page.child(
+                card()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(task.prompt.clone()),
+                    )
+                    .child(subtitle(format!(
+                        "{} · Next run {} UTC",
+                        if task.enabled { "Enabled" } else { "Paused" },
+                        task.next_run.format("%b %d, %H:%M")
+                    )))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                button(
+                                    ("pause-schedule", i),
+                                    if task.enabled { "Pause" } else { "Resume" },
                                 )
-                                .child(button(("delete-schedule", i), "Delete").on_click(
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.host_call(cx, |h| h.remove_schedule(id))
-                                    }),
+                                .disabled(self.schedule_pending.is_some())
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.mutate_schedule(Some(paused.clone()), id, cx)
+                                    },
                                 )),
-                        ),
-                );
+                            )
+                            .child(
+                                button(("delete-schedule", i), "Delete")
+                                    .disabled(self.schedule_pending.is_some())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.mutate_schedule(None, id, cx)
+                                    })),
+                            ),
+                    ),
+            );
         }
         page.into_any_element()
     }
-    fn create_schedule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn create_schedule(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.schedule_pending.is_some() {
+            return;
+        }
         let Some(workspace) = self.workspace.clone() else {
             self.error = Some("Choose a project folder first.".into());
             cx.notify();
@@ -136,67 +155,74 @@ impl Xylo {
                 return;
             }
         };
+        let request_id = Uuid::new_v4();
+        let submitted = self.schedule_prompt.read(cx).value().to_string();
         let result = self
             .host
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
-            .and_then(|h| h.create_schedule(prompt, expression, workspace));
+            .and_then(|h| h.create_schedule_tracked(request_id, prompt, expression, workspace));
         if result.is_ok() {
-            self.schedule_prompt
-                .update(cx, |s, cx| s.set_value("", window, cx));
+            self.schedule_pending = Some((request_id, Some(submitted)));
+            self.schedule_notice.clear();
         }
         self.result(result, cx);
     }
-    pub(super) fn teams_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut page = div()
-            .id("team-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .p_6()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(heading(
-                "Teams",
-                "Follow tasks your assistant has shared with teammates.",
-            ))
-            .child(
-                button("refresh-teams", "Refresh")
-                    .on_click(cx.listener(|this, _, _, cx| this.host_call(cx, |h| h.team_tasks()))),
-            );
-        if self.team_tasks.is_empty() {
-            page = page.child(
-                card()
-                    .child(div().text_sm().child("No team tasks yet."))
-                    .child(subtitle(
-                        "Ask your assistant to work on a task with teammates.",
-                    )),
-            );
+    fn mutate_schedule(
+        &mut self,
+        task: Option<xylo_runtime::scheduler::ScheduledTask>,
+        id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        if self.schedule_pending.is_some() {
+            return;
         }
-        for (i, task) in self.team_tasks.iter().enumerate() {
-            page = page.child(
-                card()
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(task.title.clone()),
-                            )
-                            .child(subtitle(task.status.clone())),
-                    )
-                    .when(!task.summary.is_empty(), |d| {
-                        d.child(
-                            TextView::markdown(("team-summary", i), truncate(&task.summary, 6000))
-                                .selectable(true),
-                        )
-                    }),
-            );
+        let request_id = Uuid::new_v4();
+        let result = self
+            .host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
+            .and_then(|host| match task {
+                Some(task) => host.save_schedule_tracked(request_id, task),
+                None => host.remove_schedule_tracked(request_id, id),
+            });
+        if result.is_ok() {
+            self.schedule_pending = Some((request_id, None));
+            self.schedule_notice.clear();
         }
-        page.into_any_element()
+        self.result(result, cx);
     }
+    pub(super) fn schedule_mutated(
+        &mut self,
+        id: Uuid,
+        result: Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .schedule_pending
+            .as_ref()
+            .is_some_and(|(expected, _)| *expected == id)
+        {
+            return;
+        }
+        let (_, submitted) = self.schedule_pending.take().unwrap();
+        match result {
+            Ok(()) => {
+                if submitted
+                    .as_ref()
+                    .is_some_and(|text| self.schedule_prompt.read(cx).value().as_ref() == text)
+                {
+                    self.schedule_prompt
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                }
+                self.schedule_notice = "Saved".into();
+            }
+            Err(error) => self.schedule_notice = format!("Could not save task: {error}"),
+        }
+        cx.notify();
+    }
+
 }
 fn schedule_expression(frequency: usize, time: &str) -> Result<String, String> {
     if frequency == 3 {

@@ -153,6 +153,8 @@ impl GuardedProvider {
         messages: &[Message],
         tools: &[ToolSchema],
         max_tokens: Option<u32>,
+        model: Option<&str>,
+        extra: Option<&serde_json::Value>,
     ) -> Result<Vec<Message>, AgentError> {
         let proactive = self.message_allowance(tools, max_tokens, self.context_tokens * 4 / 5)?;
         let costs = self.costs(messages);
@@ -160,7 +162,9 @@ impl GuardedProvider {
             return Ok(messages.to_vec());
         }
         if self.summarize
-            && let Some(view) = self.summarized_view(messages, &costs, proactive).await
+            && let Some(view) = self
+                .summarized_view(messages, &costs, proactive, model, extra)
+                .await
         {
             return self.fit_context(&view, tools, max_tokens);
         }
@@ -174,6 +178,8 @@ impl GuardedProvider {
         messages: &[Message],
         costs: &[usize],
         allowance: usize,
+        model: Option<&str>,
+        extra: Option<&serde_json::Value>,
     ) -> Option<Vec<Message>> {
         let system = messages
             .iter()
@@ -265,12 +271,18 @@ impl GuardedProvider {
             .summarize_history(
                 previous.as_ref().map(|entry| entry.summary.as_str()),
                 &rest[floor..cut],
+                model,
+                extra,
             )
             .await
-            .inspect_err(
-                |error| tracing::warn!(error=%error, "Context summary unavailable; using excerpts"),
-            )
+            .inspect_err(|_| tracing::warn!("Context summary unavailable; using excerpts"))
             .ok()?;
+        let view = assemble(cut, &summary);
+        // Cache only an admissible view; an oversized summary must not poison
+        // later attempts or replace a previously usable summary.
+        if self.costs(&view).iter().sum::<usize>() > allowance {
+            return None;
+        }
         {
             let mut entries = self.summaries.lock();
             entries.push(SummaryEntry {
@@ -282,13 +294,15 @@ impl GuardedProvider {
                 entries.remove(0);
             }
         }
-        Some(assemble(cut, &summary))
+        Some(view)
     }
 
     async fn summarize_history(
         &self,
         previous: Option<&str>,
         history: &[Message],
+        model: Option<&str>,
+        extra: Option<&serde_json::Value>,
     ) -> Result<String, AgentError> {
         // The summarizer's own request must fit comfortably in the context.
         let budget = (self.context_tokens as usize * 3 / 5).saturating_sub(SUMMARY_TOKENS as usize);
@@ -311,6 +325,17 @@ impl GuardedProvider {
         request.push_str("Transcript:\n");
         request.push_str(&transcript);
         let messages = [Message::system(SUMMARIZER), Message::user(request)];
+        let reasoning = extra.and_then(|extra| extra.as_object()).map(|fields| {
+            serde_json::Value::Object(
+                fields
+                    .iter()
+                    .filter(|(key, _)| {
+                        matches!(key.as_str(), "reasoning" | "reasoning_effort" | "thinking")
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        });
         let reply = tokio::select! {
             _ = self.cancel.cancelled() => return Err(interrupted()),
             reply = tokio::time::timeout(
@@ -320,8 +345,8 @@ impl GuardedProvider {
                     &[],
                     Some(SUMMARY_TOKENS.min(self.output_tokens)),
                     None,
-                    None,
-                    None,
+                    model,
+                    reasoning.as_ref(),
                 ),
             ) => reply.map_err(|_| AgentError::Timeout("Context summary deadline exceeded".into()))??,
         };
@@ -502,6 +527,13 @@ impl GuardedProvider {
         }
     }
 }
+fn admission_error(error: anyhow::Error) -> AgentError {
+    if error.is::<xylo_runtime::resources::AdmissionCancelled>() {
+        interrupted()
+    } else {
+        AgentError::Config(error.to_string())
+    }
+}
 fn interrupted() -> AgentError {
     AgentError::Interrupted {
         message: Some("Task cancelled during model generation".into()),
@@ -566,9 +598,11 @@ impl LlmProvider for GuardedProvider {
                 self.cancel.clone(),
             )
             .await
-            .map_err(|e| AgentError::Config(e.to_string()))?;
+            .map_err(admission_error)?;
         let _lease = self.lease().await?;
-        let messages = self.fit_with_summary(messages, tools, max_tokens).await?;
+        let messages = self
+            .fit_with_summary(messages, tools, max_tokens, model, extra_body)
+            .await?;
         tokio::select! {_ = self.cancel.cancelled()=>Err(interrupted()),result=tokio::time::timeout(self.timeout,self.inner.chat_completion(&messages,tools,max_tokens,temperature,model,extra_body))=>result.map_err(|_|AgentError::Timeout("Model generation deadline exceeded".into()))?}
     }
     fn chat_completion_stream(
@@ -591,12 +625,13 @@ impl LlmProvider for GuardedProvider {
         let model = model.map(str::to_owned);
         let extra = extra_body.cloned();
         Box::pin(async_stream::try_stream! {
-            let _resources=this.resources.acquire(TaskDemand::interactive(this.context_tokens),this.cancel.clone()).await.map_err(|e|AgentError::Config(e.to_string()))?;
+            let _resources=this.resources.acquire(TaskDemand::interactive(this.context_tokens),this.cancel.clone()).await.map_err(admission_error)?;
             let _lease=this.lease().await?;
-            let messages = this.fit_with_summary(&messages,&tools,max_tokens).await?;
+            let messages = this.fit_with_summary(&messages,&tools,max_tokens,model.as_deref(),extra.as_ref()).await?;
             let mut stream=this.inner.chat_completion_stream(&messages,&tools,max_tokens,temperature,model.as_deref(),extra.as_ref());
-            let deadline=tokio::time::Instant::now()+this.timeout;
-            loop{let next=tokio::select!{_ = this.cancel.cancelled()=>Err(interrupted()),_ = tokio::time::sleep_until(deadline)=>Err(AgentError::Timeout("Streaming model deadline exceeded".into())),next=stream.next()=>Ok(next)}?;
+            let mut first_response = true;
+            loop{let next=tokio::select!{_ = this.cancel.cancelled()=>Err(interrupted()),next=tokio::time::timeout(this.timeout, stream.next())=>next.map_err(|_|AgentError::Timeout(if first_response { "Model first response deadline exceeded" } else { "Model stream idle deadline exceeded" }.into()))}?;
+                first_response = false;
                 let Some(chunk)=next else{break};yield chunk?;
             }
         })
@@ -750,7 +785,7 @@ mod tests {
             round(&mut messages, index, 300);
         }
         let view = guard
-            .fit_with_summary(&messages, &[], Some(512))
+            .fit_with_summary(&messages, &[], Some(512), None, None)
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -777,7 +812,7 @@ mod tests {
         // A small next step reuses the same summary and the same prefix.
         round(&mut messages, 12, 20);
         let next = guard
-            .fit_with_summary(&messages, &[], Some(512))
+            .fit_with_summary(&messages, &[], Some(512), None, None)
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -964,12 +999,24 @@ mod tests {
             .unwrap();
         fs2::FileExt::lock_exclusive(&lock).unwrap();
         guard.cancel.cancel();
-        assert!(
+        assert!(matches!(
             guard
                 .chat_completion(&[Message::user("small")], &[], Some(512), None, None, None)
-                .await
-                .is_err()
+                .await,
+            Err(AgentError::Interrupted { .. })
+        ));
+        let mut stream = guard.chat_completion_stream(
+            &[Message::user("small")],
+            &[],
+            Some(512),
+            None,
+            None,
+            None,
         );
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(AgentError::Interrupted { .. }))
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
@@ -1045,5 +1092,107 @@ mod cancellation_boundary_tests {
             ));
             assert!(stream.next().await.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod deadline_regressions {
+    use super::*;
+    struct Pulses;
+    #[async_trait]
+    impl LlmProvider for Pulses {
+        async fn chat_completion(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: Option<f64>,
+            _: Option<&str>,
+            _: Option<&serde_json::Value>,
+        ) -> Result<LlmResponse, AgentError> {
+            unreachable!()
+        }
+        fn chat_completion_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: Option<f64>,
+            _: Option<&str>,
+            _: Option<&serde_json::Value>,
+        ) -> BoxStream<'static, Result<StreamChunk, AgentError>> {
+            Box::pin(async_stream::stream! {
+                for _ in 0..5 {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    yield Ok(StreamChunk { delta: None, finish_reason: None, usage: None });
+                }
+                std::future::pending::<()>().await;
+            })
+        }
+    }
+    #[tokio::test]
+    async fn active_stream_can_outlive_response_deadline_but_idle_stream_times_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut guard = GuardedProvider::new(
+            Arc::new(Pulses),
+            &ProviderConfig::default(),
+            directory.path().join("lock"),
+            CancellationToken::new(),
+            false,
+        );
+        guard.timeout = Duration::from_millis(60);
+        let mut stream = guard.chat_completion_stream(
+            &[Message::user("small")],
+            &[],
+            Some(32),
+            None,
+            None,
+            None,
+        );
+        for _ in 0..5 {
+            assert!(stream.next().await.unwrap().is_ok());
+        }
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("idle deadline"));
+        assert!(stream.next().await.is_none());
+    }
+    #[tokio::test]
+    async fn first_response_timeout_is_distinct_from_stream_idle_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut guard = GuardedProvider::new(
+            Arc::new(Pulses),
+            &ProviderConfig::default(),
+            directory.path().join("lock"),
+            CancellationToken::new(),
+            false,
+        );
+        guard.timeout = Duration::from_millis(5);
+        let mut stream = guard.chat_completion_stream(
+            &[Message::user("small")],
+            &[],
+            Some(32),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("first response deadline")
+        );
+    }
+    #[test]
+    fn resource_faults_remain_distinct_from_cancellation() {
+        assert!(
+            matches!(admission_error(anyhow::anyhow!("resource monitor I/O failed")),AgentError::Config(message) if message.contains("I/O failed"))
+        );
+        assert!(matches!(
+            admission_error(xylo_runtime::resources::AdmissionCancelled.into()),
+            AgentError::Interrupted { .. }
+        ));
     }
 }

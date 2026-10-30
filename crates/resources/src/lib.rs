@@ -107,6 +107,17 @@ struct Shared {
     changed: Notify,
 }
 
+/// Distinct from invalid estimates or resource-monitor I/O failures so hosts
+/// preserve a user's Stop request rather than reporting configuration failure.
+#[derive(Debug)]
+pub struct AdmissionCancelled;
+impl std::fmt::Display for AdmissionCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Task cancelled while queued")
+    }
+}
+impl std::error::Error for AdmissionCancelled {}
+
 #[derive(Clone)]
 pub struct ResourceManager(Arc<Shared>);
 
@@ -152,7 +163,9 @@ impl ResourceManager {
             "Invalid task resource estimate"
         );
         loop {
-            ensure!(!cancel.is_cancelled(), "Task cancelled while queued");
+            if cancel.is_cancelled() {
+                return Err(AdmissionCancelled.into());
+            }
             if let Some(lease) = self.try_acquire(demand)? {
                 return Ok(lease);
             }

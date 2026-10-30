@@ -49,11 +49,19 @@ impl InstallJob {
     }
 }
 #[derive(Default)]
+enum CatalogState {
+    #[default]
+    Idle,
+    Loading,
+    Ready,
+    Failed(String),
+}
+#[derive(Default)]
 pub(super) struct AssetsUi {
     catalog: Vec<AssetInfo>,
     jobs: Vec<InstallJob>,
     pub filter: usize,
-    loaded: bool,
+    state: CatalogState,
     poll: Option<Task<()>>,
     notice: String,
 }
@@ -61,6 +69,10 @@ impl Xylo {
     pub(super) fn open_assets(&mut self, filter: usize, cx: &mut Context<Self>) {
         self.assets.filter = filter;
         self.navigate(Page::Assets, cx);
+    }
+    pub(super) fn refresh_assets(&mut self, cx: &mut Context<Self>) {
+        self.assets.state = CatalogState::Loading;
+        self.assets.notice.clear();
         self.capability(
             "helper_asset_catalog",
             json!({}),
@@ -76,6 +88,23 @@ impl Xylo {
             cx,
         );
     }
+    pub(super) fn asset_error(&mut self, name: &str, error: &str, cx: &mut Context<Self>) -> bool {
+        match name {
+            "helper_asset_catalog" => {
+                self.assets.state = CatalogState::Failed(product_error(error))
+            }
+            "helper_asset_status" => {
+                self.assets.poll = None;
+                self.assets.notice = format!(
+                    "Could not check download progress. {} Refresh to try again.",
+                    product_error(error)
+                );
+            }
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
     pub(super) fn asset_result(
         &mut self,
         name: &str,
@@ -87,10 +116,12 @@ impl Xylo {
                 match serde_json::from_value(value.get("assets").cloned().unwrap_or(json!([]))) {
                     Ok(assets) => {
                         self.assets.catalog = assets;
-                        self.assets.loaded = true;
+                        self.assets.state = CatalogState::Ready;
                     }
                     Err(error) => {
-                        self.error = Some(format!("Could not read available features: {error}"));
+                        self.assets.state = CatalogState::Failed(format!(
+                            "Could not read available features: {error}"
+                        ));
                     }
                 }
             }
@@ -222,29 +253,34 @@ impl Xylo {
             ))
             .child(filters)
             .child(
-                button("refresh-assets", "Refresh").on_click(cx.listener(|view, _, _, cx| {
-                    view.capability(
-                        "helper_asset_catalog",
-                        json!({}),
-                        "Refreshing available features",
-                        None,
-                        cx,
-                    );
-                    view.capability(
-                        "helper_asset_status",
-                        json!({}),
-                        "Checking downloads",
-                        None,
-                        cx,
-                    );
-                })),
+                button("refresh-assets", "Refresh")
+                    .self_start()
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.refresh_assets(cx);
+                    })),
             );
         if !self.assets.notice.is_empty() {
             page = page.child(subtitle(self.assets.notice.clone()));
         }
-        if !self.assets.loaded {
-            page = page.child(subtitle("Loading available features…"));
+        match &self.assets.state {
+            CatalogState::Idle => {
+                page = page.child(subtitle("Refresh to load available features."))
+            }
+            CatalogState::Loading => page = page.child(subtitle("Loading available features…")),
+            CatalogState::Failed(error) => {
+                page = page.child(
+                    card()
+                        .child(div().text_color(rgb(danger())).child(error.clone()))
+                        .child(
+                            button("retry-assets", "Try again")
+                                .self_start()
+                                .on_click(cx.listener(|view, _, _, cx| view.refresh_assets(cx))),
+                        ),
+                )
+            }
+            CatalogState::Ready => {}
         }
+        let mut visible_count = 0;
         for (i, asset) in self
             .assets
             .catalog
@@ -261,6 +297,7 @@ impl Xylo {
                 _ => true,
             })
         {
+            visible_count += 1;
             let job = self
                 .assets
                 .jobs
@@ -385,6 +422,9 @@ impl Xylo {
                 );
             }
             page = page.child(row);
+        }
+        if matches!(self.assets.state, CatalogState::Ready) && visible_count == 0 {
+            page = page.child(subtitle("No features available in this category."));
         }
         page.into_any_element()
     }

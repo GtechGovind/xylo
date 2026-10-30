@@ -71,6 +71,8 @@ impl Xylo {
                             let Some(key) = row.key else {
                                 return Some(
                                     div()
+                                        .id(("file-notice", i))
+                                        .w_full()
                                         .h(px(30.))
                                         .pl(px(padding + 16.))
                                         .pr_2()
@@ -79,7 +81,14 @@ impl Xylo {
                                         .min_w_0()
                                         .text_xs()
                                         .text_color(rgb(muted()))
-                                        .child(div().truncate().child(detail))
+                                        .tooltip({
+                                            let detail = SharedString::from(detail.clone());
+                                            move |_, cx| {
+                                                cx.new(|_| crate::ui::XyloTooltip(detail.clone()))
+                                                    .into()
+                                            }
+                                        })
+                                        .child(div().flex_1().min_w_0().truncate().child(detail))
                                         .into_any_element(),
                                 );
                             };
@@ -93,26 +102,46 @@ impl Xylo {
                                 .items_center()
                                 .justify_start()
                                 .gap_1()
-                                .rounded_md()
+                                .rounded(px(7.))
                                 .min_w_0()
-                                .text_xs()
-                                .text_color(rgb(text()))
+                                .text_size(px(12.5))
+                                .text_color(rgb(if is_selected {
+                                    text()
+                                } else {
+                                    text_secondary()
+                                }))
                                 .bg(rgb(if is_selected { selected() } else { sidebar() }))
-                                .hover(|style| style.bg(rgb(hover())))
+                                .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
                                 .child(
                                     div()
-                                        .w(px(12.))
+                                        .w(px(14.))
                                         .flex_shrink_0()
-                                        .text_color(rgb(muted()))
-                                        .child(if directory {
-                                            if row.expanded { "⌄" } else { "›" }
-                                        } else {
-                                            ""
+                                        .flex()
+                                        .items_center()
+                                        .text_color(rgb(faint()))
+                                        .when(directory, |caret| {
+                                            caret.child(
+                                                Icon::new(if row.expanded {
+                                                    IconName::ChevronDown
+                                                } else {
+                                                    IconName::ChevronRight
+                                                })
+                                                .size(px(12.)),
+                                            )
                                         }),
                                 );
                             if let Some(glyph) = glyph {
-                                button = button
-                                    .child(Icon::new(glyph).size(px(14.)).text_color(rgb(muted())));
+                                button = button.child(
+                                    Icon::new(if directory && row.expanded {
+                                        Glyph::FolderOpen
+                                    } else {
+                                        glyph.into()
+                                    })
+                                    .size(px(14.))
+                                    .text_color(rgb(
+                                        if directory { accent_text() } else { muted() },
+                                    )),
+                                );
                             }
                             Some(
                                 button
@@ -147,8 +176,10 @@ impl Xylo {
         .min_h_0();
         let list = div()
             .id("file-tree")
+            .flex_shrink_0()
             .w(px(self.settings.ui.files_width))
-            .max_w(relative(0.6))
+            .max_w(relative(0.45))
+            .min_w(px(130.))
             .h_full()
             .bg(rgb(sidebar()))
             .border_r_1()
@@ -169,10 +200,10 @@ impl Xylo {
                     .items_center()
                     .justify_between()
                     .gap_1()
-                    .child(subtitle("Files").flex_1().min_w_0())
+                    .child(sidebar_label("Files").flex_1().min_w_0())
                     .child(
-                        button("refresh-files", "Refresh")
-                            .text_xs()
+                        icon_button("refresh-files", "Refresh files", IconName::RefreshCw)
+                            .size(px(26.))
                             .on_click(cx.listener(|view, _, _, cx| view.refresh_files(cx))),
                     ),
             )
@@ -186,7 +217,14 @@ impl Xylo {
                 panel.child(subtitle(self.file_browser.notice.clone()))
             })
             .when(self.workspace.is_none(), |panel| {
-                panel.child(subtitle("Open a project to browse its files."))
+                panel.child(
+                    card()
+                        .p_2()
+                        .child(subtitle("Open a project to browse its files."))
+                        .child(button("files-open-project", "Open project").on_click(
+                            cx.listener(|view, _, window, cx| view.pick_workspace(window, cx)),
+                        )),
+                )
             })
             .child(rows)
             .relative()
@@ -200,22 +238,43 @@ impl Xylo {
                 .flex_col()
                 .child(
                     div()
-                        .h(px(42.))
+                        .min_h(px(42.))
+                        .flex_shrink_0()
+                        .py_1()
                         .px_3()
                         .flex()
+                        .flex_wrap()
+                        .gap_1()
                         .items_center()
                         .justify_between()
                         .border_b_1()
                         .border_color(rgb(border()))
                         .child(
-                            subtitle(format!(
-                                "{}{}",
-                                path.display(),
-                                if self.editor_dirty { "  ●" } else { "" }
-                            ))
-                            .flex_1()
-                            .min_w_0()
-                            .truncate(),
+                            div()
+                                .id("editor-file-identity")
+                                .tooltip({
+                                    let full_path: SharedString = path.display().to_string().into();
+                                    move |_, cx| {
+                                        cx.new(|_| crate::ui::XyloTooltip(full_path.clone())).into()
+                                    }
+                                })
+                                .child(
+                                    subtitle(format!(
+                                        "{}{}",
+                                        self.workspace
+                                            .as_deref()
+                                            .and_then(|root| path.strip_prefix(root).ok())
+                                            .unwrap_or(path.as_path())
+                                            .to_string_lossy(),
+                                        if self.editor_dirty { "  ●" } else { "" }
+                                    ))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate(),
+                                )
+                                .flex_1()
+                                .min_w(px(80.))
+                                .overflow_hidden(),
                         )
                         .child(
                             button("editor-suggest", "Suggest")
@@ -256,11 +315,29 @@ impl Xylo {
         } else {
             div()
                 .flex_1()
+                .min_w_0()
                 .p_8()
                 .child(heading(
-                    "Your project, in reach",
-                    "Choose a file to edit. Changes save only when you click Save.",
+                    if self.workspace.is_none() {
+                        "Open a project"
+                    } else if self.file_browser.indexing {
+                        "Discovering project files…"
+                    } else {
+                        "Choose a file"
+                    },
+                    if self.workspace.is_none() {
+                        "Choose a project folder to browse and edit its files."
+                    } else if self.file_browser.indexing {
+                        "Files appear as they are discovered. Select one to start editing."
+                    } else {
+                        "Select a file from the list. Changes save only when you click Save."
+                    },
                 ))
+                .when(self.workspace.is_none(), |panel| {
+                    panel.child(primary("editor-open-project", "Open project").on_click(
+                        cx.listener(|view, _, window, cx| view.pick_workspace(window, cx)),
+                    ))
+                })
                 .into_any_element()
         };
         div()
@@ -269,70 +346,6 @@ impl Xylo {
             .min_h_0()
             .child(list)
             .child(content)
-            .into_any_element()
-    }
-    pub(super) fn changes(&self, cx: &mut Context<Self>) -> AnyElement {
-        let weak = cx.entity().downgrade();
-        let lines = uniform_list("diff-lines", self.diff_lines.len(), move |range, _, cx| {
-            weak.update(cx, |view, _| {
-                range
-                    .filter_map(|i| {
-                        let line = view.diff_lines.get(i)?;
-                        Some(
-                            div()
-                                .id(("diff-line", i))
-                                .h(px(22.))
-                                .px_2()
-                                .font_family("monospace")
-                                .text_sm()
-                                .whitespace_nowrap()
-                                .bg(rgb(if line.starts_with('+') && !line.starts_with("+++") {
-                                    0xecf9ee
-                                } else if line.starts_with('-') && !line.starts_with("---") {
-                                    0xffecec
-                                } else {
-                                    bg()
-                                }))
-                                .text_color(rgb(if line.starts_with('+') {
-                                    0x25713a
-                                } else if line.starts_with('-') {
-                                    0xb93636
-                                } else {
-                                    text()
-                                }))
-                                .child(line.clone())
-                                .into_any_element(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-        })
-        .track_scroll(&self.diff_scroll)
-        .flex_1()
-        .min_h_0();
-        div()
-            .size_full()
-            .p_6()
-            .flex()
-            .flex_col()
-            .min_h_0()
-            .child(heading("Changes", "Review changes in your project."))
-            .child(button("refresh-diff", "Refresh diff").on_click(cx.listener(
-                |this, _, _, cx| {
-                    if let Some(path) = this.workspace.clone() {
-                        this.host_call(cx, |host| host.git_diff(path));
-                    }
-                },
-            )))
-            .child(if self.diff.is_empty() {
-                div()
-                    .mt_5()
-                    .child(subtitle("No diff loaded. Open a Git project and refresh."))
-                    .into_any_element()
-            } else {
-                lines.into_any_element()
-            })
             .into_any_element()
     }
     pub(super) fn artifacts_page(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -349,7 +362,10 @@ impl Xylo {
             .child(self.documents_panel(cx))
             .child(self.native_result_card(cx));
         if self.artifacts.is_empty() {
-            view = view.child(card().child(subtitle("No artifacts have been returned yet.")));
+            view = view.child(card().child(heading(
+                "No artifacts yet",
+                "Ask Xylo in chat to create a document, spreadsheet, image, or other file. Returned files appear here. DOCX and XLSX files open in Xylo; other files open with your default app.",
+            )));
         }
         for (i, path) in self.artifacts.iter().enumerate() {
             let path = path.clone();
@@ -358,21 +374,74 @@ impl Xylo {
                 .unwrap_or(path.as_os_str())
                 .to_string_lossy()
                 .into_owned();
-            view = view.child(button(("artifact", i), label).on_click(cx.listener(
-                move |view, _, window, cx| {
-                    if path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| {
-                            matches!(extension.to_ascii_lowercase().as_str(), "docx" | "xlsx")
-                        })
-                    {
-                        view.document_open(path.clone(), window, cx);
-                    } else {
-                        cx.open_with_system(&path);
-                    }
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            let in_xylo = matches!(extension.as_str(), "DOCX" | "XLSX");
+            let location = path.parent().unwrap_or(Path::new(""));
+            let location = self
+                .workspace
+                .as_deref()
+                .and_then(|root| location.strip_prefix(root).ok())
+                .unwrap_or(location);
+            let location = if location.as_os_str().is_empty() {
+                "Project root".to_string()
+            } else {
+                location.display().to_string()
+            };
+            let detail = format!(
+                "{} · {}",
+                if extension.is_empty() {
+                    "File"
+                } else {
+                    &extension
                 },
-            )));
+                location
+            );
+            view = view.child(
+                button(("artifact", i), label.clone())
+                    .w_full()
+                    .min_w_0()
+                    .h_auto()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap_1()
+                    .accessibility_label(format!(
+                        "Open {label}, {}",
+                        if in_xylo {
+                            "in Xylo"
+                        } else {
+                            "with default app"
+                        }
+                    ))
+                    .tooltip({
+                        let full_path: SharedString = path.display().to_string().into();
+                        move |_, cx| cx.new(|_| crate::ui::XyloTooltip(full_path.clone())).into()
+                    })
+                    .child(subtitle(detail).w_full().min_w_0().truncate())
+                    .child(subtitle(if in_xylo {
+                        "Open in Xylo"
+                    } else {
+                        "Open with default app"
+                    }))
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        if path
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .is_some_and(|extension| {
+                                matches!(extension.to_ascii_lowercase().as_str(), "docx" | "xlsx")
+                            })
+                        {
+                            view.document_open(path.clone(), window, cx);
+                        } else {
+                            cx.open_with_system(&path);
+                        }
+                    })),
+            );
         }
         view.into_any_element()
     }

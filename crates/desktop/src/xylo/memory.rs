@@ -326,9 +326,8 @@ impl Xylo {
         }
         let mut page = div()
             .id("memory-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .p_6()
+            .w_full()
+            .max_w(px(760.))
             .flex()
             .flex_col()
             .gap_4()
@@ -378,7 +377,10 @@ impl Xylo {
                 form = form.child(
                     button("memory-cancel-edit", "Cancel correction")
                         .disabled(busy)
-                        .on_click(cx.listener(|view, _, _, cx| {
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.memory_content
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            view.facts.composing = false;
                             view.facts.editing = None;
                             view.facts.retry = None;
                             view.memory_form_changed(cx);
@@ -443,13 +445,23 @@ impl Xylo {
         }
         if self.facts.has_more {
             page = page.child(
-                button("memory-more", "Load more")
+                button("memory-more", "Next memories (replaces current page)")
                     .disabled(self.facts.query.is_some())
                     .on_click(cx.listener(|view, _, _, cx| view.request_memories(true, cx))),
             );
         }
-        page.child(self.memory_archive_controls(cx))
-            .child(self.memory_versions_panel(cx))
+        if self.facts.before.is_some() {
+            page = page.child(
+                button("memory-first", "First memories")
+                    .disabled(self.facts.query.is_some())
+                    .on_click(cx.listener(|view, _, _, cx| view.request_memories(false, cx))),
+            );
+        }
+        super::settings::settings_content("memory-settings")
+            .child(
+                page.child(self.memory_archive_controls(cx))
+                    .child(self.memory_versions_panel(cx)),
+            )
             .into_any_element()
     }
 }

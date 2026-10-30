@@ -54,10 +54,10 @@ mod xylo {
                     cx.update(|cx| {
                         let view = view.read(cx);
                         format!(
-                            "plugin={},environment={},error={:?}",
+                            "plugin={},environment={},error={:?},connector_error={:?},connectors={},connector_loading={}",
                             view.plugins.notice,
                             view.validation_environment_notice(),
-                            view.error
+                            view.error, view.connector_error, view.connectors.len(), view.connector_loading
                         )
                     })
                 );
@@ -137,9 +137,11 @@ mod xylo {
         ) {
             use std::os::unix::fs::PermissionsExt;
             let fixture = open(cx);
-            let server = fixture.base.join("mcp-fixture");
+            let server = fixture.workspace.join("mcp-fixture");
             std::fs::write(&server, r#"#!/usr/bin/env python3
-import json,sys,time,pathlib
+import json,sys,time,pathlib,os
+pathlib.Path(__file__+".pid").write_text(str(os.getpid()))
+assert sys.argv[1:] == ["first argument", "--readonly"], sys.argv
 for line in sys.stdin:
     request=json.loads(line)
     if 'id' not in request: continue
@@ -172,7 +174,7 @@ for line in sys.stdin:
                         window,
                         cx,
                     );
-                    Xylo::set_input(&view.connector_args, "", window, cx);
+                    view.connector_args.update(cx, |input, cx| input.set_value("first argument\n--readonly", window, cx));
                 });
                 window.click("connector-save", cx);
             })
@@ -216,6 +218,7 @@ for line in sys.stdin:
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].command.as_deref(), Some(server.as_path()));
             assert!(saved[0].credential_ref.is_none());
+            assert_eq!(saved[0].args,vec!["first argument","--readonly"]);
             cx.update_window(fixture.window, |_, window, cx| {
                 window.render_frame(cx);
                 window.click(("connector-tools", 0usize), cx);
@@ -264,7 +267,7 @@ for line in sys.stdin:
             })
             .unwrap();
             assert!(
-                xylo_services::LearningService::new(store)
+                xylo_services::LearningService::new(store.clone())
                     .skills(&fixture.workspace.to_string_lossy(), 20)
                     .unwrap()
                     .iter()
@@ -329,7 +332,46 @@ for line in sys.stdin:
                         .iter()
                         .any(|tool| tool.name == "fixture_echo")
             });
+            std::fs::write(&mode,"slow").unwrap();
+            let pid=std::fs::read_to_string(PathBuf::from(format!("{}.pid",server.display()))).unwrap();
+            cx.update_window(fixture.window,|_,window,cx| {
+                window.click("manage-context-connections",cx);
+                window.render_frame(cx);
+                window.click(("connector-tools",0usize),cx);
+                assert!(fixture.view.read(cx).connector_loading);
+                window.click(("connector-remove",0usize),cx);
+            }).unwrap();
+            wait(cx,&fixture.view,|view,_|view.connector_pending.is_none() && view.connectors.is_empty());
+            let deadline=Instant::now()+Duration::from_secs(8);
+            loop {
+                let alive=std::process::Command::new("/bin/kill").arg("-0").arg(pid.trim()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap().success();
+                if !alive { break; }
+                assert!(Instant::now()<deadline,"Removing a connection must end its sandboxed inspection descendant");
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(store.connectors().unwrap().is_empty());
             shutdown(cx, &fixture);
+        }
+
+        #[gpui_kit::test]
+        fn connector_inspection_receipts_require_current_request_and_workspace(cx:&mut TestAppContext) {
+            let fixture=open(cx);
+            let other=fixture.base.join("other-project"); std::fs::create_dir(&other).unwrap();
+            cx.update_window(fixture.window,|_,window,cx| { fixture.view.update(cx,|view,cx| {
+                let id=Uuid::new_v4(); let old=Uuid::new_v4(); let original=view.workspace.clone();
+                view.connector_inspected=Some(id);view.connector_inspection_request=Some(old);view.connector_loading=true;
+                view.set_workspace(other,window,cx);
+                assert!(view.connector_inspection_request.is_none()); assert!(!view.connector_loading); assert!(view.connector_tools.is_empty());
+                let current=Uuid::new_v4();view.connector_inspected=Some(id);view.connector_inspection_request=Some(current);view.connector_loading=true;
+                for (request_id,workspace) in [(old,view.workspace.clone()),(current,original)] {
+                    view.event(xylo_runtime::host::HostEvent::ConnectorTools {request_id,workspace,connector_id:id,tools:vec![]},window,cx);
+                    assert!(view.connector_loading); assert_eq!(view.connector_inspection_request,Some(current));
+                }
+                view.event(xylo_runtime::host::HostEvent::ConnectorTools {request_id:current,workspace:view.workspace.clone(),connector_id:id,tools:vec![]},window,cx);
+                assert!(!view.connector_loading);assert!(view.connector_inspection_request.is_none());
+            }); }).unwrap();
+            shutdown(cx,&fixture);
         }
 
         #[gpui_kit::test]
@@ -341,12 +383,15 @@ for line in sys.stdin:
             let b = Uuid::new_v4();
             cx.update_window(fixture.window, |_, window, cx| {
                 fixture.view.update(cx, |view, cx| {
+                    let request_id=Uuid::new_v4();
+                    view.connector_inspection_request=Some(request_id);
                     view.connector_inspected = Some(b);
                     view.connector_loading = true;
                     view.connector_tools.clear();
                     view.connector_error = None;
                     view.event(
                         xylo_runtime::host::HostEvent::ConnectorTools {
+                            request_id, workspace:view.workspace.clone(),
                             connector_id: a,
                             tools: vec![xylo_core::ToolDefinition {
                                 name: "stale_tool".into(),
@@ -362,6 +407,7 @@ for line in sys.stdin:
                     assert!(view.connector_tools.is_empty());
                     view.event(
                         xylo_runtime::host::HostEvent::ConnectorTools {
+                            request_id, workspace:view.workspace.clone(),
                             connector_id: b,
                             tools: Vec::new(),
                         },
@@ -380,11 +426,14 @@ for line in sys.stdin:
                 window.render_frame(cx);
                 assert!(window.find_by_label("No tools returned").visible());
                 fixture.view.update(cx, |view, cx| {
+                    let request_id=Uuid::new_v4();
+                    view.connector_inspection_request=Some(request_id);
                     view.connector_inspected = Some(b);
                     view.connector_loading = true;
                     view.connector_error = None;
                     view.event(
                         xylo_runtime::host::HostEvent::ConnectorToolsFailed {
+                            request_id, workspace:view.workspace.clone(),
                             connector_id: a,
                             message: "old failure".into(),
                         },
@@ -395,6 +444,7 @@ for line in sys.stdin:
                     assert!(view.connector_error.is_none());
                     view.event(
                         xylo_runtime::host::HostEvent::ConnectorToolsFailed {
+                            request_id, workspace:view.workspace.clone(),
                             connector_id: b,
                             message: "Fixture discovery failed".into(),
                         },
@@ -415,6 +465,12 @@ for line in sys.stdin:
         }
 
         fn inspect(cx: &mut TestAppContext, fixture: &Fixture, path: PathBuf) {
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.render_frame(cx);
+                if window.try_find("extensions-native").is_some() { window.click("extensions-native",cx); }
+                window.render_frame(cx);
+            }).unwrap();
+            wait(cx,&fixture.view,|view,_|view.validation_plugin_idle());
             cx.update_window(fixture.window, |_, _, cx| {
                 fixture
                     .view

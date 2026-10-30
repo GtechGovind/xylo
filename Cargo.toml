@@ -2,7 +2,7 @@
 resolver = "2"
 members = ["crates/core", "crates/runtime", "crates/resources", "crates/worker", "crates/desktop", "crates/services", "crates/capabilities", "crates/engine", "crates/scheduler", "crates/helper-client", "crates/helper", "crates/distribution", "crates/notifications"]
 default-members = ["crates/desktop"]
-exclude = ["vendor/hermes-ultra"]
+exclude = ["vendor/hermes-ultra", "vendor/block"]
 
 [workspace.package]
 version = "0.1.0"
@@ -38,3 +38,6 @@ codegen-units = 16
 
 [profile.dev]
 debug = 1
+
+[patch.crates-io]
+block = { path = "vendor/block" }

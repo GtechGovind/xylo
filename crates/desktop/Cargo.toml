@@ -18,6 +18,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rfd = "0.15"
 shell-words = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 ignore = "0.4"
 lsp-types = { version = "0.97", features = ["proposed"] }
@@ -29,5 +30,6 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 
 
 [dev-dependencies]
+gpui-kit = { version = "=0.8.0", features = ["test-support"] }
 tempfile = "3"
 sha2 = "0.10"

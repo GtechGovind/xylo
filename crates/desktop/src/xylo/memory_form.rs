@@ -509,6 +509,9 @@ impl Xylo {
         cx.notify();
     }
     pub(super) fn memory_form_status(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.facts.forms.oversize {
+            return subtitle("Current text is not saved: Memory drafts are limited to 256 KiB (262,144 UTF-8 bytes). Copy your text before shortening it.").into_any_element();
+        }
         let Some(entry) = self.facts.forms.entries.get(&self.scope()) else {
             return subtitle("Loading draft…").into_any_element();
         };

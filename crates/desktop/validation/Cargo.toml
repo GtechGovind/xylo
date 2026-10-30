@@ -23,6 +23,7 @@ async-channel="2"
 zip={version="6",default-features=false,features=["deflate"]}
 rfd="0.15"
 shell-words="1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sha2="0.10"
 image={version="=0.25.10",default-features=false,features=["png"]}
 
@@ -139,3 +140,21 @@ path="account_interactions.rs"
 [[test]]
 name="composer-interactions"
 path="composer_interactions.rs"
+
+[[test]]
+name="extension-rendering"
+path="extension_rendering.rs"
+harness=false
+
+[[test]]
+name="portable-tool-rendering"
+path="portable_tool_rendering.rs"
+harness=false
+
+[patch.crates-io]
+block = { path = "../../../vendor/block" }
+
+[[test]]
+name="paste-rendering"
+path="paste_rendering.rs"
+harness=false

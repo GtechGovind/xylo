@@ -3,12 +3,12 @@ impl AgentLoop {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Remove duplicate tool calls that share the same function name and arguments.
+    /// Remove repeated wire IDs while preserving distinct provider call IDs.
     fn deduplicate_tool_calls(calls: &[ToolCall]) -> Vec<ToolCall> {
         let mut seen = HashSet::new();
         let mut deduped = Vec::new();
         for tc in calls {
-            let key = format!("{}:{}", tc.function.name, tc.function.arguments);
+            let key = tc.id.clone();
             if seen.insert(key) {
                 deduped.push(tc.clone());
             } else {
@@ -907,6 +907,19 @@ impl AgentLoop {
             }
         }
 
+        // A worker panic or cancellation is still an outcome for the original
+        // provider call. Never leave a dangling assistant tool-call in history.
+        for tc in tool_calls {
+            if !results.iter().any(|result| result.tool_call_id == tc.id) {
+                let error = "Tool execution stopped before returning a result; its effects may be incomplete. Inspect state before repeating a mutation.";
+                tool_errors.push(hermes_core::ToolErrorRecord {
+                    tool_name: tc.function.name.clone(),
+                    error: error.into(),
+                    turn,
+                });
+                results.push(ToolResult::err(&tc.id, error));
+            }
+        }
         results
     }
 

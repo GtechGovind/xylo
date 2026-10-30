@@ -101,6 +101,48 @@ fn readable(value: &Value) -> Option<&str> {
         .find_map(|key| value.get(*key).and_then(Value::as_str))
     })
 }
+fn component_preview(value: &Value, depth: usize) -> String {
+    if let Some(text) = readable(value).filter(|text| !text.is_empty()) {
+        return short(text, 2000);
+    }
+    let command_output = ["stdout", "stderr"]
+        .iter()
+        .filter_map(|key| value.get(*key).and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .map(|text| short(text, 1000))
+        .collect::<Vec<_>>();
+    if !command_output.is_empty() {
+        return command_output.join("\n");
+    }
+    if let Some(content) = value.get("content").or_else(|| value.get("contents")) {
+        let blocks: Vec<&Value> = content
+            .as_array()
+            .map(|blocks| blocks.iter().take(ROW_LIMIT).collect())
+            .unwrap_or_else(|| vec![content]);
+        let texts = blocks
+            .into_iter()
+            .filter_map(|block| {
+                block
+                    .as_str()
+                    .or_else(|| block.get("text").and_then(Value::as_str))
+                    .or_else(|| block.get("value").and_then(Value::as_str))
+            })
+            .map(|text| short(text, 400))
+            .collect::<Vec<_>>();
+        if !texts.is_empty() {
+            return short(&texts.join("\n"), 2000);
+        }
+    }
+    if let Some(tools) = value.get("tools").and_then(Value::as_array) {
+        return format!("{} tools available", tools.len());
+    }
+    if depth < 2
+        && let Some(result) = value.get("result")
+    {
+        return component_preview(result, depth + 1);
+    }
+    "Completed".into()
+}
 fn search_match(row: &str) -> Option<(&str, u64, &str)> {
     row.match_indices(':').find_map(|(index, _)| {
         let (number, content) = row[index + 1..].split_once(':')?;
@@ -133,6 +175,9 @@ impl ToolPresentation {
             "git_diff" => "Git diff",
             "memory_search" => "Recall",
             "memory_remember" => "Remember",
+            "extension_skill" => "Use skill",
+            "extension_resource" => "Read resource",
+            "extension_component" => "Run plugin",
             _ => name,
         };
         let mut target = [
@@ -145,6 +190,16 @@ impl ToolPresentation {
         if name == "files_list" && target.is_empty() {
             target = ".".into();
         }
+        if name == "extension_skill" {
+            target = text(input, "id")
+                .rsplit(':')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+        }
+        if name == "extension_component" {
+            target = input.get("input").and_then(|value| value.get("entry")).and_then(Value::as_str).unwrap_or_else(|| match text(input, "component") { "mcpServers" => "MCP servers", "lspServers" => "Language servers", "hooks" => "Hooks", other => other }).to_owned();
+        }
         let mut shown = Self {
             verb: verb.replace('_', " "),
             target: short(&target, 160),
@@ -152,6 +207,8 @@ impl ToolPresentation {
                 "file_write" | "file_edit" => "Allow this change to your project?",
                 "run_command" | "shell_command" => "Allow this command in your project?",
                 "agent_delegate" => "Start a helper agent?",
+                "extension_skill" => "Run this skill with the current project permissions?",
+                "extension_component" => "Run this plugin component in its configured project?",
                 _ => "Allow this action?",
             }
             .into(),
@@ -179,6 +236,37 @@ impl ToolPresentation {
             ));
         }
         shown.body = match name {
+            "extension_skill" => {
+                if !text(output, "instructions").is_empty() {
+                    ToolBody::Markdown(short(text(output, "instructions"), 8000))
+                } else {
+                    readable(output)
+                        .map(|text| ToolBody::Markdown(short(text, 8000)))
+                        .unwrap_or(ToolBody::Empty)
+                }
+            }
+            "extension_component" => {
+                shown.meta = Some(short(text(input, "operation"), 40));
+                if let Some(results) = output.get("results").and_then(Value::as_array) {
+                    let rows = results
+                        .iter()
+                        .take(ROW_LIMIT)
+                        .map(|row| {
+                            let entry = text(row, "entry");
+                            let detail = component_preview(&row["output"], 0);
+                            format!("{}: {}", short(entry, 100), short(&detail, 2000))
+                        })
+                        .collect::<Vec<_>>();
+                    ToolBody::Message(short(&rows.join("\n"), 8000))
+                } else if result.is_some() {
+                    ToolBody::Message(
+                        "Component status available. Open Raw details for its configuration."
+                            .into(),
+                    )
+                } else {
+                    ToolBody::Empty
+                }
+            }
             "files_list" | "find_files" => {
                 let values = output
                     .get(if name == "files_list" {
@@ -383,6 +471,41 @@ mod tests {
         )
     }
     use serde_json::Value;
+    #[test]
+    fn portable_tools_show_skill_and_component_names_without_raw_envelopes() {
+        let skill = prepare(
+            "extension_skill",
+            json!({"id":"extension-abcd:review"}),
+            json!({"instructions":"Review the diff."}),
+        );
+        assert_eq!(skill.verb, "Use skill");
+        assert_eq!(skill.target, "review");
+        assert!(matches!(skill.body, ToolBody::Markdown(ref text) if text == "Review the diff."));
+        let component = prepare(
+            "extension_component",
+            json!({"component":"mcpServers","operation":"call"}),
+            json!({"results":[{"entry":"search","output":{"content":[{"type":"text","text":"Three matches found"}]}}]}),
+        );
+        assert_eq!(component.verb, "Run plugin");
+        assert_eq!(component.meta.as_deref(), Some("call"));
+        assert!(
+            matches!(component.body, ToolBody::Message(ref text) if text == "search: Three matches found")
+        );
+        let hook = prepare(
+            "extension_component",
+            json!({"component":"hooks","operation":"event"}),
+            json!({"results":[{"entry":"After tools","output":{"stdout":"Checks passed","stderr":""}}]}),
+        );
+        assert!(matches!(hook.body, ToolBody::Message(ref text) if text.contains("Checks passed")));
+        let lsp = prepare(
+            "extension_component",
+            json!({"component":"lspServers","operation":"request"}),
+            json!({"results":[{"entry":"rust","output":{"result":{"contents":{"kind":"markdown","value":"A workspace value"}}}}]}),
+        );
+        assert!(
+            matches!(lsp.body, ToolBody::Message(ref text) if text.contains("A workspace value"))
+        );
+    }
     #[test]
     fn directory_listing_is_names_and_types_without_envelopes() {
         let shown = prepare(

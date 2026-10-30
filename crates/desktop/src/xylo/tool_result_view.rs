@@ -50,7 +50,7 @@ fn remaining(count: usize) -> AnyElement {
         .pt_1()
         .text_size(px(10.))
         .text_color(rgb(muted()))
-        .child(format!("{count} more · full output in Raw details"))
+        .child(format!("{count} more · output preview in Raw details"))
         .into_any_element()
 }
 impl Xylo {
@@ -210,7 +210,7 @@ impl Xylo {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(muted()))
-                            .child("Output shortened · full output in Raw details"),
+                            .child("Output shortened · output preview in Raw details"),
                     );
                 }
                 body = body.child(command_body);
@@ -272,8 +272,14 @@ impl Xylo {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(muted()))
-                            .child("Arguments"),
+                            .child("Arguments preview"),
                     )
+                    .child(button(("tool-copy-input", i), "Copy full arguments")
+                        .text_size(px(10.))
+                        .on_click({
+                            let input = serde_json::to_string_pretty(&tool.input).unwrap_or_default();
+                            move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(input.clone()))
+                        }))
                     .child(code_block(
                         ("raw-arguments", i),
                         &tool.presentation.raw_input,
@@ -296,7 +302,7 @@ impl Xylo {
                                     div()
                                         .text_size(px(10.))
                                         .text_color(rgb(muted()))
-                                        .child("Result"),
+                                        .child("Result preview"),
                                 )
                                 .child(
                                     button(("tool-copy-raw", i), "Copy full result")

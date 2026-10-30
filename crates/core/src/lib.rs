@@ -388,6 +388,13 @@ impl std::fmt::Debug for WorkerCredential {
     }
 }
 
+/// Private host-to-worker credential response; never persisted in turn history.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderCredentialUpdate {
+    pub generation: u64,
+    pub credential: WorkerCredential,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 #[allow(
@@ -402,6 +409,10 @@ pub enum WorkerCommand {
     RunAuthorized {
         turn: TurnRequest,
         credential: WorkerCredential,
+    },
+    ProviderCredentialUpdated {
+        request_id: Uuid,
+        result: Result<ProviderCredentialUpdate, String>,
     },
     Cancel,
     Steer {
@@ -430,6 +441,12 @@ pub struct Usage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EngineEvent {
+    /// Internal request intercepted by the host, never forwarded to the UI.
+    ProviderCredentialRequested {
+        request_id: Uuid,
+        generation: u64,
+        force: bool,
+    },
     Ready {
         engine: String,
         revision: String,
@@ -598,6 +615,13 @@ mod tests {
         let decoded: WorkerCredential =
             serde_json::from_str(&serde_json::to_string(&credential).unwrap()).unwrap();
         assert_eq!(decoded.0, credential.0);
+        let command = WorkerCommand::ProviderCredentialUpdated {
+            request_id: Uuid::new_v4(),
+            result: Ok(ProviderCredentialUpdate { generation: 1, credential }),
+        };
+        assert!(!format!("{command:?}").contains("fixture-secret"));
+        let decoded: WorkerCommand = serde_json::from_str(&serde_json::to_string(&command).unwrap()).unwrap();
+        assert!(matches!(decoded, WorkerCommand::ProviderCredentialUpdated { result: Ok(ProviderCredentialUpdate { generation: 1, .. }), .. }));
     }
     #[test]
     fn incompatible_protocol_is_rejected() {

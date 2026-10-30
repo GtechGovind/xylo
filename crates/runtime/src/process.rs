@@ -89,11 +89,39 @@ pub async fn run(
     cancel: CancellationToken,
 ) -> Result<ProcessResult> {
     let mut command = Command::new(program);
+    command.args(args);
+    run_prepared(command, cwd, timeout, cancel).await
+}
+
+pub async fn run_sandboxed(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    read_roots: &[std::path::PathBuf],
+    protected_paths: &[std::path::PathBuf],
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<ProcessResult> {
+    let prepared =
+        xylo_services::sandbox::prepare_coding(program, args, cwd, read_roots, protected_paths)
+            .map_err(|e| anyhow::Error::new(NotStarted(e.to_string())))?;
+    let _temporary = prepared.temporary;
+    run_prepared(prepared.command, cwd, timeout, cancel).await
+}
+
+pub async fn run_prepared(
+    mut command: Command,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<ProcessResult> {
+    if cancel.is_cancelled() {
+        return Err(NotStarted("Cancelled before process start".into()).into());
+    }
     // Background pipes must not create a separate Windows console.
     #[cfg(windows)]
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
-        .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -103,7 +131,7 @@ pub async fn run(
     command.process_group(0);
     let mut child = command
         .spawn()
-        .map_err(|error| anyhow::Error::new(NotStarted(format!("Start {program}: {error}"))))?;
+        .map_err(|error| anyhow::Error::new(NotStarted(format!("Start process: {error}"))))?;
     let group = ProcessGroup {
         #[cfg(unix)]
         pid: child.id(),
@@ -148,6 +176,55 @@ pub fn require_success(result: ProcessResult) -> Result<ProcessResult> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn managed_sandbox_allows_project_write_but_denies_outside_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let result = run_sandboxed(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "printf allowed > inside; printf denied > \"$1/outside\"".into(),
+                "sh".into(),
+                outside.path().to_string_lossy().into_owned(),
+            ],
+            dir.path(),
+            &[],
+            &[],
+            Duration::from_secs(20),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("inside")).unwrap(),
+            "allowed",
+            "sandbox output: {}",
+            result.stderr
+        );
+        assert!(!outside.path().join("outside").exists());
+        assert_ne!(result.code, Some(0));
+    }
+    #[tokio::test]
+    async fn managed_sandbox_protected_subdirectory_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("credentials");
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::write(secret.join("token"), "private-fixture").unwrap();
+        let result = run_sandboxed(
+            "/bin/cat",
+            &[secret.join("token").to_string_lossy().into_owned()],
+            dir.path(),
+            &[],
+            &[secret],
+            Duration::from_secs(20),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.stdout.contains("private-fixture"));
+        assert_ne!(result.code, Some(0));
+    }
     #[tokio::test]
     async fn arguments_are_literal_and_output_is_bounded() {
         let dir = tempfile::tempdir().unwrap();

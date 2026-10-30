@@ -66,6 +66,48 @@ impl SpeechUi {
     }
 }
 impl Xylo {
+    pub(super) fn speech_recording_active(&self) -> bool {
+        self.speech.capturing()
+    }
+    pub(super) fn global_recording_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let finishing = matches!(
+            self.speech.recording_state.as_str(),
+            "finalizing" | "cancelling"
+        );
+        let label = match self.speech.recording_state.as_str() {
+            "starting" => "Waiting for microphone…".into(),
+            "finalizing" => "Finishing recording…".into(),
+            "cancelling" => "Discarding recording…".into(),
+            _ => format!(
+                "Recording {:02}:{:02}",
+                self.speech.elapsed_ms / 60000,
+                (self.speech.elapsed_ms / 1000) % 60
+            ),
+        };
+        div()
+            .px_5()
+            .py_1()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(rgb(border()))
+            .child(subtitle(label))
+            .child(
+                button(
+                    "global-recording-stop",
+                    if self.speech.recording_state == "starting" {
+                        "Cancel"
+                    } else {
+                        "Stop recording"
+                    },
+                )
+                .disabled(finishing)
+                .on_click(cx.listener(|view, _, _, cx| view.speech_record_stop(cx))),
+            )
+            .into_any_element()
+    }
+
     fn speech_request(&mut self, name: &str, args: Value, cx: &mut Context<Self>) -> Option<Uuid> {
         while self.speech.ignored.len() > 128 {
             self.speech.ignored.pop_first();

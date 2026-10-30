@@ -225,6 +225,7 @@ impl Default for ContextCompressor {
 #[derive(Debug, Clone)]
 pub struct ContextManager {
     messages: Vec<Message>,
+    external_context_management: bool,
     /// Maximum total characters for the conversation (excluding system messages).
     max_context_chars: usize,
     /// Compressor used when the context exceeds the budget threshold.
@@ -236,6 +237,7 @@ impl ContextManager {
     pub fn new(max_context_chars: usize) -> Self {
         Self {
             messages: Vec::new(),
+            external_context_management: false,
             max_context_chars,
             compressor: ContextCompressor::default(),
         }
@@ -250,9 +252,14 @@ impl ContextManager {
     pub fn with_compressor(max_context_chars: usize, compressor: ContextCompressor) -> Self {
         Self {
             messages: Vec::new(),
+            external_context_management: false,
             max_context_chars,
             compressor,
         }
+    }
+
+    pub fn set_external_context_management(&mut self, enabled: bool) {
+        self.external_context_management = enabled;
     }
 
     /// Add a message to the conversation history.
@@ -289,6 +296,9 @@ impl ContextManager {
     ///
     /// Older messages are removed from the middle until the total fits.
     pub fn truncate_to_budget(&mut self, budget: &BudgetConfig) {
+        if self.external_context_management {
+            return;
+        }
         let max_chars = budget.max_aggregate_chars.min(self.max_context_chars);
         let total_chars: usize = self
             .messages
@@ -338,6 +348,9 @@ impl ContextManager {
     /// shorter message list where older messages are replaced by a single
     /// summary system message and the most recent messages are kept intact.
     pub fn compress(&mut self) {
+        if self.external_context_management {
+            return;
+        }
         let threshold = (self.max_context_chars as f64 * 0.8) as usize;
         let total = self.total_chars();
 

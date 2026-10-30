@@ -15,3 +15,5 @@ __pycache__/
 /experiments/
 /.scratch/
 /rea-evidence/
+/crates/services/sandbox-helper/node_modules/
+/vendor/hermes-ultra/Cargo.lock

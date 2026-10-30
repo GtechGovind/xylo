@@ -84,6 +84,186 @@ mod xylo {
             }
         }
         #[gpui_kit::test]
+        fn native_paste_shortcut_imports_images_and_files_but_keeps_text_paste(cx: &mut TestAppContext) {
+            let directory = tempfile::tempdir().unwrap();
+            let base = directory.path().canonicalize().unwrap();
+            let workspace = base.join("project");
+            std::fs::create_dir(&workspace).unwrap();
+            let image = workspace.join("copied.png");
+            std::fs::write(&image, PNG).unwrap();
+            let unsupported = workspace.join("notes.txt");
+            std::fs::write(&unsupported, "Not an image").unwrap();
+            let (_client, window, view) = open(cx, AppPaths::at(base.join("profile")).unwrap());
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.set_workspace(workspace.clone(), window, cx)
+                })
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let paste = if cfg!(target_os = "macos") {
+                "cmd-v"
+            } else {
+                "ctrl-v"
+            };
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.composer.update(cx, |input, cx| {
+                        input.set_value("Existing caption", window, cx);
+                        input.focus(window, cx)
+                    })
+                });
+                cx.write_to_clipboard(ClipboardItem::from(ClipboardEntry::ExternalPaths(
+                    ExternalPaths(vec![image.clone()].into()),
+                )));
+                window.render_frame(cx);
+                window.press(paste, cx);
+                assert!(
+                    view.read(cx)
+                        .attachments
+                        .importing_for(view.read(cx).session),
+                    "The focused composer's native paste shortcut must route copied image files to import"
+                );
+            })
+            .unwrap();
+            wait(cx, &view, "keyboard pasted image file", |view, _| {
+                view.draft_attachments().len() == 1 && !view.attachments.importing_for(view.session)
+            });
+            assert_eq!(
+                cx.update(|cx| view.read(cx).draft_attachments()[0].source),
+                AttachmentSource::PastedFile
+            );
+            cx.update(|cx| {
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_str(),
+                    "Existing caption"
+                )
+            });
+            cx.update_window(window, |_, window, cx| {
+                cx.write_to_clipboard(ClipboardItem {
+                    entries: vec![
+                        ClipboardEntry::Image(gpui_kit::Image::from_bytes(
+                            gpui_kit::ImageFormat::Png,
+                            PNG.to_vec(),
+                        )),
+                        ClipboardEntry::String(gpui_kit::ClipboardString::new(
+                            "Do not insert image alt text".into(),
+                        )),
+                    ],
+                });
+                window.press(paste, cx);
+            })
+            .unwrap();
+            wait(cx, &view, "keyboard pasted image pixels", |view, _| {
+                view.draft_attachments().len() == 2 && !view.attachments.importing_for(view.session)
+            });
+            assert_eq!(
+                cx.update(|cx| view.read(cx).draft_attachments()[1].source),
+                AttachmentSource::Clipboard
+            );
+            cx.update_window(window, |_, window, cx| {
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_str(),
+                    "Existing caption"
+                );
+                window.press(
+                    if cfg!(target_os = "macos") {
+                        "cmd-a"
+                    } else {
+                        "ctrl-a"
+                    },
+                    cx,
+                );
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    "Normal text\nwith newline".into(),
+                ));
+                window.press(paste, cx);
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_str(),
+                    "Normal text\nwith newline"
+                );
+                window.press(
+                    if cfg!(target_os = "macos") {
+                        "cmd-z"
+                    } else {
+                        "ctrl-z"
+                    },
+                    cx,
+                );
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_str(),
+                    "Existing caption"
+                );
+                window.press(
+                    if cfg!(target_os = "macos") {
+                        "cmd-shift-z"
+                    } else {
+                        "ctrl-y"
+                    },
+                    cx,
+                );
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_str(),
+                    "Normal text\nwith newline"
+                );
+                cx.write_to_clipboard(ClipboardItem::from(ClipboardEntry::ExternalPaths(
+                    ExternalPaths(vec![unsupported].into()),
+                )));
+                window.press(paste, cx);
+            })
+            .unwrap();
+            wait(cx, &view, "unsupported copied file settled", |view, _| {
+                !view.attachments.importing_for(view.session)
+            });
+            cx.update(|cx| {
+                assert_eq!(view.read(cx).draft_attachments().len(), 2);
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_str(),
+                    "Normal text\nwith newline"
+                );
+                assert!(
+                    !view.read(cx).attachments.notice.is_empty()
+                        && !view
+                            .read(cx)
+                            .attachments
+                            .notice
+                            .starts_with("Image attached"),
+                    "Unsupported file paste must explain why it was not attached"
+                );
+            });
+            cx.update_window(window, |_, window, cx| {
+                cx.write_to_clipboard(ClipboardItem::from(ClipboardEntry::ExternalPaths(
+                    ExternalPaths(vec![image; 5].into()),
+                )));
+                window.press(paste, cx);
+                assert!(
+                    !view
+                        .read(cx)
+                        .attachments
+                        .importing_for(view.read(cx).session)
+                );
+                assert_eq!(view.read(cx).draft_attachments().len(), 2);
+                assert!(view.read(cx).attachments.notice.contains("four"));
+                cx.write_to_clipboard(ClipboardItem::new_image(&gpui_kit::Image::from_bytes(
+                    gpui_kit::ImageFormat::Png,
+                    vec![0; xylo_core::MAX_IMAGE_BYTES as usize + 1],
+                )));
+                window.press(paste, cx);
+                assert!(
+                    !view
+                        .read(cx)
+                        .attachments
+                        .importing_for(view.read(cx).session)
+                );
+                assert!(view.read(cx).attachments.notice.contains("8 MiB"));
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_str(),
+                    "Normal text\nwith newline"
+                );
+            })
+            .unwrap();
+        }
+        #[gpui_kit::test]
         fn native_clipboard_file_drop_remove_and_history_reopen_keep_only_managed_refs(
             cx: &mut TestAppContext,
         ) {
@@ -233,13 +413,46 @@ mod xylo {
             cx.run_until_parked();
         }
         #[gpui_kit::test]
-        fn late_import_for_previous_chat_cannot_attach_to_new_chat(cx: &mut TestAppContext) {
+        fn late_import_failure_is_shown_only_on_its_original_draft(cx: &mut TestAppContext) {
+            let directory = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(directory.path().join("profile")).unwrap();
+            let (client,window,view) = open(cx,paths);
+            let selected=directory.path().join("selected.png");
+            std::fs::write(&selected,PNG).unwrap();
+            let original_session=cx.update(|cx|view.read(cx).session);
+            let original_key=DraftKey { session_id:original_session,workspace:None };
+            wait(cx,&view,"original draft loaded",|view,_|view.drafts.validation_revision(&original_key).is_some());
+            cx.update_window(window,|_,window,cx| {
+                view.update(cx,|view,cx| {
+                    view.attach_image_paths(vec![selected],AttachmentSource::Picker,cx);
+                    let (id,session)=view.attachments.validation_import().unwrap();
+                    view.new_chat(cx);
+                    view.attachments.notice="Current chat notice".into();
+                    view.event(HostEvent::ImageImported { request_id:id,session_id:session,result:Err("Original image could not be prepared".into()) },window,cx);
+                    assert_eq!(view.attachments.notice,"Current chat notice","Late error must not appear in another chat");
+                });
+            }).unwrap();
+            cx.run_until_parked();
+            cx.update_window(window,|_,_,cx| {
+                view.update(cx,|view,cx| { view.session=original_session; view.draft_switch_deferred(cx); });
+            }).unwrap();
+            cx.run_until_parked();
+            cx.update(|cx|assert_eq!(view.read(cx).attachments.notice,"Original image could not be prepared","Originating draft must retain its own import failure"));
+            client.shutdown().unwrap();
+            cx.run_until_parked();
+        }
+
+        #[gpui_kit::test]
+        fn late_import_preserves_original_draft_without_attaching_to_new_chat(cx: &mut TestAppContext) {
             let directory = tempfile::tempdir().unwrap();
             let paths = AppPaths::at(directory.path().join("profile")).unwrap();
             let (client, window, view) = open(cx, paths.clone());
             let selected = directory.path().join("selected.png");
             std::fs::write(&selected, PNG).unwrap();
             let original_session = cx.update(|cx| view.read(cx).session);
+            let original_key = DraftKey { session_id: original_session, workspace: None };
+            let store = Store::open(&paths.database).unwrap();
+            wait(cx, &view, "original draft loaded", |view, _| view.drafts.validation_revision(&original_key).is_some());
             let assets = AttachmentStore::new(paths.artifacts.clone()).unwrap();
             let image = assets
                 .import_file(
@@ -261,7 +474,7 @@ mod xylo {
                         HostEvent::ImageImported {
                             request_id: id,
                             session_id: old_session,
-                            result: Ok((image, preview)),
+                            result: Ok((image.clone(), preview)),
                         },
                         window,
                         cx,
@@ -277,6 +490,10 @@ mod xylo {
                 |view, _| !view.attachments.importing(),
             );
             cx.update(|cx| assert!(view.read(cx).draft_attachments().is_empty()));
+            wait(cx, &view, "original draft attachment saved", |_, _| {
+                store.draft(&original_key).unwrap().attachments.iter().any(|attachment| attachment.id == image.id)
+            });
+            assert!(cx.update(|cx| view.read(cx).draft_attachments().is_empty()));
             client.shutdown().unwrap();
             cx.run_until_parked();
         }

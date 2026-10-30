@@ -3,6 +3,8 @@
 mod diagnostics;
 mod request;
 mod stream;
+mod renewal;
+pub(crate) use renewal::build_renewable;
 #[cfg(test)]
 mod tests;
 
@@ -105,9 +107,9 @@ impl NativeProvider {
         let error_redactions = Arc::new(error_redactions);
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(config.timeout_seconds))
             .build()
             .context("Create provider HTTP client")?;
         Ok(Self {
@@ -177,15 +179,21 @@ impl NativeProvider {
             .send()
             .await
             .map_err(|error| {
-                AgentError::LlmApi(format!(
-                    "Provider transport failed: {}",
-                    error.without_url()
-                ))
+                AgentError::ProviderTransport {
+                    // Once request transmission may have started, replay is unsafe.
+                    retryable: error.is_connect(),
+                    message: format!("Provider transport failed: {}", error.without_url()),
+                }
             })?;
         if response.status().is_success() {
             return Ok(response);
         }
         let status = response.status();
+        let retry_after_secs = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|value| retry_after_seconds(value, chrono::Utc::now().timestamp()));
         let payload = read_json(response).await.unwrap_or(Value::Null);
         let code = payload
             .pointer("/error/code")
@@ -227,12 +235,37 @@ impl NativeProvider {
                 ""
             }
         );
-        Err(if matches!(status.as_u16(), 401 | 403) {
+        Err(if self.chatgpt_plan && status.as_u16() == 401 && code == "token_expired" {
+            AgentError::AuthFailed(renewal::TOKEN_EXPIRED.into())
+        } else if matches!(status.as_u16(), 401 | 403) {
             AgentError::AuthFailed(message)
+        } else if matches!(
+            code.as_str(),
+            "model_not_found"
+                | "invalid_model"
+                | "model_not_available"
+                | "invalid_request_error"
+                | "invalid_request"
+                | "invalid_schema"
+                | "invalid_api_key"
+        ) {
+            AgentError::Config(message)
         } else {
-            AgentError::LlmApi(message)
+            AgentError::ProviderHttp {
+                status: status.as_u16(),
+                retry_after_secs,
+                message,
+            }
         })
     }
+}
+
+fn retry_after_seconds(value: &str, now: i64) -> Option<u64> {
+    value.trim().parse().ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|date| date.timestamp().saturating_sub(now).max(0) as u64)
+    })
 }
 
 fn contains_images(value: &Value) -> bool {
@@ -260,12 +293,15 @@ async fn read_json(mut response: reqwest::Response) -> Result<Value, AgentError>
         return Err(AgentError::LlmApi("Provider response exceeds 8 MiB".into()));
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| {
-        AgentError::LlmApi(format!(
-            "Provider response read failed: {}",
-            error.without_url()
-        ))
-    })? {
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| AgentError::ProviderTransport {
+                retryable: false,
+                message: format!("Provider response read failed: {}", error.without_url()),
+            })?
+    {
         if bytes.len() + chunk.len() > MAX {
             return Err(AgentError::LlmApi("Provider response exceeds 8 MiB".into()));
         }
@@ -333,7 +369,7 @@ impl LlmProvider for NativeProvider {
             let mut framing=stream::SseDecoder::default();
             let mut state=stream::EventState::new(provider.endpoint.protocol, provider.error_redactions.clone(), request_id);
             while let Some(chunk)=bytes.next().await {
-                let chunk=chunk.map_err(|error|AgentError::LlmApi(format!("Provider stream read failed: {}",error.without_url())))?;
+                let chunk=chunk.map_err(|error|AgentError::ProviderTransport { retryable: false, message: format!("Provider stream read failed: {}",error.without_url()) })?;
                 for event in framing.feed(&chunk)? {
                     for chunk in state.event(event)?{yield chunk;}
                 }

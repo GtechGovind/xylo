@@ -1,6 +1,7 @@
 //! Native application services.
 
 pub mod drafts;
+pub mod extensions;
 pub use xylo_services::action_review::*;
 pub mod history;
 pub mod host;
@@ -9,6 +10,7 @@ pub mod lsp;
 pub mod process;
 pub mod resources;
 pub mod steering;
+pub mod turn_queue;
 pub mod terminal;
 pub mod updates;
 pub mod workspace;

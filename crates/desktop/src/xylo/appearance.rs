@@ -73,87 +73,10 @@ impl Xylo {
         } else {
             WindowAppearance::Light
         }));
+        // Native primitives (inputs, menus, markdown, scrollbars) paint with
+        // Xylo's palette rather than the toolkit's defaults.
+        sync_toolkit_theme(cx);
+        install_fonts(cx);
         cx.notify();
-    }
-    pub(super) fn appearance_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut themes = div().flex().gap_2();
-        for (id, label) in [("light", "Light"), ("dark", "Dark")] {
-            themes = themes.child(
-                button(SharedString::from(format!("theme-{id}")), label)
-                    .border_1()
-                    .border_color(rgb(border()))
-                    .bg(rgb(if self.settings.theme == id {
-                        selected()
-                    } else {
-                        panel()
-                    }))
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        view.settings.theme = id.into();
-                        view.apply_theme(window, cx);
-                        view.persist_ui(cx);
-                    })),
-            );
-        }
-        let mut layout = card().child(subtitle(
-            "Drag a panel edge to resize it, or use the controls below.",
-        ));
-        for (i, label, kind) in [
-            (0, "Sidebar", Panel::Sidebar),
-            (1, "File browser", Panel::Files),
-            (2, "Terminal", Panel::Terminal),
-        ] {
-            let mut row = div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().flex_1().child(label));
-            for (suffix, delta, glyph) in [("smaller", -24., "−"), ("larger", 24., "+")] {
-                row = row.child(
-                    button(SharedString::from(format!("layout-{i}-{suffix}")), glyph)
-                        .accessibility_label(format!("Make {label} {suffix}"))
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            match kind {
-                                Panel::Sidebar => {
-                                    view.settings.ui.sidebar_width =
-                                        (view.settings.ui.sidebar_width + delta).clamp(200., 400.)
-                                }
-                                Panel::Files => {
-                                    view.settings.ui.files_width =
-                                        (view.settings.ui.files_width + delta).clamp(180., 480.)
-                                }
-                                Panel::Work => {
-                                    view.settings.ui.work_panel_width =
-                                        (view.settings.ui.work_panel_width + delta)
-                                            .clamp(320., 1200.);
-                                }
-                                Panel::Terminal => {
-                                    view.settings.ui.terminal_height =
-                                        (view.settings.ui.terminal_height + delta).clamp(150., 520.)
-                                }
-                            }
-                            view.persist_ui(cx);
-                            cx.notify();
-                        })),
-                );
-            }
-            layout = layout.child(row);
-        }
-        div()
-            .size_full()
-            .p_6()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(heading("Appearance", "Make your workspace comfortable."))
-            .child(card().child(subtitle("THEME")).child(themes))
-            .child(layout)
-            .child(button("reset-layout", "Reset layout").on_click(cx.listener(
-                |view, _, _, cx| {
-                    view.settings.ui = UiPreferences::default();
-                    view.persist_ui(cx);
-                    cx.notify();
-                },
-            )))
-            .into_any_element()
     }
 }

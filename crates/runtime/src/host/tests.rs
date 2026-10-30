@@ -70,6 +70,7 @@ pub(super) fn state() -> (tempfile::TempDir, Arc<HostState>, Receiver<HostEvent>
         events,
         resources: ResourceManager::new(),
         queued: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        turn_queue: turn_queue_control::TurnQueueControl::default(),
         scheduled: Arc::new(Mutex::new(HashMap::new())),
         stopping: Arc::new(AtomicBool::new(false)),
         helpers: Mutex::new(HashMap::new()),
@@ -236,8 +237,11 @@ async fn retiring_workers_remain_supervised_until_reaped_and_active_turns_surviv
         let (exited_tx, exited) = tokio::sync::watch::channel(false);
         (
             WorkerHandle {
+            credentials: Arc::new(parking_lot::Mutex::new(None)),
                 commands,
                 active: Arc::new(AtomicBool::new(active)),
+                queue_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                queue_stopped: Arc::new(AtomicBool::new(false)),
                 lease: Arc::new(Mutex::new(None)),
                 stop: CancellationToken::new(),
                 exited,
@@ -769,4 +773,125 @@ async fn provider_catalog_network_does_not_hold_settings_commit_admission() {
             break;
         }
     }
+}
+
+#[tokio::test]
+async fn connector_mutation_ack_is_durable_when_catalog_read_is_corrupt() {
+    let (_directory, host, events) = state();
+    rusqlite::Connection::open(&host.paths.database).unwrap().execute("INSERT INTO connectors(id,name,json) VALUES('broken','Broken legacy row','invalid JSON')", []).unwrap();
+    let config = ConnectorConfig { id:Uuid::new_v4(),name:"Durable fixture".into(),transport:"stdio".into(),endpoint:String::new(),command:Some(PathBuf::from("/usr/bin/true")),args:vec!["one".into(),"two".into()],credential_ref:None };
+    let request_id = Uuid::new_v4();
+    host.handle(HostCommand::MutateConnector(request_id,Some(config.clone()),None,None)).await.unwrap();
+    match events.recv().await.unwrap() {
+        HostEvent::ConnectorMutation { request_id:actual,result:Ok(receipt) } => {
+            assert_eq!(actual,request_id); assert_eq!(receipt.saved.unwrap().id,config.id);
+        }
+        _ => panic!("Durable save must acknowledge success independently of catalog decoding"),
+    }
+    assert!(host.store.connectors().is_err(),"Fixture must fail catalog refresh");
+    let count:i64=rusqlite::Connection::open(&host.paths.database).unwrap().query_row("SELECT COUNT(*) FROM connectors WHERE id=?1",[config.id.to_string()],|row|row.get(0)).unwrap(); assert_eq!(count,1);
+}
+
+#[tokio::test]
+async fn tracked_schedule_failure_is_correlated_and_does_not_claim_success() {
+    let (_directory,host,events)=state();
+    std::fs::write(host.paths.artifacts.join("schedules.json"),"invalid JSON").unwrap();
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::CreateScheduleTracked(request_id,"Fixture task".into(),"0 * * * * * *".into(),host.paths.data.clone())).await.unwrap();
+    match events.recv().await.unwrap() {
+        HostEvent::ScheduleMutation { request_id:actual,result:Err(_) } => assert_eq!(actual,request_id),
+        _=>panic!("Failed durable save requires correlated failure"),
+    }
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn schedule_durable_ack_precedes_failed_list_refresh() {
+    let (_directory,host,events)=state();
+    std::fs::write(host.paths.artifacts.join("schedules.json"),"invalid JSON").unwrap();
+    let request_id=Uuid::new_v4();
+    assert!(host.schedule_mutated(request_id,Ok(())).await.is_err());
+    match events.recv().await.unwrap() {
+        HostEvent::ScheduleMutation { request_id:actual,result:Ok(()) } => assert_eq!(actual,request_id),
+        _=>panic!("Refresh failure must not replace durable success"),
+    }
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn connector_failed_write_and_missing_reference_have_redacted_correlated_errors() {
+    let (_directory,host,events)=state();
+    let config = ConnectorConfig { id:Uuid::new_v4(),name:"Rejected fixture".into(),transport:"http".into(),endpoint:"https://example.test/mcp".into(),command:None,args:vec![],credential_ref:None };
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::MutateConnector(request_id,Some(config.clone()),None,Some("never-log-this-secret".into()))).await.unwrap();
+    match events.recv().await.unwrap() {
+        HostEvent::ConnectorMutation { request_id:actual,result:Err(error) } => { assert_eq!(actual,request_id); assert!(!error.contains("never-log-this-secret")); assert!(error.contains("Missing connector credential reference")); },
+        _=>panic!("Credential precondition must fail before any platform vault operation"),
+    }
+    assert!(host.store.connectors().unwrap().is_empty());
+    rusqlite::Connection::open(&host.paths.database).unwrap().execute_batch("CREATE TRIGGER reject_connector BEFORE INSERT ON connectors BEGIN SELECT RAISE(ABORT,'fixture write rejected'); END").unwrap();
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::MutateConnector(request_id,Some(config),None,None)).await.unwrap();
+    match events.recv().await.unwrap() {
+        HostEvent::ConnectorMutation { request_id:actual,result:Err(error) } => { assert_eq!(actual,request_id); assert!(error.contains("fixture write rejected")); },
+        _=>panic!("Failed SQLite write must not acknowledge success"),
+    }
+    assert!(host.store.connectors().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tracked_schedule_create_update_remove_acknowledge_actual_durable_state() {
+    let (_directory,host,events)=state();
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::CreateScheduleTracked(request_id,"Fixture task".into(),"0 0 * * * * *".into(),host.paths.data.clone())).await.unwrap();
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::ScheduleMutation{request_id:actual,result:Ok(())} if actual==request_id));
+    let mut task=match events.recv().await.unwrap() { HostEvent::Schedules(mut rows)=>{assert_eq!(rows.len(),1);rows.remove(0)}, _=>panic!("Expected durable task list") };
+    assert_eq!(host.default_scheduler().unwrap().list().await.unwrap()[0].id,task.id);
+    task.enabled=false;
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::SaveScheduleTracked(request_id,task.clone())).await.unwrap();
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::ScheduleMutation{request_id:actual,result:Ok(())} if actual==request_id));
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::Schedules(rows) if rows.len()==1 && !rows[0].enabled));
+    assert!(!host.default_scheduler().unwrap().list().await.unwrap()[0].enabled);
+    let request_id=Uuid::new_v4();
+    host.handle(HostCommand::RemoveScheduleTracked(request_id,task.id)).await.unwrap();
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::ScheduleMutation{request_id:actual,result:Ok(())} if actual==request_id));
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::Schedules(rows) if rows.is_empty()));
+    assert!(host.default_scheduler().unwrap().list().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn local_connector_inspection_without_project_is_rejected_before_launch() {
+    let (_directory,host,events)=state();
+    let config=ConnectorConfig { id:Uuid::new_v4(),name:"Local fixture".into(),transport:"stdio".into(),endpoint:String::new(),command:Some(PathBuf::from("/usr/bin/true")),args:vec![],credential_ref:None };
+    host.store.save_connector(&config).unwrap();
+    host.handle(HostCommand::ConnectorTools(Uuid::new_v4(),config.id,None)).await.unwrap();
+    match events.recv().await.unwrap() {
+        HostEvent::ConnectorToolsFailed { connector_id,message,.. } => { assert_eq!(connector_id,config.id); assert!(message.contains("Choose a project")); },
+        _=>panic!("Local inspection requires an explicit captured project"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn connector_remove_gate_prevents_waiting_inspection_from_launching_deleted_config() {
+    let (directory,host,events)=state();
+    let workspace=directory.path().join("project"); std::fs::create_dir(&workspace).unwrap();
+    let script=workspace.join("must-not-launch.sh");let marker=workspace.join("launched");
+    std::fs::write(&script,"#!/bin/sh\ntouch launched\nsleep 30\n").unwrap();
+    let config=ConnectorConfig { id:Uuid::new_v4(),name:"Deleted fixture".into(),transport:"stdio".into(),endpoint:String::new(),command:Some(PathBuf::from("/bin/sh")),args:vec![script.to_string_lossy().into_owned()],credential_ref:None };
+    host.store.save_connector(&config).unwrap();
+    let held=host.connectors.configuration_guard(config.id).await.unwrap();
+    let removal_id=Uuid::new_v4();let connector_id=config.id;let deleting=host.clone();
+    let removal=tokio::spawn(async move { deleting.handle(HostCommand::MutateConnector(removal_id,None,Some(connector_id),None)).await });
+    tokio::task::yield_now().await;
+    let inspection_id=Uuid::new_v4();let inspecting=host.clone();
+    let inspection=tokio::spawn(async move { inspecting.handle(HostCommand::ConnectorTools(inspection_id,connector_id,Some(workspace))).await });
+    tokio::task::yield_now().await;
+    assert!(!removal.is_finished()); assert!(!inspection.is_finished()); drop(held);
+    removal.await.unwrap().unwrap();inspection.await.unwrap().unwrap();
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::ConnectorMutation{request_id,result:Ok(_)} if request_id==removal_id));
+    assert!(matches!(events.recv().await.unwrap(),HostEvent::ConnectorToolsFailed{request_id,message,..} if request_id==inspection_id && message.contains("no longer exists")));
+    assert!(!marker.exists(),"No process may launch from a configuration removed before inspection obtains ownership");
+    assert!(host.store.connectors().unwrap().is_empty());assert!(host.connectors.cached_tools(&config).unwrap().is_empty());
 }

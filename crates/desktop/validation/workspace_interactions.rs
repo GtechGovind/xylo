@@ -61,7 +61,8 @@ mod xylo {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 // Drive the native receiver's bounded-backlog yield timer.
-                cx.executor().advance_clock(std::time::Duration::from_millis(2));
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 if cx.update(|cx| condition(view.read(cx), cx)) {
                     return;
@@ -852,8 +853,225 @@ mod xylo {
                     "Existing draft\nReviewed current transcript"
                 );
                 assert_eq!(view.read(cx).page, Page::Chat);
+                assert!(
+                    !view.read(cx).settings_open,
+                    "Add transcript must restore workspace navigation"
+                );
             })
             .unwrap();
+        }
+        #[gpui_kit::test]
+        fn recording_controls_remain_available_after_settings_navigation(cx: &mut TestAppContext) {
+            let (handle, view) = open_view(cx, Err(anyhow::anyhow!("No external device or host")));
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.error = None;
+                    view.speech
+                        .validation_request(Uuid::new_v4(), "helper_audio_record_start");
+                    view.navigate(Page::Providers, cx);
+                });
+                window.render_frame(cx);
+                assert!(
+                    window.try_find("global-recording-stop").is_some(),
+                    "Recording Stop must remain available outside the composer"
+                );
+            })
+            .unwrap();
+        }
+        #[gpui_kit::test]
+        fn schedule_enqueue_preserves_prompt_until_durable_creation(cx: &mut TestAppContext) {
+            let (_directory, workspace, client, handle, view) = host_fixture(cx);
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.workspace = Some(workspace);
+                    view.schedule_prompt.update(cx, |input, cx| {
+                        input.set_value("Review the local notes", window, cx)
+                    });
+                    view.navigate(Page::Schedules, cx);
+                });
+                window.render_frame(cx);
+                window.click("create-schedule", cx);
+                view.update(cx, |view, cx| {
+                    assert_eq!(
+                        view.schedule_prompt.read(cx).value().as_ref(),
+                        "Review the local notes",
+                        "Queue admission is not durable task creation"
+                    );
+                });
+            })
+            .unwrap();
+            wait_for(cx, &view, "durable scheduled task", |view, cx| {
+                view.schedule_pending.is_none()
+                    && view.schedule_prompt.read(cx).value().is_empty()
+                    && view
+                        .schedules
+                        .iter()
+                        .any(|task| task.prompt == "Review the local notes")
+            });
+            client.shutdown().unwrap();
+        }
+        #[gpui_kit::test]
+        fn schedule_receipts_preserve_newer_input_and_ignore_unrelated_completions(
+            cx: &mut TestAppContext,
+        ) {
+            let (handle, view) = open_view(cx, Err(anyhow::anyhow!("No host required")));
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    let id = Uuid::new_v4();
+                    view.schedule_pending = Some((id, Some("Submitted draft".into())));
+                    view.schedule_prompt
+                        .update(cx, |input, cx| input.set_value("Newer draft", window, cx));
+                    view.event(
+                        HostEvent::ScheduleMutation {
+                            request_id: Uuid::new_v4(),
+                            result: Ok(()),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(view.schedule_pending.is_some());
+                    view.event(
+                        HostEvent::ScheduleMutation {
+                            request_id: id,
+                            result: Ok(()),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(view.schedule_pending.is_none());
+                    assert_eq!(
+                        view.schedule_prompt.read(cx).value().as_ref(),
+                        "Newer draft"
+                    );
+                    let id = Uuid::new_v4();
+                    view.schedule_pending = Some((id, Some("Newer draft".into())));
+                    view.event(
+                        HostEvent::ScheduleMutation {
+                            request_id: id,
+                            result: Err("Disk unavailable".into()),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        view.schedule_prompt.read(cx).value().as_ref(),
+                        "Newer draft"
+                    );
+                    assert!(view.schedule_notice.contains("Disk unavailable"));
+                    let id = Uuid::new_v4();
+                    view.schedule_pending = Some((id, Some("Newer draft".into())));
+                    view.event(
+                        HostEvent::ScheduleMutation {
+                            request_id: id,
+                            result: Ok(()),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(view.schedule_prompt.read(cx).value().is_empty());
+                });
+            })
+            .unwrap();
+        }
+        #[gpui_kit::test]
+        fn task_error_stays_in_its_chat_instead_of_repeating_as_global_banner(
+            cx: &mut TestAppContext,
+        ) {
+            let (handle, view) = open_view(cx, Err(anyhow::anyhow!("No live provider")));
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.error = None;
+                    let session = view.session;
+                    let id = Uuid::new_v4();
+                    view.event(
+                        HostEvent::Engine(xylo_core::Envelope::new(
+                            id,
+                            Some(session),
+                            1,
+                            xylo_core::EngineEvent::Started,
+                        )),
+                        window,
+                        cx,
+                    );
+                    view.event(
+                        HostEvent::Engine(xylo_core::Envelope::new(
+                            id,
+                            Some(session),
+                            2,
+                            xylo_core::EngineEvent::Error {
+                                message: "Provider unavailable".into(),
+                                retryable: true,
+                            },
+                        )),
+                        window,
+                        cx,
+                    );
+                    assert!(view.error.is_none());
+                    assert_eq!(
+                        view.turns
+                            .get(&session)
+                            .and_then(|turn| turn.error.as_deref()),
+                        Some("Provider unavailable")
+                    );
+                });
+            })
+            .unwrap();
+        }
+        #[gpui_kit::test]
+        fn downloads_enqueue_failure_exposes_retry_without_eternal_loading(
+            cx: &mut TestAppContext,
+        ) {
+            let (handle, view) = open_view(cx, Err(anyhow::anyhow!("No host required")));
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.error = None;
+                    view.page = Page::Assets;
+                    view.refresh_assets(cx);
+                });
+                window.render_frame(cx);
+                assert!(window.try_find("retry-assets").is_some());
+                assert!(view.read(cx).error.is_none());
+                window.click("retry-assets", cx);
+                window.render_frame(cx);
+                assert!(window.try_find("retry-assets").is_some());
+            })
+            .unwrap();
+        }
+        #[gpui_kit::test]
+        fn downloads_retry_dispatches_and_settles_real_helper_catalog(cx: &mut TestAppContext) {
+            let (_directory, _workspace, client, handle, view) = host_fixture(cx);
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.page = Page::Assets;
+                    view.error = None;
+                    assert!(view.asset_error("helper_asset_catalog", "Fixture failure", cx));
+                });
+                window.render_frame(cx);
+                assert!(window.try_find("retry-assets").is_some());
+                window.click("retry-assets", cx);
+                assert!(
+                    view.read(cx)
+                        .native
+                        .pending_id("Loading available features")
+                        .is_some()
+                );
+            })
+            .unwrap();
+            wait_for(cx, &view, "retried helper catalog", |view, _| {
+                view.native
+                    .pending_id("Loading available features")
+                    .is_none()
+            });
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(
+                    window.try_find("retry-assets").is_none(),
+                    "Real helper catalog must settle successfully"
+                );
+                assert!(view.read(cx).error.is_none());
+            })
+            .unwrap();
+            client.shutdown().unwrap();
         }
     }
 }

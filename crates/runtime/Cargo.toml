@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tempfile = "3"
 xylo-core.workspace = true
 xylo-resources.workspace = true
 xylo-services.workspace = true

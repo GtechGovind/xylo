@@ -1353,3 +1353,32 @@ async fn stream_request_ids_with_connection_text_do_not_retry_invalid_requests()
         1
     );
 }
+
+#[test]
+fn retry_after_accepts_delta_seconds_and_http_dates() {
+    assert_eq!(retry_after_seconds("17", 0), Some(17));
+    assert_eq!(
+        retry_after_seconds("Thu, 01 Jan 1970 00:00:30 GMT", 10),
+        Some(20)
+    );
+    assert_eq!(
+        retry_after_seconds("Thu, 01 Jan 1970 00:00:30 GMT", 50),
+        Some(0)
+    );
+    assert_eq!(retry_after_seconds("req_429", 0), None);
+}
+
+
+#[tokio::test]
+async fn only_exact_chatgpt_http401_token_expired_is_eligible_for_renewal() {
+    for (chatgpt,status,code,eligible) in [(true,401,"token_expired",true),(true,403,"token_expired",false),(true,401,"invalid_api_key",false),(false,401,"token_expired",false)] {
+        let (endpoint,recorded)=fixture(serde_json::to_vec(&json!({"error":{"code":code}})).unwrap(),status,"application/json").await;
+        let mut provider=provider(ApiFamily::OpenAiResponses,endpoint);
+        // Only the fixture's classification flag changes; production constructor
+        // still refuses ChatGPT credentials at a custom/loopback origin.
+        provider.chatgpt_plan=chatgpt;
+        let error=provider.chat_completion(&[Message::user("local fixture")],&[],None,None,None,None).await.unwrap_err();
+        assert_eq!(matches!(&error,AgentError::AuthFailed(message) if message==renewal::TOKEN_EXPIRED),eligible);
+        recorded.await.unwrap();
+    }
+}

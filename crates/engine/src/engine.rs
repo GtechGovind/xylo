@@ -28,6 +28,17 @@ use xylo_services::{CredentialVault, LearningService, Store};
 /// Upper bound on model calls in one turn, a runaway guard rather than a budget.
 const MAX_MODEL_CALLS: u32 = 200;
 
+fn bounded_memory_excerpt(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} [excerpt; remainder omitted]", &text[..end])
+}
+
 /// Covers every error return, cancellation and future drop after turn admission.
 /// A process kill is covered by Store recovery's same-transaction evidence enqueue.
 struct LearningTurnGuard {
@@ -53,6 +64,7 @@ pub struct HermesEngine {
     interrupt: InterruptController,
     steering: crate::steering::SteeringControl,
     provider_credential: Option<xylo_core::WorkerCredential>,
+    credential_resolver: Option<Arc<dyn crate::ProviderCredentialResolver>>,
 }
 
 impl HermesEngine {
@@ -60,6 +72,7 @@ impl HermesEngine {
         Self {
             steering: crate::steering::SteeringControl::new(store.clone()),
             provider_credential: None,
+            credential_resolver: None,
             store,
             paths,
             approvals,
@@ -76,13 +89,18 @@ impl HermesEngine {
         self
     }
 
-    fn provider(&self, config: &ProviderConfig) -> Result<Arc<dyn LlmProvider>> {
+    pub fn with_provider_credential_resolver(mut self, resolver: Arc<dyn crate::ProviderCredentialResolver>) -> Self {
+        self.credential_resolver = Some(resolver);
+        self
+    }
+
+    fn provider(&self, config: &ProviderConfig, cancel: CancellationToken) -> Result<Arc<dyn LlmProvider>> {
         if let Some(credential) = &self.provider_credential {
             ensure!(
                 config.credential_ref.is_none() || credential.0.is_some(),
                 "Host did not authorize the provider credential"
             );
-            return crate::providers::build(config, credential.0.clone());
+            return crate::providers::build_renewable(config, credential.clone(), self.credential_resolver.clone(), cancel);
         }
         let key = match &config.credential_ref {
             Some(reference) => CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?
@@ -140,7 +158,17 @@ impl HermesEngine {
             .iter()
             .take_while(|message| message.role == MessageRole::System)
             .count();
-        messages.drain(..prefix);
+        let summaries = messages[..prefix]
+            .iter()
+            .filter_map(|message| {
+                let content = message.content.as_deref()?;
+                let start = content
+                    .find("# Summary of earlier work in this task")
+                    .or_else(|| content.find("[Conversation summary]"))?;
+                Some(Message::system(content[start..].to_owned()))
+            })
+            .collect::<Vec<_>>();
+        messages.splice(..prefix, summaries);
         if !resuming_same_turn {
             messages.push(crate::attachments::user_message(request)?);
         }
@@ -285,7 +313,7 @@ impl EngineBackend for HermesEngine {
         let start = Instant::now();
         let provider: Arc<dyn LlmProvider> = Arc::new(crate::provider_guard::GuardedProvider::new(
             Arc::new(crate::attachments::AttachmentProvider::new(
-                self.provider(&request.provider)?,
+                self.provider(&request.provider, cancel.clone())?,
                 attachment_store,
                 request.session_id,
                 cancel.clone(),
@@ -302,7 +330,14 @@ impl EngineBackend for HermesEngine {
         let facts = broker.project_facts()?;
         let memory_context = facts
             .iter()
-            .map(|m| format!("- {} (source: {})", m.content, m.source))
+            .take(8)
+            .map(|m| {
+                format!(
+                    "- {} (source: {})",
+                    bounded_memory_excerpt(&m.content, 2000),
+                    bounded_memory_excerpt(&m.source, 200)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let skill_context = broker.project_skill_context().unwrap_or_else(|error| {
@@ -317,6 +352,7 @@ impl EngineBackend for HermesEngine {
         std::fs::create_dir_all(&home)?;
         let config = AgentConfig {
             native_product_finalization: true,
+            external_context_management: true,
             allow_model_fallbacks: false,
             // Coding work routinely needs dozens of tool rounds; the user can
             // stop or steer at any time, and context is compacted as needed.
@@ -384,7 +420,9 @@ impl EngineBackend for HermesEngine {
         let delegate_cancel = cancel.clone();
         let helper_resources = xylo_runtime::resources::ResourceManager::new();
         let helper_slots = Arc::new(tokio::sync::Semaphore::new(
-            helper_resources.suggested_parallelism(64 * 1024 * 1024)?,
+            helper_resources
+                .suggested_parallelism(64 * 1024 * 1024)?
+                .min(child_config.max_concurrent_delegates.max(1) as usize),
         ));
         let helper_demand =
             xylo_runtime::resources::TaskDemand::interactive(request.provider.context_tokens);
@@ -392,12 +430,20 @@ impl EngineBackend for HermesEngine {
             let task=args.get("task").and_then(Value::as_str).filter(|s|!s.trim().is_empty()).context("Subtask text is required")?;
             let _permit=handle.block_on(async{tokio::select!{_ = delegate_cancel.cancelled()=>Err(anyhow::anyhow!("Delegation cancelled")),permit=helper_slots.acquire()=>permit.map_err(Into::into)}})?;
             let _resource_lease=handle.block_on(helper_resources.acquire(helper_demand,delegate_cancel.clone()))?;
-            let child_registry=build_registry(child_broker.upgrade().context("Parent task has ended")?,Some(parent_call_key.to_owned()))?;
+            let mut scoped_child=child_broker.upgrade().context("Parent task has ended")?.scoped_child()?;
+            if let Some(allowed) = args.get("allowed_tools") {
+                let allowed = allowed.as_array().context("allowed_tools must be an array")?.iter().map(|value| value.as_str().map(str::to_owned).context("allowed_tools entries must be strings")).collect::<Result<Vec<_>>>()?;
+                scoped_child.restrict_tools(&allowed)?;
+            }
+            let child_broker=Arc::new(scoped_child);
+            let child_cancel=child_broker.cancellation_token();
+            let child_registry=build_registry(child_broker.clone(),Some(parent_call_key.to_owned()))?;
             let schemas=child_registry.schemas();
             let orchestrator=Arc::new(SubAgentOrchestrator::new(SubAgentOrchestratorConfig{
                 parent_config:child_config.clone(),tool_registry:child_registry,llm_provider:child_provider.clone(),parent_credential_pool:None,parent_interrupt:child_interrupt.clone(),hermes_home:child_home.clone(),parent_session_id:Some(child_session.clone()),timeout:Duration::from_secs(900),background_delegation_callback:None,
-            }));
+            }).with_child_cancellation(Arc::new(move || child_cancel.cancel())));
             let result=handle.block_on(orchestrator.execute(hermes_agent::SubAgentRequest{task:task.into(),context:args.get("context").and_then(Value::as_str).map(str::to_owned),child_depth:1,max_depth:1,inherited_tool_schemas:schemas,..Default::default()}));
+            handle.block_on(child_broker.shutdown())?;
             serde_json::from_str(&result).context("Read subagent result")
         }));
         let agent =

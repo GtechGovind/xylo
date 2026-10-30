@@ -5,6 +5,74 @@ use xylo_runtime::drafts::{
     DraftAdmission, DraftCursor, DraftKey, DraftPage, DraftSave, DraftSnapshot, DraftSubmission,
     DraftSummary, DraftWrite, MAX_DRAFT_ATTACHMENTS, MAX_DRAFT_BYTES,
 };
+/// Admission errors can contain provider bodies, URLs, paths or credentials.
+/// Only recognized causes become product copy; never echo arbitrary service text.
+pub(super) fn draft_admission_failure(error: &str) -> String {
+    let error = error.to_ascii_lowercase();
+    let cause = if error.contains("required application component is missing") {
+        "Xylo is missing required task components. Rebuild or reinstall the complete app, then retry."
+    } else if error.contains("plan usage is not authorized") {
+        "ChatGPT has not authorized plan usage for this connection. In Providers, reconnect and allow plan usage before retrying."
+    } else if error.contains("official public responses api") {
+        "This ChatGPT connection requires the official Responses API endpoint. Check its endpoint and reconnect in Providers."
+    } else if error.contains("provider credential is not configured")
+        || error.contains("credential is missing")
+    {
+        "The saved provider credential is unavailable. Reconnect this connection in Providers before retrying."
+    } else if error.contains("keyring")
+        || error.contains("credential store")
+        || error.contains("secure storage")
+    {
+        "The saved provider credential could not be read. Check system credential access and reconnect in Providers."
+    } else if [
+        "http 401",
+        "http 403",
+        "status 401",
+        "status 403",
+        "status code: 401",
+        "status code: 403",
+        "401 unauthorized",
+        "403 forbidden",
+        "unauthorized",
+        "forbidden",
+        "refresh token",
+        "refresh chatgpt",
+    ]
+    .iter()
+    .any(|status| error.contains(status))
+    {
+        "The provider could not authorize this connection. Reconnect it in Providers, then retry."
+    } else if error.contains("selected project is unavailable") {
+        "The selected project folder is unavailable. Reopen it before resending."
+    } else if error.contains("chat belongs to another project") {
+        "This chat belongs to a different project. Open its original project or start a new chat here."
+    } else if error.contains("already waiting to start")
+        || error.contains("already working")
+        || error.contains("cannot accept another message yet")
+    {
+        "This chat already has a task starting or running. Wait for it or stop it before resending."
+    } else if error.contains("application is closing") {
+        "Xylo is closing. Reopen it before resending."
+    } else if error.contains("cancelled before admission")
+        || error.contains("draft was not admitted")
+    {
+        "The task stopped before the message was admitted. Send again when ready."
+    } else if error.contains("database")
+        || error.contains("disk is full")
+        || error.contains("read-only")
+    {
+        "The message could not be saved. Check free disk space and write access to Xylo's data folder, then retry."
+    } else if error.contains("application service unavailable")
+        || error.contains("queue is full")
+        || error.contains("disconnected")
+    {
+        "Xylo's task service is unavailable or busy. Restart Xylo, then retry."
+    } else {
+        "The message could not start. Check the connection in Providers, or restart Xylo and retry."
+    };
+    format!("{cause} Your draft is still here.")
+}
+
 const MAX_CACHED_DRAFTS: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DraftFlushAction {
@@ -17,6 +85,7 @@ struct SaveAttempt {
     write: DraftWrite,
 }
 struct Submission {
+    queued: bool,
     id: Uuid,
     generation: u64,
     text: String,
@@ -42,11 +111,14 @@ struct Entry {
     save: Option<SaveAttempt>,
     retry: Option<SaveAttempt>,
     send: Option<Submission>,
+    // Background admission feedback must survive unrelated autosave receipts.
+    send_error: Option<String>,
     conflict: Option<DraftSnapshot>,
     conflict_generation: Option<u64>,
     guidance: Option<GuidanceIntent>,
     guidance_clear: Option<(i64, u64)>,
     error: Option<String>,
+    attachment_notice: String,
 }
 pub(super) struct DraftUi {
     window: AnyWindowHandle,
@@ -169,7 +241,72 @@ impl Xylo {
         self.draft_changed(cx);
         cx.notify();
     }
-    fn current_draft_key(&self) -> DraftKey {
+    #[cfg(test)]
+    pub(super) fn validation_draft_surface(
+        &mut self,
+        saved: Option<String>,
+        pending: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self.current_draft_key();
+        self.activate_draft(key.clone(), window, cx);
+        self.composer.update(cx, |input, cx| {
+            input.set_value(
+                "Keep the approved colors and refine the composer spacing.",
+                window,
+                cx,
+            )
+        });
+        self.draft_changed(cx);
+        let entry = self.drafts.entries.get_mut(&key).unwrap();
+        entry.load = None;
+        entry.error = None;
+        entry.conflict = saved.map(|text| DraftSnapshot {
+            key: key.clone(),
+            text,
+            attachments: vec![],
+            revision: 2,
+            updated_at: 1,
+        });
+        if pending {
+            entry.send = Some(Submission {
+                queued: false,
+                id: Uuid::new_v4(),
+                generation: entry.generation,
+                text: entry.text.clone(),
+                dispatched: true,
+                turn: TurnRequest {
+                    session_id: key.session_id,
+                    turn_id: Uuid::new_v4(),
+                    prompt: entry.text.clone(),
+                    workspace: self.workspace.clone().unwrap_or_default(),
+                    provider: self.settings.provider.clone(),
+                    permissions: self.settings.permissions,
+                    attachments: vec![],
+                },
+            });
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn validation_draft_images(
+        &mut self,
+        current: Vec<ImageAttachment>,
+        saved: Vec<ImageAttachment>,
+    ) {
+        if let Some(entry) = self
+            .drafts
+            .active
+            .as_ref()
+            .and_then(|key| self.drafts.entries.get_mut(key))
+        {
+            entry.attachments = current;
+            if let Some(conflict) = &mut entry.conflict {
+                conflict.attachments = saved;
+            }
+        }
+    }
+    pub(super) fn current_draft_key(&self) -> DraftKey {
         DraftKey {
             session_id: self.session,
             workspace: self.workspace.clone(),
@@ -186,6 +323,7 @@ impl Xylo {
                 .iter()
                 .find(|(candidate, entry)| {
                     Some(*candidate) != self.drafts.active.as_ref()
+                        && !self.attachments.has_import_for(candidate)
                         && !entry.dirty
                         && entry.save.is_none()
                         && entry.retry.is_none()
@@ -222,6 +360,7 @@ impl Xylo {
         if self.drafts.entries.len() >= MAX_CACHED_DRAFTS
             && !self.drafts.entries.iter().any(|(key, entry)| {
                 Some(key) != self.drafts.active.as_ref()
+                    && !self.attachments.has_import_for(key)
                     && !entry.dirty
                     && entry.save.is_none()
                     && entry.retry.is_none()
@@ -241,6 +380,7 @@ impl Xylo {
     /// The stored window handle lets callers without a Window defer safely.
     pub(super) fn draft_switch_deferred(&mut self, cx: &mut Context<Self>) {
         let requested = self.current_draft_key();
+        self.attachments.notice.clear();
         if !self.ensure_draft_entry(&requested, cx) {
             return;
         }
@@ -264,8 +404,10 @@ impl Xylo {
         }
         // The old key was captured before the parent mutated its session.
         self.drafts.active = Some(key.clone());
+        self.refresh_turn_queue(key.session_id, cx);
         self.drafts.oversize = false;
         let entry = &self.drafts.entries[&key];
+        self.attachments.notice = entry.attachment_notice.clone();
         let text = entry.text.clone();
         let needs_load = entry.revision.is_none() && entry.load.is_none();
         self.composer
@@ -332,6 +474,7 @@ impl Xylo {
         entry.generation = entry.generation.wrapping_add(1);
         entry.dirty = true;
         entry.error = None;
+        entry.send_error = None;
         let needs_load = entry.revision.is_none() && entry.load.is_none();
         self.cancel_memory_forms_flush(cx);
         self.cancel_document_drafts_flush(cx);
@@ -600,14 +743,23 @@ impl Xylo {
             cx.notify();
             return;
         }
+        let queued = self.running();
         let entry = self.drafts.entries.get_mut(&key).unwrap();
-        if entry.send.is_some() || entry.guidance.is_some() || entry.conflict.is_some() {
+        if entry.send.is_some()
+            || entry
+                .guidance
+                .as_ref()
+                .is_some_and(|guidance| !guidance.dispatched || guidance.text == entry.text)
+            || entry.conflict.is_some()
+        {
             return;
         }
         if entry.text.trim().is_empty() && entry.attachments.is_empty() {
             return;
         }
+        entry.send_error = None;
         entry.send = Some(Submission {
+            queued,
             id: Uuid::new_v4(),
             generation: entry.generation,
             text: entry.text.clone(),
@@ -650,7 +802,13 @@ impl Xylo {
             .host
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
-            .and_then(|host| host.submit_draft(send.id, send.turn.clone(), submission));
+            .and_then(|host| {
+                if send.queued {
+                    host.queue_draft(send.id, send.turn.clone(), submission)
+                } else {
+                    host.submit_draft(send.id, send.turn.clone(), submission)
+                }
+            });
         match result {
             Ok(()) => send.dispatched = true,
             Err(error) => {
@@ -661,6 +819,33 @@ impl Xylo {
             }
         }
         cx.notify();
+    }
+    pub(super) fn reconcile_queue_receipt(
+        &mut self,
+        id: Uuid,
+        receipt: &mut xylo_runtime::turn_queue::QueueReceipt,
+    ) -> bool {
+        let Some((key, entry)) = self.drafts.entries.iter_mut().find(|(_, entry)| {
+            entry
+                .send
+                .as_ref()
+                .is_some_and(|send| send.id == id && send.queued)
+        }) else {
+            return false;
+        };
+        let send = entry.send.as_mut().unwrap();
+        let mut expected = send.turn.clone();
+        expected.turn_id = receipt.item.id;
+        if receipt.item.id != receipt.item.turn.turn_id
+            || receipt.draft.key != *key
+            || serde_json::to_value(&expected).ok() != serde_json::to_value(&receipt.item.turn).ok()
+        {
+            return false;
+        }
+        // A retry of the same saved revision can return its canonical queue ID.
+        // Only an exact immutable request match may reconcile that identity.
+        send.turn.turn_id = receipt.item.id;
+        true
     }
     pub(super) fn draft_admitted(
         &mut self,
@@ -678,7 +863,9 @@ impl Xylo {
         else {
             return;
         };
-        if self.drafts.active.as_ref() == Some(&key) {
+        let is_current =
+            self.drafts.active.as_ref() == Some(&key) && self.current_draft_key() == key;
+        if is_current {
             self.draft_changed(cx);
         }
         let entry = self.drafts.entries.get_mut(&key).unwrap();
@@ -689,12 +876,13 @@ impl Xylo {
             Ok(receipt) if receipt.turn_id == send.turn.turn_id && receipt.draft.key == key => {
                 entry.revision = Some(receipt.draft.revision);
                 entry.error = None;
+                entry.send_error = None;
                 if entry.generation == send.generation && receipt.cleared {
                     entry.text.clear();
                     entry.attachments.clear();
                     entry.dirty = false;
                     entry.generation = entry.generation.wrapping_add(1);
-                    if self.drafts.active.as_ref() == Some(&key) {
+                    if is_current {
                         self.composer
                             .update(cx, |input, cx| input.set_value("", window, cx));
                     }
@@ -705,7 +893,8 @@ impl Xylo {
                 let mut user = message(key.session_id, "user", send.turn.prompt);
                 user.id = Uuid::new_v5(&send.turn.turn_id, b"user-message");
                 user.attachments = send.turn.attachments;
-                if self.session == key.session_id
+                if !send.queued
+                    && self.session == key.session_id
                     && self.workspace == key.workspace
                     && !self.messages.iter().any(|item| item.id == user.id)
                 {
@@ -722,9 +911,14 @@ impl Xylo {
                 );
             }
             Err(error) => {
-                tracing::warn!(detail=%error,"Draft admission failed");
-                self.error = Some("The message could not start. Your draft is still here.".into());
-                entry.error = None;
+                let message = draft_admission_failure(&error);
+                tracing::warn!(request_id=%id, reason=%message, "Draft admission failed");
+                if is_current {
+                    self.error = Some(message);
+                    entry.error = None;
+                } else {
+                    entry.send_error = Some(message);
+                }
             }
         }
         self.persist_draft_key(&key, cx);
@@ -735,25 +929,54 @@ impl Xylo {
         self.drafts
             .active
             .as_ref()
+            .filter(|key| **key == self.current_draft_key())
             .and_then(|key| self.drafts.entries.get(key))
             .map(|entry| entry.attachments.clone())
             .unwrap_or_default()
     }
+    pub(super) fn draft_attachment_notice(
+        &mut self,
+        key: &DraftKey,
+        notice: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.drafts.entries.get_mut(key) {
+            entry.attachment_notice = notice.clone();
+        }
+        if *key == self.current_draft_key() {
+            self.attachments.notice = notice;
+        }
+        cx.notify();
+    }
+    #[cfg(test)]
     pub(super) fn add_draft_attachment(
         &mut self,
         attachment: ImageAttachment,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.draft_changed(cx);
         let key = self.current_draft_key();
-        let Some(entry) = self.drafts.entries.get_mut(&key) else {
+        self.add_draft_attachment_to(&key, attachment, cx)
+    }
+    pub(super) fn add_draft_attachment_to(
+        &mut self,
+        key: &DraftKey,
+        attachment: ImageAttachment,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.drafts.active.as_ref() == Some(key) {
+            self.draft_changed(cx);
+        }
+        let Some(entry) = self.drafts.entries.get_mut(key) else {
             return false;
         };
         if attachment.session_id != key.session_id
             || entry.attachments.len() >= MAX_DRAFT_ATTACHMENTS
         {
-            self.error = Some("Attach at most four images to this chat.".into());
-            cx.notify();
+            self.draft_attachment_notice(
+                key,
+                "Attach at most four images to this chat.".into(),
+                cx,
+            );
             return false;
         }
         if entry
@@ -766,7 +989,9 @@ impl Xylo {
         entry.attachments.push(attachment);
         entry.dirty = true;
         entry.generation = entry.generation.wrapping_add(1);
-        self.schedule_draft_save(cx);
+        // Imports belong to the captured draft even if another chat is visible.
+        self.persist_draft_key(key, cx);
+        cx.notify();
         true
     }
     pub(super) fn remove_draft_attachment(&mut self, id: Uuid, cx: &mut Context<Self>) {
@@ -874,6 +1099,32 @@ impl Xylo {
         cx.notify();
     }
     /// Routine autosaving stays quiet; decisions and failures remain visible.
+    pub(super) fn pending_guidance_text(&self) -> Option<String> {
+        self.drafts
+            .active
+            .as_ref()
+            .filter(|key| **key == self.current_draft_key())
+            .and_then(|key| self.drafts.entries.get(key))
+            .and_then(|entry| entry.guidance.as_ref())
+            .map(|guidance| guidance.text.clone())
+    }
+    pub(super) fn steer_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.running()
+            || self.attachments.importing_for(self.session)
+            || self.draft_flush_pending()
+            || self.recovery_blocks_submit()
+        {
+            return;
+        }
+        self.submit_persisted_steering(window, cx);
+    }
+    pub(super) fn draft_send_pending(&self) -> bool {
+        self.drafts
+            .active
+            .as_ref()
+            .and_then(|key| self.drafts.entries.get(key))
+            .is_some_and(|entry| entry.send.is_some())
+    }
     pub(super) fn draft_needs_attention(&self) -> bool {
         self.drafts.flush.is_some()
             || self
@@ -882,7 +1133,7 @@ impl Xylo {
                 .as_ref()
                 .and_then(|key| self.drafts.entries.get(key))
                 .is_some_and(|entry| {
-                    entry.error.is_some() || entry.conflict.is_some() || entry.guidance.is_some()
+                    entry.error.is_some() || entry.send_error.is_some() || entry.conflict.is_some()
                 })
     }
     pub(super) fn draft_status_footer(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -895,22 +1146,31 @@ impl Xylo {
             "Saving your drafts before closing…".into()
         } else if let Some(error) = entry.and_then(|entry| entry.error.clone()) {
             error
+        } else if let Some(error) = entry.and_then(|entry| entry.send_error.clone()) {
+            error
         } else if entry.is_some_and(|entry| entry.conflict.is_some()) {
             "A saved draft arrived after you started typing. Choose which version to keep.".into()
-        } else if entry.is_some_and(|entry| entry.guidance.is_some()) {
-            "Guidance queued for this task…".into()
+        } else if entry.is_some_and(|entry| entry.send.is_some()) {
+            "Sending…".into()
         } else if entry.is_some_and(|entry| entry.save.is_some() || entry.dirty) {
             "Saving draft…".into()
         } else {
             String::new()
         };
+        let status = subtitle(label.clone())
+            .id("draft-status-message")
+            .test_support()
+            .w_full()
+            .min_w_0()
+            .whitespace_normal();
         let mut row = div()
+            .w_full()
+            .min_w_0()
             .flex()
             .items_center()
             .gap_2()
             .flex_wrap()
             .justify_end()
-            .when(!label.is_empty(), |row| row.child(subtitle(label)))
             .child(
                 button("saved-drafts", "Saved drafts")
                     .text_xs()
@@ -921,7 +1181,7 @@ impl Xylo {
         if entry.is_some_and(|entry| entry.conflict.is_some()) {
             row = row
                 .child(
-                    button("draft-keep-current", "Keep current text").on_click(cx.listener(
+                    button("draft-keep-current", "Keep current draft").on_click(cx.listener(
                         |view, _, window, cx| view.resolve_draft_conflict(false, window, cx),
                     )),
                 )
@@ -943,7 +1203,129 @@ impl Xylo {
                     .on_click(cx.listener(|view, _, _, cx| view.cancel_draft_flush(cx))),
             );
         }
-        row.into_any_element()
+        if let Some(entry) = entry
+            && let Some(saved) = &entry.conflict
+        {
+            let mut comparison = div().w_full().flex().gap_3().min_w_0();
+            for (id, copy_id, title, text, attachments) in [
+                (
+                    "draft-compare-current",
+                    "draft-copy-current",
+                    "Current draft",
+                    &entry.text,
+                    &entry.attachments,
+                ),
+                (
+                    "draft-compare-saved",
+                    "draft-copy-saved",
+                    "Saved draft",
+                    &saved.text,
+                    &saved.attachments,
+                ),
+            ] {
+                let copy = text.clone();
+                let details =
+                    serde_json::json!({ "text": text, "attachments": attachments }).to_string();
+                comparison = comparison.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(subtitle(title))
+                                .child(button(copy_id, "Copy").text_xs().on_click(
+                                    move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy.clone(),
+                                        ));
+                                    },
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id(id)
+                                .test_support()
+                                .h(px(100.))
+                                .overflow_y_scroll()
+                                .p_2()
+                                .rounded_md()
+                                .bg(rgb(panel()))
+                                .text_sm()
+                                .children(attachments.iter().map(|image| {
+                                    let metadata = format!(
+                                        "{} × {} · {} KiB · {}",
+                                        image.width,
+                                        image.height,
+                                        image.bytes.div_ceil(1024),
+                                        image.sha256.chars().take(12).collect::<String>()
+                                    );
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .mt_2()
+                                        .child(subtitle(format!("Image: {}", image.name)))
+                                        .child(
+                                            subtitle(metadata.clone())
+                                                .id(SharedString::from(format!(
+                                                    "draft-image-{id}-{}",
+                                                    image.id
+                                                )))
+                                                .role(Role::Label)
+                                                .aria_label(metadata)
+                                                .test_support(),
+                                        )
+                                }))
+                                .child(if text.is_empty() {
+                                    "Empty text".to_string()
+                                } else {
+                                    text.clone()
+                                }),
+                        )
+                        .when(!attachments.is_empty(), |column| {
+                            column.child(
+                                button(
+                                    SharedString::from(format!("{copy_id}-details")),
+                                    "Copy draft details",
+                                )
+                                .text_xs()
+                                .self_start()
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        details.clone(),
+                                    ))
+                                }),
+                            )
+                        }),
+                );
+            }
+            return div()
+                .id("draft-conflict-panel")
+                .test_support()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(status)
+                .child(comparison)
+                .child(row)
+                .into_any_element();
+        }
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .when(!label.is_empty(), |panel| panel.child(status))
+            .child(row)
+            .into_any_element()
     }
     pub(super) fn open_saved_drafts(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Drafts;
@@ -1348,5 +1730,207 @@ impl Xylo {
         self.persist_draft_key(&key, cx);
         self.advance_draft_flush(window, cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod admission_feedback_tests {
+    use super::{Xylo, draft_admission_failure};
+    use gpui_kit::{AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size};
+
+    #[test]
+    fn admission_feedback_is_actionable_and_never_echoes_service_payloads() {
+        let authorization = draft_admission_failure(
+            "ChatGPT plan usage is not authorized; reconnect and allow plan usage",
+        );
+        assert!(authorization.contains("Providers") && authorization.contains("allow plan usage"));
+        let unknown = draft_admission_failure(
+            "unexpected response secret_token=DO_NOT_EXPOSE https://private.example/path?token=DO_NOT_EXPOSE",
+        );
+        assert!(!unknown.contains("DO_NOT_EXPOSE") && !unknown.contains("private.example"));
+        assert!(draft_admission_failure("The selected project is unavailable").contains("Reopen"));
+        assert!(
+            draft_admission_failure("This chat belongs to another project")
+                .contains("original project")
+        );
+    }
+
+    #[test]
+    fn mapped_missing_component_reason_survives_the_actual_banner_formatter() {
+        let message = draft_admission_failure(
+            "A required application component is missing. Reinstall the complete application.",
+        );
+        assert_eq!(super::super::product_error(&message), message);
+        assert!(message.contains("Rebuild") || message.contains("rebuild"));
+    }
+
+    #[test]
+    fn numeric_request_or_path_fragments_are_not_http_authorization_statuses() {
+        assert!(
+            draft_admission_failure("database request failed at /tmp/cache-1401/entry")
+                .contains("could not be saved")
+        );
+        assert!(draft_admission_failure("HTTP 401 Unauthorized").contains("Reconnect"));
+    }
+
+    #[gpui_kit::test]
+    fn failed_old_send_stays_with_its_draft_during_deferred_chat_switch(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1000.), px(680.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+                },
+            )
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| view.update(cx, |view, cx| {
+            view.validation_draft_surface(None, true, window, cx);
+            let original = view.current_draft_key();
+            let request = view.drafts.entries[&original].send.as_ref().unwrap().id;
+            view.drafts.entries.get_mut(&original).unwrap().dirty = false;
+            view.new_chat(cx);
+            assert_ne!(view.current_draft_key(), original);
+            assert_eq!(view.drafts.active.as_ref(), Some(&original), "Exercise the deferred-switch interval");
+            view.error = None;
+            view.drafts.entries.get_mut(&original).unwrap().dirty = false;
+            view.draft_admitted(request, Err("A required application component is missing. Reinstall the complete application.".into()), window, cx);
+            assert!(view.error.is_none(), "An old chat's send failure must not become the new chat's banner");
+            assert!(view.drafts.entries[&original].send_error.as_deref().is_some_and(|error| error.contains("missing")));
+            view.activate_draft(view.current_draft_key(), window, cx);
+            let save_id = uuid::Uuid::new_v4();
+            let snapshot = {
+                let entry = view.drafts.entries.get_mut(&original).unwrap();
+                entry.text = "Newer unsent revision".into();
+                entry.generation += 1;
+                entry.revision = Some(1);
+                entry.dirty = true;
+                entry.save = Some(super::SaveAttempt {
+                    id: save_id, generation: entry.generation,
+                    write: super::DraftWrite { key: original.clone(), expected_revision: 1, mutation_id: uuid::Uuid::new_v4(), text: entry.text.clone(), attachments: entry.attachments.clone() },
+                });
+                super::DraftSnapshot { key: original.clone(), text: entry.text.clone(), attachments: entry.attachments.clone(), revision: 2, updated_at: 1 }
+            };
+            view.draft_saved(save_id, Ok(super::DraftSave::Saved(snapshot)), window, cx);
+            assert_eq!(view.drafts.entries[&original].text, "Newer unsent revision");
+            assert!(view.drafts.entries[&original].send_error.as_deref().is_some_and(|error| error.contains("missing")), "Autosave acknowledgement must not consume the originating send failure");
+        })).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn canonical_queue_receipt_clears_only_its_draft_and_transcript_waits_for_start(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.workspace = Some(std::path::PathBuf::from("/fixture"));
+                view.validation_draft_surface(None, true, window, cx);
+                let key = view.current_draft_key();
+                let entry = view.drafts.entries.get_mut(&key).unwrap();
+                entry.revision = Some(7);
+                entry.dirty = false;
+                let send = entry.send.as_mut().unwrap();
+                send.queued = true;
+                let id = send.id;
+                let mut turn = send.turn.clone();
+                turn.turn_id = uuid::Uuid::new_v4();
+                let item = xylo_runtime::turn_queue::QueuedTurn {
+                    id: turn.turn_id,
+                    turn,
+                    paused: false,
+                    reason: None,
+                };
+                let receipt = xylo_runtime::turn_queue::QueueReceipt {
+                    item: item.clone(),
+                    draft: super::DraftSnapshot {
+                        key: key.clone(),
+                        text: String::new(),
+                        attachments: vec![],
+                        revision: 8,
+                        updated_at: 1,
+                    },
+                    cleared: true,
+                };
+                view.queue_added(uuid::Uuid::new_v4(), Ok(receipt.clone()), window, cx);
+                assert!(
+                    view.turn_queue.items.is_empty(),
+                    "Unowned receipts must not create ghost queue rows"
+                );
+                view.queue_added(id, Ok(receipt), window, cx);
+                assert!(
+                    view.messages.is_empty(),
+                    "Queued messages are not transcript messages yet"
+                );
+                assert!(view.composer.read(cx).value().is_empty());
+                assert_eq!(view.turn_queue.items[&view.session].len(), 1);
+                view.composer.update(cx, |input, cx| {
+                    input.set_value("A newer unsent draft", window, cx)
+                });
+                view.queued_turn_started(view.session, item.clone(), cx);
+                view.queued_turn_started(view.session, item, cx);
+                assert_eq!(
+                    view.messages.len(),
+                    1,
+                    "Duplicate start receipts must not duplicate transcript content"
+                );
+                assert_eq!(
+                    view.composer.read(cx).value().as_str(),
+                    "A newer unsent draft"
+                );
+                assert!(view.turn_queue.items[&view.session].is_empty());
+            })
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn missing_worker_feedback_explains_setup_without_discarding_the_draft(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1000.), px(680.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+                },
+            )
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| view.update(cx, |view, cx| {
+            view.validation_draft_surface(None, true, window, cx);
+            let key = view.current_draft_key();
+            let entry = &view.drafts.entries[&key];
+            let request = entry.send.as_ref().unwrap().id;
+            let original = entry.text.clone();
+            view.draft_admitted(request, Err("A required application component is missing. Reinstall the complete application.".into()), window, cx);
+            assert!(view.error.as_deref().unwrap().contains("missing required task components"), "The missing component needs actionable feedback, not a generic send failure");
+            assert_eq!(view.drafts.entries[&key].text, original);
+            assert_eq!(view.composer.read(cx).value().as_str(), original);
+            assert!(!view.draft_send_pending());
+            assert!(view.messages.is_empty());
+        })).unwrap();
     }
 }

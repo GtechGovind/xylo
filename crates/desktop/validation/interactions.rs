@@ -227,7 +227,8 @@ mod xylo {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 // Drive the native receiver's bounded-backlog yield timer.
-                cx.executor().advance_clock(std::time::Duration::from_millis(2));
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 if cx.update(|cx| condition(view.read(cx), cx)) {
                     return;
@@ -708,7 +709,8 @@ mod xylo {
             .unwrap();
             let mut completed = false;
             for _ in 0..300 {
-                cx.executor().advance_clock(std::time::Duration::from_millis(2));
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 completed = cx.update(|cx| {
                     view.read(cx)
@@ -775,7 +777,8 @@ mod xylo {
                 .advance_clock(std::time::Duration::from_millis(200));
             let mut hovered = false;
             for _ in 0..200 {
-                cx.executor().advance_clock(std::time::Duration::from_millis(2));
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 hovered = cx.update(|cx| view.read(cx).editor.read(cx).hover_popover().is_some());
                 if hovered {
@@ -822,6 +825,66 @@ mod xylo {
                 )
                 .unwrap()
             })
+        }
+        #[gpui_kit::test]
+        fn short_chat_messages_do_not_reserve_empty_attachment_or_action_space(cx: &mut TestAppContext) {
+            let (handle, view) = fixture(cx);
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.error = None;
+                    view.settings.ui.sidebar_visible = false;
+                    view.messages = vec![
+                        super::message(view.session, "user", "hi".into()),
+                        super::message(view.session, "assistant", "Hi! What can I help you with?".into()),
+                        super::message(view.session, "user", "Study this project and explain the agent flow.".into()),
+                    ];
+                    view.sync_history_list(cx);
+                });
+                window.render_frame(cx);
+                let user = window.find(("chat-message", 1usize)).bounds();
+                let answer = window.find(("chat-message", 2usize)).bounds();
+                let next = window.find(("chat-message", 3usize)).bounds();
+                assert!(user.size.height <= px(40.), "A short user message must hug its text, not reserve invisible controls: {user:?}");
+                assert!(answer.size.height <= px(50.), "A short answer must not reserve an empty attachment strip: {answer:?}");
+                assert!(answer.top() - user.bottom() <= px(24.), "Turn spacing must stay compact");
+                assert!(next.top() - answer.bottom() <= px(24.), "Followup spacing must stay compact");
+                window.hover(("message-body", 1usize), cx);
+                window.click(("copy-message", 1usize), cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "hi");
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("changed".into()));
+                window.hover(("message-body", 3usize), cx);
+                assert_eq!(window.find(("copy-message", 1usize)).focused(), Some(true));
+                assert!(window.find(("copy-message", 1usize)).visible(), "Keyboard focus must reveal the copy action after pointer leaves");
+                window.press("enter", cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "hi");
+            }).unwrap();
+        }
+        #[gpui_kit::test]
+        fn sidebar_project_action_and_chat_rows_share_consistent_geometry(cx: &mut TestAppContext) {
+            let (handle, view) = fixture(cx);
+            for width in [200., 222., 300.] {
+                cx.update_window(handle, |_, window, cx| {
+                    view.update(cx, |view, _cx| {
+                        let root = PathBuf::from("/fixture/xylo");
+                        view.workspace = Some(root.clone());
+                        view.settings.ui.sidebar_visible = true;
+                        view.settings.ui.sidebar_width = width;
+                        view.settings.ui.open_projects = vec![root.clone()];
+                        view.conversations = vec![Conversation { id: uuid::Uuid::new_v4(), title: "hi".into(), workspace: root, updated_at: 1 }];
+                        view.messages.clear();
+                        view.sidebar_state.dirty = true;
+                    });
+                    window.render_frame(cx);
+                    let add = window.find(("project-new-chat", 0usize)).bounds();
+                    assert!((f32::from(add.right()) - (width - 8.)).abs() <= 2., "Project action should align to sidebar trailing edge: {add:?}, sidebar {width}");
+                    let draft = window.find("unsaved-chat").bounds();
+                    let saved = window.find(("conversation", 2usize)).bounds();
+                    assert_eq!(draft.left(), saved.left());
+                    assert_eq!(draft.size, saved.size);
+                    assert!(draft.size.height <= px(28.), "Chat controls should be compact");
+                    assert!(draft.left() >= px(40.), "Chats must visibly nest under the project");
+                }).unwrap();
+            }
         }
         #[gpui_kit::test]
         fn settings_routes_and_controls_preserve_the_active_chat(cx: &mut TestAppContext) {
@@ -971,7 +1034,10 @@ mod xylo {
                     window.render_frame(cx);
                     let edge = window.find("files-resize").bounds().center();
                     window.drag(edge, edge + gpui_kit::point(px(24.), px(0.)), cx);
+                    window.render_frame(cx);
                     let width = view.read(cx).settings.ui.files_width;
+                    let moved = f32::from(window.find("files-resize").bounds().center().x - edge.x);
+                    assert!((moved - 24.).abs() < 4., "visible file split should move 24px, moved {moved} with sidebar={sidebar_visible}");
                     assert!(
                         (width - 264.).abs() < 8.,
                         "expected local 24px resize, got {width} with sidebar={sidebar_visible}"
@@ -1005,7 +1071,8 @@ mod xylo {
             let wait = |cx: &mut TestAppContext, condition: &dyn Fn(&gpui_kit::App) -> bool| {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 loop {
-                    cx.executor().advance_clock(std::time::Duration::from_millis(2));
+                    cx.executor()
+                        .advance_clock(std::time::Duration::from_millis(2));
                     cx.run_until_parked();
                     if cx.update(|cx| condition(cx)) {
                         break;
@@ -1097,8 +1164,8 @@ mod xylo {
 
     #[cfg(test)]
     mod provider_editor_tests {
-        use gpui_kit::test::TestWindowExt;
         use super::{ApiFamily, ProviderConfig, Xylo};
+        use gpui_kit::test::TestWindowExt;
         use gpui_kit::{AppContext, TestAppContext, WindowOptions};
         #[gpui_kit::test]
         fn provider_editor_uses_selected_identity_without_changing_active_provider(
@@ -1228,23 +1295,21 @@ mod xylo {
             })
             .unwrap();
         }
-            #[gpui_kit::test]
-            fn controlled_approval_controls_route_allow_once_always_and_deny(
-                cx: &mut TestAppContext,
-            ) {
-                let (handle, view) = super::design_tests::fixture(cx);
-                let (sender, receiver) = std::sync::mpsc::sync_channel(8);
-                cx.update(|cx| {
-                    view.update(cx, |view, _| view.validation_worker_commands = Some(sender))
-                });
-                for (control, expected_allow, expected_remember) in [
-                    ("allow", true, false),
-                    ("allow-always", true, true),
-                    ("deny", false, false),
-                ] {
-                    let action = uuid::Uuid::new_v4();
-                    let session = cx.update(|cx| view.read(cx).session);
-                    cx.update_window(handle,|_,window,cx| {
+        #[gpui_kit::test]
+        fn controlled_approval_controls_route_allow_once_always_and_deny(cx: &mut TestAppContext) {
+            let (handle, view) = super::design_tests::fixture(cx);
+            let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+            cx.update(|cx| {
+                view.update(cx, |view, _| view.validation_worker_commands = Some(sender))
+            });
+            for (control, expected_allow, expected_remember) in [
+                ("allow", true, false),
+                ("allow-always", true, true),
+                ("deny", false, false),
+            ] {
+                let action = uuid::Uuid::new_v4();
+                let session = cx.update(|cx| view.read(cx).session);
+                cx.update_window(handle,|_,window,cx| {
                     view.update(cx,|view,cx| {
                         view.event(xylo_runtime::host::HostEvent::Engine(xylo_core::Envelope::new(uuid::Uuid::new_v4(),Some(session),1,xylo_core::EngineEvent::Started)),window,cx);
                         view.event(xylo_runtime::host::HostEvent::Engine(xylo_core::Envelope::new(uuid::Uuid::new_v4(),Some(session),2,xylo_core::EngineEvent::ApprovalRequired { action_id:action,name:"write_file".into(),arguments:serde_json::json!({"path":"hello.txt","content":"Hello"}),rule:Some("write hello.txt".into()) })),window,cx);
@@ -1255,34 +1320,34 @@ mod xylo {
                     assert!(!turn.tools[0].approval);
                     if !expected_allow { assert_eq!(turn.tools[0].success,Some(false)); }
                 }).unwrap();
-                    match receiver.try_recv().expect("UI decision dispatched") {
-                        (
-                            actual_session,
-                            xylo_core::WorkerCommand::Approve {
-                                action_id,
-                                allow,
-                                remember,
-                            },
-                        ) => {
-                            assert_eq!(actual_session, session);
-                            assert_eq!(action_id, action);
-                            assert_eq!(allow, expected_allow);
-                            assert_eq!(remember, expected_remember);
-                        }
-                        other => panic!("Unexpected UI dispatch: {other:?}"),
+                match receiver.try_recv().expect("UI decision dispatched") {
+                    (
+                        actual_session,
+                        xylo_core::WorkerCommand::Approve {
+                            action_id,
+                            allow,
+                            remember,
+                        },
+                    ) => {
+                        assert_eq!(actual_session, session);
+                        assert_eq!(action_id, action);
+                        assert_eq!(allow, expected_allow);
+                        assert_eq!(remember, expected_remember);
                     }
+                    other => panic!("Unexpected UI dispatch: {other:?}"),
                 }
-                assert!(receiver.try_recv().is_err());
             }
-            #[gpui_kit::test]
-            fn controlled_stop_control_preserves_partial_output_and_background_chat(
-                cx: &mut TestAppContext,
-            ) {
-                let (handle, view) = super::design_tests::fixture(cx);
-                let (sender, receiver) = std::sync::mpsc::sync_channel(4);
-                let background = uuid::Uuid::new_v4();
-                let session = cx.update(|cx| view.read(cx).session);
-                cx.update_window(handle,|_,window,cx| {
+            assert!(receiver.try_recv().is_err());
+        }
+        #[gpui_kit::test]
+        fn controlled_stop_control_preserves_partial_output_and_background_chat(
+            cx: &mut TestAppContext,
+        ) {
+            let (handle, view) = super::design_tests::fixture(cx);
+            let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+            let background = uuid::Uuid::new_v4();
+            let session = cx.update(|cx| view.read(cx).session);
+            cx.update_window(handle,|_,window,cx| {
                 view.update(cx,|view,cx|{
                     view.validation_worker_commands=Some(sender);
                     for (id,text) in [(session,"Partial response"),(background,"Background response")] {
@@ -1298,104 +1363,228 @@ mod xylo {
                 assert!(view.read(cx).turns[&background].running);
                 assert_eq!(view.read(cx).turns[&background].text,"Background response");
             }).unwrap();
-            }
+        }
     }
     #[cfg(test)]
     mod responsiveness_tests {
         use super::Xylo;
-        use gpui_kit::{AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size, EntityInputHandler};
         use gpui_kit::test::TestWindowExt;
+        use gpui_kit::{
+            AppContext, Bounds, EntityInputHandler, TestAppContext, WindowBounds, WindowOptions,
+            px, size,
+        };
         #[gpui_kit::test]
-        fn thousand_delta_receiver_yields_to_native_input_and_preserves_every_token(cx: &mut TestAppContext) {
-            use std::sync::{Arc,Mutex};
-            use std::time::{Instant,Duration};
+        fn thousand_delta_receiver_yields_to_native_input_and_preserves_every_token(
+            cx: &mut TestAppContext,
+        ) {
+            use std::sync::{Arc, Mutex};
+            use std::time::{Duration, Instant};
             cx.executor().allow_parking();
-            let directory=tempfile::tempdir().unwrap();
-            let paths=xylo_runtime::AppPaths::at(directory.path().join("profile")).unwrap();
-            let (client,_actual_events)=xylo_runtime::host::HostClient::spawn_at(paths).unwrap();
-            let (sender,receiver)=async_channel::unbounded();
+            let directory = tempfile::tempdir().unwrap();
+            let paths = xylo_runtime::AppPaths::at(directory.path().join("profile")).unwrap();
+            let (client, _actual_events) = xylo_runtime::host::HostClient::spawn_at(paths).unwrap();
+            let (sender, receiver) = async_channel::unbounded();
             cx.update(gpui_kit::init);
-            let (handle,view)=cx.update(|cx|gpui_kit::open_window(WindowOptions {
-                window_bounds:Some(WindowBounds::Windowed(Bounds {origin:Default::default(),size:size(px(1280.),px(820.))})),..Default::default()
-            },cx,|window,cx|cx.new(|cx|Xylo::new(Ok((client.clone(),receiver)),window,cx))).unwrap());
+            let (handle, view) = cx.update(|cx| {
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds {
+                            origin: Default::default(),
+                            size: size(px(1280.), px(820.)),
+                        })),
+                        ..Default::default()
+                    },
+                    cx,
+                    |window, cx| cx.new(|cx| Xylo::new(Ok((client.clone(), receiver)), window, cx)),
+                )
+                .unwrap()
+            });
             cx.run_until_parked();
-            let session=cx.update(|cx|view.read(cx).session);
-            let chunk="A realistic reasoning token batch with Unicode αβ and ordered output. ";
-            let expected=chunk.repeat(1000);
-            let stream=uuid::Uuid::new_v4();
-            sender.try_send(xylo_runtime::host::HostEvent::Engine(xylo_core::Envelope::new(stream,Some(session),0,xylo_core::EngineEvent::Started))).unwrap();
-            for index in 0..1000 { sender.try_send(xylo_runtime::host::HostEvent::Engine(xylo_core::Envelope::new(stream,Some(session),index+1,xylo_core::EngineEvent::Delta {text:chunk.into()}))).unwrap(); }
-            let observed=Arc::new(Mutex::new(None));let receipt=observed.clone();
-            cx.update_window(handle,|_,window,cx|view.update(cx,|_,cx|{
-                cx.spawn_in(window,async move |view,cx| {
-                    loop {
-                        let ready=view.update_in(cx,|view,window,cx|{
-                            let count=view.turns.get(&session).map_or(0,|turn|turn.text.len());
-                            if count==0 { return false; }
-                            view.composer.update(cx,|input,cx|{input.focus(window,cx);input.replace_text_in_range(None,"Follow up while reasoning αβ",window,cx);});
-                            *receipt.lock().unwrap()=Some(count);
-                            true
-                        }).unwrap();
-                        if ready { break; }
-                        cx.background_executor().timer(Duration::from_millis(1)).await;
-                    }
-                }).detach();
-            })).unwrap();
-            let deadline=Instant::now()+Duration::from_secs(10);
+            let session = cx.update(|cx| view.read(cx).session);
+            let chunk = "A realistic reasoning token batch with Unicode αβ and ordered output. ";
+            let expected = chunk.repeat(1000);
+            let stream = uuid::Uuid::new_v4();
+            sender
+                .try_send(xylo_runtime::host::HostEvent::Engine(
+                    xylo_core::Envelope::new(
+                        stream,
+                        Some(session),
+                        0,
+                        xylo_core::EngineEvent::Started,
+                    ),
+                ))
+                .unwrap();
+            for index in 0..1000 {
+                sender
+                    .try_send(xylo_runtime::host::HostEvent::Engine(
+                        xylo_core::Envelope::new(
+                            stream,
+                            Some(session),
+                            index + 1,
+                            xylo_core::EngineEvent::Delta { text: chunk.into() },
+                        ),
+                    ))
+                    .unwrap();
+            }
+            let observed = Arc::new(Mutex::new(None));
+            let receipt = observed.clone();
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |_, cx| {
+                    cx.spawn_in(window, async move |view, cx| {
+                        loop {
+                            let ready = view
+                                .update_in(cx, |view, window, cx| {
+                                    let count =
+                                        view.turns.get(&session).map_or(0, |turn| turn.text.len());
+                                    if count == 0 {
+                                        return false;
+                                    }
+                                    view.composer.update(cx, |input, cx| {
+                                        input.focus(window, cx);
+                                        input.replace_text_in_range(
+                                            None,
+                                            "Follow up while reasoning αβ",
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    *receipt.lock().unwrap() = Some(count);
+                                    true
+                                })
+                                .unwrap();
+                            if ready {
+                                break;
+                            }
+                            cx.background_executor()
+                                .timer(Duration::from_millis(1))
+                                .await;
+                        }
+                    })
+                    .detach();
+                })
+            })
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 cx.run_until_parked();
-                if cx.update(|cx|view.read(cx).turns.get(&session).is_some_and(|turn|turn.text.len()==expected.len())) {break;}
-                assert!(Instant::now()<deadline,"Receiver failed to deliver all stream events: {} bytes, {} queued, input {:?}",cx.update(|cx|view.read(cx).turns.get(&session).map_or(0,|turn|turn.text.len())),sender.len(),observed.lock().unwrap());
+                if cx.update(|cx| {
+                    view.read(cx)
+                        .turns
+                        .get(&session)
+                        .is_some_and(|turn| turn.text.len() == expected.len())
+                }) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Receiver failed to deliver all stream events: {} bytes, {} queued, input {:?}",
+                    cx.update(|cx| view
+                        .read(cx)
+                        .turns
+                        .get(&session)
+                        .map_or(0, |turn| turn.text.len())),
+                    sender.len(),
+                    observed.lock().unwrap()
+                );
                 // GPUI's timer clock is virtual; real sleeps do not advance it.
                 cx.executor().advance_clock(Duration::from_millis(2));
                 std::thread::sleep(Duration::from_millis(2));
             }
-            let delivered=observed.lock().unwrap().expect("Input task must run");
-            assert!(delivered>0 && delivered<expected.len(),"Input must run between stream batches, observed {delivered} of {} bytes",expected.len());
-            cx.update(|cx|{
-                assert_eq!(view.read(cx).turns[&session].text,expected);
-                assert_eq!(view.read(cx).composer.read(cx).value().as_ref(),"Follow up while reasoning αβ");
+            let delivered = observed.lock().unwrap().expect("Input task must run");
+            assert!(
+                delivered > 0 && delivered < expected.len(),
+                "Input must run between stream batches, observed {delivered} of {} bytes",
+                expected.len()
+            );
+            cx.update(|cx| {
+                assert_eq!(view.read(cx).turns[&session].text, expected);
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_ref(),
+                    "Follow up while reasoning αβ"
+                );
                 assert!(view.read(cx).turns[&session].running);
             });
             client.shutdown().unwrap();
         }
         #[gpui_kit::test]
-        fn long_live_response_typing_does_not_invalidate_unchanged_history(cx: &mut TestAppContext) {
+        fn long_live_response_typing_does_not_invalidate_unchanged_history(
+            cx: &mut TestAppContext,
+        ) {
             cx.update(gpui_kit::init);
-            let (handle,view)=cx.update(|cx| gpui_kit::open_window(WindowOptions {
-                window_bounds:Some(WindowBounds::Windowed(Bounds {origin:Default::default(),size:size(px(1280.),px(820.))})),..Default::default()
-            },cx,|window,cx|cx.new(|cx|Xylo::new(Err(anyhow::anyhow!("Controlled stream fixture")),window,cx))).unwrap());
-            cx.update_window(handle,|_,window,cx|{
-                view.update(cx,|view,cx|{
-                    view.error=None;
-                    let turn=view.turns.entry(view.session).or_default();
+            let (handle, view) = cx.update(|cx| {
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds {
+                            origin: Default::default(),
+                            size: size(px(1280.), px(820.)),
+                        })),
+                        ..Default::default()
+                    },
+                    cx,
+                    |window, cx| {
+                        cx.new(|cx| {
+                            Xylo::new(
+                                Err(anyhow::anyhow!("Controlled stream fixture")),
+                                window,
+                                cx,
+                            )
+                        })
+                    },
+                )
+                .unwrap()
+            });
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.error = None;
+                    let turn = view.turns.entry(view.session).or_default();
                     turn.apply(xylo_core::EngineEvent::Started);
-                    turn.apply(xylo_core::EngineEvent::Delta {text:"Reasoning through the implementation with Unicode αβ.\n\n".repeat(2000)});
+                    turn.apply(xylo_core::EngineEvent::Delta {
+                        text: "Reasoning through the implementation with Unicode αβ.\n\n"
+                            .repeat(2000),
+                    });
                     view.sync_history_list(cx);
                 });
                 window.render_frame(cx);
-                let before=view.read(cx).histories[&view.read(cx).session].validation_remeasures;
+                let before = view.read(cx).histories[&view.read(cx).session].validation_remeasures;
                 for text in ["Continue", " with", " the", " second", " message αβ"] {
-                    let composer=view.read(cx).composer.clone();
-                    composer.update(cx,|input,cx|{input.focus(window,cx);input.replace_text_in_range(None,text,window,cx);});
-                    view.update(cx,|_,cx|cx.notify());
+                    let composer = view.read(cx).composer.clone();
+                    composer.update(cx, |input, cx| {
+                        input.focus(window, cx);
+                        input.replace_text_in_range(None, text, window, cx);
+                    });
+                    view.update(cx, |_, cx| cx.notify());
                     window.render_frame(cx);
                 }
-                assert_eq!(view.read(cx).composer.read(cx).value().as_ref(),"Continue with the second message αβ");
-                assert_eq!(view.read(cx).histories[&view.read(cx).session].validation_remeasures,before,"Typing must reuse unchanged live history measurements");
-            }).unwrap();
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_ref(),
+                    "Continue with the second message αβ"
+                );
+                assert_eq!(
+                    view.read(cx).histories[&view.read(cx).session].validation_remeasures,
+                    before,
+                    "Typing must reuse unchanged live history measurements"
+                );
+            })
+            .unwrap();
         }
     }
 
     #[cfg(test)]
     mod tool_results_tests {
         use super::Xylo;
-        use gpui_kit::{AppContext,TestAppContext,WindowOptions};
         use gpui_kit::test::TestWindowExt;
+        use gpui_kit::{AppContext, TestAppContext, WindowOptions};
         #[gpui_kit::test]
-        fn file_results_expand_to_rows_with_secondary_raw_disclosure(cx:&mut TestAppContext) {
+        fn file_results_expand_to_rows_with_secondary_raw_disclosure(cx: &mut TestAppContext) {
             cx.update(gpui_kit::init);
-            let (handle,view)=cx.update(|cx|gpui_kit::open_window(WindowOptions::default(),cx,|window,cx|cx.new(|cx|Xylo::new(Err(anyhow::anyhow!("Controlled tool fixture")),window,cx))).unwrap());
+            let (handle, view) = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        Xylo::new(Err(anyhow::anyhow!("Controlled tool fixture")), window, cx)
+                    })
+                })
+                .unwrap()
+            });
             cx.update_window(handle,|_,window,cx|{
                 view.update(cx,|view,cx|{
                     view.error=None;let id=uuid::Uuid::new_v4();let turn=view.turns.entry(view.session).or_default();
@@ -1417,33 +1606,98 @@ mod xylo {
             }).unwrap();
         }
         #[gpui_kit::test]
-        fn large_tool_result_reuses_cached_presentation_across_native_frames(cx:&mut TestAppContext) {
+        fn large_tool_result_reuses_cached_presentation_across_native_frames(
+            cx: &mut TestAppContext,
+        ) {
             cx.update(gpui_kit::init);
-            let (handle,view)=cx.update(|cx|gpui_kit::open_window(WindowOptions::default(),cx,|window,cx|cx.new(|cx|Xylo::new(Err(anyhow::anyhow!("Controlled large result")),window,cx))).unwrap());
-            cx.update_window(handle,|_,window,cx|{
-                view.update(cx,|view,cx|{
-                    view.error=None;let id=uuid::Uuid::new_v4();let turn=view.turns.entry(view.session).or_default();turn.apply(xylo_core::EngineEvent::Started);
-                    turn.apply(xylo_core::EngineEvent::ToolStarted {action_id:id,name:"files_list".into(),arguments:serde_json::json!({"path":"src"})});
-                    let entries=(0..2000).map(|index|format!("folder-{index}-{}", "unicode-αβ".repeat(8))).collect::<Vec<_>>();
-                    turn.apply(xylo_core::EngineEvent::ToolFinished {action_id:id,name:"files_list".into(),result:serde_json::json!({"status":"success","summary":{"entries":entries}}).to_string(),success:true});cx.notify();
+            let (handle, view) = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        Xylo::new(Err(anyhow::anyhow!("Controlled large result")), window, cx)
+                    })
+                })
+                .unwrap()
+            });
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.error = None;
+                    let id = uuid::Uuid::new_v4();
+                    let turn = view.turns.entry(view.session).or_default();
+                    turn.apply(xylo_core::EngineEvent::Started);
+                    turn.apply(xylo_core::EngineEvent::ToolStarted {
+                        action_id: id,
+                        name: "files_list".into(),
+                        arguments: serde_json::json!({"path":"src"}),
+                    });
+                    let entries = (0..2000)
+                        .map(|index| format!("folder-{index}-{}", "unicode-αβ".repeat(8)))
+                        .collect::<Vec<_>>();
+                    turn.apply(xylo_core::EngineEvent::ToolFinished {
+                        action_id: id,
+                        name: "files_list".into(),
+                        result:
+                            serde_json::json!({"status":"success","summary":{"entries":entries}})
+                                .to_string(),
+                        success: true,
+                    });
+                    cx.notify();
                 });
-                let cached=view.read(cx).turns[&view.read(cx).session].tools[0].presentation.parsed_output.clone().unwrap();
-                window.render_frame(cx);window.click(("tool-detail",0usize),cx);
-                assert!(window.try_find(("tool-files",0usize)).is_some());
-                for _ in 0..20 {view.update(cx,|_,cx|cx.notify());window.render_frame(cx);}
-                let tool=&view.read(cx).turns[&view.read(cx).session].tools[0];
-                assert!(std::sync::Arc::ptr_eq(&cached,tool.presentation.parsed_output.as_ref().unwrap()),"Rendering must not parse/rebuild the result presentation");
-                let crate::state::tool_presentation::ToolBody::Files {entries,remaining}= &tool.presentation.body else {panic!("Expected file rows")};
-                assert_eq!(entries.len(),24);assert_eq!(*remaining,1976);
-                assert!(tool.result.as_ref().unwrap().len()>100_000);
-                assert!(tool.presentation.raw_result.as_ref().unwrap().chars().count()<=12_001);
-            }).unwrap();
+                let cached = view.read(cx).turns[&view.read(cx).session].tools[0]
+                    .presentation
+                    .parsed_output
+                    .clone()
+                    .unwrap();
+                window.render_frame(cx);
+                window.click(("tool-detail", 0usize), cx);
+                assert!(window.try_find(("tool-files", 0usize)).is_some());
+                for _ in 0..20 {
+                    view.update(cx, |_, cx| cx.notify());
+                    window.render_frame(cx);
+                }
+                let tool = &view.read(cx).turns[&view.read(cx).session].tools[0];
+                assert!(
+                    std::sync::Arc::ptr_eq(
+                        &cached,
+                        tool.presentation.parsed_output.as_ref().unwrap()
+                    ),
+                    "Rendering must not parse/rebuild the result presentation"
+                );
+                let crate::state::tool_presentation::ToolBody::Files { entries, remaining } =
+                    &tool.presentation.body
+                else {
+                    panic!("Expected file rows")
+                };
+                assert_eq!(entries.len(), 24);
+                assert_eq!(*remaining, 1976);
+                assert!(tool.result.as_ref().unwrap().len() > 100_000);
+                assert!(
+                    tool.presentation
+                        .raw_result
+                        .as_ref()
+                        .unwrap()
+                        .chars()
+                        .count()
+                        <= 12_001
+                );
+            })
+            .unwrap();
         }
 
         #[gpui_kit::test]
-        fn read_search_command_and_delegate_expand_without_raw_envelopes(cx:&mut TestAppContext) {
+        fn read_search_command_and_delegate_expand_without_raw_envelopes(cx: &mut TestAppContext) {
             cx.update(gpui_kit::init);
-            let (handle,view)=cx.update(|cx|gpui_kit::open_window(WindowOptions::default(),cx,|window,cx|cx.new(|cx|Xylo::new(Err(anyhow::anyhow!("Controlled structured outputs")),window,cx))).unwrap());
+            let (handle, view) = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        Xylo::new(
+                            Err(anyhow::anyhow!("Controlled structured outputs")),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .unwrap()
+            });
             cx.update_window(handle,|_,window,cx|{
                 let cases=[
                     ("file_read",serde_json::json!({"path":"src/main.rs"}),serde_json::json!({"content":"    12\tfn main() {}\n","start_line":12,"end_line":12,"total_lines":20}),"tool-read"),
@@ -1465,7 +1719,5 @@ mod xylo {
                 }
             }).unwrap();
         }
-
     }
-
 }

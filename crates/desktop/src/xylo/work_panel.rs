@@ -271,6 +271,24 @@ impl Xylo {
             }
         }
     }
+    /// Clamp only the rendered panel so a narrow window keeps readable chat.
+    /// The saved width returns automatically when the viewport grows again.
+    fn available_work_panel_width(&self, total: f32) -> f32 {
+        let sidebar = if self.settings.ui.sidebar_visible || self.settings_open {
+            self.settings.ui.sidebar_width
+        } else {
+            0.
+        };
+        (total - sidebar).max(0.)
+    }
+    pub(super) fn effective_work_panel_width(&self, total: f32) -> f32 {
+        let available = self.available_work_panel_width(total);
+        self.settings
+            .ui
+            .work_panel_width
+            .max(320.)
+            .min((available - 400.).max(320.))
+    }
     pub(super) fn native_workspace(
         &mut self,
         window: &mut Window,
@@ -290,40 +308,65 @@ impl Xylo {
             &self.settings.ui.work_panel
         };
         let mut tabs = div()
-            .h(px(40.))
+            .h(px(52.))
             .flex_shrink_0()
-            .px_2()
+            .px(px(10.))
             .flex()
             .items_center()
-            .gap_1()
+            .gap(px(2.))
+            .bg(rgb(sidebar()))
             .border_b_1()
             .border_color(rgb(border()));
-        for (key, label) in [
-            ("changes", "Changes"),
-            ("files", "Files"),
-            ("terminal", "Terminal"),
+        for (key, label, glyph) in [
+            ("changes", "Changes", Glyph::GitBranch),
+            ("files", "Files", Glyph::FolderOpen),
+            ("terminal", "Terminal", Glyph::Terminal),
         ] {
+            let active = key == selected;
             tabs = tabs.child(
-                button(SharedString::from(format!("work-tab-{key}")), label)
-                    .text_size(px(10.))
-                    .h_full()
-                    .rounded_none()
-                    .border_0()
-                    .border_b_2()
-                    .border_color(rgb(if key == selected { accent() } else { panel() }))
-                    .text_color(rgb(if key == selected { text() } else { muted() }))
-                    .bg(rgb(panel()))
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        view.page = Page::Chat;
-                        view.settings_open = false;
-                        view.settings.ui.work_panel = key.into();
-                        view.settings.ui.work_panel_open = true;
-                        view.activate_work_panel(window, cx);
-                        view.persist_ui(cx);
-                        cx.notify();
-                    })),
+                focus_ring(gpui_kit::base::Button::new(SharedString::from(format!(
+                    "work-tab-{key}"
+                ))))
+                .accessibility_label(label)
+                .h(px(30.))
+                .px(px(10.))
+                .rounded(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(if active { text() } else { muted() }))
+                .bg(rgb(if active {
+                    crate::ui::selected()
+                } else {
+                    sidebar()
+                }))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
+                .child(icon(glyph).size(px(14.)))
+                .child(label)
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    view.page = Page::Chat;
+                    view.settings_open = false;
+                    view.settings.ui.work_panel = key.into();
+                    view.settings.ui.work_panel_open = true;
+                    view.activate_work_panel(window, cx);
+                    view.persist_ui(cx);
+                    cx.notify();
+                })),
             );
         }
+        tabs = tabs.child(div().flex_1()).child(
+            icon_button("close-work-panel", "Hide work panel", IconName::Close)
+                .size(px(28.))
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.page = Page::Chat;
+                    view.settings.ui.work_panel_open = false;
+                    view.persist_ui(cx);
+                    cx.notify();
+                })),
+        );
         let content = match selected {
             "changes" => self.git_changes_panel(cx),
             "terminal" => self
@@ -342,26 +385,60 @@ impl Xylo {
                 }),
             _ => self.files_page(cx),
         };
-        let _ = window;
+        let total = f32::from(window.viewport_size().width);
+        let stacked = self.available_work_panel_width(total) < 720.;
+        let work_width = self.effective_work_panel_width(total);
+        // Home includes generous vertical spacing. Scroll it rather than letting
+        // its composer paint over the work pane in a short stacked viewport.
+        let chat =
+            if stacked && self.messages.is_empty() && !self.running() && !self.history_loading() {
+                div()
+                    .w_full()
+                    .h_full()
+                    .min_h(px(460.))
+                    .child(chat)
+                    .into_any_element()
+            } else {
+                chat
+            };
         div()
+            .id("native-workspace")
+            .test_support()
             .size_full()
             .min_h_0()
             .flex()
-            .child(div().flex_1().min_w_0().h_full().child(chat))
+            .when(stacked, |layout| layout.flex_col())
             .child(
                 div()
-                    .w(px(self.settings.ui.work_panel_width))
-                    .max_w(relative(0.62))
-                    .min_w(px(320.))
+                    .id("native-chat-pane")
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .when(stacked, |pane| pane.w_full().overflow_y_scroll())
+                    .when(!stacked, |pane| pane.h_full())
+                    .child(chat),
+            )
+            .child(
+                div()
+                    .id("native-work-pane")
+                    .test_support()
+                    .flex_shrink_0()
+                    .min_h_0()
                     .relative()
-                    .child(self.resize_edge(Panel::Work))
-                    .h_full()
+                    .when(stacked, |pane| pane.w_full().h(relative(0.5)).border_t_1())
+                    .when(!stacked, |pane| {
+                        pane.w(px(work_width))
+                            .h_full()
+                            .border_l_1()
+                            .child(self.resize_edge(Panel::Work))
+                    })
                     .flex()
                     .flex_col()
-                    .border_l_1()
+                    .bg(rgb(sidebar()))
                     .border_color(rgb(border()))
                     .child(tabs)
-                    .child(div().flex_1().min_h_0().child(content)),
+                    .child(div().flex_1().min_h_0().bg(rgb(panel())).child(content)),
             )
             .into_any_element()
     }
@@ -485,7 +562,11 @@ impl Xylo {
         .flex_1()
         .min_h_0();
         let mut explorer = div()
+            .id("git-changes-explorer")
+            .test_support()
             .w(px(self.settings.ui.files_width.min(230.)))
+            .max_w(relative(0.45))
+            .min_w(px(130.))
             .flex_shrink_0()
             .h_full()
             .flex()
@@ -553,6 +634,8 @@ impl Xylo {
         .h_full()
         .min_h_0();
         let source = div()
+            .id("git-diff-pane")
+            .test_support()
             .flex_1()
             .min_w_0()
             .h_full()
@@ -561,6 +644,10 @@ impl Xylo {
             .child(
                 div()
                     .h(px(36.))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .truncate()
                     .px_3()
                     .flex()
                     .items_center()
@@ -580,6 +667,14 @@ impl Xylo {
                             }),
                     ),
             )
+            .when(self.git_panel.selected.is_none() && self.git_panel.diff_request.is_none(), |pane| {
+                pane.child(
+                    div().p_4().child(heading(
+                        "Review your changes",
+                        "Choose a changed file from the list to inspect its diff. Added and removed lines appear here; viewing a diff does not modify files.",
+                    )),
+                )
+            })
             .child(
                 div()
                     .id("git-code-scroll")

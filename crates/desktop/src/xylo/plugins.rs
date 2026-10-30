@@ -138,6 +138,7 @@ impl Xylo {
         self.result(result, cx);
     }
     pub(super) fn refresh_plugins(&mut self, cx: &mut Context<Self>) {
+        self.extension_request("extension_snapshot", json!({}), cx);
         self.plugin_request("helper_plugin_list", json!({}), RequestKind::List, cx);
     }
     pub(super) fn plugin_owns_request(&self, id: Uuid) -> bool {

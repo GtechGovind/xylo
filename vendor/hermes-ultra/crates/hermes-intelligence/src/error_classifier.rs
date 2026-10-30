@@ -77,6 +77,28 @@ impl ErrorClassifier {
     /// Classify an `AgentError` into an `ErrorCategory`.
     pub fn classify(&self, error: &AgentError) -> ErrorCategory {
         match error {
+            AgentError::ProviderTransport { retryable, .. } => {
+                if *retryable {
+                    ErrorCategory::NetworkError
+                } else {
+                    ErrorCategory::InvalidRequest
+                }
+            }
+            AgentError::ProviderHttp {
+                status,
+                retry_after_secs,
+                ..
+            } => match status {
+                401 | 403 => ErrorCategory::AuthFailed,
+                429 => ErrorCategory::RateLimit {
+                    retry_after_secs: *retry_after_secs,
+                },
+                408 => ErrorCategory::Timeout,
+                500..=599 => ErrorCategory::ServerError {
+                    status_code: *status,
+                },
+                _ => ErrorCategory::InvalidRequest,
+            },
             AgentError::LlmApi(msg) => classify_llm_api_message(msg),
             AgentError::RateLimited { retry_after_secs } => ErrorCategory::RateLimit {
                 retry_after_secs: *retry_after_secs,

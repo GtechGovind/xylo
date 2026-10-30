@@ -1,5 +1,7 @@
 #[path = "xylo/environments.rs"]
 mod environments;
+#[path = "xylo/extensions.rs"]
+mod extensions;
 #[path = "xylo/management.rs"]
 mod management;
 #[path = "xylo/notifications.rs"]
@@ -12,6 +14,9 @@ use notifications::NotificationUi;
 #[path = "xylo/drafts.rs"]
 mod drafts;
 use drafts::{DraftFlushAction, DraftUi};
+#[path = "xylo/turn_queue.rs"]
+mod turn_queue;
+use turn_queue::TurnQueueUi;
 #[path = "xylo/attachments.rs"]
 mod attachments;
 use attachments::AttachmentUi;
@@ -53,10 +58,6 @@ mod editor_assist;
 use editor_assist::EditorAssist;
 #[path = "xylo/chat.rs"]
 mod chat;
-#[path = "xylo/connectors.rs"]
-mod connectors;
-#[path = "xylo/diagnostics.rs"]
-mod diagnostics;
 #[path = "xylo/memory.rs"]
 mod memory;
 #[path = "xylo/memory_form.rs"]
@@ -122,9 +123,7 @@ enum Page {
     Plugins,
     Environments,
     Providers,
-    Diagnostics,
     Schedules,
-    Teams,
     Appearance,
     Assets,
 }
@@ -153,9 +152,7 @@ impl Page {
             Self::Plugins => "Plugins",
             Self::Environments => "Environments",
             Self::Providers => "Providers",
-            Self::Diagnostics => "Activity",
             Self::Schedules => "Scheduled Tasks",
-            Self::Teams => "Teams",
         }
     }
 }
@@ -178,9 +175,7 @@ impl Page {
             Self::Plugins => "plugins",
             Self::Environments => "environments",
             Self::Providers => "providers",
-            Self::Diagnostics => "activity",
             Self::Schedules => "schedules",
-            Self::Teams => "teams",
             Self::Assets => "downloads",
             Self::Appearance => "appearance",
             Self::Agent => "agent",
@@ -275,11 +270,16 @@ pub struct Xylo {
     connector_name: Entity<InputState>,
     connector_endpoint: Entity<InputState>,
     connector_command: Entity<InputState>,
-    connector_args: Entity<InputState>,
+    connector_args: Entity<TextareaState>,
+    connector_pending: Option<Uuid>,
+    connector_pending_save: bool,
+    connector_editing: Option<Uuid>,
+    connector_credential: Entity<InputState>,
     connector_transport: String,
     connectors: Vec<ConnectorConfig>,
     connector_tools: Vec<ToolDefinition>,
     connector_inspected: Option<Uuid>,
+    connector_inspection_request: Option<Uuid>,
     connector_loading: bool,
     connector_error: Option<String>,
     status: String,
@@ -296,14 +296,14 @@ pub struct Xylo {
     provider_form_open: bool,
     search_open: bool,
     conversation_query: Entity<InputState>,
-    selected_assistant: usize,
     expanded_tools: BTreeSet<Uuid>,
     raw_tool_details: BTreeSet<Uuid>,
     schedules: Vec<xylo_runtime::scheduler::ScheduledTask>,
-    team_tasks: Vec<TeamTask>,
     schedule_prompt: Entity<TextareaState>,
     schedule_time: Entity<InputState>,
     schedule_frequency: usize,
+    schedule_pending: Option<(Uuid, Option<String>)>,
+    schedule_notice: String,
     quitting: bool,
     quit_prompt_open: bool,
     quit_after_save: Option<PathBuf>,
@@ -317,10 +317,12 @@ pub struct Xylo {
     updates: UpdateUi,
     history_search: HistorySearchUi,
     drafts: DraftUi,
+    turn_queue: TurnQueueUi,
     attachments: AttachmentUi,
     image_generation: ImageGenerationUi,
     notifications: NotificationUi,
     plugins: plugins::PluginUi,
+    extensions: extensions::ExtensionUi,
     environments: environments::EnvironmentUi,
     management_confirming: bool,
     recovery: recovery::RecoveryUi,
@@ -337,7 +339,7 @@ impl Xylo {
         };
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Describe a change…")
+                .placeholder("How can I help you today?")
                 .auto_grow(1, 8)
         });
         let editor = cx.new(|cx| EditorState::new(window, cx).language("rust"));
@@ -501,11 +503,24 @@ impl Xylo {
             connector_name: input("Connector name", window, cx),
             connector_endpoint: input("https://…/mcp", window, cx),
             connector_command: input("Executable path", window, cx),
-            connector_args: input("Arguments (one per line)", window, cx),
+            connector_args: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .rows(3)
+                    .placeholder("Arguments (one per line)")
+            }),
+            connector_pending: None,
+            connector_pending_save: false,
+            connector_editing: None,
+            connector_credential: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Access token (optional)")
+                    .masked(true)
+            }),
             connector_transport: "stdio".into(),
             connectors: vec![],
             connector_tools: vec![],
             connector_inspected: None,
+            connector_inspection_request: None,
             connector_loading: false,
             connector_error: None,
             status: "Connecting…".into(),
@@ -522,11 +537,9 @@ impl Xylo {
             provider_form_open: false,
             search_open: false,
             conversation_query,
-            selected_assistant: 0,
             expanded_tools: BTreeSet::new(),
             raw_tool_details: BTreeSet::new(),
             schedules: vec![],
-            team_tasks: vec![],
             schedule_prompt: cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .placeholder("What should your assistant do?")
@@ -534,10 +547,12 @@ impl Xylo {
             }),
             schedule_time: input("09:00", window, cx),
             schedule_frequency: 0,
+            schedule_pending: None,
+            schedule_notice: String::new(),
             quitting: false,
             quit_prompt_open: false,
             quit_after_save: None,
-            native: NativeUi::new(window, cx),
+            native: NativeUi::new(),
             documents: documents::DocumentUi::new(window, cx),
             assets: AssetsUi::default(),
             account: AccountUi::default(),
@@ -547,10 +562,12 @@ impl Xylo {
             updates: UpdateUi::default(),
             history_search: HistorySearchUi::new(window, cx),
             drafts: DraftUi::new(window),
+            turn_queue: TurnQueueUi::default(),
             attachments: AttachmentUi::new(),
             image_generation: ImageGenerationUi::new(window, cx),
             notifications: NotificationUi::default(),
             plugins: plugins::PluginUi::new(window, cx),
+            extensions: extensions::ExtensionUi::new(window, cx),
             environments: environments::EnvironmentUi::new(window, cx),
             management_confirming: false,
             recovery: recovery::RecoveryUi::new(window, cx),
@@ -657,7 +674,7 @@ impl Xylo {
         self.result(result, cx);
     }
     fn begin_shutdown(&mut self, cx: &mut Context<Self>) {
-        if self.management_busy() || self.management_dirty() {
+        if self.management_busy() || self.management_dirty(cx) {
             self.error = Some(
                 "Finish or discard your plugin and environment setup before closing Xylo.".into(),
             );
@@ -862,6 +879,17 @@ impl Xylo {
                 self.draft_saved(request_id, result, window, cx)
             }
             HostEvent::Drafts { request_id, result } => self.drafts_listed(request_id, result, cx),
+            HostEvent::QueueAdded { request_id, result } => {
+                self.queue_added(request_id, result, window, cx)
+            }
+            HostEvent::TurnQueue {
+                request_id,
+                session_id,
+                result,
+            } => self.turn_queue_result(request_id, session_id, result, cx),
+            HostEvent::QueuedTurnStarted { session_id, item } => {
+                self.queued_turn_started(session_id, item, cx)
+            }
             HostEvent::DraftAdmitted { request_id, result } => {
                 self.draft_admitted(request_id, result, window, cx)
             }
@@ -980,7 +1008,10 @@ impl Xylo {
                 diagnostics,
             } => self.editor_diagnostics(path, version, diagnostics, cx),
             HostEvent::Schedules(tasks) => self.schedules = tasks,
-            HostEvent::TeamTasks(tasks) => self.team_tasks = tasks,
+            HostEvent::ScheduleMutation { request_id, result } => {
+                self.schedule_mutated(request_id, result, window, cx)
+            }
+            HostEvent::TeamTasks(_) => {}
             HostEvent::Stopped => {
                 cx.quit();
                 return;
@@ -1033,7 +1064,6 @@ impl Xylo {
                             | Page::Connectors
                             | Page::Plugins
                             | Page::Environments
-                            | Page::Diagnostics
                             | Page::Appearance
                             | Page::Assets
                             | Page::Voice
@@ -1046,6 +1076,9 @@ impl Xylo {
                     }
                     if self.page == Page::Images {
                         self.load_image_generation_provider(cx);
+                    }
+                    if self.page == Page::Assets {
+                        self.refresh_assets(cx);
                     }
                     if self.page == Page::Updates {
                         self.refresh_updates(cx);
@@ -1122,9 +1155,17 @@ impl Xylo {
                 if !self.provider_catalog_received(&provider, generation, &models) {
                     return;
                 }
-                self.native.select_local_model=false;
-                if let Err(error)=self.register_discovered_models(&provider,&models,&context_limits,&reasoning_options,&default_reasoning_efforts,window,cx) {
-                    self.error=Some(error.to_string());
+                self.native.select_local_model = false;
+                if let Err(error) = self.register_discovered_models(
+                    &provider,
+                    &models,
+                    &context_limits,
+                    &reasoning_options,
+                    &default_reasoning_efforts,
+                    window,
+                    cx,
+                ) {
+                    self.error = Some(error.to_string());
                 }
                 self.model_context_limits = context_limits;
                 self.status = format!("Discovered {} models", models.len());
@@ -1231,21 +1272,36 @@ impl Xylo {
                 self.memory_exported(request_id, result, cx)
             }
             HostEvent::Connectors(connectors) => self.connectors = connectors,
+            HostEvent::ConnectorMutation { request_id, result } => {
+                self.connector_mutation_result(request_id, result, window, cx)
+            }
             HostEvent::ConnectorTools {
+                request_id,
+                workspace,
                 connector_id,
                 tools,
             } => {
-                if self.connector_inspected == Some(connector_id) {
+                if self.connector_inspected == Some(connector_id)
+                    && self.connector_inspection_request == Some(request_id)
+                    && self.workspace == workspace
+                {
+                    self.connector_inspection_request = None;
                     self.connector_loading = false;
                     self.connector_error = None;
                     self.connector_tools = tools;
                 }
             }
             HostEvent::ConnectorToolsFailed {
+                request_id,
+                workspace,
                 connector_id,
                 message,
             } => {
-                if self.connector_inspected == Some(connector_id) {
+                if self.connector_inspected == Some(connector_id)
+                    && self.connector_inspection_request == Some(request_id)
+                    && self.workspace == workspace
+                {
+                    self.connector_inspection_request = None;
                     self.connector_loading = false;
                     self.connector_tools.clear();
                     self.connector_error = Some(message);
@@ -1287,9 +1343,6 @@ impl Xylo {
                                 .push(message(session, "assistant", text.clone()));
                         }
                         let _ = self.host.as_ref().map(|h| h.list_conversations());
-                    }
-                    EngineEvent::Error { message, .. } if session == self.session => {
-                        self.error = Some(message.clone());
                     }
                     _ => {}
                 }
@@ -1344,14 +1397,10 @@ impl Xylo {
             cx.notify();
             return;
         }
-        if self.attachments.importing()
+        if self.attachments.importing_for(self.session)
             || self.draft_flush_pending()
             || self.memory_forms_flush_pending()
         {
-            return;
-        }
-        if self.running() {
-            self.submit_persisted_steering(window, cx);
             return;
         }
         self.submit_persisted_draft(window, cx);
@@ -1602,7 +1651,7 @@ impl Xylo {
             self.provider_form_open = false;
         }
         self.page = page;
-        if matches!(
+        self.settings_open = matches!(
             page,
             Page::Providers
                 | Page::Agent
@@ -1619,11 +1668,11 @@ impl Xylo {
                 | Page::Notifications
                 | Page::Plugins
                 | Page::Environments
-        ) {
-            self.settings_open = true;
-        }
+        );
         self.persist_ui(cx);
         match page {
+            Page::Schedules => self.host_call(cx, |h| h.list_schedules()),
+            Page::Assets => self.refresh_assets(cx),
             Page::Updates => self.refresh_updates(cx),
             Page::Notifications => self.refresh_notifications(cx),
             Page::Plugins => self.refresh_plugins(cx),
@@ -1681,8 +1730,18 @@ impl Xylo {
                 provider.credential_ref = Some(reference);
             }
             let mut settings = self.settings.clone();
-            if let Some(existing)=settings.providers.iter_mut().find(|saved|providers::same_connection(saved,&provider) && saved.model==provider.model) { *existing=provider.clone(); } else {settings.providers.push(provider.clone());}
-            self.dispatch_provider_save(settings.clone(), provider.clone(), (!key.is_empty()).then_some(key))?;
+            if let Some(existing) = settings.providers.iter_mut().find(|saved| {
+                providers::same_connection(saved, &provider) && saved.model == provider.model
+            }) {
+                *existing = provider.clone();
+            } else {
+                settings.providers.push(provider.clone());
+            }
+            self.dispatch_provider_save(
+                settings.clone(),
+                provider.clone(),
+                (!key.is_empty()).then_some(key),
+            )?;
             self.settings = settings;
             let kind = self.provider_editor_kind.clone();
             self.provider_form(&provider, window, cx);
@@ -1696,59 +1755,6 @@ impl Xylo {
         }
         self.result(result, cx);
     }
-    fn preset(
-        &mut self,
-        name: &str,
-        endpoint: &str,
-        family: ApiFamily,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let p = ProviderConfig {
-            name: name.into(),
-            endpoint: endpoint.into(),
-            family,
-            ..Default::default()
-        };
-        self.provider_form(&p, window, cx);
-        self.models.clear();
-        self.model_context_limits.clear();
-        cx.notify();
-    }
-    fn save_connector(&mut self, cx: &mut Context<Self>) {
-        let name = self.connector_name.read(cx).value().trim().to_string();
-        if name.is_empty() {
-            self.error = Some("A connector needs a name.".into());
-            cx.notify();
-            return;
-        }
-        let args = self.connector_args.read(cx).value().to_string();
-        let args: Result<Vec<String>, std::convert::Infallible> = Ok(args
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect());
-        match args {
-            Ok(args) => {
-                let command = self.connector_command.read(cx).value().trim().to_string();
-                let config = ConnectorConfig {
-                    id: Uuid::new_v4(),
-                    name,
-                    transport: self.connector_transport.clone(),
-                    endpoint: self.connector_endpoint.read(cx).value().trim().into(),
-                    command: (!command.is_empty()).then(|| PathBuf::from(command)),
-                    args,
-                    credential_ref: None,
-                };
-                self.host_call(cx, |h| h.save_connector(config));
-            }
-            Err(error) => {
-                self.error = Some(error.to_string());
-                cx.notify();
-            }
-        }
-    }
 }
 impl Render for Xylo {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1757,8 +1763,10 @@ impl Render for Xylo {
                 .size_full()
                 .bg(rgb(bg()))
                 .text_color(rgb(text()))
-                .p_8()
-                .child(heading(
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(empty_state(
                     "Installing update…",
                     "Keep Xylo open until installation finishes.",
                 ))
@@ -1791,12 +1799,11 @@ impl Render for Xylo {
             Page::Connectors => self.connections_settings_page(cx),
             Page::Plugins => self.plugins_page(cx),
             Page::Environments => self.environments_page(cx),
-            Page::Diagnostics => self.diagnostics_page(cx),
             Page::Schedules => self.schedules_page(cx),
-            Page::Teams => self.teams_page(cx),
         };
+        // Settings pages carry their own serif heading; the toolbar stays quiet.
         let title = if self.settings_open {
-            self.page.label().to_owned()
+            String::new()
         } else {
             self.conversations
                 .iter()
@@ -1808,49 +1815,61 @@ impl Render for Xylo {
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(rgb(panel()))
+            .bg(rgb(bg()))
             .flex()
             .flex_col();
+        let sidebar_hidden = !self.settings.ui.sidebar_visible && !self.settings_open;
         let mut toolbar = div()
-            .h(px(49.))
+            .h(px(52.))
             .flex_shrink_0()
-            .px(px(17.))
+            .pl(px(if sidebar_hidden { 12. } else { 20. }))
+            .pr(px(12.))
             .flex()
             .items_center()
-            .gap_2()
-            .border_b_1()
-            .border_color(rgb(border()));
-        if !self.settings_open {
-            toolbar = toolbar.child(
-                icon_button(
-                    "toggle-sidebar",
-                    "Toggle sidebar",
-                    gpui_kit::component::IconName::PanelLeft,
+            .gap_2();
+        if sidebar_hidden {
+            toolbar = toolbar
+                .child(
+                    icon_button(
+                        "toggle-sidebar",
+                        "Show sidebar",
+                        gpui_kit::component::IconName::PanelLeft,
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.settings.ui.sidebar_visible = true;
+                        view.persist_ui(cx);
+                        cx.notify();
+                    })),
                 )
-                .on_click(cx.listener(|view, _, _, cx| {
-                    view.settings.ui.sidebar_visible = !view.settings.ui.sidebar_visible;
-                    view.persist_ui(cx);
-                    cx.notify();
-                })),
-            );
+                .child(brand_mark(20.).ml(px(4.)).mr(px(2.)));
         }
         toolbar = toolbar.child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(12.))
+                .text_size(px(13.5))
                 .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(text_secondary()))
                 .child(title),
         );
         if !self.settings_open {
             toolbar = toolbar.child(self.conversation_actions(cx));
+            let work_open = self.settings.ui.work_panel_open
+                || matches!(self.page, Page::Files | Page::Changes);
             toolbar = toolbar.child(
                 icon_button(
                     "toggle-work-panel",
-                    "Toggle work panel",
+                    if work_open {
+                        "Hide work panel"
+                    } else {
+                        "Show work panel"
+                    },
                     gpui_kit::component::IconName::PanelRight,
                 )
+                .when(work_open, |button| {
+                    button.text_color(rgb(text())).bg(rgb(selected()))
+                })
                 .on_click(cx.listener(|view, _, window, cx| {
                     let was_open = view.settings.ui.work_panel_open
                         || matches!(view.page, Page::Files | Page::Changes);
@@ -1871,26 +1890,30 @@ impl Render for Xylo {
             );
         }
         main = main.child(toolbar);
+        if !matches!(
+            self.page,
+            Page::Chat | Page::Files | Page::Changes | Page::Voice
+        ) && self.speech_recording_active()
+        {
+            main = main.child(self.global_recording_controls(cx));
+        }
         if let Some(error) = &self.error {
             main = main.child(
-                div()
-                    .px_5()
-                    .py_2()
-                    .bg(rgb(panel()))
-                    .border_b_1()
-                    .border_color(rgb(border()))
-                    .text_color(rgb(muted()))
-                    .text_sm()
-                    .flex()
-                    .justify_between()
-                    .gap_3()
-                    .child(div().flex_1().min_w_0().child(product_error(error)))
-                    .child(button("dismiss-error", "Dismiss").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.error = None;
-                            cx.notify();
-                        },
-                    ))),
+                div().px(px(20.)).pb_2().flex().justify_center().child(
+                    notice(BadgeTone::Danger, product_error(error))
+                        .max_w(px(760.))
+                        .items_center()
+                        .child(
+                            button("dismiss-error", "Dismiss")
+                                .h(px(26.))
+                                .text_size(px(12.))
+                                .text_color(rgb(danger()))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.error = None;
+                                    cx.notify();
+                                })),
+                        ),
+                ),
             );
         }
         if self.draft_flush_pending()
@@ -1988,7 +2011,7 @@ impl Render for Xylo {
             .on_action(cx.listener(|view, _: &AllowPendingAction, _, cx| view.allow_pending(cx)))
             .on_action(cx.listener(|view, _: &DenyOrStop, _, cx| view.deny_or_stop(cx)))
             .on_action(cx.listener(|view, _: &FocusComposer, window, cx| {
-                view.page = Page::Chat;
+                view.navigate(Page::Chat, cx);
                 view.composer
                     .update(cx, |input, cx| input.focus(window, cx));
                 cx.notify();
@@ -1997,7 +2020,7 @@ impl Render for Xylo {
             .overflow_hidden()
             .bg(rgb(bg()))
             .text_color(rgb(text()))
-            .text_size(px(13.))
+            .text_size(px(14.))
             // Theme resolves the installed platform family once. Replacing it
             // with .SystemUIFont makes every text run repeat failed font lookup.
             .font_family(gpui_kit::component::Theme::global(cx).font_family.clone())
@@ -2011,21 +2034,11 @@ impl Render for Xylo {
                         }
                         Panel::Files => {
                             let total = f32::from(event.bounds.size.width);
-                            let side = if view.settings.ui.sidebar_visible {
-                                view.settings.ui.sidebar_width
-                            } else {
-                                0.
-                            };
-                            let work_width = view
-                                .settings
-                                .ui
-                                .work_panel_width
-                                .min((total - side).max(0.) * 0.62)
-                                .max(320.);
+                            let work_width = view.effective_work_panel_width(total);
                             let left = total - work_width;
                             view.settings.ui.files_width =
                                 (f32::from(event.event.position.x - event.bounds.origin.x) - left)
-                                    .clamp(130., (work_width * 0.6).max(130.).min(480.));
+                                    .clamp(130., (work_width * 0.45).max(130.).min(480.));
                         }
                         Panel::Work => {
                             view.settings.ui.work_panel_width =

@@ -506,7 +506,8 @@ impl Store {
             tx.execute("INSERT INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) SELECT DISTINCT session_id,turn_id,'pending',?1,?1 FROM actions WHERE state IN ('pending','running') ON CONFLICT(session_id,turn_id) DO UPDATE SET state=CASE WHEN learning_jobs.state='processing' THEN 'processing' ELSE 'pending' END,updated_at=excluded.updated_at",[now_ms()])?;
             let writes=tx.execute("UPDATE actions SET state='outcome_unknown',error='Interrupted while executing; reconcile before retry',updated_at=?1 WHERE state='running' AND json_extract(intent,'$.writes')=1",[now_ms()])?;
             let reads=tx.execute("UPDATE actions SET state='failed',error='Interrupted before a result was recorded',updated_at=?1 WHERE state IN ('pending','running')",[now_ms()])?;
-            tx.commit()?; Ok(writes+reads) })
+            let extensions = tx.execute("UPDATE extension_execution_receipts SET state='outcome_unknown',error='Application interrupted during component execution; effects require inspection',updated_at=?1 WHERE state='running'",[now_ms()])?;
+            tx.commit()?; Ok(writes+reads+extensions) })
     }
     /// Recover only a confirmed-dead worker's session, including its child tool
     /// namespaces. Call after the process is reaped and before admitting a retry.
@@ -776,6 +777,8 @@ CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL
 CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id,created_at);
 CREATE TABLE IF NOT EXISTS checkpoints(session_id TEXT PRIMARY KEY REFERENCES conversations(id),turn_id TEXT NOT NULL,messages TEXT NOT NULL,updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,action_key TEXT NOT NULL,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL,UNIQUE(session_id,turn_id,action_key));
+CREATE TABLE IF NOT EXISTS extension_action_bindings(action_id TEXT PRIMARY KEY REFERENCES actions(id) ON DELETE CASCADE,binding TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS extension_execution_receipts(id TEXT PRIMARY KEY,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS actions_state ON actions(state);
 CREATE INDEX IF NOT EXISTS actions_name_time ON actions(json_extract(intent,'$.name'),updated_at DESC);
 CREATE TABLE IF NOT EXISTS completed_turns(session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,json TEXT NOT NULL,completed_at INTEGER NOT NULL,PRIMARY KEY(session_id,turn_id));
