@@ -11,7 +11,19 @@ use xylo_core::{
 };
 const MAX_PER_TURN: i64 = 64;
 const MAX_TURN_BYTES: i64 = 128 * 1024;
-const MAX_RECORDS: i64 = 16384;
+/// Cap on guidance still waiting to be delivered, across all chats.
+const MAX_QUEUED: i64 = 16384;
+/// Applied and cancelled guidance is kept this long so receipts can still be
+/// shown and retried requests deduplicated, then purged.
+const FINISHED_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+fn purge_finished(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM user_guidance WHERE state IN('applied','cancelled') AND updated_at<?1",
+        [now_ms().saturating_sub(FINISHED_RETENTION_MS)],
+    )?;
+    Ok(())
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SteeringOutcome {
     /// Canonical ID can differ after deduplicating the same draft revision.
@@ -19,7 +31,6 @@ pub struct SteeringOutcome {
     pub receipt: SteeringReceipt,
     pub draft: DraftSnapshot,
     /// Exact empty revision committed by this guidance, if its draft CAS won.
-    #[serde(default)]
     pub cleared_revision: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -27,29 +38,6 @@ pub struct SteeringApplication {
     pub messages: Value,
     pub applied: Vec<SteeringOutcome>,
     pub has_more: bool,
-}
-fn initialize(conn: &mut Connection) -> Result<()> {
-    crate::drafts::initialize(conn)?;
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='user_guidance')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !exists {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS user_guidance(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,turn_id TEXT NOT NULL,workspace TEXT NOT NULL,draft_revision INTEGER NOT NULL,text TEXT NOT NULL,submission TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN('queued','applied','cancelled')),reason TEXT,created_at INTEGER NOT NULL,applied_at INTEGER,cleared_revision INTEGER,UNIQUE(session_id,turn_id,workspace,draft_revision));CREATE INDEX IF NOT EXISTS user_guidance_pending ON user_guidance(session_id,turn_id,state,created_at,id);")?;
-        tx.commit()?;
-    }
-    let has_clear:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('user_guidance') WHERE name='cleared_revision')",[],|row|row.get(0))?;
-    if !has_clear {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('user_guidance') WHERE name='cleared_revision')",[],|row|row.get(0))?;
-        if !exists {
-            tx.execute_batch("ALTER TABLE user_guidance ADD COLUMN cleared_revision INTEGER")?;
-        }
-        tx.commit()?;
-    }
-    Ok(())
 }
 struct Record {
     request: SteeringRequest,
@@ -129,19 +117,22 @@ pub fn guidance_name(id: Uuid) -> String {
 }
 impl Store {
     /// Startup-only recovery, before accepting work or spawning new workers.
+    /// Also purges finished guidance older than the retention window.
     pub fn recover_steering(&self) -> Result<usize> {
         self.call(|conn| {
-            initialize(conn)?;
+            purge_finished(conn)?;
             Ok(conn.execute(
-                "UPDATE user_guidance SET state='cancelled',
+                "UPDATE user_guidance SET state='cancelled',updated_at=?1,
                  reason='Application restarted before guidance was added' WHERE state='queued'",
-                [],
+                [now_ms()],
             )?)
         })
     }
 
     /// Host calls after validating a live target and reserving dispatch capacity.
-    /// The draft is not cleared. Repeated IDs/revisions reuse the canonical row.
+    /// The draft is not cleared. Repeated IDs/revisions reuse the canonical row
+    /// while it is queued or applied; a cancelled row is replaced, so submitting
+    /// again after a cancellation queues the guidance anew.
     pub fn queue_steering(
         &self,
         request: &SteeringRequest,
@@ -167,8 +158,8 @@ impl Store {
         let request = request.clone();
         let submission = submission.clone();
         self.call(move |conn| {
-            initialize(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            purge_finished(&tx)?;
             if let Some(previous) = record(&tx, request.id)? {
                 ensure!(
                     previous.request == request
@@ -177,9 +168,12 @@ impl Store {
                         && previous.submission.text == submission.text,
                     "Guidance ID was reused for different input"
                 );
-                let result = outcome(&tx, previous)?;
-                tx.commit()?;
-                return Ok(result);
+                if previous.state != SteeringState::Cancelled {
+                    let result = outcome(&tx, previous)?;
+                    tx.commit()?;
+                    return Ok(result);
+                }
+                tx.execute("DELETE FROM user_guidance WHERE id=?1", [request.id.to_string()])?;
             }
             let prior: Option<String> = tx.query_row(
                 "SELECT id FROM user_guidance WHERE session_id=?1 AND turn_id=?2
@@ -194,9 +188,12 @@ impl Store {
                     previous.request.text == request.text && previous.submission.text == submission.text,
                     "This draft revision already has different guidance"
                 );
-                let result = outcome(&tx, previous)?;
-                tx.commit()?;
-                return Ok(result);
+                if previous.state != SteeringState::Cancelled {
+                    let result = outcome(&tx, previous)?;
+                    tx.commit()?;
+                    return Ok(result);
+                }
+                tx.execute("DELETE FROM user_guidance WHERE id=?1", [id])?;
             }
             let draft = crate::drafts::snapshot_in_transaction(&tx, &submission.key)?;
             ensure!(
@@ -219,11 +216,11 @@ impl Store {
                 count < MAX_PER_TURN && bytes + request.text.len() as i64 <= MAX_TURN_BYTES,
                 "This task has reached its guidance limit; start another turn"
             );
-            let total: i64 = tx.query_row("SELECT count(*) FROM user_guidance", [], |row| row.get(0))?;
-            ensure!(total < MAX_RECORDS, "Saved guidance has reached its storage limit");
+            let queued: i64 = tx.query_row("SELECT count(*) FROM user_guidance WHERE state='queued'", [], |row| row.get(0))?;
+            ensure!(queued < MAX_QUEUED, "Too much guidance is waiting to be delivered");
             tx.execute(
-                "INSERT INTO user_guidance(id,session_id,turn_id,workspace,draft_revision,text,submission,state,created_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',?8)",
+                "INSERT INTO user_guidance(id,session_id,turn_id,workspace,draft_revision,text,submission,state,created_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',?8,?8)",
                 params![request.id.to_string(), request.session_id.to_string(), request.turn_id.to_string(),
                     workspace, submission.expected_revision, request.text, serde_json::to_string(&submission)?, now_ms()],
             )?;
@@ -235,7 +232,6 @@ impl Store {
 
     pub fn steering(&self, id: Uuid) -> Result<Option<SteeringOutcome>> {
         self.call(move |conn| {
-            initialize(conn)?;
             record(conn, id)?
                 .map(|record| outcome(conn, record))
                 .transpose()
@@ -249,7 +245,6 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<SteeringOutcome>> {
         self.call(move |conn| {
-            initialize(conn)?;
             let mut statement = conn.prepare(
                 "SELECT id FROM user_guidance WHERE session_id=?1 AND(?2 IS NULL OR turn_id=?2)
                  ORDER BY created_at DESC,id DESC LIMIT ?3",
@@ -289,7 +284,6 @@ impl Store {
             .context("Guidance needs a message checkpoint")?
             .clone();
         self.call(move |conn| {
-            initialize(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut statement = tx.prepare(
                 "SELECT id FROM user_guidance WHERE session_id=?1 AND turn_id=?2 AND state='queued'
@@ -305,7 +299,17 @@ impl Store {
             let checkpoint: Option<String> = tx.query_row(
                 "SELECT turn_id FROM checkpoints WHERE session_id=?1", [session.to_string()], |row|row.get(0),
             ).optional()?;
-            ensure!(checkpoint.as_deref()==Some(&turn.to_string()),"Guidance target checkpoint is no longer active");
+            if checkpoint.as_deref() != Some(&turn.to_string()) {
+                let finished: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM completed_turns WHERE session_id=?1 AND turn_id=?2)",
+                    params![session.to_string(), turn.to_string()], |row| row.get(0),
+                )?;
+                ensure!(!finished, "Guidance target checkpoint is no longer active");
+                // The turn has not saved its first checkpoint yet. Keep the
+                // guidance queued and ask the engine to try again later.
+                tx.commit()?;
+                return Ok(SteeringApplication { messages:Value::Array(messages), applied:Vec::new(), has_more:true });
+            }
             let mut applied = Vec::new();
             for id in ids {
                 let id = Uuid::parse_str(&id)?;
@@ -319,7 +323,7 @@ impl Store {
                 let timestamp = now_ms();
                 let message = ChatMessage {
                     id:Uuid::new_v5(&id,b"steering-message"), session_id:session, role:"user".into(),
-                    content:record.request.text.clone(), created_at:timestamp, attachments:Vec::new(),
+                    content:record.request.text.clone(), created_at:timestamp, attachments:Vec::new(), status: Default::default(),
                 };
                 tx.execute(
                     "INSERT OR IGNORE INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4)",
@@ -329,7 +333,7 @@ impl Store {
                 let draft = crate::drafts::clear_submission_in_transaction(&tx,&record.submission,id)?;
                 let cleared_revision = (draft.revision > before.revision).then_some(draft.revision);
                 tx.execute(
-                    "UPDATE user_guidance SET state='applied',reason=NULL,applied_at=?1,cleared_revision=?3 WHERE id=?2",
+                    "UPDATE user_guidance SET state='applied',reason=NULL,applied_at=?1,updated_at=?1,cleared_revision=?3 WHERE id=?2",
                     params![timestamp,id.to_string(),cleared_revision],
                 )?;
                 applied.push(SteeringOutcome {
@@ -360,7 +364,6 @@ impl Store {
     ) -> Result<Vec<SteeringOutcome>> {
         let reason = reason.chars().take(256).collect::<String>();
         self.call(move |conn| {
-            initialize(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut statement = tx.prepare(
                 "SELECT id FROM user_guidance WHERE session_id=?1 AND(?2 IS NULL OR turn_id=?2)
@@ -371,7 +374,7 @@ impl Store {
             drop(statement);
             let mut outcomes = Vec::new();
             for id in ids {
-                tx.execute("UPDATE user_guidance SET state='cancelled',reason=?1 WHERE id=?2 AND state='queued'",params![reason,id])?;
+                tx.execute("UPDATE user_guidance SET state='cancelled',reason=?1,updated_at=?3 WHERE id=?2 AND state='queued'",params![reason,id,now_ms()])?;
                 outcomes.push(outcome(&tx,record(&tx,Uuid::parse_str(&id)?)?.context("Guidance disappeared")?)?);
             }
             tx.commit()?;
@@ -381,5 +384,4 @@ impl Store {
 }
 
 #[cfg(test)]
-#[path = "steering/tests.rs"]
 mod tests;

@@ -1,11 +1,16 @@
 //! Variable-height native history list. Older pages splice in without moving the
-//! visible message; tail following pauses when the reader scrolls upward.
+//! visible message; tail following pauses when the reader scrolls upward and a
+//! "Jump to latest" control resumes it. Rows are the header, the history
+//! messages, then the live turn's transcript rows (`Xylo::live_row_count`).
 use super::*;
 use xylo_runtime::history::HistoryWindow;
 
 pub(super) struct ChatHistory {
     pub list: ListState,
-    live_revision: Option<(u64, usize)>,
+    live_revision: Option<(u64, usize, bool)>,
+    /// Whether the list followed the tail at the last scroll event; a change
+    /// shows or hides "Jump to latest".
+    following: std::rc::Rc<std::cell::Cell<bool>>,
     #[cfg(test)]
     pub validation_remeasures: usize,
     messages: Vec<ChatMessage>,
@@ -29,6 +34,7 @@ impl ChatHistory {
         Self {
             list,
             live_revision: None,
+            following: std::rc::Rc::new(std::cell::Cell::new(true)),
             #[cfg(test)]
             validation_remeasures: 0,
             messages: vec![],
@@ -46,8 +52,32 @@ impl ChatHistory {
             highlight: None,
         }
     }
+    /// Whether the page in flight is an earlier page of an open conversation.
+    pub(super) fn loading_older(&self) -> bool {
+        self.loading && self.older_request
+    }
+    /// The reader scrolled up while the live list follows its tail.
+    pub(super) fn reader_scrolled_away(&self) -> bool {
+        !self.windowed && !self.list.is_following_tail()
+    }
 }
 impl Xylo {
+    pub(super) fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
+        if let Some(history) = self.histories.get(&self.session) {
+            history.list.set_follow_mode(FollowMode::Tail);
+            history.following.set(true);
+        }
+        cx.notify();
+    }
+    /// History now holds a finished turn's reply; its live transcript would
+    /// repeat it.
+    fn history_covers_turn(&mut self, session: Uuid) {
+        if let Some(turn) = self.turns.get_mut(&session)
+            && !turn.running
+        {
+            turn.archive();
+        }
+    }
     pub(super) fn history_loading(&self) -> bool {
         self.histories
             .get(&self.session)
@@ -107,6 +137,7 @@ impl Xylo {
         }
         self.recovery_activate(window, cx);
         self.persist_ui(cx);
+        self.refresh_composer_placeholder(cx);
         cx.notify();
     }
     fn request_history(&mut self, older: bool, cx: &mut Context<Self>) {
@@ -212,6 +243,7 @@ impl Xylo {
             *messages = page.messages;
             history.list.reset(0);
         }
+        let refreshed = !history.older_request;
         if !retained_cursor {
             history.before = page.before;
             history.has_more = page.has_more;
@@ -219,8 +251,12 @@ impl Xylo {
         history.stale = false;
         history.loading = false;
         history.loaded = true;
+        if refreshed {
+            self.history_covers_turn(page.session_id);
+        }
         if active {
             self.sync_history_list(cx);
+            self.refresh_composer_placeholder(cx);
         }
         cx.notify();
     }
@@ -230,16 +266,14 @@ impl Xylo {
         }
     }
     pub(super) fn sync_history_list(&mut self, cx: &mut Context<Self>) {
-        let revision = (self.turns.get(&self.session).map_or(0, |turn| turn.render_revision), self.messages.len());
-        let count = 1
-            + self.messages.len()
-            + self.turns.get(&self.session).map_or(0, |turn| {
-                turn.tools.len()
-                    + usize::from(
-                        !turn.text.is_empty() && (turn.running || turn.status == "Cancelled"),
-                    )
-                    + usize::from(turn.running || turn.error.is_some())
-            });
+        let revision = (
+            self.turns
+                .get(&self.session)
+                .map_or(0, |turn| turn.render_revision),
+            self.messages.len(),
+            self.sending_turn(),
+        );
+        let count = 1 + self.messages.len() + self.live_row_count();
         let history = self
             .histories
             .entry(self.session)
@@ -253,23 +287,34 @@ impl Xylo {
         // defeats its height cache on every spinner/input frame. Only actual
         // turn changes or explicit action expansion invalidate live rows.
         if history.live_revision != Some(revision) {
-            let previous_messages = history.live_revision.map_or(self.messages.len(), |(_, count)| count);
+            let previous_messages = history
+                .live_revision
+                .map_or(self.messages.len(), |(_, count, _)| count);
             let first = (1 + previous_messages.min(self.messages.len())).min(count);
             if first < count {
                 history.list.remeasure_items(first..count);
                 #[cfg(test)]
-                { history.validation_remeasures += 1; }
+                {
+                    history.validation_remeasures += 1;
+                }
             }
             history.live_revision = Some(revision);
         }
         let weak = cx.entity().downgrade();
         let session = self.session;
+        let following = history.following.clone();
         history.list.set_scroll_handler(move |event, _, cx| {
-            if event.is_scrolled && event.visible_range.start <= 2 {
+            let changed = following.replace(event.is_following_tail) != event.is_following_tail;
+            let older = event.is_scrolled && event.visible_range.start <= 2;
+            if changed || older {
                 let _ = weak.update(cx, |view, cx| {
-                    if view.session == session {
+                    if view.session != session {
+                        return;
+                    }
+                    if older {
                         view.load_older(cx);
                     }
+                    cx.notify();
                 });
             }
         });
@@ -317,6 +362,7 @@ impl Xylo {
         self.request_message_window(anchor, cx);
         self.recovery_activate(window, cx);
         self.persist_ui(cx);
+        self.refresh_composer_placeholder(cx);
     }
     fn request_message_window(&mut self, anchor: Uuid, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.clone() else {
@@ -422,6 +468,7 @@ impl Xylo {
         history.has_newer = page.has_newer;
         history.messages = self.messages.clone();
         self.sync_history_list(cx);
+        self.refresh_composer_placeholder(cx);
         if let Some(history) = self.histories.get(&self.session) {
             // A new centered window contains unmeasured rows. Scrolling by its
             // stable item index reveals the source immediately and pauses tail

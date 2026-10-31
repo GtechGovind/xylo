@@ -1,11 +1,21 @@
 //! Explicit saved SSH/container identities. Requests carry a stable operation
 //! identity and revision; neither cancellation nor a saved flag means success.
+//!
+//! An environment lets the agent run commands on a remote machine (SSH) or in
+//! a container instead of this computer. "Test" is the helper's connection
+//! probe (the Connect action); its last result is kept per environment for
+//! this session. SSH forms default to `~/.ssh/known_hosts` and can import
+//! hosts from `~/.ssh/config`.
 use super::*;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::Instant;
+#[path = "ssh_config.rs"]
+mod ssh_config;
 #[path = "environments_view.rs"]
 mod view;
+use ssh_config::SshHost;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Ssh,
@@ -18,6 +28,30 @@ impl Kind {
             Self::Ssh => "SSH",
             Self::Docker => "Docker",
             Self::Podman => "Podman",
+        }
+    }
+    /// One line on what this kind of environment is for.
+    fn helper(self) -> &'static str {
+        match self {
+            Self::Ssh => "Build, test or deploy on a machine you already reach with SSH.",
+            Self::Docker => {
+                "Run commands in an isolated container from an image or a running container."
+            }
+            Self::Podman => "The same, using Podman (rootless by default).",
+        }
+    }
+    /// How to get the client program when it is missing.
+    fn install_hint(self) -> &'static str {
+        match self {
+            Self::Ssh => {
+                "OpenSSH isn't installed. Install it from your system's package manager, or choose the ssh program."
+            }
+            Self::Docker => {
+                "Docker isn't installed. Install Docker Desktop from docker.com, or choose the docker program."
+            }
+            Self::Podman => {
+                "Podman isn't installed. Install it from podman.io, or choose the podman program."
+            }
         }
     }
     fn runtime(self) -> &'static str {
@@ -191,6 +225,22 @@ pub(super) struct EnvironmentUi {
     picking: bool,
     confirming: bool,
     pub notice: String,
+    /// The form is open (new or editing a saved environment).
+    editing: bool,
+    /// Hosts parsed from `~/.ssh/config`, once the user asked to import.
+    ssh_hosts: Option<Vec<SshHost>>,
+    /// Contents of the form's trusted-hosts file, read when it changes.
+    known_hosts_text: Option<(PathBuf, String)>,
+    /// Last test per environment: success, message, time.
+    tests: BTreeMap<Uuid, (bool, String, i64)>,
+    /// The Connect operation started by a test.
+    testing: Option<Uuid>,
+    /// Test this environment once its pending save succeeds.
+    test_after_save: Option<Uuid>,
+    /// When the one pending host request was sent, for the slow-wait caption.
+    waiting_since: Option<Instant>,
+    /// `~/.ssh/config` is being read for the import list.
+    ssh_loading: bool,
 }
 impl EnvironmentUi {
     pub fn new(window: &mut Window, cx: &mut Context<Xylo>) -> Self {
@@ -225,6 +275,14 @@ impl EnvironmentUi {
             picking: false,
             confirming: false,
             notice: String::new(),
+            editing: false,
+            ssh_hosts: None,
+            known_hosts_text: None,
+            tests: BTreeMap::new(),
+            testing: None,
+            test_after_save: None,
+            waiting_since: None,
+            ssh_loading: false,
         }
     }
     pub fn busy(&self) -> bool {
@@ -252,6 +310,16 @@ impl EnvironmentUi {
     fn selected_record(&self) -> Option<&EnvironmentRecord> {
         self.selected
             .and_then(|id| self.records.iter().find(|record| record.profile.id == id))
+    }
+    /// Whether the pending host request is of the kind `matches` accepts.
+    fn waiting_for(&self, matches: impl Fn(&RequestKind) -> bool) -> bool {
+        self.pending.values().any(|request| matches(&request.kind))
+    }
+    /// Whether a lifecycle action of `action` is waiting on the host.
+    fn waiting_for_action(&self, action: EnvironmentAction) -> bool {
+        self.waiting_for(
+            |kind| matches!(kind, RequestKind::Receipt { action: sent, .. } if *sent == action),
+        )
     }
     fn unresolved(&self, id: Uuid) -> bool {
         self.operations
@@ -329,6 +397,7 @@ impl Xylo {
                     kind,
                 },
             );
+            self.environments.waiting_since = Some(self.arm_slow_hint(cx));
         } else {
             self.environments.notice =
                 "This request could not start. Your setup stays here; try again.".into();
@@ -361,6 +430,7 @@ impl Xylo {
             self.environments.pending.remove(&id);
             self.environments.retired.insert(id);
         }
+        self.environments.waiting_since = None;
         self.environments.epoch = self.environments.epoch.saturating_add(1);
         self.environments.statuses.clear();
         self.environments.history = Arc::new(Vec::new());
@@ -388,12 +458,7 @@ impl Xylo {
                     .find(|client| client.runtime == values.kind.runtime() && client.available)
                     .map(|client| client.executable.clone())
             })
-            .ok_or_else(|| {
-                format!(
-                    "Install {} or choose its client application.",
-                    values.kind.label()
-                )
-            })?;
+            .ok_or_else(|| values.kind.install_hint().to_owned())?;
         let target = match values.kind {
             Kind::Ssh => {
                 if values.host.trim().is_empty() || values.user.trim().is_empty() {
@@ -406,9 +471,9 @@ impl Xylo {
                     .ok()
                     .filter(|port| *port > 0)
                     .ok_or("Enter a valid SSH port.")?;
-                let known_hosts = values
-                    .known_hosts
-                    .ok_or("Choose your verified hosts file before saving SSH setup.")?;
+                let known_hosts = values.known_hosts.ok_or(
+                    "No trusted hosts file found. Connect once with ssh in Terminal to create ~/.ssh/known_hosts, or choose the file.",
+                )?;
                 EnvironmentTarget::Ssh {
                     executable,
                     host: values.host.trim().into(),
@@ -555,7 +620,7 @@ impl Xylo {
         let values = record
             .as_ref()
             .map(|record| values_from_profile(&record.profile))
-            .unwrap_or_default();
+            .unwrap_or_else(new_values);
         self.environment_apply_values(values, window, cx);
         self.environments.form.id = record
             .as_ref()
@@ -592,6 +657,165 @@ impl Xylo {
         form.dirty = false;
         form.generation = form.generation.saturating_add(1);
         form.restoring = false;
+        self.environment_read_known_hosts();
+    }
+    /// Re-reads the trusted-hosts file after it changed, for the inline
+    /// "not trusted yet" warning. Small files only; a failed read shows none.
+    fn environment_read_known_hosts(&mut self) {
+        let Some(path) = self.environments.form.known_hosts.clone() else {
+            self.environments.known_hosts_text = None;
+            return;
+        };
+        if self
+            .environments
+            .known_hosts_text
+            .as_ref()
+            .is_some_and(|(read, _)| *read == path)
+        {
+            return;
+        }
+        self.environments.known_hosts_text = std::fs::metadata(&path)
+            .ok()
+            .filter(|meta| meta.len() <= 4 << 20)
+            .and_then(|_| std::fs::read_to_string(&path).ok())
+            .map(|text| (path, text));
+    }
+    /// Whether the form's host is listed in its trusted-hosts file; `None`
+    /// when that cannot be told (no file, hashed entries, incomplete form).
+    fn environment_host_trusted(&self, cx: &App) -> Option<bool> {
+        let form = &self.environments.form;
+        if form.kind != Kind::Ssh {
+            return None;
+        }
+        let host = form.host.read(cx).value().trim().to_owned();
+        let port = form.port.read(cx).value().trim().parse::<u16>().ok()?;
+        if host.is_empty() {
+            return None;
+        }
+        let (_, text) = self.environments.known_hosts_text.as_ref()?;
+        ssh_config::known_host(text, &host, port)
+    }
+    /// Opens the form for a new environment of `kind`.
+    fn environment_new(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.environments.busy() || self.environments.form.dirty {
+            self.environments.notice = "Save or discard your changes first.".into();
+            cx.notify();
+            return;
+        }
+        self.environment_apply_selection(None, window, cx);
+        self.environments.form.kind = kind;
+        self.environments.form.baseline.kind = kind;
+        self.environments.form.last.kind = kind;
+        self.environments.editing = true;
+        cx.notify();
+    }
+    /// Opens a saved environment's page.
+    fn environment_open(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.environments.busy() {
+            return;
+        }
+        self.environments.editing = true;
+        self.environment_select(Some(id), window, cx);
+    }
+    /// Returns from an environment's page to the list, asking first when its
+    /// setup has unsaved changes.
+    fn environment_back_to_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.environments.busy() {
+            return;
+        }
+        let close = |view: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            view.environment_apply_selection(None, window, cx);
+            view.environments.editing = false;
+            view.environments.ssh_hosts = None;
+            cx.notify();
+        };
+        if !self.environments.form.dirty {
+            close(self, window, cx);
+            return;
+        }
+        self.confirm_destructive(
+            "Discard unsaved environment changes?",
+            "The saved environment stays unchanged.",
+            "Discard changes",
+            window,
+            cx,
+            close,
+        );
+    }
+    /// Loads `~/.ssh/config` hosts for the import list.
+    fn environment_load_ssh_hosts(&mut self, cx: &mut Context<Self>) {
+        let Some(home) = ssh_config::home() else {
+            self.environments.ssh_hosts = Some(Vec::new());
+            cx.notify();
+            return;
+        };
+        self.environments.ssh_loading = true;
+        cx.notify();
+        let task = cx.background_executor().spawn(async move {
+            let text =
+                std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
+            ssh_config::parse_config(&text, &home)
+        });
+        cx.spawn(async move |view, cx| {
+            let hosts = task.await;
+            let _ = view.update(cx, |view, cx| {
+                view.environments.ssh_hosts = Some(hosts);
+                view.environments.ssh_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    /// Prefills the SSH form from one `~/.ssh/config` host.
+    fn environment_import_ssh_host(
+        &mut self,
+        host: SshHost,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let form = &self.environments.form;
+        for (input, value) in [
+            (&form.name, Some(host.alias.clone())),
+            (&form.host, Some(host.address().to_owned())),
+            (&form.user, host.user.clone()),
+            (&form.port, Some(host.port.unwrap_or(22).to_string())),
+        ] {
+            if let Some(value) = value {
+                Self::set_input(input, value, window, cx);
+            }
+        }
+        self.environments.form.identity = host.identity_file;
+        self.environments.ssh_hosts = None;
+        self.environment_form_changed(cx);
+    }
+    /// Tests a saved environment with the helper's connection probe.
+    fn environment_test(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.environments.selected != Some(id) {
+            if self.environments.form.dirty || self.environments.busy() {
+                self.environments.notice = "Save or discard your changes first.".into();
+                cx.notify();
+                return;
+            }
+            self.environment_apply_selection(Some(id), window, cx);
+        }
+        self.environments.testing = self.environment_action(EnvironmentAction::Connect, cx);
+        if self.environments.testing.is_some() {
+            self.environments.notice = "Testing connection…".into();
+        }
+        cx.notify();
+    }
+    /// The form's Test: saves first when the form has unsaved changes.
+    fn environment_test_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.environments.form.id;
+        if self.environments.form.dirty || self.environments.form.original.is_none() {
+            self.environments.test_after_save = Some(id);
+            self.environment_save(cx);
+            if self.environments.pending.is_empty() {
+                self.environments.test_after_save = None;
+            }
+        } else {
+            self.environment_test(id, window, cx);
+        }
     }
     pub(super) fn discard_environment_setup(
         &mut self,
@@ -615,9 +839,9 @@ impl Xylo {
         self.environments.picking = true;
         cx.spawn_in(window, async move |view, cx| {
             let title = match asset {
-                Asset::Client => "Choose client application",
-                Asset::KnownHosts => "Choose verified SSH hosts file",
-                Asset::Identity => "Choose SSH identity file",
+                Asset::Client => "Choose the client program",
+                Asset::KnownHosts => "Choose the trusted hosts file",
+                Asset::Identity => "Choose an SSH key file",
             };
             let file = rfd::AsyncFileDialog::new()
                 .set_title(title)
@@ -637,6 +861,7 @@ impl Xylo {
                         Asset::KnownHosts => view.environments.form.known_hosts = path,
                         Asset::Identity => view.environments.form.identity = path,
                     };
+                    view.environment_read_known_hosts();
                     view.environment_form_changed(cx);
                 }
                 cx.notify();
@@ -656,19 +881,23 @@ impl Xylo {
             cx,
         );
     }
-    fn environment_action(&mut self, action: EnvironmentAction, cx: &mut Context<Self>) {
+    /// Starts a lifecycle action on the selected environment; returns its
+    /// operation id when the request was sent.
+    fn environment_action(
+        &mut self,
+        action: EnvironmentAction,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
         if self.environments.busy()
             || self.environments.form.dirty
             || self.environments.form.conflict
         {
-            return;
+            return None;
         }
-        let Some(record) = self.environments.selected_record() else {
-            return;
-        };
+        let record = self.environments.selected_record()?;
         let environment_id = record.profile.id;
         if self.environments.unresolved(environment_id) {
-            return;
+            return None;
         }
         let operation_id = Uuid::new_v4();
         let tool = match action {
@@ -679,7 +908,7 @@ impl Xylo {
             EnvironmentAction::Stop => "helper_environment_stop",
             EnvironmentAction::RemoveContainer => "helper_environment_remove_container",
             EnvironmentAction::Remove => "helper_environment_remove",
-            _ => return,
+            _ => return None,
         };
         let args = json!({"operation_id":operation_id,"environment_id":environment_id,"expected_revision":record.revision});
         self.environments.notice = format!("{}…", action_progress(action));
@@ -694,6 +923,13 @@ impl Xylo {
             },
             cx,
         );
+        self.environments
+            .pending
+            .values()
+            .any(|request| {
+                matches!(request.kind, RequestKind::Receipt { operation_id: sent, .. } if sent == operation_id)
+            })
+            .then_some(operation_id)
     }
     fn environment_confirm_remove(
         &mut self,
@@ -921,6 +1157,9 @@ impl Xylo {
         let Some(request) = self.environments.pending.remove(&id) else {
             return;
         };
+        if self.environments.pending.is_empty() {
+            self.environments.waiting_since = None;
+        }
         if request.epoch != self.environments.epoch {
             return;
         }
@@ -1193,6 +1432,19 @@ impl Xylo {
     ) {
         self.environments.notice = receipt.message.clone();
         let id = receipt.environment_id;
+        if self.environments.testing == Some(receipt.operation_id) && terminal(receipt.state) {
+            self.environments.testing = None;
+            let ok = receipt.state == EnvironmentOperationState::Succeeded;
+            self.environments
+                .tests
+                .insert(id, (ok, receipt.message.clone(), now_ms()));
+        }
+        let test_next = receipt.action == EnvironmentAction::Save
+            && receipt.state == EnvironmentOperationState::Succeeded
+            && self.environments.test_after_save == Some(id);
+        if receipt.action == EnvironmentAction::Save && terminal(receipt.state) {
+            self.environments.test_after_save = None;
+        }
         self.environments
             .checked_operations
             .insert(receipt.operation_id);
@@ -1233,7 +1485,9 @@ impl Xylo {
                     .retain(|record| record.profile.id != id);
                 if self.environments.selected == Some(id) {
                     self.environment_apply_selection(None, window, cx);
+                    self.environments.editing = false;
                 }
+                self.environments.tests.remove(&id);
             }
         } else if let Some(record) = &receipt.environment
             && self.environments.form.original.as_ref().is_some_and(|old| {
@@ -1256,6 +1510,9 @@ impl Xylo {
                 .operations
                 .insert(receipt.operation_id, receipt);
         }
+        if test_next {
+            self.environment_test(id, window, cx);
+        }
     }
     fn environment_refresh_form_conflict(&mut self) {
         if let Some(original) = &self.environments.form.original {
@@ -1271,6 +1528,13 @@ impl Xylo {
                 _ => self.environments.form.conflict = true,
             }
         }
+    }
+}
+/// A new form: SSH with the user's trusted-hosts file preselected.
+fn new_values() -> Values {
+    Values {
+        known_hosts: ssh_config::home().and_then(|home| ssh_config::default_known_hosts(&home)),
+        ..Values::default()
     }
 }
 fn terminal(state: EnvironmentOperationState) -> bool {
@@ -1361,6 +1625,7 @@ impl Xylo {
         cx: &mut Context<Self>,
     ) {
         self.environment_apply_values(values_from_profile(&profile), window, cx);
+        self.environments.editing = true;
         self.environments.form.original = None;
         self.environments.form.id = profile.id;
         self.environments.form.baseline = Values::default();

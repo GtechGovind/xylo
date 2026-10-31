@@ -64,12 +64,12 @@ pub fn parse(xml: &str, cancel: &CancellationToken) -> Result<Element> {
                 let mut attrs = BTreeMap::new();
                 for attr in e.attributes() {
                     let attr = attr?;
-                    let key = String::from_utf8(attr.key.as_ref().to_vec())?;
+                    let key = attr.key.as_ref().to_owned();
                     ensure!(
                         attrs
                             .insert(
                                 key,
-                                attr.decode_and_unescape_value(reader.decoder())?
+                                attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?
                                     .into_owned()
                             )
                             .is_none(),
@@ -77,7 +77,7 @@ pub fn parse(xml: &str, cancel: &CancellationToken) -> Result<Element> {
                     );
                 }
                 let node = Element {
-                    name: String::from_utf8(e.name().as_ref().to_vec())?,
+                    name: e.name().as_ref().to_owned(),
                     attrs,
                     start,
                     open_end: end,
@@ -148,3 +148,6 @@ pub fn patches(xml: &str, mut replacements: Vec<(usize, usize, String)>) -> Resu
     );
     Ok(output)
 }
+
+#[cfg(test)]
+mod tests;

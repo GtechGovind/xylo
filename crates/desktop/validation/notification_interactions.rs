@@ -2,6 +2,10 @@
 //! tests have no HostClient and cannot reach notification permissions or OS APIs.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]

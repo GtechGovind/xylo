@@ -4,21 +4,35 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
-    sync::mpsc::{self, SyncSender, TrySendError},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 use xylo_core::{
-    AppSettings, ChatMessage, ConnectorConfig, Conversation, ConversationCursor, ConversationPage,
-    HistoryPage, TurnRequest, Usage, now_ms,
+    AppSettings, ApprovalRule, ChatMessage, ConnectorConfig, Conversation, ConversationCursor,
+    ConversationPage, HistoryPage, MessageStatus, TitleSource, TurnRequest, Usage, now_ms,
 };
 
 type JournalRow = (String, String, Option<String>, Option<String>, i64);
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
-const QUEUE_CAPACITY: usize = 128;
+/// Operations admitted to the database thread at once. Callers beyond this wait
+/// for a slot (up to [`QUEUE_WAIT`]) instead of failing a burst outright.
+pub(crate) const QUEUE_CAPACITY: usize = 128;
+const QUEUE_WAIT: Duration = Duration::from_secs(30);
 const MAX_PAGE: usize = 1000;
+
+/// Reads a non-negative SQLite integer as `usize`. rusqlite deliberately has no
+/// `usize` conversion because SQLite integers are signed 64-bit values.
+pub(crate) fn row_usize(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<usize> {
+    let value: i64 = row.get(index)?;
+    usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
+
+/// Converts a bounded in-memory count to an SQLite integer parameter.
+pub(crate) fn sql_count(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
 
 /// Shared by user-turn registration and atomic draft admission. The caller owns
 /// the transaction; this function never commits or performs filesystem I/O.
@@ -73,6 +87,9 @@ pub(crate) fn register_user_turn_in_transaction(
             },
             workspace: turn.workspace.clone(),
             updated_at: timestamp,
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
         },
     };
     conversation.updated_at = timestamp;
@@ -84,6 +101,7 @@ pub(crate) fn register_user_turn_in_transaction(
         content: turn.prompt.clone(),
         created_at: timestamp,
         attachments: turn.attachments.clone(),
+        status: Default::default(),
     };
     conn.execute(
         "INSERT OR IGNORE INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4)",
@@ -97,11 +115,62 @@ pub(crate) fn register_user_turn_in_transaction(
     Ok(())
 }
 
-/// Cloneable bounded handle to a dedicated SQLite thread. Queue saturation returns an
-/// explicit error rather than allocating unbounded work or blocking the producer.
+/// Starts a transaction that takes the write lock up front. Every transaction
+/// that reads and then writes must use this: a deferred transaction that later
+/// upgrades its lock fails immediately with "database is locked" when another
+/// process holds the write lock, because SQLite cannot honour the busy timeout
+/// on a lock upgrade without risking deadlock.
+pub(crate) fn write_transaction(
+    conn: &mut Connection,
+) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
+/// Counting semaphore bounding the operations queued for the database thread.
+struct QueueSlots {
+    free: Mutex<usize>,
+    released: Condvar,
+}
+
+impl QueueSlots {
+    fn acquire(self: &Arc<Self>, deadline: Instant) -> Result<QueueSlot> {
+        let mut free = self
+            .free
+            .lock()
+            .map_err(|_| anyhow!("Database queue lock poisoned"))?;
+        while *free == 0 {
+            let now = Instant::now();
+            ensure!(now < deadline, "The database is busy; retry later");
+            free = self
+                .released
+                .wait_timeout(free, deadline - now)
+                .map_err(|_| anyhow!("Database queue lock poisoned"))?
+                .0;
+        }
+        *free -= 1;
+        Ok(QueueSlot(self.clone()))
+    }
+}
+
+/// Returns its slot when the queued operation finishes or is dropped unrun.
+struct QueueSlot(Arc<QueueSlots>);
+
+impl Drop for QueueSlot {
+    fn drop(&mut self) {
+        if let Ok(mut free) = self.0.free.lock() {
+            *free += 1;
+            self.0.released.notify_one();
+        }
+    }
+}
+
+/// Cloneable handle to a dedicated SQLite thread. At most [`QUEUE_CAPACITY`]
+/// operations are queued; further callers wait for a slot until a deadline.
 #[derive(Clone)]
 pub struct Store {
-    sender: SyncSender<Job>,
+    sender: mpsc::Sender<Job>,
+    slots: Arc<QueueSlots>,
+    reset: Option<Arc<crate::schema::DatabaseReset>>,
     pub(crate) action_lease_root: Arc<PathBuf>,
 }
 
@@ -148,40 +217,37 @@ pub struct SkillVersion {
     pub version: i64,
     pub content: String,
     pub created_at: i64,
-    pub evaluation: Option<SkillEvaluation>,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SkillEvaluation {
-    pub passed: bool,
-    pub score: f64,
-    pub cases: usize,
-    pub evidence: String,
 }
 
 impl Store {
-    /// Opens/migrates a database on its worker thread. Does not create parent folders.
+    /// Opens the database as its owner (the host): creates the schema in a new
+    /// file, and deletes a database with any other schema (or a file that is
+    /// not a database) and creates a fresh one; [`Store::reset_notice`] then
+    /// reports it. Call this from exactly one process. Does not create parent
+    /// folders.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_owned();
+        Self::start(path.as_ref(), crate::schema::OpenMode::Owner)
+    }
+
+    /// Opens a database the host already created, for workers and tools. A
+    /// missing file, an empty database or any other schema is an error; the
+    /// file is never created, migrated, renamed or replaced.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        Self::start(path.as_ref(), crate::schema::OpenMode::Existing)
+    }
+
+    fn start(path: &Path, mode: crate::schema::OpenMode) -> Result<Self> {
+        let path = path.to_owned();
         let connection_path = path.clone();
-        let (sender, receiver) = mpsc::sync_channel::<Job>(QUEUE_CAPACITY);
+        let (sender, receiver) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name("xylo-sqlite".into())
             .spawn(move || {
-                let connection = (|| -> Result<Connection> {
-                    register_vec();
-                    let conn = Connection::open(connection_path).context("Open xylo database")?;
-                    conn.busy_timeout(Duration::from_secs(5))?;
-                    conn.execute_batch(
-                        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
-                    )?;
-                    migrate(&conn)?;
-                    crate::action_review::initialize(&conn)?;
-                    Ok(conn)
-                })();
-                match connection {
-                    Ok(mut conn) => {
-                        let _ = ready_tx.send(Ok(()));
+                register_vec();
+                match crate::schema::open(&connection_path, mode) {
+                    Ok((mut conn, reset)) => {
+                        let _ = ready_tx.send(Ok(reset));
                         for job in receiver {
                             job(&mut conn);
                         }
@@ -192,7 +258,7 @@ impl Store {
                 }
             })
             .context("Start database worker")?;
-        ready_rx
+        let reset = ready_rx
             .recv()
             .context("Database worker stopped during startup")??;
         let path = std::fs::canonicalize(path)?;
@@ -203,23 +269,33 @@ impl Store {
         let action_lease_root = Arc::new(path.with_file_name(format!("{name}.action-leases")));
         Ok(Self {
             sender,
+            slots: Arc::new(QueueSlots {
+                free: Mutex::new(QUEUE_CAPACITY),
+                released: Condvar::new(),
+            }),
+            reset: reset.map(Arc::new),
             action_lease_root,
         })
+    }
+
+    /// Set when opening replaced an unusable database with an empty one; the
+    /// host shows its text once so the user knows their data was reset.
+    pub fn reset_notice(&self) -> Option<crate::schema::DatabaseReset> {
+        self.reset.as_deref().cloned()
     }
 
     pub(crate) fn call<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        let slot = self.slots.acquire(Instant::now() + QUEUE_WAIT)?;
         let (tx, rx) = mpsc::sync_channel(1);
         self.sender
-            .try_send(Box::new(move |conn| {
+            .send(Box::new(move |conn| {
                 let _ = tx.send(operation(conn));
+                drop(slot);
             }))
-            .map_err(|e| match e {
-                TrySendError::Full(_) => anyhow!("Database queue is full; retry later"),
-                TrySendError::Disconnected(_) => anyhow!("Database worker unavailable"),
-            })?;
+            .map_err(|_| anyhow!("Database worker unavailable"))?;
         rx.recv().context("Database operation interrupted")?
     }
 
@@ -237,9 +313,197 @@ impl Store {
         })
     }
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
+        // Settings are plain JSON on disk: refuse secrets in custom headers.
+        for provider in std::iter::once(&settings.provider).chain(&settings.providers) {
+            crate::providers::validate_custom_headers(&provider.headers)?;
+        }
         let json = serde_json::to_string(settings)?;
         self.call(move |conn| { conn.execute("INSERT INTO settings(key,value) VALUES('app',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [json])?; Ok(()) })
     }
+    /// Standing approvals ("always allow" rules) recorded for one project.
+    pub fn approval_rules(&self, workspace: &std::path::Path) -> Result<Vec<ApprovalRule>> {
+        let workspace = workspace.to_string_lossy().into_owned();
+        self.call(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT key,label,workspace,created_at FROM approval_rules WHERE workspace=?1 ORDER BY created_at,key",
+            )?;
+            let rows = statement.query_map([workspace], |row| {
+                Ok(ApprovalRule {
+                    key: row.get(0)?,
+                    label: row.get(1)?,
+                    workspace: PathBuf::from(row.get::<_, String>(2)?),
+                    created_at: row.get(3)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// Records a standing approval for one project. Saving the same key again
+    /// updates its label and keeps the original creation time.
+    pub fn save_approval_rule(&self, rule: &ApprovalRule) -> Result<()> {
+        ensure!(
+            !rule.key.trim().is_empty() && rule.key.len() <= 512 && rule.label.len() <= 512,
+            "Invalid approval rule"
+        );
+        let rule = rule.clone();
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO approval_rules(workspace,key,label,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(workspace,key) DO UPDATE SET label=excluded.label",
+                params![rule.workspace.to_string_lossy(), rule.key, rule.label, rule.created_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Revokes a standing approval. Removing an absent rule is not an error.
+    pub fn remove_approval_rule(&self, workspace: &std::path::Path, key: &str) -> Result<()> {
+        let workspace = workspace.to_string_lossy().into_owned();
+        let key = key.to_owned();
+        self.call(move |conn| {
+            conn.execute(
+                "DELETE FROM approval_rules WHERE workspace=?1 AND key=?2",
+                params![workspace, key],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Renames a conversation. A generated title never replaces one the user chose.
+    /// Returns the stored conversation, or `None` when it does not exist.
+    pub fn rename_conversation(
+        &self,
+        id: Uuid,
+        title: &str,
+        source: TitleSource,
+    ) -> Result<Option<Conversation>> {
+        let title = title.trim().to_owned();
+        ensure!(
+            !title.is_empty() && title.chars().count() <= 120,
+            "Titles must be 1 to 120 characters"
+        );
+        self.call(move |conn| {
+            let tx = write_transaction(conn)?;
+            let Some(json) = tx
+                .query_row(
+                    "SELECT json FROM conversations WHERE id=?1",
+                    [id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            let mut conversation: Conversation = serde_json::from_str(&json)?;
+            if source == TitleSource::Generated && conversation.title_source == TitleSource::User {
+                return Ok(Some(conversation));
+            }
+            conversation.title = title;
+            conversation.title_source = source;
+            tx.execute(
+                "UPDATE conversations SET json=?1 WHERE id=?2",
+                params![serde_json::to_string(&conversation)?, id.to_string()],
+            )?;
+            tx.commit()?;
+            Ok(Some(conversation))
+        })
+    }
+
+    /// Pins or unpins a conversation. Returns the stored conversation, or
+    /// `None` when it does not exist.
+    pub fn set_conversation_pinned(&self, id: Uuid, pinned: bool) -> Result<Option<Conversation>> {
+        self.update_conversation(id, move |conversation| conversation.pinned = pinned)
+    }
+
+    /// Archives or restores a conversation. Archived chats keep their history
+    /// but are left out of the chat list and chat search. Returns the stored
+    /// conversation, or `None` when it does not exist.
+    pub fn set_conversation_archived(
+        &self,
+        id: Uuid,
+        archived: bool,
+    ) -> Result<Option<Conversation>> {
+        self.update_conversation(id, move |conversation| {
+            conversation.archived = archived;
+            if archived {
+                conversation.pinned = false;
+            }
+        })
+    }
+
+    /// Applies `change` to one stored conversation inside a write transaction.
+    fn update_conversation(
+        &self,
+        id: Uuid,
+        change: impl FnOnce(&mut Conversation) + Send + 'static,
+    ) -> Result<Option<Conversation>> {
+        self.call(move |conn| {
+            let tx = write_transaction(conn)?;
+            let Some(json) = tx
+                .query_row(
+                    "SELECT json FROM conversations WHERE id=?1",
+                    [id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            let mut conversation: Conversation = serde_json::from_str(&json)?;
+            change(&mut conversation);
+            tx.execute(
+                "UPDATE conversations SET json=?1 WHERE id=?2",
+                params![serde_json::to_string(&conversation)?, id.to_string()],
+            )?;
+            tx.commit()?;
+            Ok(Some(conversation))
+        })
+    }
+
+    /// Stores what an interrupted or failed turn had streamed, so the transcript
+    /// keeps it after a reload. Idempotent per turn; a later completion of the
+    /// same turn replaces it, and a turn that already completed is left alone.
+    pub fn record_interrupted_reply(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        text: &str,
+        status: MessageStatus,
+    ) -> Result<()> {
+        ensure!(
+            status != MessageStatus::Complete,
+            "Use complete_turn for completed replies"
+        );
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        let message = ChatMessage {
+            id: interrupted_reply_id(turn_id),
+            session_id,
+            role: "assistant".into(),
+            content: text.to_owned(),
+            created_at: now_ms(),
+            attachments: Vec::new(),
+            status,
+        };
+        self.call(move |conn| {
+            let tx = write_transaction(conn)?;
+            let completed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM completed_turns WHERE session_id=?1 AND turn_id=?2)",
+                params![session_id.to_string(), turn_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !completed {
+                tx.execute(
+                    "INSERT INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET json=excluded.json",
+                    params![message.id.to_string(), session_id.to_string(), serde_json::to_string(&message)?, message.created_at],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn conversation(&self, id: Uuid) -> Result<Option<Conversation>> {
         self.call(move |conn| {
             let json: Option<String> = conn
@@ -257,7 +521,7 @@ impl Store {
         self.call(move |conn| {
             json_rows(
                 conn,
-                "SELECT json FROM conversations ORDER BY updated_at DESC LIMIT ?1",
+                "SELECT json FROM conversations WHERE json_extract(json,'$.archived') IS NOT 1 ORDER BY updated_at DESC LIMIT ?1",
                 [limit.min(MAX_PAGE) as i64],
             )
         })
@@ -272,7 +536,7 @@ impl Store {
         let limit = limit.clamp(1, 200);
         self.call(move|connection|{
             let (timestamp,id)=before.map_or((None,None),|cursor|(Some(cursor.updated_at),Some(cursor.id.to_string())));
-            let mut statement=connection.prepare("SELECT json FROM conversations WHERE ?1 IS NULL OR updated_at<?1 OR (updated_at=?1 AND id<?2) ORDER BY updated_at DESC,id DESC LIMIT ?3")?;
+            let mut statement=connection.prepare("SELECT json FROM conversations WHERE json_extract(json,'$.archived') IS NOT 1 AND (?1 IS NULL OR updated_at<?1 OR (updated_at=?1 AND id<?2)) ORDER BY updated_at DESC,id DESC LIMIT ?3")?;
             let mut conversations=statement.query_map(params![timestamp,id,(limit+1) as i64],|row|row.get::<_,String>(0))?.map(|row|Ok(serde_json::from_str::<Conversation>(&row?)?)).collect::<Result<Vec<_>>>()?;
             let has_more=conversations.len()>limit;conversations.truncate(limit);
             let before=if has_more{conversations.last().map(|conversation|ConversationCursor{updated_at:conversation.updated_at,id:conversation.id})}else{None};
@@ -290,7 +554,7 @@ impl Store {
     pub fn register_user_turn(&self, turn: &TurnRequest) -> Result<()> {
         let turn = turn.clone();
         self.call(move |conn| {
-            let tx = conn.transaction()?;
+            let tx = write_transaction(conn)?;
             register_user_turn_in_transaction(&tx, &turn)?;
             tx.commit()?;
             Ok(())
@@ -395,13 +659,14 @@ impl Store {
             usage: usage.clone(),
         };
         let receipt_json = serde_json::to_string(&receipt)?;
-        self.call(move|conn|{let tx=conn.transaction()?;
+        self.call(move|conn|{let tx=write_transaction(conn)?;
             let existing:Option<String>=tx.query_row("SELECT json FROM completed_turns WHERE session_id=?1 AND turn_id=?2",params![session_id.to_string(),turn_id.to_string()],|r|r.get(0)).optional()?;
             if let Some(existing)=existing{ensure!(serde_json::from_str::<Value>(&existing)?==serde_json::from_str::<Value>(&receipt_json)?,"Turn was already completed with a different result");return Ok(())}
             let timestamp=now_ms();
             tx.execute("INSERT INTO checkpoints(session_id,turn_id,messages,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET turn_id=excluded.turn_id,messages=excluded.messages,updated_at=excluded.updated_at",params![session_id.to_string(),turn_id.to_string(),messages,timestamp])?;
-            let message=ChatMessage{id:Uuid::new_v4(),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new()};
+            let message=ChatMessage{id:assistant_reply_id(turn_id),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new(), status: Default::default(),};
             tx.execute("INSERT INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4)",params![message.id.to_string(),session_id.to_string(),serde_json::to_string(&message)?,timestamp])?;
+            tx.execute("DELETE FROM messages WHERE id=?1",[interrupted_reply_id(turn_id).to_string()])?;
             tx.execute("INSERT INTO completed_turns(session_id,turn_id,json,completed_at) VALUES(?1,?2,?3,?4)",params![session_id.to_string(),turn_id.to_string(),receipt_json,timestamp])?;
             tx.execute("UPDATE conversations SET updated_at=?1,json=json_set(json,'$.updated_at',?1) WHERE id=?2",params![timestamp,session_id.to_string()])?;
             tx.execute("INSERT OR IGNORE INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) VALUES(?1,?2,'pending',?3,?3)",params![session_id.to_string(),turn_id.to_string(),timestamp])?;
@@ -420,7 +685,7 @@ impl Store {
         );
         let intent = intent.clone();
         self.call(move |conn| {
-            let tx = conn.transaction()?;
+            let tx = write_transaction(conn)?;
             let old: Option<(String,String,Option<String>)> = tx.query_row("SELECT intent,state,result FROM actions WHERE session_id=?1 AND turn_id=?2 AND action_key=?3",params![intent.session_id.to_string(),intent.turn_id.to_string(),intent.idempotency_key],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
             if let Some((old_json,state,result)) = old {
                 let old: ActionIntent = serde_json::from_str(&old_json)?;
@@ -501,7 +766,7 @@ impl Store {
     /// Startup recovery is explicit and should run once after obtaining the app's
     /// single-instance lock. Pending intents never executed; running writes may have.
     pub fn recover_interrupted(&self) -> Result<usize> {
-        self.call(|conn| { let tx=conn.transaction()?;
+        self.call(|conn| { let tx=write_transaction(conn)?;
             tx.execute("INSERT OR IGNORE INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) SELECT DISTINCT a.session_id,a.turn_id,'pending',?1,?1 FROM actions a WHERE NOT EXISTS(SELECT 1 FROM completed_turns c WHERE c.session_id=a.session_id AND c.turn_id=a.turn_id)",[now_ms()])?;
             tx.execute("INSERT INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) SELECT DISTINCT session_id,turn_id,'pending',?1,?1 FROM actions WHERE state IN ('pending','running') ON CONFLICT(session_id,turn_id) DO UPDATE SET state=CASE WHEN learning_jobs.state='processing' THEN 'processing' ELSE 'pending' END,updated_at=excluded.updated_at",[now_ms()])?;
             let writes=tx.execute("UPDATE actions SET state='outcome_unknown',error='Interrupted while executing; reconcile before retry',updated_at=?1 WHERE state='running' AND json_extract(intent,'$.writes')=1",[now_ms()])?;
@@ -514,7 +779,7 @@ impl Store {
     /// Live workers in other sessions must never be affected by this operation.
     pub fn recover_session_interrupted(&self, session_id: Uuid) -> Result<usize> {
         self.call(move |conn| {
-            let tx = conn.transaction()?;
+            let tx = write_transaction(conn)?;
             let session = session_id.to_string();
             let timestamp = now_ms();
             tx.execute("INSERT INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) SELECT DISTINCT a.session_id,a.turn_id,'pending',?1,?1 FROM actions a WHERE a.session_id=?2 AND NOT EXISTS(SELECT 1 FROM completed_turns c WHERE c.session_id=a.session_id AND c.turn_id=a.turn_id) ON CONFLICT(session_id,turn_id) DO UPDATE SET state=CASE WHEN learning_jobs.state='processing' THEN 'processing' ELSE 'pending' END,updated_at=excluded.updated_at",params![timestamp,session])?;
@@ -606,14 +871,6 @@ impl Store {
             row.map(|(intent,state,result,error,updated_at)|Ok(JournalAction{intent:serde_json::from_str(&intent)?,state,result:result.map(|j|serde_json::from_str(&j)).transpose()?,error,updated_at})).transpose()
         })
     }
-    /// Latest content version per skill, whether promoted or still under evaluation.
-    pub fn skills(&self) -> Result<Vec<SkillVersion>> {
-        self.call(|conn|json_rows(conn,"SELECT s.json FROM skills s JOIN (SELECT name,MAX(version) version FROM skills GROUP BY name) latest ON s.name=latest.name AND s.version=latest.version ORDER BY s.name",[]))
-    }
-    /// Currently active versions; append-only promotion IDs disambiguate equal timestamps.
-    pub fn promoted_skills(&self) -> Result<Vec<SkillVersion>> {
-        self.call(|conn|json_rows(conn,"SELECT s.json FROM skills s JOIN skill_promotions p ON s.name=p.name AND s.version=p.version JOIN (SELECT name,MAX(id) id FROM skill_promotions GROUP BY name) latest ON p.id=latest.id ORDER BY s.name",[]))
-    }
     pub fn unresolved_actions(&self, session_id: Uuid) -> Result<Vec<JournalAction>> {
         self.call(move |conn| { let mut stmt=conn.prepare("SELECT intent,state,result,error,updated_at FROM actions WHERE session_id=?1 AND state IN ('pending','running','outcome_unknown') ORDER BY updated_at")?;
             let rows=stmt.query_map([session_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?)))?;
@@ -633,94 +890,8 @@ impl Store {
         })
     }
 
-    pub fn create_skill_version(&self, name: &str, content: &str) -> Result<SkillVersion> {
-        ensure!(
-            !name.trim().is_empty() && !content.trim().is_empty(),
-            "Skill name and content are required"
-        );
-        let name = name.to_owned();
-        let content = content.to_owned();
-        self.call(move |conn| {
-            let tx = conn.transaction()?;
-            let version: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(version),0)+1 FROM skills WHERE name=?1",
-                [&name],
-                |r| r.get(0),
-            )?;
-            let s = SkillVersion {
-                name,
-                version,
-                content,
-                created_at: now_ms(),
-                evaluation: None,
-            };
-            tx.execute(
-                "INSERT INTO skills(name,version,json) VALUES(?1,?2,?3)",
-                params![s.name, s.version, serde_json::to_string(&s)?],
-            )?;
-            tx.commit()?;
-            Ok(s)
-        })
-    }
-    pub fn evaluate_skill(
-        &self,
-        name: &str,
-        version: i64,
-        evaluation: SkillEvaluation,
-    ) -> Result<()> {
-        ensure!(
-            evaluation.score.is_finite()
-                && (0.0..=1.0).contains(&evaluation.score)
-                && evaluation.cases > 0
-                && !evaluation.evidence.trim().is_empty(),
-            "Evaluation needs a normalized score, cases, and evidence"
-        );
-        let name = name.to_owned();
-        self.call(move |conn| {
-            let json: String = conn.query_row(
-                "SELECT json FROM skills WHERE name=?1 AND version=?2",
-                params![name, version],
-                |r| r.get(0),
-            )?;
-            let mut s: SkillVersion = serde_json::from_str(&json)?;
-            s.evaluation = Some(evaluation);
-            conn.execute(
-                "UPDATE skills SET json=?1 WHERE name=?2 AND version=?3",
-                params![serde_json::to_string(&s)?, name, version],
-            )?;
-            Ok(())
-        })
-    }
-    pub fn promote_skill(&self, name: &str, version: i64) -> Result<()> {
-        let name = name.to_owned();
-        self.call(move |conn| {
-            let tx = conn.transaction()?;
-            let json: String = tx.query_row(
-                "SELECT json FROM skills WHERE name=?1 AND version=?2",
-                params![name, version],
-                |r| r.get(0),
-            )?;
-            let s: SkillVersion = serde_json::from_str(&json)?;
-            ensure!(
-                s.evaluation.as_ref().is_some_and(|e| e.passed),
-                "Only an evaluated passing skill can be promoted"
-            );
-            tx.execute(
-                "INSERT INTO skill_promotions(name,version,created_at) VALUES(?1,?2,?3)",
-                params![name, version, now_ms()],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-    }
-    pub fn active_skill(&self, name: &str) -> Result<Option<SkillVersion>> {
-        let name = name.to_owned();
-        self.call(move|conn|{let json:Option<String>=conn.query_row("SELECT s.json FROM skills s JOIN skill_promotions p ON s.name=p.name AND s.version=p.version WHERE s.name=?1 ORDER BY p.id DESC LIMIT 1",[name],|r|r.get(0)).optional()?;json.map(|j|serde_json::from_str(&j).map_err(Into::into)).transpose()})
-    }
-    /// Rollback is a new auditable promotion of an earlier passing version.
-    pub fn rollback_skill(&self, name: &str, version: i64) -> Result<()> {
-        self.promote_skill(name, version)
-    }
+    /// Every stored version of a learned skill, newest first. Evaluation and
+    /// promotion belong to the learning service.
     pub fn skill_versions(&self, name: &str) -> Result<Vec<SkillVersion>> {
         let name = name.to_owned();
         self.call(move |conn| {
@@ -762,37 +933,14 @@ fn register_vec() {
         }
     });
 }
-fn migrate(conn: &Connection) -> Result<()> {
-    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(
-        version <= 3,
-        "Database schema is newer than this application"
-    );
-    conn.execute_batch("BEGIN IMMEDIATE;
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY,json TEXT NOT NULL,updated_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS conversations_updated ON conversations(updated_at DESC);
-CREATE INDEX IF NOT EXISTS conversations_keyset ON conversations(updated_at DESC,id DESC);
-CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES conversations(id),json TEXT NOT NULL,created_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id,created_at);
-CREATE TABLE IF NOT EXISTS checkpoints(session_id TEXT PRIMARY KEY REFERENCES conversations(id),turn_id TEXT NOT NULL,messages TEXT NOT NULL,updated_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,action_key TEXT NOT NULL,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL,UNIQUE(session_id,turn_id,action_key));
-CREATE TABLE IF NOT EXISTS extension_action_bindings(action_id TEXT PRIMARY KEY REFERENCES actions(id) ON DELETE CASCADE,binding TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS extension_execution_receipts(id TEXT PRIMARY KEY,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS actions_state ON actions(state);
-CREATE INDEX IF NOT EXISTS actions_name_time ON actions(json_extract(intent,'$.name'),updated_at DESC);
-CREATE TABLE IF NOT EXISTS completed_turns(session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,json TEXT NOT NULL,completed_at INTEGER NOT NULL,PRIMARY KEY(session_id,turn_id));
-CREATE TABLE IF NOT EXISTS connectors(id TEXT PRIMARY KEY,name TEXT NOT NULL,json TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS memories(id TEXT PRIMARY KEY,scope TEXT NOT NULL,content TEXT NOT NULL,json TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,embedding BLOB,embedding_model TEXT);
-CREATE INDEX IF NOT EXISTS memories_scope ON memories(scope,active);
-CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED,scope UNINDEXED,content,tokenize='unicode61');
-CREATE TABLE IF NOT EXISTS skills(name TEXT NOT NULL,version INTEGER NOT NULL,json TEXT NOT NULL,PRIMARY KEY(name,version));
-CREATE TABLE IF NOT EXISTS skill_promotions(id INTEGER PRIMARY KEY,name TEXT NOT NULL,version INTEGER NOT NULL,created_at INTEGER NOT NULL,FOREIGN KEY(name,version) REFERENCES skills(name,version));
-")?;
-    crate::learning::schema(conn)?;
-    conn.execute_batch("PRAGMA user_version=3; COMMIT;")?;
-    let _: String = conn
-        .query_row("SELECT vec_version()", [], |r| r.get(0))
-        .context("Initialize sqlite-vec")?;
-    Ok(())
+/// Message id of a turn's completed assistant reply. Derived from the turn,
+/// like the user message id, so the UI can match the streamed reply to the
+/// stored one exactly.
+pub fn assistant_reply_id(turn_id: Uuid) -> Uuid {
+    Uuid::new_v5(&turn_id, b"assistant-message")
+}
+
+/// Message id of a turn's interrupted reply; stable so recording is idempotent.
+fn interrupted_reply_id(turn_id: Uuid) -> Uuid {
+    Uuid::new_v5(&turn_id, b"assistant-interrupted")
 }

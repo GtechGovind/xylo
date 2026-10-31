@@ -3,7 +3,7 @@ name="xylo-native-validation"
 version="0.1.0"
 edition="2024"
 [dependencies]
-gpui-kit={version="=0.8.0",features=["test-support","tree-sitter","tree-sitter-rust", "tree-sitter-c", "tree-sitter-cpp","tree-sitter-python","tree-sitter-typescript","tree-sitter-javascript","tree-sitter-markdown"]}
+gpui-kit={version="=0.8.1",features=["test-support","tree-sitter","tree-sitter-rust", "tree-sitter-c", "tree-sitter-cpp","tree-sitter-python","tree-sitter-typescript","tree-sitter-javascript","tree-sitter-markdown"]}
 xylo-core={path="../../core"}
 xylo-runtime={path="../../runtime"}
 xylo-services={path="../../services"}
@@ -12,19 +12,20 @@ serde={version="1",features=["derive"]}
 serde_json="1"
 tokio={version="1",features=["full"]}
 tokio-util="0.7"
-uuid={version="1",features=["v4","serde"]}
+uuid={version="1",features=["v4","v5","serde"]}
 tracing="0.1"
 ignore = "0.4"
 lsp-types = { version = "0.97", features = ["proposed"] }
 
 tempfile="3"
-rusqlite={version="0.32",features=["bundled"]}
+rusqlite={version="0.41",features=["bundled"]}
 async-channel="2"
 zip={version="6",default-features=false,features=["deflate"]}
-rfd="0.15"
+rfd="0.17"
 shell-words="1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-sha2="0.10"
+sha2="0.11"
+hex="0.4"
 image={version="=0.25.10",default-features=false,features=["png"]}
 
 
@@ -40,6 +41,9 @@ strip = "symbols"
 codegen-units = 16
 
 [features]
+default = ["validation"]
+# Compiles the desktop sources' test-only accessors (see crates/desktop/Cargo.toml).
+validation = []
 performance = []
 
 [[bin]]
@@ -54,6 +58,11 @@ path="interactions.rs"
 [[test]]
 name="native-rendering"
 path="rendering.rs"
+harness=false
+
+[[test]]
+name="settings-rendering"
+path="settings_rendering.rs"
 harness=false
 
 [[test]]
@@ -150,9 +159,6 @@ harness=false
 name="portable-tool-rendering"
 path="portable_tool_rendering.rs"
 harness=false
-
-[patch.crates-io]
-block = { path = "../../../vendor/block" }
 
 [[test]]
 name="paste-rendering"

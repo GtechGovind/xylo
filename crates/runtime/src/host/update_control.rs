@@ -173,5 +173,4 @@ impl HostState {
 }
 
 #[cfg(test)]
-#[path = "update_control_tests.rs"]
 mod tests;

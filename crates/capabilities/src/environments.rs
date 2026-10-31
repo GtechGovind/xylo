@@ -6,8 +6,6 @@ mod capture_fs;
 mod native;
 mod operations;
 mod storage;
-#[cfg(test)]
-mod tests;
 
 use crate::{CapabilityConfig, definition, observation, process};
 use anyhow::{Context, Result, bail, ensure};
@@ -477,3 +475,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod tests;

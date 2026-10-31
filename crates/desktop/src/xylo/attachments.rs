@@ -1,5 +1,7 @@
 //! Native user image attachment controls. The draft owns durable references;
 //! this state holds only bounded preview paths and in-flight request correlation.
+//! The composer's picker also accepts other files, which are referenced by path
+//! in the message instead of attached.
 use super::*;
 use xylo_runtime::drafts::DraftKey;
 
@@ -31,6 +33,7 @@ impl AttachmentUi {
         )
     }
     #[cfg(test)]
+    #[allow(dead_code)] // Used by the native validation harness.
     pub(super) fn importing(&self) -> bool {
         self.pending
             .values()
@@ -38,22 +41,25 @@ impl AttachmentUi {
     }
 }
 impl Xylo {
+    /// The composer's "Attach files or images…": images become attachments,
+    /// any other file is referenced by path in the message.
     pub(super) fn attachment_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let session = self.session;
+        let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |view, cx| {
-            if let Some(files) = rfd::AsyncFileDialog::new()
-                .set_title("Attach images")
-                .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
-                .pick_files()
-                .await
-            {
-                let paths = files
+            let mut picker = rfd::AsyncFileDialog::new().set_title("Attach files or images");
+            if let Some(workspace) = workspace {
+                picker = picker.set_directory(workspace);
+            }
+            if let Some(files) = picker.pick_files().await {
+                let (images, files): (Vec<PathBuf>, Vec<PathBuf>) = files
                     .into_iter()
                     .map(|file| file.path().to_path_buf())
-                    .collect();
-                let _ = view.update_in(cx, |view, _, cx| {
+                    .partition(|path| chat::is_image_path(path));
+                let _ = view.update_in(cx, |view, window, cx| {
                     if view.session == session {
-                        view.attach_image_paths(paths, AttachmentSource::Picker, cx);
+                        view.attach_image_paths(images, AttachmentSource::Picker, cx);
+                        view.reference_files_in_composer(files, window, cx);
                     }
                 });
             }
@@ -102,16 +108,6 @@ impl Xylo {
             }
             self.result(result, cx);
         }
-        cx.notify();
-    }
-    pub(super) fn attachment_paste_files(&mut self, cx: &mut Context<Self>) {
-        if let Some(item) = cx.read_from_clipboard()
-            && self.attachment_paste_item(&item, cx)
-        {
-            return;
-        }
-        self.attachments.notice =
-            "Copy an image or image files, then paste into the message.".into();
         cx.notify();
     }
     /// The native input owns text insertion/selection/undo. Consume only image
@@ -251,18 +247,18 @@ impl Xylo {
             Err(error) if session == self.session => self.attachments.notice = error,
             Err(_) => {}
         }
-        if session == self.session {
-            if let Some(history) = self.histories.get_mut(&session) {
-                for (index, message) in self.messages.iter().enumerate() {
-                    if message
-                        .attachments
-                        .iter()
-                        .any(|attachment| attachment.id == image)
-                    {
-                        let row = index + 1;
-                        if row < history.list.item_count() {
-                            history.list.remeasure_items(row..row + 1);
-                        }
+        if session == self.session
+            && let Some(history) = self.histories.get_mut(&session)
+        {
+            for (index, message) in self.messages.iter().enumerate() {
+                if message
+                    .attachments
+                    .iter()
+                    .any(|attachment| attachment.id == image)
+                {
+                    let row = index + 1;
+                    if row < history.list.item_count() {
+                        history.list.remeasure_items(row..row + 1);
                     }
                 }
             }
@@ -305,49 +301,90 @@ impl Xylo {
             }
         }
     }
+    /// The draft's images as compact chips: a thumbnail, the name and size,
+    /// and a remove control.
     pub(super) fn attachment_strip(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut strip = div().flex().flex_wrap().gap_2();
         for image in self.draft_attachments() {
             let id = image.id;
-            let mut card = div()
+            let thumbnail = div()
+                .size(px(40.))
+                .flex_shrink_0()
+                .rounded(px(6.))
+                .overflow_hidden()
+                .bg(rgb(well()))
                 .flex()
-                .gap_2()
                 .items_center()
-                .p_2()
-                .border_1()
-                .border_color(rgb(border()))
-                .rounded_md();
-            if let Some(path) = self.attachments.previews.get(&id) {
-                card = card.child(
-                    img(path.clone())
-                        .w(px(64.))
-                        .h(px(64.))
-                        .object_fit(ObjectFit::Contain),
-                );
-            }
-            card = card
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .max_w(px(180.))
-                        .child(subtitle(image.name))
-                        .child(subtitle(format!(
-                            "{} × {} · {} KiB",
-                            image.width,
-                            image.height,
-                            image.bytes.div_ceil(1024)
-                        ))),
-                )
-                .child(
-                    button(SharedString::from(format!("remove-image-{id}")), "Remove").on_click(
-                        cx.listener(move |view, _, _, cx| view.remove_draft_attachment(id, cx)),
+                .justify_center()
+                .child(match self.attachments.previews.get(&id) {
+                    Some(path) => img(path.clone())
+                        .size(px(40.))
+                        .object_fit(ObjectFit::Cover)
+                        .into_any_element(),
+                    None => icons::small(AppIcon::Image)
+                        .text_color(rgb(icons::rest_color()))
+                        .into_any_element(),
+                });
+            strip = strip.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p(px(4.))
+                    .pr(px(2.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(rgb(border()))
+                    .bg(rgb(bg()))
+                    .child(thumbnail)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .max_w(px(160.))
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .single_line()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(text()))
+                                    .child(image.name),
+                            )
+                            .child(
+                                div()
+                                    .single_line()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(muted()))
+                                    .child(format!(
+                                        "{} × {} · {} KiB",
+                                        image.width,
+                                        image.height,
+                                        image.bytes.div_ceil(1024)
+                                    )),
+                            ),
+                    )
+                    .child(
+                        icons::icon_button(
+                            SharedString::from(format!("remove-image-{id}")),
+                            AppIcon::Close,
+                            "Remove image",
+                        )
+                        .on_click(
+                            cx.listener(move |view, _, _, cx| view.remove_draft_attachment(id, cx)),
+                        ),
                     ),
-                );
-            strip = strip.child(card);
+            );
         }
         if self.attachments.importing_for(self.session) {
-            strip = strip.child(subtitle("Preparing image…"));
+            strip = strip.child(
+                div()
+                    .h(px(50.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(crate::motion::spinner_inline())
+                    .child(subtitle("Preparing image…")),
+            );
         }
         strip.into_any_element()
     }

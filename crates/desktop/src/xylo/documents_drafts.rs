@@ -648,7 +648,7 @@ impl Xylo {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(subtitle(error.clone()))
+                .child(notice(BadgeTone::Danger, product_error(error)))
                 .child(
                     button("document-recovery-retry", "Retry saving edits").on_click(cx.listener(
                         |view, _, _, cx| {

@@ -1,19 +1,6 @@
 use super::*;
 use std::collections::HashSet;
 
-pub(crate) fn schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS learning_jobs(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL,turn_id TEXT NOT NULL,state TEXT NOT NULL,owner TEXT,lease_until INTEGER NOT NULL DEFAULT 0,error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(session_id,turn_id));
-CREATE INDEX IF NOT EXISTS learning_jobs_pending ON learning_jobs(state,id);
-CREATE TABLE IF NOT EXISTS learning_cases(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL,turn_id TEXT NOT NULL,scope TEXT NOT NULL,workflow_key TEXT NOT NULL,json TEXT NOT NULL,UNIQUE(session_id,turn_id));
-CREATE INDEX IF NOT EXISTS learning_cases_match ON learning_cases(scope,workflow_key,id DESC);
-CREATE INDEX IF NOT EXISTS learning_cases_negative ON learning_cases(scope,workflow_key,json_extract(json,'$.eligible'),id);
-CREATE TABLE IF NOT EXISTS learning_candidates(name TEXT NOT NULL,version INTEGER NOT NULL,scope TEXT NOT NULL,workflow_key TEXT,state TEXT NOT NULL,json TEXT NOT NULL,PRIMARY KEY(name,version),FOREIGN KEY(name,version) REFERENCES skills(name,version));
-CREATE INDEX IF NOT EXISTS learning_candidates_scope ON learning_candidates(scope,state);
-CREATE VIRTUAL TABLE IF NOT EXISTS learning_fts USING fts5(name UNINDEXED,version UNINDEXED,scope UNINDEXED,content,tokenize='unicode61');
-CREATE TABLE IF NOT EXISTS learning_retrievals(session_id TEXT NOT NULL,turn_id TEXT NOT NULL,name TEXT NOT NULL,version INTEGER NOT NULL,scope TEXT NOT NULL,outcome TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(session_id,turn_id,name,version));
-CREATE INDEX IF NOT EXISTS learning_retrievals_scope ON learning_retrievals(scope,created_at DESC);")?;
-    Ok(())
-}
 fn load_skill(conn: &Connection, name: &str, version: i64) -> Result<LearnedSkill> {
     let json: String = conn.query_row(
         "SELECT json FROM learning_candidates WHERE name=?1 AND version=?2",
@@ -248,7 +235,7 @@ fn case_is_current(conn: &Connection, case: &ObservedCase) -> Result<bool> {
         return Ok(false);
     }
     let ids = serde_json::to_string(&case.evidence.action_ids)?;
-    let valid:usize=conn.query_row("SELECT count(*) FROM actions WHERE id IN (SELECT value FROM json_each(?1)) AND state='succeeded' AND result IS NOT NULL",[ids],|row|row.get(0))?;
+    let valid=conn.query_row("SELECT count(*) FROM actions WHERE id IN (SELECT value FROM json_each(?1)) AND state='succeeded' AND result IS NOT NULL",[ids],|row|crate::store::row_usize(row,0))?;
     Ok(valid == case.evidence.action_ids.len())
 }
 fn evaluate(conn: &Connection, skill: &mut LearnedSkill) -> Result<()> {
@@ -297,7 +284,6 @@ fn evaluate(conn: &Connection, skill: &mut LearnedSkill) -> Result<()> {
     let passed = distinct.len() >= 2 && held_out && !negative && guidance_verified;
     skill.provenance = proofs;
     let evaluation=LearningEvaluation{evaluator:"historical-outcome-template/v1".into(),passed,score:if passed{1.0}else{0.0},checks:vec![format!("{} distinct successful completed turns; require at least 2",distinct.len()),format!("Independent later evidence: {held_out}"),format!("Failed/unknown/external-write counterexamples: {negative}"),format!("Correction semantics checked or explicitly reviewed: {guidance_verified}"),"Exact workspace, typed procedure and current durable action states verified; no tool is executed by evaluation".into()],cases,evaluated_at:now_ms(),limitation:"Checks historical outcome/template consistency. It does not prove task-quality improvement, causal reuse, command sandbox safety, or benchmark/model training results.".into()};
-    skill.skill.evaluation = Some(evaluation.legacy());
     skill.evaluation = Some(evaluation);
     Ok(())
 }
@@ -308,13 +294,13 @@ impl LearningService {
         self.store.call(move|conn|{let json:Option<String>=conn.query_row("SELECT c.json FROM learning_candidates c JOIN skill_promotions p ON p.name=c.name AND p.version=c.version WHERE c.scope=?1 AND c.name=?2 AND c.state='promoted' AND p.id=(SELECT MAX(id) FROM skill_promotions WHERE name=c.name)",params![scope,name],|row|row.get(0)).optional()?;json.map(|json|serde_json::from_str(&json).map_err(Into::into)).transpose()})
     }
     pub(super) fn queue_latest_impl(&self, session: Uuid) -> Result<Option<Uuid>> {
-        self.store.call(move|conn|{let tx=conn.transaction()?;let turn:Option<String>=tx.query_row("SELECT turn_id FROM completed_turns WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1",[session.to_string()],|row|row.get(0)).optional()?;if let Some(turn)=&turn {tx.execute("INSERT INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) VALUES(?1,?2,'pending',?3,?3) ON CONFLICT(session_id,turn_id) DO UPDATE SET state=CASE WHEN state='processing' THEN state ELSE 'pending' END,updated_at=excluded.updated_at",params![session.to_string(),turn,now_ms()])?;}tx.commit()?;turn.map(|turn|Uuid::parse_str(&turn).map_err(Into::into)).transpose()})
+        self.store.call(move|conn|{let tx=crate::store::write_transaction(conn)?;let turn:Option<String>=tx.query_row("SELECT turn_id FROM completed_turns WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1",[session.to_string()],|row|row.get(0)).optional()?;if let Some(turn)=&turn {tx.execute("INSERT INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) VALUES(?1,?2,'pending',?3,?3) ON CONFLICT(session_id,turn_id) DO UPDATE SET state=CASE WHEN state='processing' THEN state ELSE 'pending' END,updated_at=excluded.updated_at",params![session.to_string(),turn,now_ms()])?;}tx.commit()?;turn.map(|turn|Uuid::parse_str(&turn).map_err(Into::into)).transpose()})
     }
     pub(super) fn process_one(&self) -> Result<Option<LearningBatch>> {
         let owner = self.owner.to_string();
         let claim_owner = owner.clone();
         let job=self.store.call(move|conn|{
-            let tx=conn.transaction()?;
+            let tx=crate::store::write_transaction(conn)?;
             let row:Option<(i64,String,String)>=tx.query_row("SELECT id,session_id,turn_id FROM learning_jobs WHERE state='pending' OR (state='processing' AND lease_until<?1) ORDER BY id LIMIT 1",[now_ms()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
             if let Some((id,_,_))=&row{tx.execute("UPDATE learning_jobs SET state='processing',owner=?1,lease_until=?2,updated_at=?3 WHERE id=?4",params![claim_owner,now_ms()+60_000,now_ms(),id])?;}
             tx.commit()?;Ok(row)
@@ -323,7 +309,7 @@ impl LearningService {
             return Ok(None);
         };
         let result=self.store.call(move|conn|{
-            let tx=conn.transaction()?;
+            let tx=crate::store::write_transaction(conn)?;
             let owned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM learning_jobs WHERE id=?1 AND owner=?2 AND state='processing')",params![id,owner],|row|row.get(0))?;
             ensure!(owned,"Learning job lease changed");
             let mut batch=LearningBatch::default();
@@ -341,7 +327,7 @@ impl LearningService {
                     let scope_key=digest(&case.scope)?;
                     let name=format!("learned-{}-{}",&scope_key[..10],&case.workflow_key[..16]);
                     let title=format!("Verified {} workflow",case.steps.iter().take(3).map(|step|step.tool.as_str()).collect::<Vec<_>>().join(" → "));
-                    insert_version(&tx,LearnedSkill{skill:SkillVersion{name,version:0,content:String::new(),created_at:now_ms(),evaluation:None},scope:case.scope.clone(),title,state:"candidate".into(),triggers:case.terms.clone(),steps:case.steps.clone(),provenance:vec![case.evidence.clone()],correction_message_id:None,correction_guidance:None,correction_command:None,review:None,evaluation:None,workflow_key:Some(case.workflow_key.clone()),after_ordinal:case.evidence.completed_ordinal.unwrap_or(0),after_case_id:case_id,expected_tools:Vec::new()})?;batch.candidates+=1;
+                    insert_version(&tx,LearnedSkill{skill:SkillVersion{name,version:0,content:String::new(),created_at:now_ms()},scope:case.scope.clone(),title,state:"candidate".into(),triggers:case.terms.clone(),steps:case.steps.clone(),provenance:vec![case.evidence.clone()],correction_message_id:None,correction_guidance:None,correction_command:None,review:None,evaluation:None,workflow_key:Some(case.workflow_key.clone()),after_ordinal:case.evidence.completed_ordinal.unwrap_or(0),after_case_id:case_id,expected_tools:Vec::new()})?;batch.candidates+=1;
                 }
                 let candidates={let mut statement=tx.prepare("SELECT json FROM learning_candidates WHERE scope=?1 AND (workflow_key=?2 OR workflow_key IS NULL) AND state IN ('candidate','promoted','suspended') ORDER BY rowid DESC LIMIT 16")?;statement.query_map(params![case.scope,case.workflow_key],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?};
                 for candidate in candidates {
@@ -381,11 +367,11 @@ impl LearningService {
         before: Option<i64>,
         limit: usize,
     ) -> Result<(Option<i64>, bool)> {
-        self.store.call(move|conn|{let tx=conn.transaction()?;let mut statement=tx.prepare("SELECT rowid,session_id,turn_id FROM completed_turns WHERE (?1 IS NULL OR rowid<?1) ORDER BY rowid DESC LIMIT ?2")?;let mut rows=statement.query_map(params![before,(limit.clamp(1,200)+1) as i64],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;drop(statement);let more=rows.len()>limit.clamp(1,200);rows.truncate(limit.clamp(1,200));for(_,session,turn)in rows.iter().rev(){tx.execute("INSERT OR IGNORE INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) VALUES(?1,?2,'pending',?3,?3)",params![session,turn,now_ms()])?;}let before=rows.last().map(|row|row.0);tx.commit()?;Ok((before,more))})
+        self.store.call(move|conn|{let tx=crate::store::write_transaction(conn)?;let mut statement=tx.prepare("SELECT rowid,session_id,turn_id FROM completed_turns WHERE (?1 IS NULL OR rowid<?1) ORDER BY rowid DESC LIMIT ?2")?;let mut rows=statement.query_map(params![before,(limit.clamp(1,200)+1) as i64],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;drop(statement);let more=rows.len()>limit.clamp(1,200);rows.truncate(limit.clamp(1,200));for(_,session,turn)in rows.iter().rev(){tx.execute("INSERT OR IGNORE INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) VALUES(?1,?2,'pending',?3,?3)",params![session,turn,now_ms()])?;}let before=rows.last().map(|row|row.0);tx.commit()?;Ok((before,more))})
     }
     pub(super) fn status_impl(&self, scope: &str) -> Result<LearningStatus> {
         let scope = scope.to_owned();
-        self.store.call(move|conn|Ok(LearningStatus{pending_jobs:conn.query_row("SELECT count(*) FROM learning_jobs WHERE state IN ('pending','processing')",[],|row|row.get(0))?,failed_jobs:conn.query_row("SELECT count(*) FROM learning_jobs WHERE state='failed'",[],|row|row.get(0))?,candidates:conn.query_row("SELECT count(*) FROM learning_candidates WHERE scope=?1 AND state='candidate'",[&scope],|row|row.get(0))?,promoted:conn.query_row("SELECT count(*) FROM learning_candidates WHERE scope=?1 AND state='promoted'",[&scope],|row|row.get(0))?,verified_reuses:conn.query_row("SELECT count(*) FROM learning_retrievals WHERE scope=?1 AND outcome='verified_reuse'",[&scope],|row|row.get(0))?}))
+        self.store.call(move|conn|Ok(LearningStatus{pending_jobs:conn.query_row("SELECT count(*) FROM learning_jobs WHERE state IN ('pending','processing')",[],|row|crate::store::row_usize(row,0))?,failed_jobs:conn.query_row("SELECT count(*) FROM learning_jobs WHERE state='failed'",[],|row|crate::store::row_usize(row,0))?,candidates:conn.query_row("SELECT count(*) FROM learning_candidates WHERE scope=?1 AND state='candidate'",[&scope],|row|crate::store::row_usize(row,0))?,promoted:conn.query_row("SELECT count(*) FROM learning_candidates WHERE scope=?1 AND state='promoted'",[&scope],|row|crate::store::row_usize(row,0))?,verified_reuses:conn.query_row("SELECT count(*) FROM learning_retrievals WHERE scope=?1 AND outcome='verified_reuse'",[&scope],|row|crate::store::row_usize(row,0))?}))
     }
     pub(super) fn list_impl(
         &self,
@@ -416,13 +402,13 @@ impl LearningService {
                     .all(|tool| sanitize::valid_tool(tool) && !sanitize::ignored_tool(tool)),
             "Invalid correction tool sequence"
         );
-        self.store.call(move|conn|{let tx=conn.transaction()?;let message:String=tx.query_row("SELECT json FROM messages WHERE id=?1",[input.user_message_id.to_string()],|row|row.get(0))?;let message:ChatMessage=serde_json::from_str(&message)?;ensure!(message.role=="user" && message.content.contains(&input.guidance),"Correction must quote a persisted user message");let conversation:String=tx.query_row("SELECT json FROM conversations WHERE id=?1",[message.session_id.to_string()],|row|row.get(0))?;let conversation:Conversation=serde_json::from_str(&conversation)?;let scope=conversation.workspace.to_string_lossy().into_owned();
+        self.store.call(move|conn|{let tx=crate::store::write_transaction(conn)?;let message:String=tx.query_row("SELECT json FROM messages WHERE id=?1",[input.user_message_id.to_string()],|row|row.get(0))?;let message:ChatMessage=serde_json::from_str(&message)?;ensure!(message.role=="user" && message.content.contains(&input.guidance),"Correction must quote a persisted user message");let conversation:String=tx.query_row("SELECT json FROM conversations WHERE id=?1",[message.session_id.to_string()],|row|row.get(0))?;let conversation:Conversation=serde_json::from_str(&conversation)?;let scope=conversation.workspace.to_string_lossy().into_owned();
             ensure!(expected_scope.as_ref().is_none_or(|expected|expected==&scope),"Correction source is outside the selected workspace");
             let after:i64=tx.query_row("SELECT COALESCE(MAX(rowid),0) FROM completed_turns",[],|row|row.get(0))?;let after_case:i64=tx.query_row("SELECT COALESCE(MAX(id),0) FROM learning_cases",[],|row|row.get(0))?;
             let name=if let Some(previous)=&input.replaces{let old=load_skill(&tx,&previous.name,previous.version)?;ensure!(old.scope==scope,"Correction cannot replace another workspace's skill");tx.execute("UPDATE learning_candidates SET state='suspended',json=json_set(json,'$.state','suspended') WHERE name=?1 AND state='promoted'",[&previous.name])?;tx.execute("DELETE FROM learning_fts WHERE name=?1",[&previous.name])?;previous.name.clone()}else{let key=digest(&(scope.as_str(),input.user_message_id,input.guidance.as_str()))?;format!("correction-{}",&key[..24])};
             let duplicate:Option<String>=tx.query_row("SELECT json FROM learning_candidates WHERE name=?1 AND json_extract(json,'$.correction_message_id')=?2 AND json_extract(json,'$.correction_guidance')=?3 ORDER BY version DESC LIMIT 1",params![name,input.user_message_id.to_string(),input.guidance],|row|row.get(0)).optional()?;
             if let Some(duplicate)=duplicate {return Ok(serde_json::from_str(&duplicate)?);}
-            let skill=insert_version(&tx,LearnedSkill{skill:SkillVersion{name,version:0,content:format!("User correction: {}",input.guidance),created_at:now_ms(),evaluation:None},scope:scope.clone(),title:"Sourced user correction".into(),state:"candidate".into(),triggers:sanitize::terms(&input.guidance),steps:Vec::new(),provenance:Vec::new(),correction_message_id:Some(input.user_message_id),correction_command:sanitize::correction_command(&input.guidance,&scope),correction_guidance:Some(input.guidance),review:None,evaluation:None,workflow_key:None,after_ordinal:after,after_case_id:after_case+1,expected_tools:input.expected_tools})?;tx.commit()?;Ok(skill)})
+            let skill=insert_version(&tx,LearnedSkill{skill:SkillVersion{name,version:0,content:format!("User correction: {}",input.guidance),created_at:now_ms()},scope:scope.clone(),title:"Sourced user correction".into(),state:"candidate".into(),triggers:sanitize::terms(&input.guidance),steps:Vec::new(),provenance:Vec::new(),correction_message_id:Some(input.user_message_id),correction_command:sanitize::correction_command(&input.guidance,&scope),correction_guidance:Some(input.guidance),review:None,evaluation:None,workflow_key:None,after_ordinal:after,after_case_id:after_case+1,expected_tools:input.expected_tools})?;tx.commit()?;Ok(skill)})
     }
     pub(super) fn relevant_impl(
         &self,
@@ -460,7 +446,7 @@ impl LearningService {
                 )
             })
             .collect::<Vec<_>>();
-        self.store.call(move|conn|{let tx=conn.transaction()?;let scope:String=tx.query_row("SELECT json_extract(json,'$.workspace') FROM conversations WHERE id=?1",[session.to_string()],|row|row.get(0))?;for(name,version,skill_scope)in skills{ensure!(scope==skill_scope,"Skill retrieval cannot cross workspaces");let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM learning_candidates WHERE name=?1 AND version=?2 AND scope=?3 AND state='promoted')",params![name,version,scope],|row|row.get(0))?;ensure!(active,"Skill is no longer promoted");tx.execute("INSERT OR IGNORE INTO learning_retrievals(session_id,turn_id,name,version,scope,outcome,created_at) VALUES(?1,?2,?3,?4,?5,'retrieved',?6)",params![session.to_string(),turn.to_string(),name,version,scope,now_ms()])?;}tx.commit()?;Ok(())})
+        self.store.call(move|conn|{let tx=crate::store::write_transaction(conn)?;let scope:String=tx.query_row("SELECT json_extract(json,'$.workspace') FROM conversations WHERE id=?1",[session.to_string()],|row|row.get(0))?;for(name,version,skill_scope)in skills{ensure!(scope==skill_scope,"Skill retrieval cannot cross workspaces");let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM learning_candidates WHERE name=?1 AND version=?2 AND scope=?3 AND state='promoted')",params![name,version,scope],|row|row.get(0))?;ensure!(active,"Skill is no longer promoted");tx.execute("INSERT OR IGNORE INTO learning_retrievals(session_id,turn_id,name,version,scope,outcome,created_at) VALUES(?1,?2,?3,?4,?5,'retrieved',?6)",params![session.to_string(),turn.to_string(),name,version,scope,now_ms()])?;}tx.commit()?;Ok(())})
     }
     pub(super) fn reuses_impl(&self, scope: &str, limit: usize) -> Result<Vec<SkillReuse>> {
         let scope = scope.to_owned();
@@ -481,7 +467,7 @@ impl LearningService {
         let name = name.to_owned();
         let evidence = evidence.to_owned();
         self.store.call(move |conn| {
-            let tx = conn.transaction()?;
+            let tx = crate::store::write_transaction(conn)?;
             let mut skill = load_skill(&tx, &name, version)?;
             ensure!(skill.scope == scope, "Review cannot cross workspaces");
             skill.review = Some(SkillReview {
@@ -504,7 +490,7 @@ impl LearningService {
         let scope = scope.to_owned();
         let name = name.to_owned();
         self.store.call(move |conn| {
-            let tx = conn.transaction()?;
+            let tx = crate::store::write_transaction(conn)?;
             let mut skill = load_skill(&tx, &name, version)?;
             ensure!(skill.scope == scope, "Rollback cannot cross workspaces");
             evaluate(&tx, &mut skill)?;

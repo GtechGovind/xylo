@@ -381,7 +381,7 @@ fn tag(event: &NoticeEvent) -> String {
         event.event_id,
         event.kind.key()
     );
-    format!("wb-{:x}", Sha256::digest(value.as_bytes()))[..35].to_owned()
+    format!("wb-{}", hex::encode(Sha256::digest(value.as_bytes())))[..35].to_owned()
 }
 pub fn now() -> Result<i64> {
     SystemTime::now()

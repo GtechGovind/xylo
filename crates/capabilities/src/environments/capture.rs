@@ -1,5 +1,13 @@
 //! Durable bounded output collection, independent of remote command effects.
 //! Operation/profile leases follow actual readers/writers and finalization.
+//!
+//! The usage ledger bounds output that is still live: admitted captures that
+//! have not settled (running, staged, or awaiting the user's reconciliation of
+//! an unknown outcome). A settled capture's bytes are ordinary published
+//! artifacts, so its reservation is released; every admission also runs a
+//! maintenance pass that reclaims reservations without a live entry. A ledger
+//! that does not decode is discarded and rewritten empty. Per-operation
+//! `intent.json` files remain as deduplication evidence.
 use super::{
     capture_fs::{self, Directory},
     storage::{Manager, Operation},
@@ -16,9 +24,6 @@ use std::{
 
 #[path = "capture_pipes.rs"]
 mod pipes;
-#[cfg(all(test, unix))]
-#[path = "capture_tests.rs"]
-mod tests;
 
 pub(super) const STREAM_LIMIT: u64 = 16 * 1024 * 1024;
 const STORAGE_LIMIT: u64 = 1024 * 1024 * 1024;
@@ -26,12 +31,23 @@ const ENTRY_RESERVATION: u64 = 2 * MAX_METADATA as u64 + 4096;
 const RESERVATION: u64 = STREAM_LIMIT * 2 + ENTRY_RESERVATION;
 const MAX_METADATA: usize = 256 * 1024;
 const MAX_USAGE: usize = 2 * 1024 * 1024;
+const MAX_LIVE: usize = 1024;
 
+/// Admission refused because unsettled captures already hold the whole output
+/// budget. Only reconciling or finishing those operations frees space.
 #[derive(Debug)]
-pub(super) struct QuotaUnavailable;
+pub(super) struct QuotaUnavailable {
+    live: usize,
+    reserved_bytes: u64,
+}
 impl std::fmt::Display for QuotaUnavailable {
     fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        output.write_str("Retained command output reached its 1 GiB storage budget; existing results remain preserved and no new command was dispatched")
+        write!(
+            output,
+            "Command output storage is full: {} unsettled command(s) hold {} MiB of the 1 GiB budget. Review or reconcile them in Environments, then retry. No command was dispatched.",
+            self.live,
+            self.reserved_bytes.div_ceil(1024 * 1024)
+        )
     }
 }
 impl std::error::Error for QuotaUnavailable {}
@@ -85,15 +101,77 @@ impl Drop for CancelOnDrop {
 }
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Usage {
     version: u8,
+    /// Bytes held by each live capture; keys are always a subset of `pending`.
     reservations: BTreeMap<Uuid, u64>,
-    #[serde(default)]
+    /// Live captures (operation id to profile id) awaiting settlement.
     pending: BTreeMap<Uuid, Uuid>,
     // Bounded original metadata survives a crash after quota admission but
     // before the per-operation files/intent are created. Never contains argv.
-    #[serde(default)]
     intents: BTreeMap<Uuid, Intent>,
+}
+
+impl Usage {
+    fn new() -> Self {
+        Self {
+            version: 1,
+            ..Default::default()
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.version == 1
+                && self.reservations.len() <= MAX_LIVE
+                && self.pending.len() <= MAX_LIVE
+                && self.intents.len() <= MAX_LIVE,
+            "Invalid output storage ledger"
+        );
+        Ok(())
+    }
+
+    /// Maintenance pass: drop reservations that no live capture owns. Returns
+    /// how many were reclaimed.
+    fn reclaim(&mut self) -> usize {
+        let before = self.reservations.len();
+        let pending = &self.pending;
+        self.reservations.retain(|id, _| pending.contains_key(id));
+        self.intents.retain(|id, _| pending.contains_key(id));
+        before - self.reservations.len()
+    }
+
+    /// Release everything a settled capture held.
+    fn settle(&mut self, id: Uuid) -> bool {
+        let pending = self.pending.remove(&id).is_some();
+        let reserved = self.reservations.remove(&id).is_some();
+        self.intents.remove(&id);
+        pending || reserved
+    }
+
+    fn live_bytes(&self) -> Result<u64> {
+        self.reservations.values().try_fold(0u64, |total, bytes| {
+            total.checked_add(*bytes).context("Output quota overflow")
+        })
+    }
+}
+
+/// The ledger, and whether it had to be replaced. A ledger that does not
+/// decode or validate is discarded: it reads as empty, and the next locked
+/// writer overwrites it.
+fn load_usage(directory: &Directory) -> Result<(Usage, bool)> {
+    if !directory.exists("usage.json")? {
+        return Ok((Usage::new(), false));
+    }
+    let bytes = directory.read("usage.json", MAX_USAGE)?;
+    match serde_json::from_slice::<Usage>(&bytes) {
+        Ok(usage) if usage.validate().is_ok() => Ok((usage, false)),
+        _ => Ok((Usage::new(), true)),
+    }
+}
+fn read_usage(directory: &Directory) -> Result<Usage> {
+    Ok(load_usage(directory)?.0)
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Intent {
@@ -181,42 +259,29 @@ fn update_usage(
 ) -> Result<()> {
     let directory = root(manager, true)?;
     let _lock = lock(&directory, cancel)?;
-    let mut usage: Usage = if directory.exists("usage.json")? {
-        serde_json::from_slice(&directory.read("usage.json", MAX_USAGE)?)?
-    } else {
-        Usage {
-            version: 1,
-            ..Default::default()
-        }
-    };
-    ensure!(
-        usage.version == 1
-            && usage.reservations.len() <= 16384
-            && usage.pending.len() <= 1024
-            && usage.intents.len() <= 1024,
-        "Invalid output storage ledger"
-    );
+    let mut usage = read_usage(&directory)?;
     let current = usage.reservations.get(&id).copied();
     if let Some(intent) = intent {
+        usage.reclaim();
         ensure!(
-            current.is_none(),
+            current.is_none() && !usage.pending.contains_key(&id),
             "This output identity already has a retained reservation; check its original receipt"
         );
-        let total = usage
-            .reservations
-            .values()
-            .try_fold(MAX_USAGE as u64, |total, bytes| {
-                total.checked_add(*bytes).context("Output quota overflow")
-            })?;
-        if total
-            .checked_add(bytes)
+        let live = usage.live_bytes()?;
+        if live
+            .checked_add(MAX_USAGE as u64)
+            .and_then(|total| total.checked_add(bytes))
             .is_none_or(|total| total > STORAGE_LIMIT)
         {
-            return Err(QuotaUnavailable.into());
+            return Err(QuotaUnavailable {
+                live: usage.pending.len(),
+                reserved_bytes: live,
+            }
+            .into());
         }
         ensure!(
-            usage.pending.len() < 1024,
-            "Retained command output is full of unresolved requests; check saved results before continuing"
+            usage.pending.len() < MAX_LIVE,
+            "{MAX_LIVE} commands still have unsettled output; review or reconcile them in Environments before running another command. No command was dispatched."
         );
         usage.pending.insert(id, intent.operation.profile.id);
         usage.intents.insert(id, intent.clone());
@@ -317,11 +382,7 @@ fn read_intent(manager: &Manager, id: Uuid) -> Result<Option<Intent>> {
     if !captures.exists("usage.json")? {
         return Ok(None);
     }
-    let usage: Usage = serde_json::from_slice(&captures.read("usage.json", MAX_USAGE)?)?;
-    ensure!(
-        usage.version == 1 && usage.intents.len() <= 1024,
-        "Invalid retained output intent ledger"
-    );
+    let usage = read_usage(&captures)?;
     let Some(mut intent) = usage.intents.get(&id).cloned() else {
         return Ok(None);
     };
@@ -507,7 +568,7 @@ impl Session {
             "environment_id":self.intent.operation.receipt.environment_id,"request_sha256":self.intent.operation.digest,
             "artifacts":output.artifacts});
         let bytes = serde_json::to_vec(&public)?;
-        let digest = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes));
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes));
         self.directory.resume_publication(
             "manifest.part",
             &self.target,
@@ -702,19 +763,12 @@ pub(super) fn pending_ids(manager: &Manager) -> Result<Vec<Uuid>> {
         }
         Err(error) => return Err(error),
     };
-    if !directory.exists("usage.json")? {
-        return Ok(Vec::new());
-    }
-    let usage: Usage = serde_json::from_slice(&directory.read("usage.json", MAX_USAGE)?)?;
-    ensure!(
-        usage.version == 1 && usage.pending.len() <= 1024,
-        "Invalid active output index"
-    );
-    Ok(usage.pending.keys().copied().collect())
+    Ok(read_usage(&directory)?.pending.keys().copied().collect())
 }
 
-/// Caller has already synced the terminal ordinary receipt. Only its active
-/// discovery entry is removed; bytes and deduplication evidence stay retained.
+/// Caller has already synced the terminal ordinary receipt. The capture leaves
+/// the live ledger and its reservation is released; published artifacts and
+/// the per-operation intent (deduplication evidence) stay on disk.
 pub(super) fn settled(manager: &Manager, operation: &Operation) -> Result<()> {
     if operation.receipt.action != EnvironmentAction::Execute
         || !matches!(
@@ -741,62 +795,16 @@ pub(super) fn settled(manager: &Manager, operation: &Operation) -> Result<()> {
         return Ok(());
     }
     let _lease = lock(&directory, &CancellationToken::new())?;
-    let mut usage: Usage = serde_json::from_slice(&directory.read("usage.json", MAX_USAGE)?)?;
-    if usage
-        .pending
-        .remove(&operation.receipt.operation_id)
-        .is_some()
-    {
-        usage.intents.remove(&operation.receipt.operation_id);
+    let (mut usage, replaced) = load_usage(&directory)?;
+    let released = usage.settle(operation.receipt.operation_id);
+    if usage.reclaim() > 0 || released || replaced {
         directory.write("usage.json", &serde_json::to_vec(&usage)?, MAX_USAGE)?;
     }
     Ok(())
 }
 
-#[cfg(test)]
-mod lock_tests {
-    use super::*;
+#[cfg(all(test, unix))]
+mod tests;
 
-    #[tokio::test]
-    async fn a_live_capture_lease_keeps_a_caller_queued_until_cancellation() {
-        let temporary = tempfile::tempdir().unwrap();
-        let directory = Directory::open(&temporary.path().canonicalize().unwrap()).unwrap();
-        let owner = lock(&directory, &CancellationToken::new()).unwrap();
-        let cancel = CancellationToken::new();
-        let _cancel_on_drop = cancel.clone().drop_guard();
-        let waiting_directory = directory.clone();
-        let waiting_cancel = cancel.clone();
-        let (entered, started) = tokio::sync::oneshot::channel();
-        let mut waiting = tokio::task::spawn_blocking(move || {
-            let _ = entered.send(());
-            lock(&waiting_directory, &waiting_cancel)
-        });
-        tokio::time::timeout(Duration::from_secs(2), started)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), &mut waiting)
-                .await
-                .is_err(),
-            "The competing caller must wait on the actual held output-storage lock"
-        );
-        cancel.cancel();
-        let error = tokio::time::timeout(Duration::from_secs(2), waiting)
-            .await
-            .expect("A queued capture lease must observe cancellation")
-            .unwrap()
-            .unwrap_err();
-        assert!(error.to_string().contains("cancelled before dispatch"));
-        let probe = directory.lock_file("storage.lock").unwrap();
-        let contention = probe.try_lock_exclusive().unwrap_err();
-        assert_eq!(
-            contention.raw_os_error(),
-            fs2::lock_contended_error().raw_os_error(),
-            "Cancelling the waiter must retain the original owner's lease"
-        );
-        drop(probe);
-        drop(owner);
-        drop(lock(&directory, &CancellationToken::new()).unwrap());
-    }
-}
+#[cfg(test)]
+mod lock_tests;

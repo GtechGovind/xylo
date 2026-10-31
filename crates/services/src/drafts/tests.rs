@@ -33,6 +33,7 @@ fn make_turn(key: &DraftKey, text: &str) -> TurnRequest {
         provider: ProviderConfig::default(),
         permissions: PermissionMode::ReadOnly,
         attachments: Vec::new(),
+        approved_rules: Vec::new(),
     }
 }
 #[test]

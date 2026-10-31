@@ -324,8 +324,10 @@ async fn cancellation_reaches_the_native_child_and_helper_remains_available() {
     use std::time::Duration;
     let root = tempfile::tempdir().unwrap();
     let executable = root.path().join("native-fixture");
-    // A local fixture stands in for the SSH executable. It never contacts a
-    // host. exec makes its PID the long-lived command's PID for cleanup proof.
+    let model = root.path().join("fixture.gguf");
+    std::fs::write(&model, b"fixture").unwrap();
+    // A local fixture stands in for llama-server and never becomes ready.
+    // exec makes its PID the long-lived command's PID for cleanup proof.
     std::fs::write(
         &executable,
         "#!/bin/sh\nprintf '%s' $$ > \"$0.pid\"\nexec sleep 30\n",
@@ -339,11 +341,21 @@ async fn cancellation_reaches_the_native_child_and_helper_remains_available() {
     )
     .await
     .unwrap();
+    client
+        .execute(
+            "helper_patch_config",
+            &json!({"config":{"llama":{"executable":executable,"model":model}}}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
     let cancel = CancellationToken::new();
     let running_client = client.clone();
     let running_cancel = cancel.clone();
     let running = tokio::spawn(async move {
-        running_client.execute("remote_execute", &json!({"kind":"ssh","executable":executable,"target":"localhost","command":["fixture"]}), running_cancel).await
+        running_client
+            .execute("local_inference_start", &json!({}), running_cancel)
+            .await
     });
     let pid_file = root.path().join("native-fixture.pid");
     tokio::time::timeout(Duration::from_secs(3), async {

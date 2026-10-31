@@ -201,81 +201,38 @@ impl Xylo {
         cx.notify();
         true
     }
+    /// Re-reads the system notification permission when the window becomes
+    /// active, replacing a manual Refresh: the person changes it in System
+    /// Settings, then returns to Xylo. Only once preferences have loaded, and
+    /// never on top of a request already in flight.
+    pub(super) fn recheck_notification_permission(&mut self, cx: &mut Context<Self>) {
+        if self.notifications.status.get("preferences").is_some() && !self.notifications.busy() {
+            self.notification_request("notifications_refresh", json!({}), cx);
+        }
+    }
     pub(super) fn notifications_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let preferences = self.notifications.preferences();
         let loaded = self.notifications.status["loaded"] == true;
         let busy = self.notifications.busy();
+        let running = |name: &str| {
+            self.notifications
+                .pending
+                .values()
+                .any(|pending| pending == name)
+        };
         let permission = self.notifications.status["permission"].as_str();
         let deliverable = matches!(permission, Some("allowed" | "quiet" | "not_required"));
-        let mut general = card()
-            .max_w(px(820.))
-            .child(
-                crate::ui::XyloSwitch::new("notifications-enabled")
-                    .label("Enable desktop notifications")
-                    .checked(preferences.enabled)
-                    .disabled(!loaded || self.notifications.saving())
-                    .on_change(cx.listener(|view, checked, _, cx| {
-                        view.set_notification_preference(
-                            NotificationPreference::Enabled,
-                            *checked,
-                            cx,
-                        )
-                    })),
-            )
-            .child(subtitle(
-                "Notifications are silent and contain no conversation text.",
-            ));
-        general = general.child(subtitle(if !loaded {
+        let status: SharedString = if !loaded {
             if self.notifications.pending.is_empty() {
-                "Notification preferences unavailable. Retry below."
+                "Notification preferences unavailable. Retry to load them."
             } else {
                 "Loading notification preferences…"
             }
         } else {
             permission_text(permission)
-        }));
-        let mut actions = div().flex().flex_wrap().gap_2();
-        if permission == Some("not_determined")
-            && self.notifications.status["capabilities"]["request_permission"] == true
-        {
-            actions = actions.child(
-                primary("notifications-allow", "Allow notifications")
-                    .disabled(busy || !preferences.enabled)
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.notification_request("notifications_request_permission", json!({}), cx)
-                    })),
-            );
         }
-        actions = actions
-            .child(
-                button(
-                    "notifications-refresh",
-                    if loaded {
-                        "Refresh permission"
-                    } else {
-                        "Retry preferences"
-                    },
-                )
-                .disabled(busy)
-                .on_click(cx.listener(|view, _, _, cx| {
-                    view.notification_request(
-                        if view.notifications.status.get("preferences").is_some() {
-                            "notifications_refresh"
-                        } else {
-                            "notifications_status"
-                        },
-                        json!({}),
-                        cx,
-                    )
-                })),
-            )
-            .child(
-                button("notifications-test", "Send test notification")
-                    .disabled(busy || !preferences.enabled || !deliverable)
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.notification_request("notifications_test", json!({}), cx)
-                    })),
-            );
+        .into();
+        let mut actions = div().flex().items_center().gap(px(8.));
         if self.notifications.pending.values().any(|name| {
             matches!(
                 name.as_str(),
@@ -283,18 +240,88 @@ impl Xylo {
             )
         }) {
             actions = actions.child(
-                button("notifications-cancel", "Cancel request")
+                settings_ui::text_button("notifications-cancel", "Cancel request")
                     .on_click(cx.listener(|view, _, _, cx| view.cancel_notification_action(cx))),
             );
         }
-        general = general.child(actions);
-        if self.notifications.status["capabilities"]["live_activation"] == true && deliverable {
-            general = general.child(subtitle(
-                "Open a task from its notification while Xylo is running.",
-            ));
+        if permission == Some("not_determined")
+            && self.notifications.status["capabilities"]["request_permission"] == true
+        {
+            actions = actions.child(
+                settings_ui::busy(
+                    settings_ui::primary_button("notifications-allow", "Allow notifications")
+                        .disabled(busy || !preferences.enabled),
+                    running("notifications_request_permission"),
+                )
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.notification_request("notifications_request_permission", json!({}), cx)
+                })),
+            );
         }
-        let mut choices = card().max_w(px(820.));
-        for (id, label, key, checked, description) in [
+        if !loaded && self.notifications.pending.is_empty() {
+            actions = actions.child(
+                settings_ui::secondary_button("notifications-refresh", "Retry")
+                    .on_click(cx.listener(|view, _, _, cx| view.refresh_notifications(cx))),
+            );
+        }
+        let mut system = vec![
+            settings_ui::setting_row(
+                "Desktop notifications",
+                Some("Silent, and never include conversation text.".into()),
+                Some(
+                    settings_ui::switch(
+                        "notifications-enabled",
+                        "Enable desktop notifications",
+                        preferences.enabled,
+                    )
+                    .disabled(!loaded || self.notifications.saving())
+                    .on_change(cx.listener(|view, checked, _, cx| {
+                        view.set_notification_preference(
+                            NotificationPreference::Enabled,
+                            *checked,
+                            cx,
+                        )
+                    }))
+                    .into_any_element(),
+                ),
+            )
+            .into_any_element(),
+            settings_ui::setting_row(
+                "System permission",
+                Some(status),
+                Some(actions.into_any_element()),
+            )
+            .into_any_element(),
+            settings_ui::setting_row(
+                "Test notification",
+                Some(
+                    if self.notifications.status["capabilities"]["live_activation"] == true
+                        && deliverable
+                    {
+                        "Send one now to check delivery. Open a task from its notification while Xylo is running."
+                    } else {
+                        "Send one now to check delivery."
+                    }
+                    .into(),
+                ),
+                Some(
+                    settings_ui::busy(
+                        settings_ui::secondary_button("notifications-test", "Send test")
+                            .disabled(busy || !preferences.enabled || !deliverable),
+                        running("notifications_test"),
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.notification_request("notifications_test", json!({}), cx)
+                    }))
+                    .into_any_element(),
+                ),
+            )
+            .into_any_element(),
+        ];
+        if !self.notifications.notice.is_empty() {
+            system.push(settings_ui::caption(self.notifications.notice.clone()).into_any_element());
+        }
+        let choices = [
             (
                 "notifications-completion",
                 "Task completion",
@@ -330,43 +357,35 @@ impl Xylo {
                 preferences.background_only,
                 "Keep desktop alerts quiet while you are using Xylo.",
             ),
-        ] {
-            choices = choices.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .py_1()
-                    .child(
-                        crate::ui::XyloSwitch::new(id)
-                            .label(label)
-                            .checked(checked)
-                            .disabled(
-                                !loaded || !preferences.enabled || self.notifications.saving(),
-                            )
-                            .on_change(cx.listener(move |view, checked, _, cx| {
-                                view.set_notification_preference(key, *checked, cx)
-                            })),
-                    )
-                    .child(subtitle(description)),
-            );
-        }
-        div()
-            .id("notifications-page")
-            .tab_group()
-            .size_full()
-            .overflow_y_scroll()
-            .p_6()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(heading(
-                "Notifications",
-                "Choose when Xylo should get your attention.",
+        ]
+        .into_iter()
+        .map(|(id, label, key, checked, description)| {
+            settings_ui::setting_row(
+                label,
+                Some(description.into()),
+                Some(
+                    settings_ui::switch(id, label, checked)
+                        .disabled(!loaded || !preferences.enabled || self.notifications.saving())
+                        .on_change(cx.listener(move |view, checked, _, cx| {
+                            view.set_notification_preference(key, *checked, cx)
+                        }))
+                        .into_any_element(),
+                ),
+            )
+            .into_any_element()
+        });
+        settings_ui::settings_page("notifications-page", "Notifications")
+            .description("Choose when Xylo should get your attention.")
+            .child(settings_ui::section(
+                "Desktop",
+                None,
+                settings_ui::rows(system),
             ))
-            .child(general)
-            .child(choices)
-            .child(subtitle(self.notifications.notice.clone()))
+            .child(settings_ui::section(
+                "Notify me about",
+                None,
+                settings_ui::rows(choices),
+            ))
             .into_any_element()
     }
 }
@@ -377,12 +396,12 @@ fn permission_text(permission: Option<&str>) -> &'static str {
         Some("not_required") => "Your desktop notification center is ready.",
         Some("not_determined") => "Choose Allow notifications to give Xylo permission.",
         Some("denied") => {
-            "Notifications are blocked. Allow Xylo in your system notification settings, then refresh."
+            "Notifications are blocked. Allow Xylo in your system notification settings, then return to Xylo."
         }
         Some("unsupported") => "Native notifications are unavailable in this installation.",
         Some("unavailable") => {
-            "Your notification center is unavailable. Check your desktop settings and refresh."
+            "Your notification center is unavailable. Check your desktop settings, then return to Xylo."
         }
-        _ => "Refresh permission to check your system notification settings.",
+        _ => "Xylo checks your system notification settings when you return to it.",
     }
 }

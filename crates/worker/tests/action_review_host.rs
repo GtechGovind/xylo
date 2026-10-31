@@ -82,8 +82,9 @@ async fn real_host_denies_resolution_during_active_worker_then_records_after_can
             timeout_seconds: 15,
             ..Default::default()
         },
-        permissions: PermissionMode::AskForWrites,
+        permissions: PermissionMode::AskForApproval,
         attachments: vec![],
+        approved_rules: Vec::new(),
     };
     let (host, events) = HostClient::spawn_at(paths).unwrap();
     host.send_to(session, WorkerCommand::Run { turn }).unwrap();

@@ -1,11 +1,12 @@
 //! A project-scoped collection of native terminals. Session creation stays off
 //! the UI thread; shell text/rendering/IME remain owned by `TerminalView`.
 use crate::{
+    icons::{self, AppIcon},
     terminal_view::{TerminalEvent, TerminalView},
-    ui::{border, hover, muted, panel, selected, sidebar, text},
+    ui::{SingleLine, XyloTooltip, border, muted, panel, selected, sidebar, text},
 };
 use gpui_kit::{
-    component::{Icon, IconName},
+    component::menu::{DropdownMenu, PopupMenuItem},
     prelude::*,
     *,
 };
@@ -79,7 +80,6 @@ struct ShellTab {
     id: Uuid,
     title: String,
     exited: bool,
-    session: TerminalSession,
     view: Entity<TerminalView>,
     _subscriptions: Vec<Subscription>,
 }
@@ -123,12 +123,14 @@ impl TerminalWorkspace {
         this
     }
 
-    #[allow(dead_code)]
+    /// How many shells exist, including exited ones. For validation.
+    #[cfg(feature = "validation")]
     pub fn session_count(&self) -> usize {
         self.tabs.len()
     }
 
-    #[allow(dead_code)]
+    /// Whether any shell is starting or still running. For validation.
+    #[cfg(feature = "validation")]
     pub fn has_live_sessions(&self) -> bool {
         self.pending.is_some() || self.tabs.iter().any(|tab| !tab.exited)
     }
@@ -137,10 +139,11 @@ impl TerminalWorkspace {
         self.active_tab().map(|tab| tab.view.clone())
     }
 
-    /// A handle to the selected existing shell, never a new execution request.
-    #[allow(dead_code)]
-    pub fn active_session(&self) -> Option<TerminalSession> {
-        self.active_tab().map(|tab| tab.session.clone())
+    /// A handle to the selected existing shell, never a new execution
+    /// request. For validation.
+    #[cfg(feature = "validation")]
+    pub fn active_session(&self, cx: &App) -> Option<TerminalSession> {
+        self.active_tab().map(|tab| tab.view.read(cx).session())
     }
 
     pub fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -187,11 +190,7 @@ impl TerminalWorkspace {
         cx: &mut Context<Self>,
     ) {
         let initial = updates.borrow().clone();
-        let view = cx.new(|cx| {
-            let mut view = TerminalView::new(session.clone(), updates.clone(), window, cx);
-            view.set_embedded(true, cx);
-            view
-        });
+        let view = cx.new(|cx| TerminalView::new(session, updates.clone(), window, cx));
         let assist = cx.subscribe(&view, move |this, _, event, cx| {
             if this.tabs.iter().any(|tab| tab.id == id) {
                 match event {
@@ -213,7 +212,6 @@ impl TerminalWorkspace {
             id,
             title: safe_title(&initial.title, number),
             exited: initial.exited,
-            session,
             view,
             _subscriptions: vec![assist, focused],
         });
@@ -366,6 +364,50 @@ impl TerminalWorkspace {
         cx.notify();
     }
 
+    /// Runs `action` on the focused shell's view, for the toolbar's menu.
+    fn with_active_view(
+        &self,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(&mut TerminalView, &mut Context<TerminalView>),
+    ) {
+        if let Some(view) = self.active_view() {
+            view.update(cx, action);
+        }
+    }
+
+    /// The toolbar's "…" menu: actions on the focused shell that have
+    /// keyboard shortcuts and so do not need their own buttons.
+    fn more_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let weak = cx.entity().downgrade();
+        icons::menu_trigger("terminal-more", AppIcon::More, "More terminal actions")
+            .dropdown_menu(move |menu, _, _| {
+                let item = |label: &'static str,
+                            action: fn(
+                    &mut TerminalView,
+                    &mut Window,
+                    &mut Context<TerminalView>,
+                )| {
+                    let weak = weak.clone();
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.with_active_view(cx, |view, cx| action(view, window, cx))
+                        });
+                    })
+                };
+                menu.item(item("Ask Xylo about output", |view, window, cx| {
+                    view.toggle_assist(window, cx)
+                }))
+                .item(item("Find…", |view, window, cx| {
+                    view.open_search(window, cx)
+                }))
+                .separator()
+                .item(item("Bigger text", |view, _, cx| view.zoom(1., cx)))
+                .item(item("Smaller text", |view, _, cx| view.zoom(-1., cx)))
+                .item(item("Actual size", |view, _, cx| view.reset_zoom(cx)))
+            })
+            .into_any_element()
+    }
+
     fn pane(&self, id: Uuid, cx: &mut Context<Self>) -> AnyElement {
         let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
             return div().into_any_element();
@@ -402,6 +444,8 @@ impl Render for TerminalWorkspace {
             .h_full()
             .overflow_x_scroll()
             .track_scroll(&self.scroll);
+        // Where every shell started; shown on hover instead of as toolbar text.
+        let started_in: SharedString = format!("Started in {}", self.cwd.display()).into();
         for tab in &self.tabs {
             let id = tab.id;
             let active = self.layout.active == Some(id);
@@ -410,13 +454,15 @@ impl Render for TerminalWorkspace {
             } else {
                 tab.title.clone()
             };
+            let tooltip = started_in.clone();
             strip = strip.child(
                 div()
                     .flex()
                     .items_center()
                     .flex_shrink_0()
-                    .h(px(30.))
-                    .rounded_md()
+                    .h(px(28.))
+                    .pr(px(2.))
+                    .rounded(px(7.))
                     .bg(rgb(if active { selected() } else { sidebar() }))
                     .child(
                         gpui_kit::base::Button::new(element_id(id, "tab"))
@@ -424,27 +470,31 @@ impl Render for TerminalWorkspace {
                                 "Select {label}{}",
                                 if active { " (active)" } else { "" }
                             ))
+                            .tooltip(move |_, cx| cx.new(|_| XyloTooltip(tooltip.clone())).into())
                             .selected(active)
                             .flex()
                             .justify_start()
                             .items_center()
-                            .gap_2()
-                            .h(px(30.))
-                            .min_w(px(88.))
-                            .max_w(px(210.))
-                            .px_2()
-                            .rounded_md()
-                            .text_xs()
+                            .gap(px(6.))
+                            .h(px(28.))
+                            .min_w(px(72.))
+                            .max_w(px(200.))
+                            .pl(px(8.))
+                            .pr(px(4.))
+                            .rounded(px(7.))
+                            .text_size(px(12.))
                             .text_color(rgb(if active { text() } else { muted() }))
-                            .hover(|style| style.bg(rgb(hover())))
-                            .child(Icon::new(IconName::SquareTerminal).size(px(13.)))
-                            .child(div().min_w_0().truncate().child(label))
+                            .hover(|style| style.text_color(rgb(text())))
+                            .child(icons::small(AppIcon::Terminal))
+                            .child(div().min_w_0().single_line().child(label))
                             .on_click(
                                 cx.listener(move |this, _, window, cx| this.select(id, window, cx)),
                             ),
                     )
                     .child(
-                        control(element_id(id, "close"), "×", "Close terminal")
+                        icons::button_frame(element_id(id, "close"), "Close terminal")
+                            .size(px(22.))
+                            .child(icons::small(AppIcon::Close))
                             .disabled(self.confirming.is_some())
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.request_close(id, window, cx)
@@ -452,56 +502,46 @@ impl Render for TerminalWorkspace {
                     ),
             );
         }
-        let project = self
-            .cwd
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Project".into());
-        let mut header = div()
+        let split = self.layout.right.is_some();
+        let header = div()
             .flex()
             .items_center()
-            .gap_1()
-            .h(px(36.))
+            .gap(px(2.))
+            .h(px(40.))
             .flex_shrink_0()
-            .px_2()
+            .px(px(8.))
             .bg(rgb(sidebar()))
             .border_b_1()
             .border_color(rgb(border()))
             .child(strip)
+            .when(busy, |header| {
+                header.child(
+                    div()
+                        .px(px(6.))
+                        .child(crate::motion::spinner(icons::SMALL).color(rgb(muted()).into())),
+                )
+            })
             .child(
-                control("terminal-new", "+", "New terminal")
+                icons::icon_button("terminal-new", AppIcon::Add, "New terminal")
                     .disabled(busy || full)
                     .on_click(cx.listener(|this, _, window, cx| this.new_tab(window, cx))),
             )
-            .child(
-                control("terminal-split", "Split", "Split terminal")
-                    .disabled(busy || full || self.layout.right.is_some())
-                    .on_click(cx.listener(|this, _, window, cx| this.split_active(window, cx))),
-            );
-        if self.layout.right.is_some() {
-            header = header.child(
-                control("terminal-unsplit", "Single", "Show one terminal pane").on_click(
-                    cx.listener(|this, _, window, cx| {
+            // Split is a toggle: pressed while two panes show.
+            .child(if split {
+                icons::icon_button("terminal-unsplit", AppIcon::Split, "Show one pane")
+                    .bg(rgb(selected()))
+                    .text_color(rgb(text()))
+                    .on_click(cx.listener(|this, _, window, cx| {
                         this.layout.collapse();
                         this.focus_active(window, cx);
                         cx.notify();
-                    }),
-                ),
-            );
-        }
-        header = header.child(
-            div()
-                .ml_2()
-                .max_w(px(180.))
-                .truncate()
-                .text_xs()
-                .text_color(rgb(muted()))
-                .child(if busy {
-                    "Starting…".to_string()
-                } else {
-                    format!("Opened in {project}")
-                }),
-        );
+                    }))
+            } else {
+                icons::icon_button("terminal-split", AppIcon::Split, "Split terminal")
+                    .disabled(busy || full)
+                    .on_click(cx.listener(|this, _, window, cx| this.split_active(window, cx)))
+            })
+            .child(self.more_menu(cx));
         let mut body = div().flex().flex_1().min_h_0().min_w_0().bg(rgb(0x0f1117));
         if let Some(id) = self.layout.left {
             body = body.child(self.pane(id, cx));
@@ -530,24 +570,6 @@ impl Render for TerminalWorkspace {
         }
         result.child(body)
     }
-}
-
-fn control(
-    id: impl Into<ElementId>,
-    glyph: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-) -> gpui_kit::base::Button {
-    let glyph: SharedString = glyph.into();
-    gpui_kit::base::Button::new(id)
-        .accessibility_label(label)
-        .h(px(28.))
-        .min_w(px(26.))
-        .px_2()
-        .rounded_md()
-        .text_xs()
-        .text_color(rgb(muted()))
-        .hover(|style| style.bg(rgb(hover())))
-        .child(glyph)
 }
 
 fn safe_title(title: &str, number: usize) -> String {

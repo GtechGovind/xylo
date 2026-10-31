@@ -26,8 +26,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
-pub const HERMES_REVISION: &str = "c002f8c4efe475c89c9f14d3995d44e6a5df5b27";
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_PROTOCOL_BYTES: usize = 8 * 1024 * 1024;
 pub const EVENT_QUEUE_CAPACITY: usize = 256;
 
@@ -189,49 +188,96 @@ impl ProviderConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// How much the agent may do without asking. The presets mirror Codex.
+///
+/// The mode stored in settings is the source of truth: the host forwards every
+/// change to running workers and the engine reads the current mode at each tool
+/// call, so a change applies to the running task immediately.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
-    /// Ask before every change, command and external write.
+    /// Sandboxed project commands (no network), memory writes, enabled plugin
+    /// hooks and ordinary file edits inside the project run without asking.
+    /// Edits to files that run code or hold secrets (auto-run config, CI,
+    /// hooks, `.env`), anything outside the project, network access,
+    /// connectors, plugin components, desktop and browser control, image
+    /// generation, remote environments and schedules ask first.
     #[default]
-    AskForWrites,
-    /// Inspect only; any writing tool is refused.
+    AskForApproval,
+    /// Ask only for actions the engine assesses as potentially unsafe.
+    ApproveForMe,
+    /// No approvals and no sandbox: unrestricted file and network access.
+    FullAccess,
+    /// Read and search only; any write is refused.
     ReadOnly,
-    /// Apply file edits inside the project without asking; ask for commands
-    /// and external writes.
-    AcceptEdits,
-    /// Apply project file edits and run local commands without asking; ask for
-    /// connectors, plugins, remote environments and other external writes.
-    Auto,
 }
 
 impl PermissionMode {
+    /// Presentation order for menus and settings.
     pub const ALL: [PermissionMode; 4] = [
-        PermissionMode::AskForWrites,
-        PermissionMode::AcceptEdits,
-        PermissionMode::Auto,
+        PermissionMode::AskForApproval,
+        PermissionMode::ApproveForMe,
+        PermissionMode::FullAccess,
         PermissionMode::ReadOnly,
     ];
+
+    /// The one product label for this mode.
     pub fn label(self) -> &'static str {
         match self {
-            PermissionMode::AskForWrites => "Ask before changes",
-            PermissionMode::AcceptEdits => "Auto-accept edits",
-            PermissionMode::Auto => "Edits and commands",
+            PermissionMode::AskForApproval => "Ask for approval",
+            PermissionMode::ApproveForMe => "Approve for me",
+            PermissionMode::FullAccess => "Full access",
             PermissionMode::ReadOnly => "Read only",
         }
     }
+
+    /// One-line explanation shown beside the label.
     pub fn description(self) -> &'static str {
         match self {
-            PermissionMode::AskForWrites => "Approve each file change and command",
-            PermissionMode::AcceptEdits => {
-                "Project file edits apply automatically; commands still ask"
+            PermissionMode::AskForApproval => {
+                "Always ask to edit files outside the project and use the internet"
             }
-            PermissionMode::Auto => {
-                "Project edits and local commands run without asking; external actions still ask"
+            PermissionMode::ApproveForMe => "Only ask for actions detected as potentially unsafe",
+            PermissionMode::FullAccess => {
+                "Unrestricted access to the internet and any file on your computer"
             }
             PermissionMode::ReadOnly => "Read and search only; nothing is changed",
         }
     }
+
+    /// Whether the agent may change anything at all.
+    pub fn allows_writes(self) -> bool {
+        self != PermissionMode::ReadOnly
+    }
+
+    /// Whether commands run inside the OS sandbox.
+    pub fn sandboxed(self) -> bool {
+        self != PermissionMode::FullAccess
+    }
+}
+
+/// Where Xylo keeps provider keys, tokens and connector secrets.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStorage {
+    /// An encrypted vault file whose key is an owner-only file in the
+    /// application data directory. No operating-system prompts.
+    #[default]
+    LocalFile,
+    /// The same encrypted vault, with its key held as a single item in the
+    /// operating system's credential store.
+    OsKeychain,
+}
+
+/// A user's standing approval for one kind of action in one project.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalRule {
+    /// Stable rule key emitted by the engine (`ApprovalRequired.rule_key`).
+    pub key: String,
+    /// What the rule allows, in product words.
+    pub label: String,
+    pub workspace: PathBuf,
+    pub created_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -245,6 +291,8 @@ pub struct AppSettings {
     pub telemetry_export: bool,
     #[serde(default)]
     pub ui: UiPreferences,
+    #[serde(default)]
+    pub secret_storage: SecretStorage,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -277,9 +325,16 @@ pub struct UiPreferences {
     pub work_panel: String,
     pub sidebar_width: f32,
     pub files_width: f32,
-    pub terminal_height: f32,
-    pub terminal_visible: bool,
     pub active_page: String,
+    /// Most recently chosen models, newest first, for the model picker.
+    pub recent_models: Vec<RecentModel>,
+}
+
+/// A model the user picked recently, identified by its connection endpoint.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecentModel {
+    pub endpoint: String,
+    pub model: String,
 }
 
 impl Default for UiPreferences {
@@ -294,9 +349,8 @@ impl Default for UiPreferences {
             work_panel: "files".into(),
             sidebar_width: 222.0,
             files_width: 240.0,
-            terminal_height: 260.0,
-            terminal_visible: false,
             active_page: "chat".into(),
+            recent_models: Vec::new(),
         }
     }
 }
@@ -333,6 +387,7 @@ impl Default for AppSettings {
             local_context: 8192,
             telemetry_export: false,
             ui: UiPreferences::default(),
+            secret_storage: SecretStorage::default(),
         }
     }
 }
@@ -347,6 +402,9 @@ pub struct TurnRequest {
     pub permissions: PermissionMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ImageAttachment>,
+    /// Keys of the project's standing approvals ("always allow" rules).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved_rules: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -415,9 +473,6 @@ pub enum WorkerCommand {
         result: Result<ProviderCredentialUpdate, String>,
     },
     Cancel,
-    Steer {
-        message: String,
-    },
     SteerDurable {
         guidance: SteeringRequest,
     },
@@ -428,14 +483,98 @@ pub enum WorkerCommand {
         #[serde(default)]
         remember: bool,
     },
+    /// Apply a permission change to the running and all later tool calls.
+    SetPermissions {
+        mode: PermissionMode,
+    },
+    /// The secret-vault key for this worker. Sent once, before any `Run`.
+    Unlock {
+        key: WorkerCredential,
+    },
     Shutdown,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
+    /// Prompt tokens summed over every model call of the turn.
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub elapsed_ms: u64,
+    /// Prompt tokens of the turn's last model call: the context actually in use.
+    #[serde(default)]
+    pub context_tokens: u64,
+}
+
+/// What a running turn is doing right now, for the activity line.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnPhase {
+    /// Admission: resources, credentials, local model start.
+    Preparing,
+    /// A model request is in flight and nothing has streamed yet.
+    Thinking,
+    /// The model is streaming text.
+    Responding,
+    /// Tools from the last response are executing.
+    RunningTools,
+    /// An action is waiting for the user's decision.
+    WaitingForApproval,
+    /// Earlier context is being condensed to fit the window.
+    Compacting,
+    /// Waiting before retrying a failed or rate-limited model request.
+    Retrying { attempt: u32, delay_ms: u64 },
+    /// A helper agent is working on a delegated task.
+    Delegating,
+}
+
+/// Token accounting of the context sent with the latest model request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUsage {
+    /// The configured context window.
+    pub capacity: u64,
+    /// Tokens reserved for the model's output.
+    pub output_reserve: u64,
+    /// System prompt, project instructions and retained facts.
+    pub system: u64,
+    /// Schemas of the tools offered directly.
+    pub tools: u64,
+    pub tool_count: u32,
+    /// Tools discoverable through search; not counted in `tools`.
+    pub deferred_tool_count: u32,
+    /// Conversation messages sent with the request.
+    pub messages: u64,
+    /// Condensed summary of earlier work, when compaction happened.
+    pub summary: u64,
+    pub compacted: bool,
+    /// Usage above which earlier context is condensed.
+    pub autocompact_threshold: u64,
+    /// Prompt tokens the provider reported for the last request, when known.
+    #[serde(default)]
+    pub provider_input: Option<u64>,
+}
+
+impl ContextUsage {
+    /// Tokens of the request as estimated before sending.
+    pub fn used(&self) -> u64 {
+        self.system + self.tools + self.messages + self.summary
+    }
+}
+
+/// Why a turn ended in an error; decides Retry versus Reconnect in the UI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// Credentials are missing, expired or rejected.
+    Authentication,
+    /// The provider rate-limited or is overloaded.
+    RateLimited,
+    /// The provider or network failed.
+    Provider,
+    /// The task no longer fits the model's context window.
+    ContextOverflow,
+    /// An application fault.
+    #[default]
+    Internal,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -447,9 +586,9 @@ pub enum EngineEvent {
         generation: u64,
         force: bool,
     },
+    /// The worker is ready for commands; `version` is the worker's build version.
     Ready {
-        engine: String,
-        revision: String,
+        version: String,
     },
     Started,
     Delta {
@@ -465,21 +604,46 @@ pub enum EngineEvent {
         action_id: Uuid,
         name: String,
         arguments: Value,
+        /// The `agent_delegate` action that started the child agent issuing this call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<Uuid>,
     },
     ApprovalRequired {
         action_id: Uuid,
         name: String,
         arguments: Value,
-        /// What "always allow" would cover for the rest of this chat, when the
-        /// action can be remembered (for example "`cargo test` commands").
+        /// What "always allow" would cover in this project, in product words
+        /// (for example "`cargo test` commands").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule: Option<String>,
+        /// Stable key of that rule, persisted when the user chooses "always allow".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_key: Option<String>,
+        /// Why the action needs approval under the current mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<Uuid>,
     },
     ToolFinished {
         action_id: Uuid,
         name: String,
         result: String,
         success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<Uuid>,
+    },
+    /// The turn's current activity changed.
+    Phase {
+        phase: TurnPhase,
+    },
+    /// Context accounting after the latest request was fitted.
+    ContextUsage {
+        usage: ContextUsage,
+    },
+    /// A generated title for the conversation.
+    TitleUpdated {
+        title: String,
     },
     Completed {
         text: String,
@@ -489,6 +653,8 @@ pub enum EngineEvent {
     Error {
         message: String,
         retryable: bool,
+        #[serde(default)]
+        kind: ErrorKind,
     },
 }
 
@@ -498,6 +664,39 @@ pub struct Conversation {
     pub title: String,
     pub workspace: PathBuf,
     pub updated_at: i64,
+    #[serde(default)]
+    pub title_source: TitleSource,
+    /// Pinned chats are listed first in the sidebar.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Archived chats are kept with their history but left out of the chat
+    /// list and chat search.
+    #[serde(default)]
+    pub archived: bool,
+}
+
+/// Where a conversation's title came from. Generated titles never replace a
+/// title the user chose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    /// The first characters of the first prompt.
+    #[default]
+    Prompt,
+    Generated,
+    User,
+}
+
+/// Whether a stored assistant reply is complete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageStatus {
+    #[default]
+    Complete,
+    /// The user stopped the turn; the text is what had streamed.
+    Interrupted,
+    /// The turn failed; the text is what had streamed.
+    Failed,
 }
 
 /// Stable keyset pagination in most-recently-updated order; IDs break timestamp ties.
@@ -523,6 +722,12 @@ pub struct ChatMessage {
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ImageAttachment>,
+    #[serde(default, skip_serializing_if = "is_complete")]
+    pub status: MessageStatus,
+}
+
+fn is_complete(status: &MessageStatus) -> bool {
+    *status == MessageStatus::Complete
 }
 
 /// A bounded page of conversation history in durable append order. `before`
@@ -570,7 +775,6 @@ pub trait EngineBackend: Send + Sync {
         events: mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
     ) -> Result<()>;
-    fn steer(&self, message: String);
 }
 
 #[async_trait]
@@ -606,153 +810,4 @@ pub struct TeamTask {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn worker_credential_debug_is_redacted() {
-        let credential = WorkerCredential(Some("fixture-secret".into()));
-        assert!(!format!("{credential:?}").contains("fixture-secret"));
-        let decoded: WorkerCredential =
-            serde_json::from_str(&serde_json::to_string(&credential).unwrap()).unwrap();
-        assert_eq!(decoded.0, credential.0);
-        let command = WorkerCommand::ProviderCredentialUpdated {
-            request_id: Uuid::new_v4(),
-            result: Ok(ProviderCredentialUpdate { generation: 1, credential }),
-        };
-        assert!(!format!("{command:?}").contains("fixture-secret"));
-        let decoded: WorkerCommand = serde_json::from_str(&serde_json::to_string(&command).unwrap()).unwrap();
-        assert!(matches!(decoded, WorkerCommand::ProviderCredentialUpdated { result: Ok(ProviderCredentialUpdate { generation: 1, .. }), .. }));
-    }
-    #[test]
-    fn incompatible_protocol_is_rejected() {
-        let mut message = Envelope::new(Uuid::new_v4(), None, 0, WorkerCommand::Hello);
-        message.version = 2;
-        assert!(message.validate().is_err());
-    }
-    #[test]
-    fn context_and_endpoint_are_validated() {
-        let mut config = ProviderConfig::default();
-        assert!(config.validate().is_err());
-        config.model = "user-selected-model".into();
-        assert!(config.validate().is_ok());
-        config.output_tokens = 9000;
-        assert!(config.validate().is_err());
-    }
-}
-
-#[cfg(test)]
-mod reasoning_tests {
-    use super::*;
-
-    #[test]
-    fn remembering_a_model_preserves_distinct_custom_connections() {
-        let base = ProviderConfig {
-            model: "shared-model".into(),
-            ..Default::default()
-        };
-        for different_catalog in [false, true] {
-            let mut first = base.clone();
-            let mut second = base.clone();
-            if different_catalog {
-                first.discovery_url = Some("https://example.com/catalog-a".into());
-                second.discovery_url = Some("https://example.com/catalog-b".into());
-            } else {
-                first.headers.insert("X-Tenant".into(), "a".into());
-                second.headers.insert("X-Tenant".into(), "b".into());
-            }
-            let mut settings = AppSettings::default();
-            settings.remember_model(first.clone());
-            settings.remember_model(second.clone());
-            assert_eq!(settings.providers.len(), 2);
-            second.reasoning_effort = Some("high".into());
-            settings.remember_model(second.clone());
-            assert_eq!(settings.providers.len(), 2);
-            assert_eq!(settings.providers[0].headers, first.headers);
-            assert_eq!(settings.providers[0].discovery_url, first.discovery_url);
-            assert_eq!(settings.providers[0].reasoning_effort, None);
-            assert_eq!(settings.providers[1].reasoning_effort, second.reasoning_effort);
-        }
-    }
-
-    #[test]
-    fn legacy_provider_configuration_keeps_provider_default_reasoning() {
-        let mut value = serde_json::to_value(ProviderConfig::default()).unwrap();
-        value.as_object_mut().unwrap().remove("reasoning_effort");
-        value.as_object_mut().unwrap().remove("reasoning_options");
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("default_reasoning_effort");
-        value.as_object_mut().unwrap().remove("discovery_url");
-        let config: ProviderConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(config.reasoning_effort, None);
-        assert_eq!(config.reasoning_options, None);
-        assert_eq!(config.default_reasoning_effort, None);
-        assert_eq!(config.discovery_url, None);
-    }
-
-    #[test]
-    fn advertised_reasoning_survives_persistence_and_explicit_no_support_wins() {
-        let mut config = ProviderConfig {
-            model: "future-account-model".into(),
-            reasoning_options: Some(vec![
-                "high".into(),
-                "low".into(),
-                "high".into(),
-                "invalid value".into(),
-            ]),
-            default_reasoning_effort: Some("low".into()),
-            reasoning_effort: Some("high".into()),
-            ..Default::default()
-        };
-        let restored: ProviderConfig =
-            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
-        assert_eq!(restored.supported_reasoning_efforts(), vec!["high", "low"]);
-        assert_eq!(restored.effective_reasoning_effort(), Some("high"));
-        assert_eq!(restored.default_reasoning_effort.as_deref(), Some("low"));
-        config.model = "gpt-5.2".into();
-        config.reasoning_options = Some(vec![]);
-        assert!(config.supported_reasoning_efforts().is_empty());
-        assert_eq!(config.effective_reasoning_effort(), None);
-        config.reasoning_options = Some(vec!["high".into()]);
-        config.family = ApiFamily::Anthropic;
-        assert!(config.supported_reasoning_efforts().is_empty());
-    }
-
-    #[test]
-    fn reasoning_capability_follows_protocol_model_and_saved_effort() {
-        let mut config = ProviderConfig {
-            model: "gpt-5.2".into(),
-            reasoning_effort: Some("xhigh".into()),
-            ..Default::default()
-        };
-        assert_eq!(config.effective_reasoning_effort(), Some("xhigh"));
-        config.model = "gpt-5.2-pro".into();
-        config.reasoning_effort = Some("low".into());
-        assert_eq!(config.effective_reasoning_effort(), None);
-        config.model = "gpt-4.1".into();
-        assert!(config.supported_reasoning_efforts().is_empty());
-        config.model = "gpt-5.2-chat-latest".into();
-        assert!(config.supported_reasoning_efforts().is_empty());
-        config.model = "gpt-5.2".into();
-        config.family = ApiFamily::Anthropic;
-        assert!(config.supported_reasoning_efforts().is_empty());
-    }
-}
-
-#[cfg(test)]
-mod native_workspace_preferences_tests {
-    use super::UiPreferences;
-    #[test]
-    fn existing_ui_preferences_load_with_new_workspace_defaults() {
-        let prefs: UiPreferences = serde_json::from_value(serde_json::json!({"sidebar_width":248.0,"files_width":240.0,"terminal_height":260.0,"terminal_visible":false,"active_page":"chat"})).unwrap();
-        assert!(prefs.sidebar_visible);
-        assert!(!prefs.work_panel_open);
-        assert!(prefs.open_projects.is_empty());
-        assert_eq!(prefs.work_panel, "files");
-        let saved = serde_json::to_value(&prefs).unwrap();
-        let restored: UiPreferences = serde_json::from_value(saved).unwrap();
-        assert_eq!(restored.active_page, "chat");
-        assert_eq!(restored.sidebar_width, 248.0);
-    }
-}
+mod tests;

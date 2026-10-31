@@ -1,6 +1,5 @@
 //! Pending messages are scoped to their chat; the host owns durable execution.
 use super::*;
-use gpui_kit::component::IconName;
 use xylo_runtime::turn_queue::{QueueReceipt, QueuedTurn};
 
 #[derive(Default)]
@@ -109,7 +108,9 @@ impl Xylo {
             items.retain(|queued| queued.id != item.id);
         }
         self.turn_queue.notice.remove(&session);
+        self.turns.entry(session).or_default().request = Some(item.turn.clone());
         if self.session == session && self.workspace.as_ref() == Some(&item.turn.workspace) {
+            self.archive_finished_turn(session);
             let mut user = message(session, "user", item.turn.prompt);
             user.id = Uuid::new_v5(&item.turn.turn_id, b"user-message");
             user.attachments = item.turn.attachments;
@@ -183,17 +184,13 @@ impl Xylo {
                     .py_2()
                     .rounded(px(10.))
                     .bg(rgb(panel()))
-                    .child(
-                        icon(IconName::ChevronRight)
-                            .size(px(14.))
-                            .text_color(rgb(muted())),
-                    )
+                    .child(icons::small(AppIcon::ChevronRight).text_color(rgb(icons::rest_color())))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_size(px(12.))
-                            .child(div().truncate().child(text)),
+                            .child(div().single_line().child(text)),
                     )
                     .child(
                         div()
@@ -219,73 +216,113 @@ impl Xylo {
             } else {
                 item.turn.prompt.clone()
             };
+            rows =
+                rows.child(
+                    div()
+                        .id(("queued-message", index))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(10.))
+                        .bg(rgb(panel()))
+                        .border_1()
+                        .border_color(rgb(border()))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(muted()))
+                                .child(format!("{}", index + 1)),
+                        )
+                        .child(
+                            div()
+                                .id(("queued-message-text", index))
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(12.))
+                                .child(div().single_line().child(title.clone()))
+                                .tooltip(move |_, cx| {
+                                    cx.new(|_| XyloTooltip(title.clone().into())).into()
+                                }),
+                        )
+                        .when(
+                            image_count > 0 && !item.turn.prompt.trim().is_empty(),
+                            |row| {
+                                row.child(div().text_size(px(11.)).text_color(rgb(muted())).child(
+                                    format!(
+                                        "{image_count} image{}",
+                                        if image_count == 1 { "" } else { "s" }
+                                    ),
+                                ))
+                            },
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(muted()))
+                                .child(if item.paused { "Paused" } else { "Queued" }),
+                        )
+                        .when(!self.running(), |row| {
+                            row.child(
+                                button(("send-queued", index), "Send")
+                                    .text_xs()
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.manage_queued_turn(id, true, cx)
+                                    })),
+                            )
+                        })
+                        .child(
+                            icons::icon_button(
+                                ("remove-queued", index),
+                                AppIcon::Close,
+                                "Remove queued message",
+                            )
+                            .disabled(pending)
+                            .on_click(cx.listener(
+                                move |view, _, _, cx| view.manage_queued_turn(id, false, cx),
+                            )),
+                        ),
+                );
+        }
+        // The host pauses the queue when a task stops or fails; say why and let
+        // the user resume it from the first message.
+        let paused = items
+            .into_iter()
+            .flatten()
+            .find(|item| item.paused)
+            .filter(|_| !self.running());
+        if let Some(item) = paused {
+            let first = items.and_then(|items| items.first()).map(|item| item.id);
+            let reason = item
+                .reason
+                .clone()
+                .unwrap_or_else(|| "The queue is paused.".into());
             rows = rows.child(
                 div()
-                    .id(("queued-message", index))
+                    .id("queue-paused")
+                    .test_support()
                     .flex()
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .py_2()
-                    .rounded(px(10.))
-                    .bg(rgb(panel()))
-                    .border_1()
-                    .border_color(rgb(border()))
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(muted()))
-                            .child(format!("{}", index + 1)),
-                    )
-                    .child(
-                        div()
-                            .id(("queued-message-text", index))
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(12.))
-                            .child(div().truncate().child(title.clone()))
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| XyloTooltip(title.clone().into())).into()
-                            }),
-                    )
-                    .when(
-                        image_count > 0 && !item.turn.prompt.trim().is_empty(),
-                        |row| {
-                            row.child(div().text_size(px(11.)).text_color(rgb(muted())).child(
-                                format!(
-                                    "{image_count} image{}",
-                                    if image_count == 1 { "" } else { "s" }
-                                ),
-                            ))
-                        },
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(muted()))
-                            .child(if item.paused { "Paused" } else { "Queued" }),
-                    )
-                    .when(!self.running(), |row| {
+                    .child(div().flex_1().min_w_0().child(subtitle(reason).text_xs()))
+                    .when_some(first, |row, first| {
+                        let pending = self
+                            .turn_queue
+                            .operations
+                            .values()
+                            .any(|entry| *entry == (self.session, first));
                         row.child(
-                            button(("send-queued", index), "Send")
+                            button("resume-queue", "Resume queue")
                                 .text_xs()
                                 .disabled(pending)
                                 .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.manage_queued_turn(id, true, cx)
+                                    view.manage_queued_turn(first, true, cx)
                                 })),
                         )
-                    })
-                    .child(
-                        focus_ring(gpui_kit::base::Button::new(("remove-queued", index)))
-                            .accessibility_label("Remove queued message")
-                            .size(px(24.))
-                            .rounded_md()
-                            .disabled(pending)
-                            .child(icon(IconName::Close).size(px(13.)))
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.manage_queued_turn(id, false, cx)
-                            })),
-                    ),
+                    }),
             );
         }
         if let Some(notice) = notice {

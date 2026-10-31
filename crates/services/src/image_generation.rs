@@ -1,8 +1,6 @@
 //! Explicit native image generation. A submitted request is never replayed
 //! automatically: transport loss and cancellation keep a durable uncertain result.
 mod http;
-#[cfg(test)]
-mod tests;
 
 use crate::{
     attachments::AttachmentStore,
@@ -164,7 +162,7 @@ impl ImageGenerationService {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(request.provider.timeout_seconds))
             .build()?;
-        let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
+        let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&request)?));
         let preparation = {
             let service = self.clone();
             let request = request.clone();
@@ -519,7 +517,7 @@ impl ImageGenerationService {
                 );
                 let bytes = read_file(&image.artifact_path, xylo_core::MAX_IMAGE_BYTES as usize)?;
                 ensure!(
-                    format!("{:x}", Sha256::digest(bytes)) == image.attachment.sha256,
+                    hex::encode(Sha256::digest(bytes)) == image.attachment.sha256,
                     "Generated artifact failed its integrity check"
                 );
             }
@@ -623,25 +621,10 @@ pub fn validate_provider(provider: &ImageGenerationProvider) -> Result<Url> {
         "Image generation timeout must be between 1 and 600 seconds"
     );
     ensure!(
-        provider.endpoint.len() <= 8192 && provider.headers.len() <= 16,
+        provider.endpoint.len() <= 8192,
         "Image provider configuration is too large"
     );
-    for (name, value) in &provider.headers {
-        let name = name.to_ascii_lowercase();
-        ensure!(
-            name.len() <= 128
-                && value.len() <= 4096
-                && !name.contains("key")
-                && !name.contains("token")
-                && !name.contains("secret")
-                && !name.contains("auth")
-                && !name.contains("cookie")
-                && !name.contains("password")
-                && !name.contains("credential")
-                && !name.contains("session"),
-            "Store image provider secrets in the OS credential store, not custom headers"
-        );
-    }
+    crate::providers::validate_custom_headers(&provider.headers)?;
     if let Some(reference) = &provider.credential_ref {
         ensure!(
             !reference.is_empty() && reference.len() <= 256,
@@ -754,3 +737,6 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     File::open(parent)?.sync_all()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

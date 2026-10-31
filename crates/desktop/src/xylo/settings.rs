@@ -1,34 +1,257 @@
 //! Focused settings destinations. Every control uses an existing host boundary.
+//!
+//! Layout comes from [`super::settings_ui`]; see `SETTINGS_DESIGN.md`.
 use super::*;
+use crate::icons::AppIcon;
 use gpui_kit::TestSupportExt;
 
-pub(super) fn settings_content(id: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .size_full()
-        .overflow_y_scroll()
-        .px(px(48.))
-        .pt(px(28.))
-        .pb(px(64.))
-        .flex()
-        .flex_col()
-        .items_center()
+/// Standing approvals of the open project, as shown on the Permissions page.
+#[derive(Default)]
+pub(super) struct PermissionsUi {
+    /// The project whose rules are listed (or being loaded).
+    workspace: Option<PathBuf>,
+    rules: Vec<ApprovalRule>,
+    loading: bool,
+    /// When the current load or revoke was sent, for the slow-wait caption.
+    loading_since: Option<std::time::Instant>,
+    error: Option<String>,
 }
-fn settings_column() -> Div {
-    div()
-        .w_full()
-        .max_w(px(720.))
-        .flex()
-        .flex_col()
-        .gap(px(18.))
+fn allowed_since(created_at: i64) -> String {
+    let seconds = now_ms().saturating_sub(created_at).max(0) / 1000;
+    match seconds {
+        0..=59 => "Allowed just now".into(),
+        60..=3599 => format!("Allowed {} min ago", seconds / 60),
+        3600..=86399 => format!("Allowed {} h ago", seconds / 3600),
+        _ => format!("Allowed {} days ago", seconds / 86400),
+    }
 }
-fn setting_title(title: &'static str) -> Div {
-    section_title(title).pt(px(10.))
+fn secret_storage_label(storage: SecretStorage) -> &'static str {
+    match storage {
+        SecretStorage::LocalFile => "Local encrypted file",
+        SecretStorage::OsKeychain => "System keychain",
+    }
 }
-fn setting_row(title: impl Into<SharedString>, detail: impl Into<SharedString>) -> Div {
-    crate::ui::setting_row(title, detail)
+fn secret_storage_detail(storage: SecretStorage) -> &'static str {
+    match storage {
+        SecretStorage::LocalFile => {
+            "Keys are encrypted in Xylo's data folder with a key file only your account can read. No system prompts."
+        }
+        SecretStorage::OsKeychain => {
+            "The encryption key lives in your system keychain: stronger protection, but your system may ask for permission."
+        }
+    }
 }
+
 impl Xylo {
+    /// The settings sidebar: back to the workspace, the "Settings" title, then
+    /// every destination in groups.
+    pub(super) fn settings_navigation(&self, cx: &mut Context<Self>) -> AnyElement {
+        let header = div()
+            .flex()
+            .flex_col()
+            .child(
+                div().h(px(52.)).flex().items_center().child(
+                    settings_ui::settings_nav_item(
+                        "back-to-chat",
+                        "Back to workspace",
+                        AppIcon::Back,
+                        false,
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.reset_provider_discovery(cx);
+                        view.cancel_account_command(cx);
+                        view.settings_open = false;
+                        view.page = Page::Chat;
+                        view.persist_ui(cx);
+                        cx.notify();
+                    })),
+                ),
+            )
+            .child(
+                div()
+                    .px(px(10.))
+                    .pt(px(4.))
+                    .pb(px(12.))
+                    .text_size(px(settings_ui::TITLE_SIZE - 2.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(text()))
+                    .child("Settings"),
+            );
+        type Destinations = Vec<(Page, &'static str, &'static str, AppIcon)>;
+        let groups: [(Option<&'static str>, Destinations); 5] = [
+            (
+                None,
+                vec![
+                    (Page::Appearance, "nav-general", "General", AppIcon::General),
+                    (
+                        Page::Permissions,
+                        "nav-permissions",
+                        "Permissions",
+                        AppIcon::Permissions,
+                    ),
+                    (
+                        Page::Notifications,
+                        "nav-notifications",
+                        "Notifications",
+                        AppIcon::Notifications,
+                    ),
+                ],
+            ),
+            (
+                Some("Models & accounts"),
+                vec![
+                    (
+                        Page::Providers,
+                        "nav-providers",
+                        "Providers",
+                        AppIcon::Model,
+                    ),
+                    (
+                        Page::Images,
+                        "nav-images",
+                        "Image generation",
+                        AppIcon::Image,
+                    ),
+                    (Page::Voice, "nav-voice", "Voice", AppIcon::Mic),
+                ],
+            ),
+            (
+                Some("Tools & integrations"),
+                vec![
+                    (
+                        Page::Connectors,
+                        "nav-connections",
+                        "Connections",
+                        AppIcon::Connectors,
+                    ),
+                    (Page::Plugins, "nav-plugins", "Plugins", AppIcon::Plugins),
+                    (
+                        Page::Environments,
+                        "nav-environments",
+                        "Environments",
+                        AppIcon::Environment,
+                    ),
+                ],
+            ),
+            (
+                Some("Knowledge"),
+                vec![
+                    (Page::Skills, "nav-skills", "Skills", AppIcon::Skills),
+                    (Page::Memory, "nav-memory", "Memory", AppIcon::Memory),
+                ],
+            ),
+            (
+                None,
+                vec![(Page::Assets, "nav-downloads", "Downloads", AppIcon::Storage)],
+            ),
+        ];
+        let groups = groups
+            .into_iter()
+            .map(|(label, pages)| {
+                let group = label.map_or_else(settings_ui::NavGroup::untitled, |label| {
+                    settings_ui::NavGroup::new(label)
+                });
+                pages
+                    .into_iter()
+                    .fold(group, |group, (page, id, label, glyph)| {
+                        group.item(
+                            settings_ui::settings_nav_item(id, label, glyph, self.page == page)
+                                .on_click(
+                                    cx.listener(move |view, _, _, cx| view.navigate(page, cx)),
+                                ),
+                        )
+                    })
+            })
+            .collect();
+        settings_ui::settings_sidebar(header, groups).into_any_element()
+    }
+    /// Switching storage starts an empty vault there: saved keys and tokens
+    /// are erased, never carried over, so the switch is confirmed first.
+    fn confirm_secret_storage(
+        &mut self,
+        option: SecretStorage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.secret_storage == option {
+            return;
+        }
+        self.confirm_destructive(
+            &format!("Switch to {}?", secret_storage_label(option)),
+            "Saved provider keys and connector tokens will be removed and you'll need to reconnect.",
+            "Switch",
+            window,
+            cx,
+            move |view, _, cx| {
+                view.settings.secret_storage = option;
+                let settings = view.settings.clone();
+                view.host_call(cx, |host| host.save_settings(settings));
+                cx.notify();
+            },
+        );
+    }
+    /// Loads the open project's standing approvals.
+    pub(super) fn refresh_approval_rules(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.clone() else {
+            self.permissions = PermissionsUi::default();
+            cx.notify();
+            return;
+        };
+        if self.permissions.workspace.as_ref() != Some(&workspace) {
+            self.permissions.rules.clear();
+        }
+        self.permissions.workspace = Some(workspace.clone());
+        self.permissions.error = None;
+        let result = self
+            .host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
+            .and_then(|host| host.approval_rules(workspace));
+        self.permissions.loading = result.is_ok();
+        self.permissions.loading_since = result.is_ok().then(|| self.arm_slow_hint(cx));
+        if let Err(error) = result {
+            self.permissions.error = Some(error.to_string());
+        }
+        cx.notify();
+    }
+    fn revoke_approval_rule(&mut self, key: String, cx: &mut Context<Self>) {
+        let Some(workspace) = self.permissions.workspace.clone() else {
+            return;
+        };
+        let result = self
+            .host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
+            .and_then(|host| host.remove_approval_rule(workspace, key));
+        self.permissions.loading = result.is_ok();
+        self.permissions.loading_since = result.is_ok().then(|| self.arm_slow_hint(cx));
+        if let Err(error) = result {
+            self.permissions.error = Some(error.to_string());
+        }
+        cx.notify();
+    }
+    /// Applies a project's rules unless the page has moved to another project.
+    pub(super) fn approval_rules_received(
+        &mut self,
+        workspace: PathBuf,
+        result: Result<Vec<ApprovalRule>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.permissions.workspace.as_ref() != Some(&workspace) {
+            return;
+        }
+        self.permissions.loading = false;
+        self.permissions.loading_since = None;
+        match result {
+            Ok(mut rules) => {
+                rules.sort_by_key(|rule| std::cmp::Reverse(rule.created_at));
+                self.permissions.rules = rules;
+                self.permissions.error = None;
+            }
+            Err(error) => self.permissions.error = Some(error),
+        }
+        cx.notify();
+    }
     pub(super) fn save_connector(&mut self, cx: &mut Context<Self>) {
         if self.connector_pending.is_some() {
             return;
@@ -122,28 +345,14 @@ impl Xylo {
                     self.connector_loading = false;
                     self.connector_tools.clear();
                 }
-                if !self.connector_pending_save {
-                    if self
-                        .connector_editing
-                        .is_some_and(|id| !self.connectors.iter().any(|config| config.id == id))
-                    {
-                        self.connector_editing = None;
-                        self.connector_error = Some("Connection removed. The retained form will add a new connection; enter its access token again if needed.".into());
-                    }
-                    cx.notify();
-                    return;
+                // A save, or removing the connection being edited (Remove
+                // lives on its edit page), returns to the list.
+                let edited_removed = self
+                    .connector_editing
+                    .is_some_and(|id| !self.connectors.iter().any(|config| config.id == id));
+                if self.connector_pending_save || edited_removed {
+                    self.clear_connector_form(window, cx);
                 }
-                self.connector_editing = None;
-                self.connector_name
-                    .update(cx, |input, cx| input.set_value("", window, cx));
-                self.connector_command
-                    .update(cx, |input, cx| input.set_value("", window, cx));
-                self.connector_args
-                    .update(cx, |input, cx| input.set_value("", window, cx));
-                self.connector_endpoint
-                    .update(cx, |input, cx| input.set_value("", window, cx));
-                self.connector_credential
-                    .update(cx, |input, cx| input.set_value("", window, cx));
             }
             Err(error) => {
                 self.connector_error = Some(format!(
@@ -166,6 +375,7 @@ impl Xylo {
             return;
         };
         self.connector_editing = Some(id);
+        self.connector_form_open = true;
         self.connector_transport = config.transport;
         self.connector_name
             .update(cx, |input, cx| input.set_value(config.name, window, cx));
@@ -187,6 +397,57 @@ impl Xylo {
         self.connector_credential
             .update(cx, |input, cx| input.set_value("", window, cx));
         cx.notify();
+    }
+    /// Opens the empty form for a new connection.
+    fn open_connector_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connector_pending.is_some() {
+            return;
+        }
+        self.clear_connector_form(window, cx);
+        self.connector_form_open = true;
+        cx.notify();
+    }
+    /// Leaves the form for the list, discarding what was typed.
+    fn close_connector_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connector_pending.is_some() {
+            return;
+        }
+        self.clear_connector_form(window, cx);
+        cx.notify();
+    }
+    fn clear_connector_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connector_form_open = false;
+        self.connector_editing = None;
+        self.connector_error = None;
+        self.connector_transport = "stdio".into();
+        for input in [
+            &self.connector_name,
+            &self.connector_command,
+            &self.connector_endpoint,
+            &self.connector_credential,
+        ] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.connector_args
+            .update(cx, |input, cx| input.set_value("", window, cx));
+    }
+    fn confirm_remove_connector(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self
+            .connectors
+            .iter()
+            .find(|config| config.id == id)
+            .map(|config| config.name.clone())
+        else {
+            return;
+        };
+        self.confirm_destructive(
+            &format!("Remove {name}?"),
+            "Chats can no longer use its tools. Its saved access token is removed.",
+            "Remove connection",
+            window,
+            cx,
+            move |view, _, cx| view.remove_connector(id, cx),
+        );
     }
     fn remove_connector(&mut self, id: Uuid, cx: &mut Context<Self>) {
         if self.connector_pending.is_some() {
@@ -226,31 +487,15 @@ impl Xylo {
         }
         cx.notify();
     }
-    fn connector_inspection_panel(&self, cx: &Context<Self>) -> AnyElement {
-        let Some(id) = self.connector_inspected else {
-            return div().into_any_element();
-        };
+    /// The tools of the inspected connection, under its own section.
+    fn connector_inspection_section(&self, cx: &Context<Self>) -> Option<Div> {
+        let id = self.connector_inspected?;
         let name = self
             .connectors
             .iter()
             .find(|connection| connection.id == id)
             .map(|connection| connection.name.clone())
             .unwrap_or_else(|| "Connection".into());
-        let mut panel = div()
-            .rounded(px(12.))
-            .bg(rgb(panel()))
-            .border_1()
-            .border_color(rgb(border()))
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(format!("{name} tools")),
-            );
         let status = if self.connector_loading {
             Some("Loading tools…".to_owned())
         } else if let Some(error) = &self.connector_error {
@@ -271,22 +516,40 @@ impl Xylo {
         } else {
             None
         };
+        let mut body = div().w_full().flex().flex_col().gap(px(10.));
+        if self.connector_loading && self.connector_tools.is_empty() {
+            body =
+                body.child(settings_ui::list_container((0..3).map(|_| {
+                    settings_ui::skeleton_list_item(false).into_any_element()
+                })));
+        }
         if let Some(status) = status {
-            panel = panel.child(
+            let failed = self.connector_error.is_some();
+            body = body.child(
                 div()
                     .id("connector-inspection-status")
                     .role(Role::Status)
                     .aria_label(status.clone())
                     .test_support()
-                    .text_sm()
-                    .text_color(rgb(muted()))
-                    .child(status),
-            );
-        }
-        if self.connector_error.is_some() {
-            panel = panel.child(
-                button("retry-connector-inspection", "Try again")
-                    .on_click(cx.listener(move |view, _, _, cx| view.inspect_connector(id, cx))),
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        settings_ui::caption(status)
+                            .flex_1()
+                            .when(failed, |text| text.text_color(rgb(danger()))),
+                    )
+                    .when(failed, |row| {
+                        row.child(
+                            settings_ui::secondary_button(
+                                "retry-connector-inspection",
+                                "Try again",
+                            )
+                            .on_click(
+                                cx.listener(move |view, _, _, cx| view.inspect_connector(id, cx)),
+                            ),
+                        )
+                    }),
             );
         }
         if !self.connector_loading
@@ -294,479 +557,539 @@ impl Xylo {
             && !self.connector_tools.is_empty()
         {
             let weak = cx.entity().downgrade();
-            panel = panel.child(
-                uniform_list(
-                    "connector-tool-results",
-                    self.connector_tools.len(),
-                    move |range, _, cx| {
+            let count = self.connector_tools.len();
+            body = body.child(
+                settings_ui::list_frame().child(
+                    uniform_list("connector-tool-results", count, move |range, _, cx| {
                         weak.update(cx, |view, _| {
                             range
                                 .filter_map(|index| {
-                                    view.connector_tools.get(index).map(|tool| {
-                                        div()
-                                            .h(px(52.))
-                                            .flex()
-                                            .flex_col()
-                                            .justify_center()
-                                            .gap_1()
-                                            .child(
-                                                div().text_sm().truncate().child(tool.name.clone()),
-                                            )
-                                            .child(subtitle(tool.description.clone()).truncate())
-                                            .into_any_element()
-                                    })
+                                    let tool = view.connector_tools.get(index)?;
+                                    Some(
+                                        settings_ui::list_item(
+                                            ("connector-tool", index),
+                                            None,
+                                            tool.name.clone(),
+                                            Some(tool.description.clone().into()),
+                                        )
+                                        .divider(index > 0)
+                                        .into_any_element(),
+                                    )
                                 })
                                 .collect()
                         })
                         .unwrap_or_default()
-                    },
-                )
-                .h(px((self.connector_tools.len() as f32 * 52.).min(280.))),
+                    })
+                    .h(px((count as f32 * settings_ui::LIST_ITEM_HEIGHT)
+                        .min(6.5 * settings_ui::LIST_ITEM_HEIGHT))),
+                ),
             );
         }
-        panel.into_any_element()
+        Some(settings_ui::section(
+            format!("{name} tools"),
+            Some("What chats can call through this connection.".into()),
+            body,
+        ))
     }
     pub(super) fn general_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut themes = segments();
-        for (key, label) in [("light", "Light"), ("dark", "Dark")] {
-            themes = themes.child(
-                segment(
-                    SharedString::from(format!("theme-{key}")),
-                    label,
-                    self.settings.theme == key,
-                )
-                .on_click(cx.listener(move |view, _, window, cx| {
-                    view.settings.theme = key.into();
-                    view.apply_theme(window, cx);
-                    view.persist_ui(cx);
-                })),
-            );
-        }
+        let theme = settings_ui::segmented(
+            "theme",
+            [("system", "System"), ("light", "Light"), ("dark", "Dark")]
+                .into_iter()
+                .map(|(key, label)| {
+                    let view = cx.entity().downgrade();
+                    settings_ui::SelectOption::new(
+                        label,
+                        self.settings.theme == key,
+                        move |window, cx| {
+                            let _ = view.update(cx, |view, cx| {
+                                if view.settings.theme != key {
+                                    view.settings.theme = key.into();
+                                    view.apply_theme(window, cx);
+                                    view.persist_ui(cx);
+                                }
+                            });
+                        },
+                    )
+                    .id(SharedString::from(format!("theme-{key}")))
+                })
+                .collect(),
+        );
         let modifier = if cfg!(target_os = "macos") {
             "⌘"
         } else {
             "Ctrl"
         };
-        let mut shortcuts = setting_group();
-        for (index, (label, key)) in [
+        let shortcuts = [
             ("New chat", "N"),
             ("Search chats", "K"),
             ("Toggle terminal", "J"),
             ("Save file", "S"),
         ]
         .into_iter()
-        .enumerate()
-        {
-            shortcuts = shortcuts.child(
-                div()
-                    .px(px(18.))
-                    .py(px(12.))
-                    .when(index > 0, |row| {
-                        row.border_t_1().border_color(rgb(border()))
-                    })
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_size(px(13.5)).child(label))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.))
-                            .child(kbd(modifier))
-                            .child(kbd(key)),
-                    ),
-            );
-        }
-        settings_content("general-settings")
-            .child(
-                settings_column()
-                    .child(heading(
-                        "General",
-                        "Appearance and keyboard shortcuts for your workspace.",
-                    ))
-                    .child(setting_title("Appearance"))
-                    .child(
-                        setting_group().child(
-                            setting_row("Theme", "Choose the appearance of your workspace.")
-                                .child(themes),
-                        ),
-                    )
-                    .child(setting_title("Keyboard shortcuts"))
-                    .child(shortcuts),
+        .map(|(label, key)| {
+            settings_ui::setting_row(
+                label,
+                None,
+                Some(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(kbd(modifier))
+                        .child(kbd(key))
+                        .into_any_element(),
+                ),
             )
             .into_any_element()
-    }
-    pub(super) fn agent_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut timeouts = div().flex().items_center().gap_2();
-        for seconds in [30u64, 120, 300] {
-            timeouts = timeouts.child(
-                button(
-                    SharedString::from(format!("agent-timeout-{seconds}")),
-                    match seconds {
-                        120 => "2 min".into(),
-                        300 => "5 min".into(),
-                        _ => format!("{seconds}s"),
-                    },
+        });
+        settings_ui::settings_page("general-settings", "General")
+            .description("Appearance, shortcuts, responses and the version of Xylo you run.")
+            .child(settings_ui::section(
+                "Appearance",
+                None,
+                settings_ui::rows([settings_ui::setting_row(
+                    "Theme",
+                    Some("System follows your Mac's light or dark appearance.".into()),
+                    Some(theme.into_any_element()),
                 )
-                .bg(rgb(if self.settings.provider.timeout_seconds == seconds {
-                    selected()
-                } else {
-                    panel()
-                }))
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.settings.provider.timeout_seconds = seconds;
-                    let provider = view.settings.provider.clone();
-                    view.settings.remember_model(provider);
-                    let settings = view.settings.clone();
-                    view.host_call(cx, |host| host.save_settings(settings));
-                    cx.notify();
-                })),
-            );
-        }
-        if ![30, 120, 300].contains(&self.settings.provider.timeout_seconds) {
-            timeouts = timeouts.child(subtitle(format!(
-                "Current: {} seconds",
-                self.settings.provider.timeout_seconds
-            )));
-        }
-        settings_content("agent-settings")
-            .child(
-                settings_column()
-                    .child(setting_title("Agent"))
-                    .child(
-                        div()
-                            .rounded(px(12.))
-                            .bg(rgb(panel()))
-                            .border_1()
-                            .border_color(rgb(border()))
-                            .child(
-                                setting_row(
-                                    "Response timeout",
-                                    "Time to first response, then the maximum pause between streaming updates.",
-                                )
-                                .child(timeouts),
-                            )
-                            .child(
-                                setting_row(
-                                    "Remote environments",
-                                    "SSH and container connections used by tools.",
-                                )
-                                .child(
-                                    button("agent-environments", "Configure").on_click(
-                                        cx.listener(|view, _, _, cx| {
-                                            view.navigate(Page::Environments, cx)
-                                        }),
-                                    ),
-                                ),
-                            )
-                            .when(self.recovery_blocks_submit(), |section| section.child(
-                                setting_row(
-                                    "Interrupted actions",
-                                    "Review actions with an uncertain result before resuming.",
-                                )
-                                .child(
-                                    button("agent-recovery", "Review").on_click(cx.listener(
-                                        |view, _, window, cx| {
-                                            view.settings_open = false;
-                                            view.page = Page::Chat;
-                                            view.recovery_activate(window, cx);
-                                            cx.notify();
-                                        },
-                                    )),
-                                ),
-                            )),
-                    )
-                    .child(setting_title("Model"))
-                    .child(
-                        setting_row(
-                            self.settings.provider.model.clone(),
-                            self.settings.provider.name.clone(),
-                        )
-                        .rounded(px(12.))
-                        .bg(rgb(panel()))
-                        .border_1()
-                        .border_color(rgb(border()))
-                        .child(
-                            button("agent-model-settings", "Configure").on_click(
-                                cx.listener(|view, _, _, cx| view.navigate(Page::Providers, cx)),
-                            ),
-                        ),
-                    ),
-            )
+                .into_any_element()]),
+            ))
+            .child(settings_ui::section(
+                "Keyboard shortcuts",
+                None,
+                settings_ui::rows(shortcuts),
+            ))
+            .child(settings_ui::section(
+                "Advanced",
+                None,
+                settings_ui::rows([self.response_timeout_row(cx)]),
+            ))
+            .child(self.about_section(cx))
             .into_any_element()
     }
-
-    pub(super) fn permission_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut modes = div()
-            .rounded(px(12.))
-            .bg(rgb(panel()))
-            .border_1()
-            .border_color(rgb(border()))
-            .flex()
-            .flex_col();
-        for (index, mode) in PermissionMode::ALL.into_iter().enumerate() {
-            modes = modes.child(
-                focus_ring(gpui_kit::base::Button::new(("permission-setting", index)))
-                    .accessibility_label(format!("{}: {}", mode.label(), mode.description()))
-                    .w_full()
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .items_center()
-                    .justify_start()
-                    .gap_3()
-                    .text_color(rgb(text()))
-                    .bg(rgb(if self.settings.permissions == mode {
-                        selected()
-                    } else {
-                        panel()
-                    }))
-                    .hover(|style| style.bg(rgb(hover())))
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .items_start()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(mode.label()),
-                            )
-                            .child(subtitle(mode.description())),
-                    )
-                    .child(div().text_color(rgb(muted())).child(
-                        if self.settings.permissions == mode {
-                            "●"
-                        } else {
-                            "○"
+    fn response_timeout_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.settings.provider.timeout_seconds;
+        let timeouts = settings_ui::segmented(
+            "agent-timeout",
+            [30u64, 120, 300]
+                .into_iter()
+                .map(|seconds| {
+                    let view = cx.entity().downgrade();
+                    settings_ui::SelectOption::new(
+                        match seconds {
+                            120 => "2 min".to_owned(),
+                            300 => "5 min".to_owned(),
+                            _ => format!("{seconds} s"),
                         },
-                    ))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.settings.permissions = mode;
-                        let settings = view.settings.clone();
-                        view.host_call(cx, |host| host.save_settings(settings));
-                        cx.notify();
-                    })),
-            );
-        }
-        settings_content("permissions-settings").child(settings_column()
-            .child(setting_title("Tool approvals"))
-            .child(modes)
-            .child(subtitle("Policy applies to new requests. External actions and uncertain effects retain their approval and recovery checks.")))
-            .into_any_element()
-    }
-
-    pub(super) fn skills_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        settings_content("skills-settings")
-            .child(
-                settings_column()
-                    .child(setting_title("Saved procedures"))
-                    .child(subtitle("Procedures learned from completed work. Install and manage portable skills in Plugins."))
-                    .child(button("manage-portable-skills", "Manage portable skills").on_click(cx.listener(|view, _, _, cx| view.navigate(Page::Plugins, cx))))
-                    .child(self.skills_settings_content(cx)),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn connections_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut transport = div().flex().flex_wrap().gap_2();
-        for (value, label) in [("stdio", "Local command"), ("http", "Remote server")] {
-            transport = transport.child(
-                button(SharedString::from(format!("transport-{value}")), label)
-                    .accessibility_label(value)
-                    .disabled(self.connector_pending.is_some())
-                    .bg(rgb(if self.connector_transport == value {
-                        selected()
-                    } else {
-                        panel()
-                    }))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.connector_transport = value.into();
-                        cx.notify();
-                    })),
-            );
-        }
-        let mut form = div()
-            .rounded(px(12.))
-            .bg(rgb(panel()))
-            .border_1()
-            .border_color(rgb(border()))
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(subtitle("Save the configuration first, then choose Inspect tools to request discovery. Saving does not start a server or verify its availability."))
-            .child(transport)
-            .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child("Connection name"))
-            .child(
-                Input::new(&self.connector_name)
-                    .readonly(self.connector_pending.is_some())
-                    .aria_label("Connection name"),
-            );
-        if self.connector_transport == "stdio" {
-            form = form
-                .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child("Server command"))
-                .child(subtitle("Path to an installed server executable, for example /absolute/path/to/server. Example only; nothing runs when you save."))
-                .child(
-                    Input::new(&self.connector_command)
-                        .readonly(self.connector_pending.is_some())
-                        .aria_label("Server command"),
-                )
-                .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child("Arguments, one per line"))
-                .child(subtitle("Optional: enter each argument on its own line, for example --workspace and /absolute/path/to/project on separate lines. These are arguments, not a shell command."))
-                .child(
-                    Textarea::new(&self.connector_args)
-                        .readonly(self.connector_pending.is_some())
-                        .aria_label("Arguments, one per line"),
-                );
-        } else {
-            form = form
-                .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child("Server endpoint"))
-                .child(subtitle("Use the endpoint supplied by your server administrator, for example https://tools.example.com/mcp. Example only; saving does not contact it."))
-                .child(Input::new(&self.connector_endpoint).readonly(self.connector_pending.is_some()).aria_label("Server endpoint"))
-                .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child("Access token (optional)"))
-                .child(Input::new(&self.connector_credential).readonly(self.connector_pending.is_some()).aria_label("Access token (optional)"))
-                .child(subtitle("Access token is stored in the system credential store. Leave blank when editing to keep the saved token."));
-        }
-        form = form.child(
-            div().flex().flex_wrap().gap_2().justify_end().child(
-                primary(
-                    "connector-save",
-                    if self.connector_pending.is_some() {
-                        "Saving…"
-                    } else if self.connector_editing.is_some() {
-                        "Save connection"
-                    } else {
-                        "Add connection"
-                    },
-                )
-                .disabled(self.connector_pending.is_some())
-                .on_click(cx.listener(|view, _, _, cx| view.save_connector(cx))),
-            ),
+                        current == seconds,
+                        move |_, cx| {
+                            let _ =
+                                view.update(cx, |view, cx| view.set_response_timeout(seconds, cx));
+                        },
+                    )
+                    .id(SharedString::from(format!("agent-timeout-{seconds}")))
+                })
+                .collect(),
         );
-        let mut column = settings_column()
-            .child(setting_title("Connection setup"))
-            .child(form);
-        if let Some(error) = &self.connector_error {
-            column = column.child(subtitle(error.clone()));
+        let detail: SharedString = if [30, 120, 300].contains(&current) {
+            "Time to the first response, then the longest pause allowed between streaming updates."
+                .into()
+        } else {
+            format!("Currently {current} seconds. Time to the first response, then the longest pause between updates.")
+                .into()
+        };
+        settings_ui::setting_row(
+            "Response timeout",
+            Some(detail),
+            Some(timeouts.into_any_element()),
+        )
+        .into_any_element()
+    }
+    fn set_response_timeout(&mut self, seconds: u64, cx: &mut Context<Self>) {
+        if self.settings.provider.timeout_seconds == seconds {
+            return;
         }
-        if !self.connectors.is_empty() {
-            column = column.child(setting_title("Connections"));
-            for (index, connection) in self.connectors.iter().enumerate() {
-                let id = connection.id;
-                column = column.child(
-                    setting_row(connection.name.clone(), connection.transport.clone())
-                        .child(
-                            button(("connector-edit", index), "Edit")
-                                .disabled(self.connector_pending.is_some())
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    view.edit_connector(id, window, cx)
-                                })),
-                        )
-                        .child(
-                            button(("connector-remove", index), "Remove")
-                                .disabled(self.connector_pending.is_some())
-                                .on_click(
-                                    cx.listener(move |view, _, _, cx| {
-                                        view.remove_connector(id, cx)
-                                    }),
-                                ),
-                        )
-                        .rounded(px(12.))
-                        .bg(rgb(panel()))
-                        .border_1()
-                        .border_color(rgb(border()))
-                        .child(
-                            button(("connector-tools", index), "Inspect tools")
-                                .disabled(
-                                    self.connector_loading && self.connector_inspected == Some(id),
-                                )
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.inspect_connector(id, cx);
-                                })),
-                        ),
-                );
-            }
-        }
-        column = column.child(self.connector_inspection_panel(cx));
-        settings_content("connections-settings")
-            .child(column)
+        self.settings.provider.timeout_seconds = seconds;
+        let provider = self.settings.provider.clone();
+        self.settings.remember_model(provider);
+        let settings = self.settings.clone();
+        self.host_call(cx, |host| host.save_settings(settings));
+        cx.notify();
+    }
+    pub(super) fn permission_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let modes = settings_ui::radio_list(
+            "permission-modes",
+            PermissionMode::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(index, mode)| {
+                    let view = cx.entity().downgrade();
+                    settings_ui::radio_option(
+                        ("permission-setting", index),
+                        mode.label(),
+                        mode.description(),
+                        self.settings.permissions == mode,
+                    )
+                    .caution(mode == PermissionMode::FullAccess)
+                    .on_choose(move |_, cx| {
+                        let _ = view.update(cx, |view, cx| view.set_permission_mode(mode, cx));
+                    })
+                }),
+        );
+        let storage = settings_ui::select(
+            "secret-storage",
+            "Where keys are kept",
+            [SecretStorage::LocalFile, SecretStorage::OsKeychain]
+                .into_iter()
+                .map(|option| {
+                    let view = cx.entity().downgrade();
+                    settings_ui::SelectOption::new(
+                        secret_storage_label(option),
+                        self.settings.secret_storage == option,
+                        move |window, cx| {
+                            let _ = view.update(cx, |view, cx| {
+                                view.confirm_secret_storage(option, window, cx)
+                            });
+                        },
+                    )
+                })
+                .collect(),
+        );
+        settings_ui::settings_page("permissions-settings", "Permissions")
+            .description("How Xylo's actions are approved. Changes apply from the next action, including in running tasks.")
+            .child(settings_ui::section("Approval mode", None, modes))
+            .child(settings_ui::section(
+                "Always-allowed actions",
+                Some("Actions you chose “Always allow” for in this project.".into()),
+                self.approval_rules_section(cx),
+            ))
+            .child(settings_ui::section(
+                "Security",
+                Some("Switching removes saved keys and tokens; you'll reconnect providers and connections afterwards.".into()),
+                settings_ui::rows([settings_ui::setting_row(
+                    "Where keys are kept",
+                    Some(secret_storage_detail(self.settings.secret_storage).into()),
+                    Some(storage),
+                )
+                .into_any_element()]),
+            ))
             .into_any_element()
     }
-
-    pub(super) fn context_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut connections = div()
-            .rounded(px(12.))
-            .bg(rgb(panel()))
-            .border_1()
-            .border_color(rgb(border()))
-            .flex()
-            .flex_col();
-        if self.connectors.is_empty() {
-            connections = connections.child(setting_row(
-                "No connections",
-                "Add a server, review its access, then discover its tools.",
+    fn approval_rules_section(&self, cx: &mut Context<Self>) -> Div {
+        let mut section = div().w_full().flex().flex_col().gap(px(10.));
+        if let Some(error) = &self.permissions.error {
+            section = section.child(settings_ui::inline_error(error));
+        }
+        if self.workspace.is_none() {
+            return section.child(settings_ui::empty_state(
+                AppIcon::Permissions,
+                "No project open",
+                "Open a project to see the actions you always allow in it.",
+                None,
             ));
         }
-        for (index, connection) in self.connectors.iter().enumerate() {
-            let id = connection.id;
-            connections = connections.child(
-                setting_row(connection.name.clone(), connection.transport.clone()).child(
-                    button(("context-tools", index), "Inspect tools")
-                        .disabled(self.connector_loading && self.connector_inspected == Some(id))
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.inspect_connector(id, cx);
-                        })),
+        if self.permissions.workspace != self.workspace {
+            // The project changed while this page was open.
+            return section.child(settings_ui::rows([settings_ui::setting_row(
+                "Another project is open",
+                Some("Its always-allowed actions have not been loaded yet.".into()),
+                Some(
+                    settings_ui::secondary_button(
+                        "load-approval-rules",
+                        "Show this project's actions",
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| view.refresh_approval_rules(cx)))
+                    .into_any_element(),
                 ),
+            )
+            .into_any_element()]));
+        }
+        if self.permissions.rules.is_empty() {
+            if self.permissions.loading {
+                return section.child(settings_ui::loading_list(3, self.permissions.loading_since));
+            }
+            return section.child(settings_ui::empty_state(
+                AppIcon::Permissions,
+                "Nothing is always allowed",
+                "Choose “Always allow” on an approval to skip asking for that action in this project.",
+                None,
+            ));
+        }
+        let rules = self
+            .permissions
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| {
+                let key = rule.key.clone();
+                settings_ui::list_item(
+                    ("approval-rule", index),
+                    None,
+                    rule.label.clone(),
+                    Some(allowed_since(rule.created_at).into()),
+                )
+                .trailing(
+                    settings_ui::text_button(("revoke-approval-rule", index), "Revoke")
+                        .disabled(self.permissions.loading)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.revoke_approval_rule(key.clone(), cx)
+                        })),
+                )
+                .into_any_element()
+            });
+        section.child(settings_ui::list_container(rules))
+    }
+
+    fn connector_form(&self, cx: &mut Context<Self>) -> Div {
+        let busy = self.connector_pending.is_some();
+        let transport = settings_ui::segmented(
+            "transport",
+            [("stdio", "Local command"), ("http", "Remote server")]
+                .into_iter()
+                .map(|(value, label)| {
+                    let view = cx.entity().downgrade();
+                    settings_ui::SelectOption::new(
+                        label,
+                        self.connector_transport == value,
+                        move |_, cx| {
+                            let _ = view.update(cx, |view, cx| {
+                                if view.connector_pending.is_none() {
+                                    view.connector_transport = value.into();
+                                    cx.notify();
+                                }
+                            });
+                        },
+                    )
+                    .id(SharedString::from(format!("transport-{value}")))
+                })
+                .collect(),
+        );
+        let mut fields = vec![
+            settings_ui::field("Type", transport, None).into_any_element(),
+            settings_ui::field(
+                "Connection name",
+                Input::new(&self.connector_name)
+                    .readonly(busy)
+                    .aria_label("Connection name"),
+                None,
+            )
+            .into_any_element(),
+        ];
+        if self.connector_transport == "stdio" {
+            fields.push(
+                settings_ui::field(
+                    "Server command",
+                    Input::new(&self.connector_command)
+                        .readonly(busy)
+                        .aria_label("Server command"),
+                    Some("Path to an installed server executable, for example /absolute/path/to/server. Nothing runs when you save.".into()),
+                )
+                .into_any_element(),
+            );
+            fields.push(
+                settings_ui::field(
+                    "Arguments, one per line",
+                    Textarea::new(&self.connector_args)
+                        .readonly(busy)
+                        .aria_label("Arguments, one per line"),
+                    Some("Optional. Each argument on its own line, for example --workspace then /absolute/path/to/project. These are arguments, not a shell command.".into()),
+                )
+                .into_any_element(),
+            );
+        } else {
+            fields.push(
+                settings_ui::field(
+                    "Server endpoint",
+                    Input::new(&self.connector_endpoint)
+                        .readonly(busy)
+                        .aria_label("Server endpoint"),
+                    Some("The endpoint from your server administrator, for example https://tools.example.com/mcp. Saving does not contact it.".into()),
+                )
+                .into_any_element(),
+            );
+            fields.push(
+                settings_ui::field(
+                    "Access token (optional)",
+                    Input::new(&self.connector_credential)
+                        .readonly(busy)
+                        .aria_label("Access token (optional)"),
+                    Some("Kept in Xylo's secret storage. Leave blank when editing to keep the saved token.".into()),
+                )
+                .into_any_element(),
             );
         }
-        connections = connections.child(
-            div().px_4().py_3().child(
-                button("manage-context-connections", "Manage connections")
-                    .on_click(cx.listener(|view, _, _, cx| view.navigate(Page::Connectors, cx))),
-            ),
-        );
-        let mut column = settings_column()
-            .child(setting_title("Context sources"))
-            .child(
-                div()
-                    .rounded(px(12.))
-                    .bg(rgb(panel()))
-                    .border_1()
-                    .border_color(rgb(border()))
-                    .flex()
-                    .flex_col()
-                    .child(setting_row(
-                        "Project files",
-                        "Files read through tools are scoped to the active project.",
-                    ))
-                    .child(
-                        setting_row(
-                            "Memory",
-                            "Saved facts are included according to their scope.",
-                        )
-                        .child(
-                            button("context-memory", "Manage").on_click(
-                                cx.listener(|view, _, _, cx| view.navigate(Page::Memory, cx)),
-                            ),
-                        ),
+        fields.push(
+            settings_ui::form_actions([
+                settings_ui::text_button("connector-cancel", "Cancel")
+                    .disabled(busy)
+                    .on_click(
+                        cx.listener(|view, _, window, cx| view.close_connector_form(window, cx)),
                     )
-                    .child(
-                        setting_row("Skills", "Reviewed procedures provide reusable guidance.")
-                            .child(button("context-skills", "Manage").on_click(
-                                cx.listener(|view, _, _, cx| view.navigate(Page::Skills, cx)),
-                            )),
+                    .into_any_element(),
+                settings_ui::busy(
+                    settings_ui::primary_button(
+                        "connector-save",
+                        if self.connector_editing.is_some() {
+                            "Save connection"
+                        } else {
+                            "Add connection"
+                        },
                     ),
+                    busy,
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.save_connector(cx)))
+                .into_any_element(),
+            ])
+            .into_any_element(),
+        );
+        settings_ui::form_column(fields)
+    }
+    /// A saved connection; the row opens its edit page.
+    fn connection_item(&self, index: usize, connection: &ConnectorConfig) -> settings_ui::ListItem {
+        let kind = if connection.transport == "http" {
+            "Remote server"
+        } else {
+            "Local command"
+        };
+        let target = if connection.transport == "http" {
+            connection.endpoint.clone()
+        } else {
+            connection
+                .command
+                .as_ref()
+                .map(|command| command.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let subtitle: SharedString = if target.is_empty() {
+            kind.into()
+        } else {
+            format!("{kind} · {target}").into()
+        };
+        let id_text = connection.id.to_string();
+        settings_ui::list_item(
+            ("connector-edit", index),
+            Some(settings_ui::monogram(&connection.name, &id_text).into_any_element()),
+            connection.name.clone(),
+            Some(subtitle),
+        )
+    }
+
+    /// Connections: the saved list with Add connection, or the add/edit form
+    /// as a sub-page once Add or a row is chosen.
+    pub(super) fn connections_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.connector_form_open || self.connector_editing.is_some() {
+            return self.connection_form_page(cx);
+        }
+        let busy = self.connector_pending.is_some();
+        let add = || {
+            settings_ui::primary_button("connector-add", "Add connection")
+                .disabled(busy)
+                .on_click(cx.listener(|view, _, window, cx| view.open_connector_form(window, cx)))
+        };
+        let mut page = settings_ui::settings_page("connections-settings", "Connections")
+            .description("Servers that give Xylo extra tools through the Model Context Protocol.");
+        if !self.connectors.is_empty() {
+            page = page.action(add());
+        }
+        if let Some(error) = &self.connector_error
+            && self.connector_inspected.is_none()
+        {
+            page = page.child(settings_ui::inline_error(error));
+        }
+        let list = if self.connectors.is_empty() {
+            settings_ui::empty_state(
+                AppIcon::Connectors,
+                "No connections yet",
+                "Connect a local command or a remote server, then inspect its tools.",
+                Some(add().into_any_element()),
             )
-            .child(setting_title("Connections"))
-            .child(connections);
-        column = column.child(self.connector_inspection_panel(cx));
-        settings_content("context-settings")
-            .child(column)
-            .into_any_element()
+        } else {
+            settings_ui::list_container(self.connectors.iter().enumerate().map(
+                |(index, connection)| {
+                    let id = connection.id;
+                    self.connection_item(index, connection)
+                        .trailing(
+                            settings_ui::busy(
+                                settings_ui::text_button(
+                                    ("connector-tools", index),
+                                    "Inspect tools",
+                                ),
+                                self.connector_loading && self.connector_inspected == Some(id),
+                            )
+                            .on_click(
+                                cx.listener(move |view, _, _, cx| view.inspect_connector(id, cx)),
+                            ),
+                        )
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.edit_connector(id, window, cx)
+                        }))
+                        .into_any_element()
+                },
+            ))
+        };
+        // An empty list is the empty state alone; a heading over it adds nothing.
+        page = if self.connectors.is_empty() {
+            page.child(list)
+        } else {
+            page.child(settings_ui::section("Your connections", None, list))
+        };
+        if let Some(inspection) = self.connector_inspection_section(cx) {
+            page = page.child(inspection);
+        }
+        page.into_any_element()
+    }
+    fn connection_form_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let editing = self.connector_editing.and_then(|id| {
+            self.connectors
+                .iter()
+                .position(|config| config.id == id)
+                .map(|index| (index, id, self.connectors[index].name.clone()))
+        });
+        let title: SharedString = editing.as_ref().map_or_else(
+            || "Add connection".into(),
+            |(_, _, name)| name.clone().into(),
+        );
+        let busy = self.connector_pending.is_some();
+        let mut page = settings_ui::settings_page("connections-settings", title.clone())
+            .breadcrumb(settings_ui::breadcrumb(
+                [settings_ui::crumb("connector-back", "Connections")
+                    .disabled(busy)
+                    .on_click(
+                        cx.listener(|view, _, window, cx| view.close_connector_form(window, cx)),
+                    )],
+                title,
+            ));
+        if let Some(error) = &self.connector_error {
+            page = page.child(settings_ui::inline_error(error));
+        }
+        page = page.child(settings_ui::section(
+            "Connection",
+            Some("Save, then choose Inspect tools to discover what it offers. Saving does not start the server or check that it is reachable.".into()),
+            self.connector_form(cx),
+        ));
+        if let Some((index, id, _)) = editing {
+            page = page.child(settings_ui::danger_zone([settings_ui::setting_row(
+                "Remove connection",
+                Some(
+                    "Chats can no longer use its tools. Its saved access token is removed.".into(),
+                ),
+                Some(
+                    settings_ui::destructive_button(("connector-remove", index), "Remove…")
+                        .disabled(busy)
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.confirm_remove_connector(id, window, cx)
+                        }))
+                        .into_any_element(),
+                ),
+            )
+            .inset()
+            .into_any_element()]));
+        }
+        page.into_any_element()
     }
 }
+
+#[cfg(test)]
+#[path = "settings/tests.rs"]
+mod tests;

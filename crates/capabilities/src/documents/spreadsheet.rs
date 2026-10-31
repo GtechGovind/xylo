@@ -366,21 +366,23 @@ fn dimensions(text: &str, cancel: &CancellationToken) -> Result<(u32, u32)> {
         check(cancel)?;
         match reader.read_event()? {
             quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e) => {
-                if e.name().as_ref() == b"dimension" {
+                if e.name().as_ref() == "dimension" {
                     for attr in e.attributes() {
                         let attr = attr?;
-                        if attr.key.as_ref() == b"ref" {
-                            let value = attr.decode_and_unescape_value(reader.decoder())?;
+                        if attr.key.as_ref() == "ref" {
+                            let value =
+                                attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
                             let (_, _, r, c) = range(&value)?;
                             return Ok((r + 1, c + 1));
                         }
                     }
                 }
-                if e.name().as_ref() == b"c" {
+                if e.name().as_ref() == "c" {
                     for attr in e.attributes() {
                         let attr = attr?;
-                        if attr.key.as_ref() == b"r" {
-                            let value = attr.decode_and_unescape_value(reader.decoder())?;
+                        if attr.key.as_ref() == "r" {
+                            let value =
+                                attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
                             let (r, c) = coordinate(&value)?;
                             rows = rows.max(r + 1);
                             columns = columns.max(c + 1);

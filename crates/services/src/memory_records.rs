@@ -53,7 +53,6 @@ impl Store {
         let scope = scope.to_owned();
         let limit = limit.clamp(1, 100);
         self.call(move|conn| {
-            conn.execute_batch("CREATE INDEX IF NOT EXISTS memories_recent ON memories(scope,active,json_extract(json,'$.created_at') DESC,id DESC)")?;
             let mut statement=conn.prepare("SELECT json FROM memories WHERE scope=?1 AND active=1 AND(?2 IS NULL OR json_extract(json,'$.created_at')<?2 OR(json_extract(json,'$.created_at')=?2 AND id<?3)) ORDER BY json_extract(json,'$.created_at') DESC,id DESC LIMIT ?4")?;
             let rows=statement.query_map(params![scope,before.as_ref().map(|v|v.created_at),before.as_ref().map(|v|v.id.to_string()),(limit+1)as i64],|row|row.get::<_,String>(0))?;
             let mut records=rows.map(|row|Ok(serde_json::from_str::<MemoryRecord>(&row?)?)).collect::<Result<Vec<_>>>()?;
@@ -127,23 +126,14 @@ pub fn export_fact_versions(
     )?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let stop = cancel.clone();
-    conn.progress_handler(1000, Some(move || stop.is_cancelled()));
+    conn.progress_handler(1000, Some(move || stop.is_cancelled()))?;
     let tx = conn.transaction()?;
-    let links: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='memory_fact_links')",
-        [],
-        |row| row.get(0),
-    )?;
     let anchor = match selection {
         crate::ExportSelection::Project => None,
         crate::ExportSelection::Chain { id } => {
             let known: Option<String> = tx
                 .query_row(
-                    if links {
-                        "SELECT scope FROM memory_fact_links WHERE id=?1"
-                    } else {
-                        "SELECT scope FROM memories WHERE id=?1"
-                    },
+                    "SELECT scope FROM memory_fact_links WHERE id=?1",
                     [id.to_string()],
                     |row| row.get(0),
                 )
@@ -155,16 +145,8 @@ pub fn export_fact_versions(
             Some(id.to_string())
         }
     };
-    let revision = if links {
-        crate::memory_facts::revision(&tx, scope)?
-    } else {
-        0
-    };
-    let connected = if links {
-        crate::memory_facts::CONNECTED.to_owned()
-    } else {
-        crate::memory_facts::CONNECTED.replacen("WITH RECURSIVE connected", "WITH RECURSIVE memory_fact_links(id,scope,parent) AS(SELECT id,scope,json_extract(json,'$.supersedes') FROM memories),connected",1)
-    };
+    let revision = crate::memory_facts::revision(&tx, scope)?;
+    let connected = crate::memory_facts::CONNECTED;
     let mut records = 0;
     {
         let mut writer = BufWriter::with_capacity(64 * 1024, staged.as_file_mut());
@@ -221,5 +203,4 @@ pub fn export_fact_versions(
 }
 
 #[cfg(test)]
-#[path = "memory_records_tests.rs"]
 mod tests;

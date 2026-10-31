@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 xylo-core.workspace = true
 xylo-runtime.workspace = true
+xylo-resources.workspace = true
 xylo-services.workspace = true
 xylo-capabilities.workspace = true
 anyhow.workspace = true
@@ -33,11 +34,11 @@ grep-searcher = "=0.1.17"
 grep-regex = "=0.1.14"
 similar = "2"
 shell-words = "1"
-hermes-agent = { path = "../../vendor/hermes-ultra/crates/hermes-agent" }
-hermes-core = { path = "../../vendor/hermes-ultra/crates/hermes-core" }
+sha2 = "0.11"
+hex = "0.4"
+hmac = "0.13"
 
 [dev-dependencies]
-sha2 = "0.10"
 xylo-services = { workspace = true, features = ["test-support"] }
 keyring-core = "1.0.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }

@@ -1,5 +1,6 @@
 //! Explicit scoped inspection, export and confirmed destruction of saved facts.
 //! A preview revision fences changes made while a confirmation dialog is open.
+use super::settings_ui;
 use super::*;
 use xylo_runtime::{
     ExportSelection, FactCursor, FactDeleteKind, FactDeletePreview, FactDeleteRequest,
@@ -22,10 +23,29 @@ pub(super) struct VersionUi {
     prompt: Option<Uuid>,
     notice: String,
     scroll: UniformListScrollHandle,
+    /// The archive sub-page (every saved version in the project) is open.
+    archive: bool,
+    /// When the pending version read was sent, for the slow-wait caption.
+    read_since: Option<std::time::Instant>,
 }
 impl VersionUi {
     pub(super) fn mutating(&self) -> bool {
         self.preview.is_some() || self.prompt.is_some() || self.deletion.is_some()
+    }
+    /// Whether a deletion matching `kind` is being previewed, confirmed or
+    /// carried out, so its button can show that it is working.
+    fn deleting(&self, kind: &FactDeleteKind) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|(_, _, pending)| pending == kind)
+            || self
+                .deletion
+                .as_ref()
+                .is_some_and(|(_, request)| &request.preview.kind == kind)
+    }
+    /// Whether the archive sub-page is showing.
+    pub(super) fn archive_open(&self) -> bool {
+        self.archive
     }
 }
 impl Xylo {
@@ -52,10 +72,17 @@ impl Xylo {
         self.facts.versions.detail = None;
         self.facts.versions.prompt = None;
         self.facts.versions.notice.clear();
+        self.facts.versions.archive = false;
         cx.notify();
+    }
+    /// Leaves the detail or archive sub-page for the Memory list.
+    fn close_memory_inspection(&mut self, cx: &mut Context<Self>) {
+        self.facts.selected = None;
+        self.cancel_memory_inspection(cx);
     }
     pub(super) fn open_fact_versions(&mut self, id: Uuid, cx: &mut Context<Self>) {
         self.facts.selected = Some(id);
+        self.facts.versions.archive = false;
         self.facts.versions.detail = None;
         self.request_fact_versions(Some(id), None, cx);
     }
@@ -79,6 +106,7 @@ impl Xylo {
             .and_then(|host| host.fact_versions(id, scope.clone(), anchor, before));
         if result.is_ok() {
             self.facts.versions.read = Some(Read { id, scope, anchor });
+            self.facts.versions.read_since = Some(self.arm_slow_hint(cx));
             self.facts.versions.notice = "Loading saved versions…".into();
         }
         self.result(result, cx);
@@ -99,6 +127,7 @@ impl Xylo {
             return;
         }
         let read = self.facts.versions.read.take().unwrap();
+        self.facts.versions.read_since = None;
         if read.scope != self.scope() {
             return;
         }
@@ -124,7 +153,7 @@ impl Xylo {
         }
         cx.notify();
     }
-    fn preview_fact_delete(&mut self, kind: FactDeleteKind, cx: &mut Context<Self>) {
+    pub(super) fn preview_fact_delete(&mut self, kind: FactDeleteKind, cx: &mut Context<Self>) {
         if self.facts.busy() {
             return;
         }
@@ -198,8 +227,8 @@ impl Xylo {
             title,
             Some(&body),
             &[
-                PromptButton::new("Delete saved versions"),
                 PromptButton::cancel("Cancel"),
+                PromptButton::new("Delete saved versions"),
             ],
             cx,
         );
@@ -211,7 +240,7 @@ impl Xylo {
                     return;
                 }
                 view.facts.versions.prompt = None;
-                if matches!(confirmed, Ok(0)) {
+                if matches!(confirmed, Ok(1)) {
                     view.submit_fact_delete(
                         FactDeleteRequest {
                             operation_id: Uuid::new_v4(),
@@ -327,146 +356,114 @@ impl Xylo {
         })
         .detach();
     }
+    /// The list page's archive and danger-zone sections.
     pub(super) fn memory_archive_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let archive = settings_ui::section(
+            "Archive",
+            None,
+            settings_ui::rows([
+                settings_ui::setting_row(
+                    "Saved versions",
+                    Some("Every saved version in this project, including corrected ones.".into()),
+                    Some(
+                        settings_ui::busy(
+                            settings_ui::secondary_button("memory-archive", "Browse").on_click(
+                                cx.listener(|view, _, _, cx| {
+                                    view.facts.versions.detail = None;
+                                    view.facts.versions.archive = true;
+                                    view.request_fact_versions(None, None, cx);
+                                }),
+                            ),
+                            self.facts.versions.read.is_some(),
+                        )
+                        .into_any_element(),
+                    ),
+                )
+                .into_any_element(),
+                settings_ui::setting_row(
+                    "Export",
+                    Some("Save every version to a JSON file.".into()),
+                    Some(
+                        settings_ui::busy(
+                            settings_ui::secondary_button("memory-export", "Export…").on_click(
+                                cx.listener(|view, _, window, cx| {
+                                    view.export_fact_selection(ExportSelection::Project, window, cx)
+                                }),
+                            ),
+                            self.facts.export.is_some(),
+                        )
+                        .into_any_element(),
+                    ),
+                )
+                .into_any_element(),
+            ]),
+        );
+        let danger = settings_ui::danger_zone([settings_ui::setting_row(
+            "Delete all project facts",
+            Some("Every saved version in this project is deleted. Chats and skills stay.".into()),
+            Some(
+                settings_ui::busy(
+                    settings_ui::destructive_button("memory-purge", "Delete all…")
+                        .disabled(self.facts.busy())
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.preview_fact_delete(FactDeleteKind::Project, cx)
+                        })),
+                    self.facts.versions.deleting(&FactDeleteKind::Project),
+                )
+                .into_any_element(),
+            ),
+        )
+        .inset()
+        .into_any_element()]);
         div()
+            .w_full()
             .flex()
-            .flex_wrap()
-            .gap_2()
-            .child(
-                button("memory-archive", "Browse all saved versions")
-                    .disabled(self.facts.versions.read.is_some())
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.facts.versions.detail = None;
-                        view.request_fact_versions(None, None, cx);
-                    })),
-            )
-            .child(
-                button("memory-purge", "Delete all project facts…")
-                    .disabled(self.facts.busy())
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.preview_fact_delete(FactDeleteKind::Project, cx)
-                    })),
-            )
+            .flex_col()
+            .gap(px(settings_ui::SECTION_GAP))
+            .child(self.memory_inspection_status(cx))
+            .child(archive)
+            .child(danger)
             .into_any_element()
     }
-    pub(super) fn memory_versions_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut panel = div().flex().flex_col().gap_3();
+    /// Progress and recovery for version reads, deletions and exports: the
+    /// latest notice with its Cancel or Retry action.
+    fn memory_inspection_status(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.facts.busy();
-        if let Some(page) = &self.facts.versions.page {
-            let weak = cx.entity().downgrade();
-            panel = panel.child(subtitle(if page.anchor.is_some() {
-                "Version history for this fact"
-            } else {
-                "All saved fact versions in this project"
-            }));
-            panel = panel.child(
-                uniform_list(
-                    "memory-version-list",
-                    page.versions.len(),
-                    move |range, _, cx| {
-                        weak.update(cx, |view, cx| {
-                            range
-                                .filter_map(|i| {
-                                    let version =
-                                        view.facts.versions.page.as_ref()?.versions.get(i)?;
-                                    let id = version.record.id;
-                                    let preview: String =
-                                        version.record.content.chars().take(120).collect();
-                                    Some(
-                                        div()
-                                            .h(px(64.))
-                                            .w_full()
-                                            .border_b_1()
-                                            .border_color(rgb(border()))
-                                            .child(
-                                                button(("memory-version", i), preview)
-                                                    .w_full()
-                                                    .justify_start()
-                                                    .on_click(cx.listener(
-                                                        move |view, _, _, cx| {
-                                                            view.open_fact_versions(id, cx)
-                                                        },
-                                                    )),
-                                            )
-                                            .child(subtitle(format!(
-                                                "{} · {}",
-                                                if version.active {
-                                                    "Current version"
-                                                } else {
-                                                    "Previous version"
-                                                },
-                                                super::memory::memory_age(
-                                                    version.record.created_at
-                                                )
-                                            )))
-                                            .into_any_element(),
-                                    )
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                    },
-                )
-                .track_scroll(&self.facts.versions.scroll)
-                .h(px(240.))
-                .w_full(),
-            );
-            if page.has_more {
-                let anchor = page.anchor;
-                let before = page.before.clone();
-                panel = panel.child(
-                    button("memory-versions-more", "Next saved versions")
-                        .disabled(self.facts.versions.read.is_some())
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.request_fact_versions(anchor, before.clone(), cx)
-                        })),
-                );
-            }
-        }
-        if let Some(version) = &self.facts.versions.detail {
-            let id = version.record.id;
-            let record = version.record.clone();
-            panel=panel.child(card().child(TextView::markdown("fact-version-detail",record.content.clone()).selectable(true))
-                .child(subtitle(format!("{} · {} · {}",record.source,super::memory::memory_age(record.created_at),if version.active{"Current version"}else{"Previous version"})))
-                .child(subtitle(format!("Project: {}",record.scope)))
-                .when(record.supersedes.is_some(),|panel|panel.child(subtitle("This version corrects an earlier saved version.")))
-                .child(div().flex().flex_wrap().gap_2()
-                    .child(button("memory-edit","Correct current fact").disabled(busy||!version.active).on_click(cx.listener(move|view,_,window,cx| {
-                        if !view.memory_content.read(cx).value().trim().is_empty() {
-                            if view.facts.editing!=Some(record.id){view.facts.notice="Save or clear your unsaved Memory entry before correcting a different fact.".into();cx.notify();}
-                            return;
-                        }
-                        view.facts.editing=Some(record.id);view.facts.retry=None;
-                        view.memory_content.update(cx,|input,cx|input.set_value(record.content.clone(),window,cx));view.memory_form_changed(cx);cx.notify();
-                    })))
-                    .child(button("memory-forget","Delete selected version…").disabled(busy).on_click(cx.listener(move|view,_,_,cx|view.preview_fact_delete(FactDeleteKind::Version{id},cx))))
-                    .child(button("memory-forget-chain","Forget entire fact…").disabled(busy).on_click(cx.listener(move|view,_,_,cx|view.preview_fact_delete(FactDeleteKind::Chain{id},cx))))
-                    .child(button("memory-export-chain","Export this fact…").disabled(self.facts.export.is_some()).on_click(cx.listener(move|view,_,window,cx|view.export_fact_selection(ExportSelection::Chain{id},window,cx))))));
-        }
+        let mut actions: Vec<AnyElement> = Vec::new();
         if self.facts.versions.read.is_some() {
-            panel = panel.child(
-                button("memory-versions-cancel", "Cancel loading versions")
-                    .on_click(cx.listener(|view, _, _, cx| view.cancel_memory_inspection(cx))),
+            actions.push(
+                settings_ui::text_button("memory-versions-cancel", "Cancel loading")
+                    .on_click(cx.listener(|view, _, _, cx| view.cancel_memory_inspection(cx)))
+                    .into_any_element(),
             );
         }
         if let Some((id, _)) = &self.facts.versions.deletion {
             let id = *id;
-            panel=panel.child(button("memory-delete-cancel","Cancel deletion").on_click(cx.listener(move|view,_,_,cx|{
-                if let Some(host)=&view.host{let _=host.fact_cancel(id);}
-                view.facts.versions.notice="Cancellation requested. Refresh after the request finishes to review your saved facts.".into();cx.notify();
-            })));
+            actions.push(
+                settings_ui::text_button("memory-delete-cancel", "Cancel deletion")
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        if let Some(host) = &view.host {
+                            let _ = host.fact_cancel(id);
+                        }
+                        view.facts.versions.notice = "Cancellation requested. Refresh after the request finishes to review your saved facts.".into();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
         }
         if let Some((id, scope)) = &self.facts.export
             && *scope == self.scope()
         {
             let id = *id;
-            panel = panel.child(button("memory-export-cancel", "Cancel export").on_click(
-                cx.listener(move |view, _, _, _| {
-                    if let Some(host) = &view.host {
-                        let _ = host.fact_cancel(id);
-                    }
-                }),
-            ));
+            actions.push(
+                settings_ui::text_button("memory-export-cancel", "Cancel export")
+                    .on_click(cx.listener(move |view, _, _, _| {
+                        if let Some(host) = &view.host {
+                            let _ = host.fact_cancel(id);
+                        }
+                    }))
+                    .into_any_element(),
+            );
         }
         if let Some(request) = self
             .facts
@@ -476,16 +473,287 @@ impl Xylo {
             .filter(|request| request.preview.scope == self.scope())
         {
             let request = request.clone();
-            panel = panel.child(
-                button("memory-delete-retry", "Retry same deletion request")
+            actions.push(
+                settings_ui::text_button("memory-delete-retry", "Retry deletion")
                     .disabled(busy)
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.submit_fact_delete(request.clone(), cx)
-                    })),
+                    }))
+                    .into_any_element(),
             );
         }
-        panel
-            .child(subtitle(self.facts.versions.notice.clone()))
+        let message = &self.facts.versions.notice;
+        if message.is_empty() && actions.is_empty() {
+            return div().into_any_element();
+        }
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(settings_ui::caption(message.clone())),
+            )
+            .children(actions)
             .into_any_element()
+    }
+    /// The loaded versions as list items; each opens its own detail page.
+    fn memory_version_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(page) = &self.facts.versions.page else {
+            return div().into_any_element();
+        };
+        if page.versions.is_empty() {
+            return div().into_any_element();
+        }
+        let count = page.versions.len();
+        let weak = cx.entity().downgrade();
+        let list = uniform_list("memory-version-list", count, move |range, _, cx| {
+            weak.update(cx, |view, cx| {
+                let shown = view
+                    .facts
+                    .versions
+                    .detail
+                    .as_ref()
+                    .map(|version| version.record.id);
+                range
+                    .filter_map(|index| {
+                        let version = view.facts.versions.page.as_ref()?.versions.get(index)?;
+                        let id = version.record.id;
+                        Some(
+                            settings_ui::list_item(
+                                ("memory-version", index),
+                                None,
+                                super::memory::memory_title(&version.record.content),
+                                Some(super::memory::memory_age(version.record.created_at).into()),
+                            )
+                            .trailing(if version.active {
+                                settings_ui::pill("Current", settings_ui::Tone::Success)
+                            } else {
+                                settings_ui::pill("Previous", settings_ui::Tone::Neutral)
+                            })
+                            .divider(index > 0)
+                            .selected(shown == Some(id))
+                            .on_click(
+                                cx.listener(move |view, _, _, cx| view.open_fact_versions(id, cx)),
+                            )
+                            .into_any_element(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+        })
+        .track_scroll(&self.facts.versions.scroll)
+        .h(px(
+            (count as f32 * settings_ui::LIST_ITEM_HEIGHT).min(6. * settings_ui::LIST_ITEM_HEIGHT)
+        ))
+        .w_full();
+        let mut column = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(settings_ui::list_frame().child(list));
+        if page.has_more {
+            let anchor = page.anchor;
+            let before = page.before.clone();
+            column = column.child(
+                div().flex().justify_end().child(
+                    settings_ui::text_button("memory-versions-more", "Older versions")
+                        .disabled(self.facts.versions.read.is_some())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.request_fact_versions(anchor, before.clone(), cx)
+                        })),
+                ),
+            );
+        }
+        column.into_any_element()
+    }
+    fn memory_crumb(&self, cx: &mut Context<Self>) -> gpui_kit::base::Button {
+        settings_ui::crumb("memory-crumb", "Memory")
+            .on_click(cx.listener(|view, _, _, cx| view.close_memory_inspection(cx)))
+    }
+    /// One fact: its text and provenance, its version history, and the
+    /// correction form or the actions that change it.
+    pub(super) fn memory_detail_page(&self, id: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        let busy = self.facts.busy();
+        let detail = self.facts.versions.detail.as_ref();
+        let title = detail
+            .map(|version| super::memory::memory_title(&version.record.content))
+            .or_else(|| {
+                self.memories
+                    .iter()
+                    .find(|record| record.id == id)
+                    .map(|record| super::memory::memory_title(&record.content))
+            })
+            .unwrap_or_else(|| "Memory".into());
+        let mut page = settings_ui::settings_page("memory-detail", title.clone())
+            .breadcrumb(settings_ui::breadcrumb([self.memory_crumb(cx)], title));
+        let correcting = self.facts.editing.is_some();
+        if let Some(version) = detail {
+            let record = version.record.clone();
+            let chain = record.id;
+            page = page.action(
+                settings_ui::secondary_button("memory-export-chain", "Export…")
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.export_fact_selection(ExportSelection::Chain { id: chain }, window, cx)
+                    }))
+                    .map(|button| settings_ui::busy(button, self.facts.export.is_some())),
+            );
+            if !correcting {
+                let correction = record.clone();
+                page = page.action(
+                    settings_ui::primary_button("memory-edit", "Correct")
+                        .disabled(busy || !version.active)
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.begin_memory_correction(correction.clone(), window, cx)
+                        })),
+                );
+            }
+        }
+        page = page.child(self.memory_inspection_status(cx));
+        if !self.facts.status_message().is_empty() {
+            page = page.child(settings_ui::caption(self.facts.status_message().to_owned()));
+        }
+        let Some(version) = detail else {
+            return page
+                .child(settings_ui::loading_list(2, self.facts.versions.read_since))
+                .into_any_element();
+        };
+        let record = &version.record;
+        let about = vec![
+            settings_ui::setting_row(
+                "Status",
+                record
+                    .supersedes
+                    .is_some()
+                    .then(|| "This version corrects an earlier saved version.".into()),
+                Some(
+                    if version.active {
+                        settings_ui::pill("Current version", settings_ui::Tone::Success)
+                    } else {
+                        settings_ui::pill("Previous version", settings_ui::Tone::Neutral)
+                    }
+                    .into_any_element(),
+                ),
+            )
+            .into_any_element(),
+            settings_ui::setting_row(
+                "Saved",
+                None,
+                Some(
+                    settings_ui::value_text(super::memory::memory_age(record.created_at))
+                        .into_any_element(),
+                ),
+            )
+            .into_any_element(),
+            settings_ui::setting_row(
+                "Source",
+                None,
+                Some(settings_ui::value_text(record.source.clone()).into_any_element()),
+            )
+            .into_any_element(),
+            settings_ui::setting_row(
+                "Project",
+                None,
+                Some(
+                    settings_ui::value_text(super::memory::scope_label(&record.scope))
+                        .into_any_element(),
+                ),
+            )
+            .into_any_element(),
+        ];
+        page = page.child(settings_ui::section(
+            "Saved text",
+            None,
+            settings_ui::list_frame().p(px(16.)).child(
+                TextView::markdown("fact-version-detail", record.content.clone()).selectable(true),
+            ),
+        ));
+        if correcting {
+            page = page.child(self.memory_form_section(cx));
+        }
+        let id = record.id;
+        page.child(settings_ui::section(
+            "Details",
+            None,
+            settings_ui::rows(about),
+        ))
+        .child(settings_ui::section(
+            "Version history",
+            Some("Open a version to read it or delete only that version.".into()),
+            self.memory_version_list(cx),
+        ))
+        .child(settings_ui::danger_zone([
+            settings_ui::setting_row(
+                "Delete this version",
+                Some("Other versions stay saved; none is restored as current.".into()),
+                Some(
+                    settings_ui::busy(
+                        settings_ui::destructive_button("memory-forget", "Delete version…")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.preview_fact_delete(FactDeleteKind::Version { id }, cx)
+                            })),
+                        self.facts
+                            .versions
+                            .deleting(&FactDeleteKind::Version { id }),
+                    )
+                    .into_any_element(),
+                ),
+            )
+            .inset()
+            .into_any_element(),
+            settings_ui::setting_row(
+                "Forget this fact",
+                Some("Every saved version of this fact is deleted.".into()),
+                Some(
+                    settings_ui::busy(
+                        settings_ui::destructive_button("memory-forget-chain", "Forget…")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.preview_fact_delete(FactDeleteKind::Chain { id }, cx)
+                            })),
+                        self.facts.versions.deleting(&FactDeleteKind::Chain { id }),
+                    )
+                    .into_any_element(),
+                ),
+            )
+            .inset()
+            .into_any_element(),
+        ]))
+        .into_any_element()
+    }
+    /// Every saved version in the project, newest first.
+    pub(super) fn memory_archive_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut page = settings_ui::settings_page("memory-archive-page", "All saved versions")
+            .description("Every version saved in this project, including corrected ones.")
+            .breadcrumb(settings_ui::breadcrumb(
+                [self.memory_crumb(cx)],
+                "All saved versions",
+            ))
+            .child(self.memory_inspection_status(cx));
+        let empty = self
+            .facts
+            .versions
+            .page
+            .as_ref()
+            .is_none_or(|page| page.versions.is_empty());
+        page = if empty && self.facts.versions.read.is_some() {
+            page.child(settings_ui::loading_list(3, self.facts.versions.read_since))
+        } else if empty {
+            page.child(settings_ui::empty_state(
+                AppIcon::Memory,
+                "No saved versions",
+                "Versions appear here once a memory is saved.",
+                None,
+            ))
+        } else {
+            page.child(self.memory_version_list(cx))
+        };
+        page.into_any_element()
     }
 }

@@ -3,10 +3,11 @@
   <h3>Your projects. Your models. One workspace.</h3>
   <p>A native desktop workspace for AI conversations, coding and everyday tools.</p>
   <p>
+    <a href="#what-you-can-do">Features</a> ·
     <a href="#get-started">Get started</a> ·
     <a href="https://github.com/GtechGovind/xylo/releases">Releases</a> ·
-    <a href="#documentation">Documentation</a> ·
-    <a href="docs/sponsorship.md">Support Xylo</a>
+    <a href="#contribute-and-get-help">Contribute</a> ·
+    <a href="#license">License</a>
   </p>
   <p><strong>Open source · Development preview · macOS, Windows and Linux targets</strong></p>
 </div>
@@ -24,15 +25,15 @@ Xylo keeps conversations, project files and practical tools together. Bring a lo
 | **Work with documents**    | Edit supported DOCX content and multi-sheet XLSX files, save a separate copy, and recover retained drafts. |
 | **Connect your tools**     | Add MCP connections, review plugin permissions, and configure SSH or container environments.               |
 
-Browser actions, images, voice and local model tools extend the workspace through services that start when used. Some features need an explicit asset download, a configured service or an operating system permission. [Explore capabilities →](docs/capabilities.md)
+Browser actions, images, voice and local model tools extend the workspace through services that start when used. Some features need an explicit asset download, a configured service or an operating system permission. The implementation and qualification status are described below and in the project source.
 
-Xylo uses a native interface, background execution and automatic local resource scheduling. Responsiveness is a design priority; [performance notes](docs/performance.md) describe the scope of the available measurements.
+Xylo uses a native interface, background execution and automatic local resource scheduling. Responsiveness is a design priority; performance measurements are still being qualified.
 
 ## Local or cloud, by your choice
 
 Use an existing **Ollama, LM Studio, llama.cpp or vLLM** server, or configure a supported local model through Xylo's asset setup. Connect **OpenAI, Anthropic, Gemini** and other supported cloud providers in Settings. Custom endpoints are supported where the provider protocol matches.
 
-Choose the provider and model under **Settings → Model**. Credentials use the operating system credential store. Available tools, image support and context limits depend on the selected model and provider. See the [provider guide](docs/providers.md) for setup and compatibility.
+Choose the provider and model under **Settings → Model**. Credentials use the operating system credential store. Available tools, image support and context limits depend on the selected model and provider.
 
 ## Get started
 
@@ -46,7 +47,7 @@ cargo run --locked
 
 The pinned Rust toolchain is selected by `rust-toolchain.toml`. Application builds do not require packaging scripts, icon files, or updater configuration. Automatic updates are disabled until a trusted release feed is configured.
 
-Local executable tools use a pinned OS sandbox helper and require Node.js 22.12 or later. Install its locked dependencies with the command above. Missing sandbox dependencies fail closed; Xylo does not fall back to unrestricted execution. The native UI and Rust backend do not run in Node.js. macOS sandbox execution has local regression coverage; Linux packaging and Windows execution remain unqualified.
+Local executable tools use a pinned OS sandbox helper and require Node.js 22.12 or later. Xylo uses a bundled runtime first, then `XYLO_SANDBOX_NODE` if set, then `node` from `PATH` (including nvm, volta, fnm or asdf installs under your home directory) as long as the binary and its parent directories are owned by you or root and are not writable by other users; otherwise sandboxed tools report which Node.js was rejected and why. Install its locked dependencies with the command above. Missing sandbox dependencies fail closed; Xylo does not fall back to unrestricted execution. The native UI and Rust backend do not run in Node.js. macOS sandbox execution has local regression coverage; Linux packaging and Windows execution remain unqualified.
 
 Portable skills and plugins are managed in **Settings → Plugins**. Installation preserves package contents without executing them. Enable packages explicitly; configure a project, credentials and network access before running executable components. Readiness and verification belong to each component and installed version, not the entire plugin ecosystem.
 
@@ -69,7 +70,7 @@ Unbound hosted dependencies, unsupported host directives and command-pattern too
 | Windows  | ARM64, x64               | Installer EXE           |
 | Linux    | ARM64, x64               | AppImage, DEB           |
 
-These are release targets, not a claim that every platform is already qualified. Preview signing and installation limits are documented in the [release guide](docs/preview-release.md).
+These are release targets, not a claim that every platform is already qualified. Packaging, signing and installation limits should be checked in the release artifacts and workflow before installing a preview.
 
 Once the app is running:
 
@@ -79,12 +80,12 @@ Once the app is running:
 
 ## Contribute and get help
 
-Bug reports, documentation, platform testing and focused pull requests are welcome. [Open an issue](https://github.com/GtechGovind/xylo/issues) with steps to reproduce and your platform/model details, or read the [contribution guide](docs/development.md#contributing). Remove credentials and private content before sharing logs.
+Bug reports, documentation, platform testing and focused pull requests are welcome. [Open an issue](https://github.com/GtechGovind/xylo/issues) with steps to reproduce and your platform/model details. Remove credentials and private content before sharing logs.
 
 ## Support Xylo
 
-GitHub Sponsors for **GtechGovind** is being prepared; **activation is pending**. If you would like to support the work, [express sponsorship interest](https://github.com/GtechGovind/xylo/issues/new?title=Sponsorship%20interest) or help with testing, issues and documentation. [Sponsorship details and setup →](docs/sponsorship.md)
+GitHub Sponsors for **GtechGovind** is being prepared; **activation is pending**. If you would like to support the work, [express sponsorship interest](https://github.com/GtechGovind/xylo/issues/new?title=Sponsorship%20interest) or help with testing, issues and documentation.
 
 ## License
 
-Xylo's application-owned code is licensed under [Apache-2.0](LICENSE). Dependencies retain their own licenses and notices; see [NOTICE](NOTICE), the vendored notices and [dependency license documentation](docs/license-supplements.md).
+Xylo's application-owned code is licensed under [Apache-2.0](LICENSE). Dependencies retain their own licenses and notices; see [NOTICE](NOTICE) and the notices distributed with third-party components.

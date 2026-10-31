@@ -1,5 +1,6 @@
 //! Native project search and watched-file presentation. Each response is tied to
 //! a request and project; late reads cannot replace a newer editor selection.
+//! Results load a page at a time as the list scrolls to its end.
 use super::*;
 use std::sync::Arc;
 use xylo_runtime::workspace::{FileIndex, SearchCursor, SearchHit, SearchOptions, SearchPage};
@@ -9,7 +10,6 @@ pub(super) struct ProjectSearchUi {
     case_sensitive: bool,
     regular_expression: bool,
     hits: Vec<SearchHit>,
-    shown_before: usize,
     submitted: Option<(String, bool, bool)>,
     next: Option<SearchCursor>,
     request: Option<(Uuid, bool)>,
@@ -40,7 +40,6 @@ impl ProjectSearchUi {
             case_sensitive: false,
             regular_expression: false,
             hits: Vec::new(),
-            shown_before: 0,
             submitted: None,
             next: None,
             request: None,
@@ -53,7 +52,6 @@ impl ProjectSearchUi {
     }
     pub(super) fn reset(&mut self) {
         self.hits.clear();
-        self.shown_before = 0;
         self.submitted = None;
         self.next = None;
         self.request = None;
@@ -77,11 +75,11 @@ impl Xylo {
         let path = self.editor_path.clone();
         let answer=window.prompt(PromptLevel::Warning,"Overwrite changes on disk?",
             Some("This file changed outside Xylo. Saving will replace those changes with your editor contents."),
-            &[PromptButton::ok("Overwrite"),PromptButton::cancel("Cancel")],cx);
+            &[PromptButton::cancel("Cancel"),PromptButton::new("Overwrite")],cx);
         cx.spawn_in(window, async move |view, cx| {
             let answer = answer.await;
             let _ = view.update_in(cx, |view, _, cx| {
-                if matches!(answer, Ok(0)) && view.editor_path == path {
+                if matches!(answer, Ok(1)) && view.editor_path == path {
                     view.save_editor(quit_after, cx);
                 } else {
                     view.updates.after_save = None;
@@ -110,7 +108,6 @@ impl Xylo {
     fn invalidate_project_search(&mut self, cx: &mut Context<Self>) {
         self.cancel_project_search(cx);
         self.project_search.hits.clear();
-        self.project_search.shown_before = 0;
         self.project_search.next = None;
         self.project_search.submitted = None;
         self.project_search.notice = "Search again for the updated query and options.".into();
@@ -161,6 +158,10 @@ impl Xylo {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
             .and_then(|host| host.search_project(id, root, options));
+        if result.is_err() {
+            // Scrolling must not retry a page that could not be requested.
+            self.project_search.next = None;
+        }
         if result.is_ok() {
             self.project_search.submitted = Some(identity);
             if !more {
@@ -187,24 +188,18 @@ impl Xylo {
         self.project_search.request = None;
         match result {
             Ok(page) if self.workspace.as_ref() == Some(&page.root) => {
-                self.project_search.shown_before = if more {
-                    self.project_search
-                        .shown_before
-                        .saturating_add(self.project_search.hits.len())
+                // Later pages extend the list that scrolling reached.
+                if more {
+                    self.project_search.hits.extend(page.hits);
                 } else {
-                    0
-                };
-                self.project_search.hits = page.hits;
-                self.project_search.scroll = UniformListScrollHandle::new();
+                    self.project_search.hits = page.hits;
+                    self.project_search.scroll = UniformListScrollHandle::new();
+                }
                 self.project_search.next = page.next;
+                let count = self.project_search.hits.len();
                 self.project_search.notice = format!(
-                    "{} matching lines on this page{}{}",
-                    self.project_search.hits.len(),
-                    if page.timed_out {
-                        " · Search paused; continue for more results"
-                    } else {
-                        ""
-                    },
+                    "{count} matching line{}{}",
+                    if count == 1 { "" } else { "s" },
                     if page.skipped_files > 0 {
                         format!(
                             " · {} unreadable or oversized files skipped",
@@ -214,12 +209,6 @@ impl Xylo {
                         String::new()
                     }
                 );
-                if self.project_search.shown_before > 0 {
-                    self.project_search.notice.push_str(&format!(
-                        " · {} shown earlier",
-                        self.project_search.shown_before
-                    ));
-                }
                 if page.indexing {
                     self.project_search
                         .notice
@@ -410,13 +399,51 @@ impl Xylo {
             )
             .into_any_element()
     }
-    pub(super) fn project_search_page(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn project_search_page(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let searching = self.project_search.request.map(|(id, _)| id);
+        // An indeterminate bar while a search runs, with the slow-system hint
+        // once it has run for a few seconds.
+        let progress = searching.map(|id| {
+            let since = crate::motion::shown_since(ElementId::Uuid(id), window, cx);
+            div()
+                .id("project-search-progress")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(crate::motion::indeterminate_bar("project-search-bar"))
+                .children(crate::motion::slow_hint(
+                    format!("project-search-{id}"),
+                    since,
+                    window,
+                    cx,
+                ))
+        });
         let weak = cx.entity().downgrade();
         let rows = uniform_list(
             "project-search-results",
             self.project_search.hits.len(),
             move |range, _, cx| {
                 weak.update(cx, |view, cx| {
+                    // Scrolling near the end loads the next page, once: the
+                    // request in flight guards against asking again.
+                    if range.end + 4 >= view.project_search.hits.len()
+                        && view.project_search.next.is_some()
+                        && view.project_search.request.is_none()
+                    {
+                        cx.spawn(async move |view, cx| {
+                            let _ = view.update(cx, |view, cx| {
+                                if view.project_search.request.is_none() {
+                                    view.run_project_search(true, cx);
+                                }
+                            });
+                        })
+                        .detach();
+                    }
                     range
                         .filter_map(|i| {
                             let hit = view.project_search.hits.get(i)?.clone();
@@ -474,17 +501,16 @@ impl Xylo {
         .track_scroll(&self.project_search.scroll)
         .flex_1()
         .min_h_0();
+        // The toolbar names the page; the body starts with the search field.
         div()
             .size_full()
-            .p_6()
+            .px(px(24.))
+            .pt(px(8.))
+            .pb(px(16.))
             .flex()
             .flex_col()
             .gap_3()
             .min_h_0()
-            .child(heading(
-                "Search project",
-                "Find text in your project and open the matching line.",
-            ))
             .child(
                 div()
                     .flex()
@@ -495,6 +521,8 @@ impl Xylo {
                                 .aria_label("Search project contents"),
                         ),
                     )
+                    // Searching again replaces a search in flight, so the
+                    // button stays enabled; the bar below shows progress.
                     .child(
                         primary("project-search-submit", "Search").on_click(
                             cx.listener(|view, _, _, cx| view.run_project_search(false, cx)),
@@ -513,13 +541,10 @@ impl Xylo {
                     .flex()
                     .gap_2()
                     .child(
-                        button(
+                        segment(
                             "project-search-case",
-                            if self.project_search.case_sensitive {
-                                "Match case ✓"
-                            } else {
-                                "Match case"
-                            },
+                            "Match case",
+                            self.project_search.case_sensitive,
                         )
                         .on_click(cx.listener(|view, _, _, cx| {
                             view.project_search.case_sensitive =
@@ -528,13 +553,10 @@ impl Xylo {
                         })),
                     )
                     .child(
-                        button(
+                        segment(
                             "project-search-regex",
-                            if self.project_search.regular_expression {
-                                "Regular expression ✓"
-                            } else {
-                                "Regular expression"
-                            },
+                            "Regular expression",
+                            self.project_search.regular_expression,
                         )
                         .on_click(cx.listener(|view, _, _, cx| {
                             view.project_search.regular_expression =
@@ -543,15 +565,9 @@ impl Xylo {
                         })),
                     ),
             )
+            .children(progress)
             .child(subtitle(self.project_search.notice.clone()))
             .child(rows)
-            .when(self.project_search.next.is_some(), |page| {
-                page.child(
-                    button("project-search-more", "Next results")
-                        .disabled(self.project_search.request.is_some())
-                        .on_click(cx.listener(|view, _, _, cx| view.run_project_search(true, cx))),
-                )
-            })
             .into_any_element()
     }
 }
@@ -570,6 +586,17 @@ impl ProjectSearchUi {
     }
     pub(super) fn validation_revision(&self) -> u64 {
         self.revision
+    }
+    pub(super) fn validation_notice(&self) -> &str {
+        &self.notice
+    }
+    pub(super) fn validation_has_more(&self) -> bool {
+        self.next.is_some()
+    }
+    /// Scrolls the results to their end, as a reader reaching the bottom does.
+    pub(super) fn validation_scroll_to_end(&self) {
+        self.scroll
+            .scroll_to_item(self.hits.len().saturating_sub(1), ScrollStrategy::Bottom);
     }
 }
 #[cfg(test)]

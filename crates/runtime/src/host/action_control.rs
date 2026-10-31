@@ -202,5 +202,4 @@ impl HostState {
 }
 
 #[cfg(test)]
-#[path = "action_control/tests.rs"]
 mod tests;

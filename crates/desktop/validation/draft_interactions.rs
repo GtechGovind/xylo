@@ -2,6 +2,10 @@
 //! and teardown flush. No inference, accounts, updater install or devices.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -459,13 +463,17 @@ mod xylo {
                 workspace: None,
             };
             save(&store, &key, "Previously durable text");
-            let connection = rusqlite::Connection::open(&paths.database).unwrap();
-            connection.execute_batch("CREATE TRIGGER reject_draft_write BEFORE UPDATE ON composer_drafts BEGIN SELECT RAISE(ABORT,'fixture unavailable storage'); END;").unwrap();
-            drop(connection);
+            let database = paths.database.clone();
             let host = HostClient::spawn_at(paths).unwrap();
             let client = host.0.clone();
             let (window, view) = open(cx, Ok(host));
             wait(cx, &view, "host settings", |view, _| view.settings_loaded);
+            // The host replaces a database whose schema differs from its own
+            // when it opens it, so the failing storage is injected only after
+            // the host has accepted the database.
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection.execute_batch("CREATE TRIGGER reject_draft_write BEFORE UPDATE ON composer_drafts BEGIN SELECT RAISE(ABORT,'fixture unavailable storage'); END;").unwrap();
+            drop(connection);
             cx.update_window(window, |_, _, cx| {
                 view.update(cx, |view, cx| {
                     assert!(view.draft_before_switch(cx));
@@ -521,51 +529,88 @@ mod xylo {
             let (window, view) = open(cx, Ok(host));
             wait(cx, &view, "settings", |view, _| view.settings_loaded);
             cx.update_window(window, |_, window, cx| {
-                view.update(cx, |view, cx| view.set_workspace(workspace.clone(), window, cx));
-            }).unwrap();
+                view.update(cx, |view, cx| {
+                    view.set_workspace(workspace.clone(), window, cx)
+                });
+            })
+            .unwrap();
             let key = cx.update(|cx| view.read(cx).current_draft_key());
-            wait(cx, &view, "initial draft", |view, _| view.drafts.validation_revision(&key).is_some());
+            wait(cx, &view, "initial draft", |view, _| {
+                view.drafts.validation_revision(&key).is_some()
+            });
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| {
                     view.settings.provider.model = "isolated-queue-fixture".into();
-                    view.turns.entry(key.session_id).or_default().apply(xylo_core::EngineEvent::Started);
+                    view.turns
+                        .entry(key.session_id)
+                        .or_default()
+                        .apply(xylo_core::EngineEvent::Started);
                     view.error = None;
                     cx.notify();
                 });
                 let composer = view.read(cx).composer.clone();
                 composer.update(cx, |input, cx| {
                     input.focus(window, cx);
-                    input.replace_text_in_range(None, "Queue this exact saved instruction αβ", window, cx);
+                    input.replace_text_in_range(
+                        None,
+                        "Queue this exact saved instruction αβ",
+                        window,
+                        cx,
+                    );
                 });
                 view.update(cx, |view, cx| view.draft_changed(cx));
                 window.render_frame(cx);
                 window.click("send-prompt", cx);
-            }).unwrap();
+            })
+            .unwrap();
             wait(cx, &view, "real queue acknowledgement", |view, cx| {
-                !view.draft_send_pending() && view.composer.read(cx).value().is_empty()
-                    && view.turn_queue.items.get(&key.session_id).is_some_and(|items| items.len() == 1)
+                !view.draft_send_pending()
+                    && view.composer.read(cx).value().is_empty()
+                    && view
+                        .turn_queue
+                        .items
+                        .get(&key.session_id)
+                        .is_some_and(|items| items.len() == 1)
             });
             let rows = store.turn_queue(key.session_id).unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].turn.prompt, "Queue this exact saved instruction αβ");
-            assert!(rows[0].paused, "Idle real host must retain the queued item without starting a worker");
+            assert!(
+                rows[0].paused,
+                "Idle real host must retain the queued item without starting a worker"
+            );
             assert!(store.draft(&key).unwrap().text.is_empty());
             cx.update_window(window, |_, window, cx| {
                 let composer = view.read(cx).composer.clone();
-                composer.update(cx, |input, cx| input.replace_text_in_range(None, "Keep my newer draft", window, cx));
+                composer.update(cx, |input, cx| {
+                    input.replace_text_in_range(None, "Keep my newer draft", window, cx)
+                });
                 view.update(cx, |view, cx| view.draft_changed(cx));
                 window.render_frame(cx);
                 assert!(window.try_find("composer-pending").is_some());
-                assert!(window.find(("remove-queued", 0usize)).bounds().origin.y < window.find("image-drop-target").bounds().origin.y);
+                assert!(
+                    window.find(("remove-queued", 0usize)).bounds().origin.y
+                        < window.find("image-drop-target").bounds().origin.y
+                );
                 window.click(("remove-queued", 0usize), cx);
-            }).unwrap();
-            wait(cx, &view, "real queue removal", |view, _| view.turn_queue.items.get(&key.session_id).is_none_or(|items| items.is_empty()));
+            })
+            .unwrap();
+            wait(cx, &view, "real queue removal", |view, _| {
+                view.turn_queue
+                    .items
+                    .get(&key.session_id)
+                    .is_none_or(|items| items.is_empty())
+            });
             assert!(store.turn_queue(key.session_id).unwrap().is_empty());
             cx.update_window(window, |_, window, cx| {
-                assert_eq!(view.read(cx).composer.read(cx).value().as_ref(), "Keep my newer draft");
+                assert_eq!(
+                    view.read(cx).composer.read(cx).value().as_ref(),
+                    "Keep my newer draft"
+                );
                 window.render_frame(cx);
                 assert!(window.try_find(("remove-queued", 0usize)).is_none());
-            }).unwrap();
+            })
+            .unwrap();
             client.shutdown().unwrap();
         }
 
@@ -602,6 +647,9 @@ mod xylo {
             let turn = Uuid::new_v4();
             store
                 .upsert_conversation(&xylo_core::Conversation {
+                    title_source: Default::default(),
+                    pinned: false,
+                    archived: false,
                     id: session,
                     title: "Live task".into(),
                     workspace,
@@ -728,6 +776,9 @@ mod xylo {
             let turn = Uuid::new_v4();
             store
                 .upsert_conversation(&xylo_core::Conversation {
+                    title_source: Default::default(),
+                    pinned: false,
+                    archived: false,
                     id: key.session_id,
                     title: "Task".into(),
                     workspace,

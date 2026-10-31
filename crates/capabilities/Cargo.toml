@@ -16,11 +16,11 @@ uuid.workspace = true
 tracing.workspace = true
 chromiumoxide = { version = "0.9.1", default-features = false, features = ["bytes"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "image_025", "thread_safe"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 calamine = "0.37"
-rust_xlsxwriter = "0.101"
+rust_xlsxwriter = "0.102"
 docx-rs = "0.4.22"
 xcap = "0.9.8"
 enigo = "0.6.1"
@@ -30,9 +30,10 @@ xylo-scheduler = { path = "../scheduler" }
 fs2 = "0.4"
 url = "2"
 libc = "0.2"
-zip = { version = "6", default-features = false, features = ["deflate"] }
-quick-xml = "0.38"
-sha2 = "0.10"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+sha2 = "0.11"
+hex = "0.4"
 tempfile = "3"
 tar = "0.4"
 flate2 = "1"
@@ -41,9 +42,8 @@ cpal = "=0.18.2"
 rodio = { version = "=0.23.0", default-features = false, features = ["playback", "wav", "mp3", "mp4", "flac", "vorbis"] }
 hound = "3.5"
 rtrb = "0.3"
-rubato = "=1.0.1"
-audioadapter-buffers = "2.0"
-sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+rubato = "5"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }

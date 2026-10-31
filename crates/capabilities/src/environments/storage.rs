@@ -110,6 +110,11 @@ async fn lease(path: PathBuf, cancel: &CancellationToken) -> Result<File> {
         }
     }
 }
+/// Whether a store failed because its contents are unusable (as opposed to
+/// an I/O failure reading it).
+fn unreadable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_none()
+}
 pub(super) fn read_json<T: serde::de::DeserializeOwned>(path: &Path, max: u64) -> Result<T> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
@@ -208,7 +213,10 @@ impl Manager {
             artifacts,
         };
         let _lease = manager.database_lease(cancel).await?;
-        if !manager.root.join("profiles.json").exists() {
+        // A missing, corrupt or older-format profile database starts fresh;
+        // saved environments are not migrated.
+        let path = manager.root.join("profiles.json");
+        if !path.exists() || manager.database().is_err_and(|error| unreadable(&error)) {
             manager.write_database(&Database {
                 version: 1,
                 installation: Uuid::new_v4(),
@@ -465,31 +473,4 @@ impl Manager {
 }
 
 #[cfg(test)]
-mod lease_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn a_live_environment_lease_remains_held_while_a_waiting_caller_cancels() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("operation.lock");
-        let owner = open_lock(&path).unwrap();
-        assert!(try_lease(&owner).unwrap());
-        assert!(!try_lease(&open_lock(&path).unwrap()).unwrap());
-        let cancel = CancellationToken::new();
-        let waiting = lease(path.clone(), &cancel);
-        tokio::pin!(waiting);
-        tokio::select! {
-            result = &mut waiting => panic!("A live lease must keep the caller queued: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(30)) => {},
-        }
-        cancel.cancel();
-        let error = tokio::time::timeout(Duration::from_secs(2), waiting)
-            .await
-            .expect("A queued lease must observe cancellation")
-            .unwrap_err();
-        assert!(error.to_string().contains("cancelled before admission"));
-        assert!(!try_lease(&open_lock(&path).unwrap()).unwrap());
-        drop(owner);
-        drop(lease(path, &CancellationToken::new()).await.unwrap());
-    }
-}
+mod lease_tests;

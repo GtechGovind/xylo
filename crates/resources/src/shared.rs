@@ -3,6 +3,16 @@
 //! Each live reservation owns an OS file lock. The small JSON record is only a
 //! demand ledger: process IDs and timestamps never determine liveness. Dropping
 //! a lease closes its handle without doing filesystem work on the calling thread.
+//!
+//! Admission is first come, first served. A caller that cannot start at once
+//! takes a queue ticket (`<id>.queuelock` holding an OS lock, `<id>.queue`
+//! holding its sequence number and demand). Nobody is admitted while a live
+//! ticket with a lower sequence could start once the current reservations
+//! end, so a large request cannot be starved by a stream of small ones. A
+//! waiter that could not start even then (its demand exceeds what other
+//! programs leave free) holds nobody back: later requests that fit run
+//! meanwhile, and it keeps its place for when memory frees up. Tickets of
+//! crashed or cancelled waiters are reaped by the same lock probe as leases.
 
 use super::{ResourceSnapshot, TaskDemand};
 use anyhow::{Context, Result, ensure};
@@ -20,9 +30,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const MAX_ACTIVE: usize = 128;
+const MAX_WAITERS: usize = 256;
 const MAX_RECORD_BYTES: u64 = 1024;
-const MAX_DIRECTORY_ENTRIES: usize = MAX_ACTIVE * 4 + 1;
+// Three files per lease (lock, record, partial), two per ticket, one lock.
+const MAX_DIRECTORY_ENTRIES: usize = MAX_ACTIVE * 3 + MAX_WAITERS * 2 + 1;
 const METADATA_LOCK: &str = "metadata.lock";
+/// The metadata lock is only held for short ledger updates; waiting this long
+/// means another process is stuck, which the caller should hear about.
+const METADATA_WAIT: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A live native-work reservation. Keep this value until the admitted operation
 /// and any admitted blocking cleanup finish. It is intentionally not Clone.
@@ -42,9 +58,26 @@ impl SharedResourceLease {
     }
 }
 
+/// A queued caller's place in line. Dropping it releases the OS lock, after
+/// which the next admission attempt by anyone reaps the ticket files.
+#[derive(Debug)]
+struct Ticket {
+    _lock: File,
+    id: Uuid,
+    sequence: u64,
+}
+
+/// Outcome of one admission attempt.
+#[derive(Debug)]
+enum Attempt {
+    Admitted(SharedResourceLease),
+    Queued(Ticket),
+}
+
 /// Acquire a profile-wide native resource reservation using current machine
-/// headroom. Directory initialization, metadata and locks stay off async/UI
-/// threads. Queued callers recheck pressure every 500 ms and cancel promptly.
+/// headroom, first come first served across processes. Directory
+/// initialization, metadata and locks stay off async/UI threads. Queued
+/// callers recheck every 250 ms and cancel promptly.
 pub async fn acquire(
     directory: PathBuf,
     demand: TaskDemand,
@@ -53,24 +86,28 @@ pub async fn acquire(
     validate_demand(demand)?;
     let child = cancel.child_token();
     let _cancel_on_drop = child.clone().drop_guard();
+    let mut ticket = None;
     loop {
         checked(&child)?;
         let task_directory = directory.clone();
         let task_cancel = child.clone();
         let attempt = tokio::task::spawn_blocking(move || {
             let hardware = hardware_snapshot()?;
-            try_acquire(&task_directory, demand, hardware, &task_cancel)
+            try_acquire(&task_directory, demand, hardware, ticket, &task_cancel)
         });
-        let lease = tokio::select! {
+        let attempt = tokio::select! {
             result = attempt => result.context("Native admission worker stopped")??,
             _ = cancel.cancelled() => anyhow::bail!("Native work cancelled while queued"),
         };
-        if let Some(lease) = lease {
-            checked(&child)?;
-            return Ok(lease);
+        match attempt {
+            Attempt::Admitted(lease) => {
+                checked(&child)?;
+                return Ok(lease);
+            }
+            Attempt::Queued(queued) => ticket = Some(queued),
         }
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+            _ = tokio::time::sleep(POLL_INTERVAL) => {},
             _ = cancel.cancelled() => anyhow::bail!("Native work cancelled while queued"),
         }
     }
@@ -90,14 +127,12 @@ fn validate_demand(demand: TaskDemand) -> Result<()> {
 }
 
 fn hardware_snapshot() -> Result<ResourceSnapshot> {
-    static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
+    static SYSTEM: OnceLock<Mutex<std::result::Result<sysinfo::System, String>>> = OnceLock::new();
     let mut system = SYSTEM
-        .get_or_init(|| Mutex::new(sysinfo::System::new()))
+        .get_or_init(|| Mutex::new(sysinfo::System::new().map_err(|error| error.to_string())))
         .lock()
         .map_err(|_| anyhow::anyhow!("Native resource monitor unavailable"))?;
-    system.refresh_memory();
-    system.refresh_cpu_usage();
-    Ok(super::snapshot(&system))
+    Ok(super::snapshot(super::refreshed(&mut system)?))
 }
 
 fn prepare_directory(directory: &Path, cancel: &CancellationToken) -> Result<PathBuf> {
@@ -214,7 +249,7 @@ fn contended(error: &std::io::Error) -> bool {
 
 fn metadata_lock(directory: &Path, cancel: &CancellationToken) -> Result<File> {
     let file = open_regular(&directory.join(METADATA_LOCK), true, false)?;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + METADATA_WAIT;
     loop {
         checked(cancel)?;
         match FileExt::try_lock_exclusive(&file) {
@@ -222,12 +257,33 @@ fn metadata_lock(directory: &Path, cancel: &CancellationToken) -> Result<File> {
             Err(error) if contended(&error) => {
                 ensure!(
                     Instant::now() < deadline,
-                    "Native admission metadata is busy; retry the action"
+                    "Another Xylo process has held the native work queue for over {} seconds; nothing was started. Retry, or restart Xylo if this keeps happening.",
+                    METADATA_WAIT.as_secs()
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(error) => return Err(error.into()),
         }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueRecord {
+    id: Uuid,
+    sequence: u64,
+    memory_bytes: u64,
+    cpu_share: f32,
+}
+
+impl QueueRecord {
+    fn demand(&self) -> Result<TaskDemand> {
+        let demand = TaskDemand {
+            memory_bytes: self.memory_bytes,
+            cpu_share: self.cpu_share,
+        };
+        validate_demand(demand)?;
+        Ok(demand)
     }
 }
 
@@ -260,6 +316,8 @@ struct Entry {
     record: bool,
     lease: bool,
     partial: bool,
+    queue: bool,
+    queue_lock: bool,
 }
 
 fn parse_name(name: &str) -> Result<(Uuid, &str)> {
@@ -267,7 +325,10 @@ fn parse_name(name: &str) -> Result<(Uuid, &str)> {
         .rsplit_once('.')
         .context("Native admission storage contains an unexpected filename")?;
     ensure!(
-        matches!(extension, "json" | "lock" | "partial"),
+        matches!(
+            extension,
+            "json" | "lock" | "partial" | "queue" | "queuelock"
+        ),
         "Native admission storage contains an unsupported file"
     );
     let id = Uuid::parse_str(stem).context("Native admission metadata identity is invalid")?;
@@ -309,19 +370,113 @@ fn entries(directory: &Path, cancel: &CancellationToken) -> Result<BTreeMap<Uuid
             "json" => entry.record = true,
             "lock" => entry.lease = true,
             "partial" => entry.partial = true,
+            "queue" => entry.queue = true,
+            "queuelock" => entry.queue_lock = true,
             _ => unreachable!(),
         }
     }
     Ok(entries)
 }
 
+/// A live queue ticket.
+#[derive(Debug)]
+struct Waiter {
+    sequence: u64,
+    id: Uuid,
+    demand: TaskDemand,
+}
+
+impl Waiter {
+    fn holds(&self, ticket: &Ticket) -> bool {
+        (self.sequence, self.id) == (ticket.sequence, ticket.id)
+    }
+}
+
+/// Live reservations and queue tickets after reaping dead ones.
+#[derive(Debug, Default)]
+struct Ledger {
+    count: usize,
+    memory: u64,
+    cpu: f32,
+    /// Live queue tickets in queue order.
+    waiters: Vec<Waiter>,
+}
+
+impl Ledger {
+    #[cfg(test)]
+    fn totals(&self) -> (usize, u64, f32) {
+        (self.count, self.memory, self.cpu)
+    }
+}
+
+fn read_small(path: &Path) -> Result<Vec<u8>> {
+    let file = open_regular(path, false, false)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_RECORD_BYTES,
+        "Native admission record grew beyond 1KiB"
+    );
+    Ok(bytes)
+}
+
+/// Reap a dead ticket, or return the live ticket's sequence and demand.
+fn reap_ticket(directory: &Path, id: Uuid, entry: &Entry) -> Result<Option<(u64, TaskDemand)>> {
+    let lock_path = directory.join(format!("{id}.queuelock"));
+    let record_path = directory.join(format!("{id}.queue"));
+    if !entry.queue_lock {
+        if entry.queue {
+            std::fs::remove_file(record_path)?;
+        }
+        return Ok(None);
+    }
+    let lock = open_regular(&lock_path, false, false)?;
+    match FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => {
+            if entry.queue {
+                std::fs::remove_file(record_path)?;
+            }
+            drop(lock);
+            std::fs::remove_file(lock_path)?;
+            Ok(None)
+        }
+        Err(error) if contended(&error) => {
+            // A live waiter writes its record before it ever releases the
+            // metadata lock, so a missing record here means tampering.
+            ensure!(entry.queue, "Live native queue ticket has no record");
+            let record: QueueRecord = serde_json::from_slice(&read_small(&record_path)?)
+                .context("Live native queue ticket is corrupt")?;
+            ensure!(
+                record.id == id,
+                "Native queue ticket identity does not match its lock"
+            );
+            Ok(Some((record.sequence, record.demand()?)))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// A lock probe, not a PID check, decides whether a record can be removed.
-fn reap_and_sum(directory: &Path, cancel: &CancellationToken) -> Result<(usize, u64, f32)> {
-    let mut count = 0usize;
-    let mut memory = 0u64;
-    let mut cpu = 0f32;
+fn reap_and_sum(directory: &Path, cancel: &CancellationToken) -> Result<Ledger> {
+    let mut ledger = Ledger::default();
     for (id, entry) in entries(directory, cancel)? {
         checked(cancel)?;
+        if entry.queue || entry.queue_lock {
+            if let Some((sequence, demand)) = reap_ticket(directory, id, &entry)? {
+                ledger.waiters.push(Waiter {
+                    sequence,
+                    id,
+                    demand,
+                });
+                ensure!(
+                    ledger.waiters.len() <= MAX_WAITERS,
+                    "Too many native operations are queued; wait for some to finish"
+                );
+            }
+            if !(entry.record || entry.lease || entry.partial) {
+                continue;
+            }
+        }
         let lock_path = directory.join(format!("{id}.lock"));
         let record_path = directory.join(format!("{id}.json"));
         let partial_path = directory.join(format!("{id}.partial"));
@@ -354,37 +509,72 @@ fn reap_and_sum(directory: &Path, cancel: &CancellationToken) -> Result<(usize, 
                     entry.record && !entry.partial,
                     "Live native admission lease has incomplete metadata"
                 );
-                let record_file = open_regular(&record_path, false, false)?;
-                let mut bytes = Vec::new();
-                record_file
-                    .take(MAX_RECORD_BYTES + 1)
-                    .read_to_end(&mut bytes)?;
-                ensure!(
-                    bytes.len() as u64 <= MAX_RECORD_BYTES,
-                    "Native admission record grew beyond 1KiB"
-                );
-                let record: Record = serde_json::from_slice(&bytes)
+                let record: Record = serde_json::from_slice(&read_small(&record_path)?)
                     .context("Live native admission metadata is corrupt")?;
                 ensure!(
                     record.id == id,
                     "Native admission record identity does not match its lease"
                 );
                 let demand = record.demand()?;
-                memory = memory
+                ledger.memory = ledger
+                    .memory
                     .checked_add(demand.memory_bytes)
                     .context("Native admission memory accounting overflow")?;
-                cpu += demand.cpu_share;
-                ensure!(cpu.is_finite(), "Native admission CPU accounting overflow");
-                count += 1;
+                ledger.cpu += demand.cpu_share;
                 ensure!(
-                    count <= MAX_ACTIVE,
+                    ledger.cpu.is_finite(),
+                    "Native admission CPU accounting overflow"
+                );
+                ledger.count += 1;
+                ensure!(
+                    ledger.count <= MAX_ACTIVE,
                     "Native admission active-record limit exceeded"
                 );
             }
             Err(error) => return Err(error.into()),
         }
     }
-    Ok((count, memory, cpu))
+    ledger
+        .waiters
+        .sort_unstable_by_key(|waiter| (waiter.sequence, waiter.id));
+    Ok(ledger)
+}
+
+/// Take a place at the back of the queue. Called with the metadata lock held.
+fn enqueue(directory: &Path, ledger: &Ledger, demand: TaskDemand) -> Result<Ticket> {
+    ensure!(
+        ledger.waiters.len() < MAX_WAITERS,
+        "Too many native operations are queued; wait for some to finish"
+    );
+    let id = Uuid::new_v4();
+    let sequence = ledger
+        .waiters
+        .last()
+        .map_or(0, |waiter| waiter.sequence + 1);
+    let lock = open_regular(&directory.join(format!("{id}.queuelock")), false, true)?;
+    FileExt::try_lock_exclusive(&lock)?;
+    let bytes = serde_json::to_vec(&QueueRecord {
+        id,
+        sequence,
+        memory_bytes: demand.memory_bytes,
+        cpu_share: demand.cpu_share,
+    })?;
+    let mut record = open_regular(&directory.join(format!("{id}.queue")), false, true)?;
+    record.write_all(&bytes)?;
+    Ok(Ticket {
+        _lock: lock,
+        id,
+        sequence,
+    })
+}
+
+/// Remove an admitted waiter's ticket. Called with the metadata lock held.
+fn dequeue(directory: &Path, ticket: Ticket) -> Result<()> {
+    let id = ticket.id;
+    std::fs::remove_file(directory.join(format!("{id}.queue")))?;
+    drop(ticket);
+    std::fs::remove_file(directory.join(format!("{id}.queuelock")))?;
+    Ok(())
 }
 
 struct Pending {
@@ -405,19 +595,50 @@ impl Drop for Pending {
     }
 }
 
+/// Whether `demand` would fit once every live reservation ended and the CPU
+/// were idle. A waiter for which this is false is held back by other
+/// programs, not by the queue, so it does not hold back the waiters behind it.
+fn fits_when_idle(hardware: ResourceSnapshot, demand: TaskDemand, ledger: &Ledger) -> bool {
+    let idle = ResourceSnapshot {
+        available_memory_bytes: hardware
+            .available_memory_bytes
+            .saturating_add(ledger.memory)
+            .min(hardware.total_memory_bytes),
+        cpu_busy_percent: 0.,
+        ..hardware
+    };
+    super::fits(idle, demand, 0, 0.)
+}
+
+/// One admission attempt. `ticket` is the caller's place in line from an
+/// earlier attempt; a caller is admitted only when its demand fits and no
+/// live ticket ahead of it could start once the current reservations end
+/// (see [`fits_when_idle`]). Otherwise it keeps (or takes) a ticket.
 fn try_acquire(
     directory: &Path,
     demand: TaskDemand,
     hardware: ResourceSnapshot,
+    ticket: Option<Ticket>,
     cancel: &CancellationToken,
-) -> Result<Option<SharedResourceLease>> {
+) -> Result<Attempt> {
     validate_demand(demand)?;
     checked(cancel)?;
     let directory = prepare_directory(directory, cancel)?;
     let _metadata = metadata_lock(&directory, cancel)?;
-    let (count, memory, cpu) = reap_and_sum(&directory, cancel)?;
-    if count == MAX_ACTIVE || !super::fits(hardware, demand, memory, cpu) {
-        return Ok(None);
+    let ledger = reap_and_sum(&directory, cancel)?;
+    let waiting_ahead = ledger
+        .waiters
+        .iter()
+        .take_while(|waiter| ticket.as_ref().is_none_or(|ticket| !waiter.holds(ticket)))
+        .any(|waiter| fits_when_idle(hardware, waiter.demand, &ledger));
+    if waiting_ahead
+        || ledger.count == MAX_ACTIVE
+        || !super::fits(hardware, demand, ledger.memory, ledger.cpu)
+    {
+        return Ok(Attempt::Queued(match ticket {
+            Some(ticket) => ticket,
+            None => enqueue(&directory, &ledger, demand)?,
+        }));
     }
     checked(cancel)?;
     let id = Uuid::new_v4();
@@ -449,7 +670,10 @@ fn try_acquire(
     std::fs::rename(partial, directory.join(format!("{id}.json")))?;
     checked(cancel)?;
     pending.committed = true;
-    Ok(Some(SharedResourceLease {
+    if let Some(ticket) = ticket {
+        dequeue(&directory, ticket)?;
+    }
+    Ok(Attempt::Admitted(SharedResourceLease {
         _lock: lease,
         directory,
         id,
@@ -457,288 +681,4 @@ fn try_acquire(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    const MIB: u64 = 1024 * 1024;
-    fn hardware() -> ResourceSnapshot {
-        ResourceSnapshot {
-            total_memory_bytes: 8 * 1024 * MIB,
-            available_memory_bytes: 2 * 1024 * MIB,
-            cpu_threads: 8,
-            cpu_busy_percent: 0.,
-        }
-    }
-    fn directory() -> (tempfile::TempDir, PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().canonicalize().unwrap().join("admission");
-        (temp, path)
-    }
-    fn demand() -> TaskDemand {
-        TaskDemand {
-            memory_bytes: 1024 * MIB,
-            cpu_share: 1.,
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn canonical_windows_directory_admission_creates_a_live_reservation() {
-        let (_temp, canonical) = directory();
-        let ordinary = PathBuf::from(
-            canonical
-                .to_str()
-                .unwrap()
-                .strip_prefix(r"\\?\")
-                .expect("The native canonical temp path must use a verbatim drive prefix"),
-        );
-        for path in [canonical.join("verbatim-雪"), ordinary.join("ordinary-雪")] {
-            let cancel = CancellationToken::new();
-            let lease = try_acquire(&path, demand(), hardware(), &cancel)
-                .unwrap_or_else(|error| panic!("Admission for {path:?} failed: {error:#}"))
-                .expect("A deterministic available-memory budget must admit the reservation");
-            assert_eq!(lease.directory(), path.canonicalize().unwrap());
-            assert_eq!(
-                reap_and_sum(lease.directory(), &cancel).unwrap(),
-                (1, 1024 * MIB, 1.)
-            );
-            drop(lease);
-            assert_eq!(reap_and_sum(&path, &cancel).unwrap(), (0, 0, 0.));
-        }
-    }
-
-    #[test]
-    fn independent_handles_share_accounting_and_drop_is_reaped_by_os_liveness() {
-        let (_temp, path) = directory();
-        let cancel = CancellationToken::new();
-        let first = try_acquire(&path, demand(), hardware(), &cancel)
-            .unwrap()
-            .unwrap();
-        assert!(
-            try_acquire(&path, demand(), hardware(), &cancel)
-                .unwrap()
-                .is_none()
-        );
-        let record = first.directory().join(format!("{}.json", first.id()));
-        assert!(record.exists());
-        drop(first);
-        let second = try_acquire(&path, demand(), hardware(), &cancel)
-            .unwrap()
-            .unwrap();
-        assert!(!record.exists());
-        assert_eq!(reap_and_sum(&path, &cancel).unwrap(), (1, 1024 * MIB, 1.));
-        drop(second);
-        assert_eq!(reap_and_sum(&path, &cancel).unwrap(), (0, 0, 0.));
-    }
-
-    #[test]
-    fn cpu_and_available_memory_changes_control_admission_without_profiles() {
-        let (_temp, path) = directory();
-        let cancel = CancellationToken::new();
-        let mut busy = hardware();
-        busy.cpu_threads = 2;
-        busy.cpu_busy_percent = 100.;
-        let first = try_acquire(
-            &path,
-            TaskDemand {
-                memory_bytes: MIB,
-                cpu_share: 1.,
-            },
-            busy,
-            &cancel,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            try_acquire(
-                &path,
-                TaskDemand {
-                    memory_bytes: MIB,
-                    cpu_share: 1.
-                },
-                busy,
-                &cancel
-            )
-            .unwrap()
-            .is_none()
-        );
-        drop(first);
-        let mut low = hardware();
-        low.available_memory_bytes = 64 * MIB;
-        assert!(
-            try_acquire(&path, demand(), low, &cancel)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            try_acquire(&path, demand(), hardware(), &cancel)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn queued_cancellation_leaves_no_live_reservation() {
-        let (_temp, path) = directory();
-        let cancel = CancellationToken::new();
-        let caller = cancel.clone();
-        let queued_path = path.clone();
-        let task = tokio::spawn(async move {
-            acquire(
-                queued_path,
-                TaskDemand {
-                    memory_bytes: u64::MAX,
-                    cpu_share: 1.,
-                },
-                caller,
-            )
-            .await
-        });
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        cancel.cancel();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err()
-        );
-        let check_path = path.clone();
-        assert_eq!(
-            tokio::task::spawn_blocking(move || {
-                let canonical = prepare_directory(&check_path, &CancellationToken::new()).unwrap();
-                let _lock = metadata_lock(&canonical, &CancellationToken::new()).unwrap();
-                reap_and_sum(&canonical, &CancellationToken::new()).unwrap()
-            })
-            .await
-            .unwrap(),
-            (0, 0, 0.)
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_outer_future_retains_admission_until_blocking_work_really_finishes() {
-        let (_temp, path) = directory();
-        let lease = std::sync::Arc::new(
-            try_acquire(&path, demand(), hardware(), &CancellationToken::new())
-                .unwrap()
-                .unwrap(),
-        );
-        let (entered, waiting) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let (finished, done) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(crate::scope_shared(lease.clone(), async move {
-            crate::spawn_blocking(move || {
-                let _ = entered.send(());
-                released.recv_timeout(Duration::from_secs(3)).unwrap();
-                let _ = finished.send(());
-            })
-            .await
-            .unwrap();
-        }));
-        drop(lease);
-        tokio::time::timeout(Duration::from_secs(1), waiting)
-            .await
-            .unwrap()
-            .unwrap();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        // The async task is gone, but its actual native closure still owns the
-        // shared lease. A second worker cannot spend that reserved headroom.
-        assert!(
-            try_acquire(&path, demand(), hardware(), &CancellationToken::new())
-                .unwrap()
-                .is_none()
-        );
-        release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), done)
-            .await
-            .unwrap()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if try_acquire(&path, demand(), hardware(), &CancellationToken::new())
-                .unwrap()
-                .is_some()
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Blocking work leaked its admission lease"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    #[test]
-    fn live_corrupt_metadata_fails_closed_but_dead_corrupt_record_is_reclaimed() {
-        let (_temp, path) = directory();
-        let cancel = CancellationToken::new();
-        let lease = try_acquire(&path, demand(), hardware(), &cancel)
-            .unwrap()
-            .unwrap();
-        let record = path.join(format!("{}.json", lease.id()));
-        std::fs::write(&record, b"{invalid").unwrap();
-        assert!(
-            try_acquire(&path, demand(), hardware(), &cancel)
-                .unwrap_err()
-                .to_string()
-                .contains("corrupt")
-        );
-        drop(lease);
-        assert!(
-            try_acquire(&path, demand(), hardware(), &cancel)
-                .unwrap()
-                .is_some()
-        );
-        assert!(!record.exists());
-    }
-
-    #[test]
-    fn traversal_unexpected_files_and_oversized_records_are_rejected() {
-        let (temp, path) = directory();
-        let cancel = CancellationToken::new();
-        // PathBuf::join normalizes parent components for Windows verbatim
-        // paths. Preserve the actual request bytes to exercise rejection.
-        let mut raw = temp.path().canonicalize().unwrap().into_os_string();
-        for part in ["admission", "..", "outside"] {
-            raw.push(std::path::MAIN_SEPARATOR_STR);
-            raw.push(part);
-        }
-        let traversal = PathBuf::from(raw);
-        assert!(
-            traversal
-                .components()
-                .any(|part| matches!(part, Component::ParentDir)),
-            "The fixture must reach admission with an actual parent component: {traversal:?}"
-        );
-        let error = try_acquire(&traversal, demand(), hardware(), &cancel).unwrap_err();
-        assert!(error.to_string().contains("without traversal"), "{error:#}");
-        assert!(!temp.path().join("outside").exists());
-        prepare_directory(&path, &cancel).unwrap();
-        std::fs::write(path.join("credentials.json"), b"{}").unwrap();
-        assert!(try_acquire(&path, demand(), hardware(), &cancel).is_err());
-        std::fs::remove_file(path.join("credentials.json")).unwrap();
-        std::fs::write(path.join(format!("{}.json", Uuid::new_v4())), vec![0; 1025]).unwrap();
-        assert!(try_acquire(&path, demand(), hardware(), &cancel).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn directory_and_metadata_symlinks_never_touch_the_outside_target() {
-        let (temp, path) = directory();
-        let cancel = CancellationToken::new();
-        let outside = temp.path().canonicalize().unwrap().join("outside");
-        std::fs::create_dir(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, &path).unwrap();
-        assert!(try_acquire(&path, demand(), hardware(), &cancel).is_err());
-        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
-        std::fs::remove_file(&path).unwrap();
-        prepare_directory(&path, &cancel).unwrap();
-        let target = outside.join("private");
-        std::fs::write(&target, b"unchanged").unwrap();
-        std::os::unix::fs::symlink(&target, path.join(METADATA_LOCK)).unwrap();
-        assert!(try_acquire(&path, demand(), hardware(), &cancel).is_err());
-        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
-    }
-}
+mod tests;

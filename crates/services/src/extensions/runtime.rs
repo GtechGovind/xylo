@@ -48,10 +48,10 @@ pub struct HookInvocation {
     pub component: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SavedSetup {
     digest: String,
     setup: ComponentSetup,
-    #[serde(default)]
     evidence: BTreeMap<String, String>,
 }
 #[derive(Clone)]
@@ -86,11 +86,21 @@ impl ExtensionService {
     fn runtime_path(&self) -> PathBuf {
         self.root.join("runtime.json")
     }
+    /// Caller holds the catalog lock.
+    pub(super) fn remove_unreadable_runtime(&self) -> Result<()> {
+        let path = self.runtime_path();
+        if super::catalog::decodes::<BTreeMap<String, SavedSetup>>(&path)? == Some(false) {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+    /// Saved setups; an unreadable file reads as no setup (the next locked
+    /// operation deletes it).
     fn read_runtime(&self) -> Result<BTreeMap<String, SavedSetup>> {
         match std::fs::read(self.runtime_path()) {
             Ok(bytes) => {
                 ensure!(bytes.len() <= 1024 * 1024, "Runtime setup exceeds 1 MiB");
-                Ok(serde_json::from_slice(&bytes)?)
+                Ok(serde_json::from_slice(&bytes).unwrap_or_default())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
             Err(e) => Err(e.into()),
@@ -200,6 +210,9 @@ impl ExtensionService {
         Ok(status(&plan, &saved.evidence))
     }
     /// The caller must authorize/journal mutations before invoking this method.
+    // The engine and host call these with positional arguments; a parameter
+    // struct would change their call sites for no behavioral gain.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_component(
         &self,
         package: &str,
@@ -216,6 +229,7 @@ impl ExtensionService {
         .await
     }
     /// Bind an approval to the exact immutable package and reviewed setup.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_component_bound(
         &self,
         package: &str,
@@ -239,6 +253,7 @@ impl ExtensionService {
         )
         .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn execute_component_inner(
         &self,
         package: &str,
@@ -284,7 +299,7 @@ impl ExtensionService {
         let mut outputs = Vec::new();
         let mut verified = BTreeMap::new();
         for entry in &plan.entries {
-            if selected.is_some_and(|name| name != entry.name) {
+            if selected.is_some_and(|name| name != entry.name) || !delivered(entry) {
                 continue;
             }
             if plan.component.kind == ComponentKind::Hooks && operation != "verify" {
@@ -520,11 +535,16 @@ impl ExtensionService {
         Ok(output)
     }
 }
+/// Hook events Xylo delivers. Entries for any other event (for example
+/// `SessionStart`) are reported as unsupported individually and never run;
+/// they do not make the rest of the component unsupported.
 fn supported_event(event: &str) -> bool {
-    matches!(
-        event,
-        "PreToolUse" | "PostToolUse" | "SessionStart" | "SessionEnd"
-    )
+    matches!(event, "PreToolUse" | "PostToolUse")
+}
+/// Whether an entry can ever run: non-hook entries always, hook entries only
+/// for a delivered event.
+fn delivered(entry: &Entry) -> bool {
+    entry.event.as_deref().is_none_or(supported_event)
 }
 fn validate_setup(setup: &ComponentSetup) -> Result<()> {
     ensure!(
@@ -685,8 +705,10 @@ fn entry_requirements(plan: &Plan, entry: &Entry) -> Vec<String> {
     {
         required.push("Install the pinned managed sandbox runtime dependencies".into());
     }
-    if entry.event.as_deref().is_some_and(|e| !supported_event(e)) {
-        required.push("Unsupported hook event".into());
+    if let Some(event) = entry.event.as_deref().filter(|e| !supported_event(e)) {
+        required.push(format!(
+            "Unsupported hook event {event}; Xylo delivers only PreToolUse and PostToolUse"
+        ));
     }
     if entry.matcher.as_deref().is_some_and(|m| {
         m.chars()
@@ -742,17 +764,7 @@ fn status(plan: &Plan, evidence: &BTreeMap<String, String>) -> ComponentRuntimeS
         .entries
         .iter()
         .map(|entry| {
-            let mut requirements = entry_requirements(plan, entry);
-            if entry
-                .event
-                .as_deref()
-                .is_some_and(|event| matches!(event, "SessionStart" | "SessionEnd"))
-            {
-                requirements.push(format!(
-                    "Unsupported automatic {} delivery; explicit event execution only",
-                    entry.event.as_deref().unwrap()
-                ));
-            }
+            let requirements = entry_requirements(plan, entry);
             let readiness = if requirements.iter().any(|r| {
                 r.starts_with("Unsupported") || r.starts_with("Only ") || r.starts_with("Hosted")
             }) {
@@ -772,14 +784,27 @@ fn status(plan: &Plan, evidence: &BTreeMap<String, String>) -> ComponentRuntimeS
             }
         })
         .collect::<Vec<_>>();
-    let readiness = if entries
+    // Entries for events Xylo never delivers stay listed with their reason
+    // but do not decide the component's readiness.
+    let runnable = plan
+        .entries
         .iter()
-        .any(|e| e.readiness == Readiness::UnsupportedRequirement)
+        .zip(&entries)
+        .filter(|(entry, _)| delivered(entry))
+        .map(|(_, status)| status)
+        .collect::<Vec<_>>();
+    let readiness = if runnable.is_empty()
+        || runnable
+            .iter()
+            .any(|e| e.readiness == Readiness::UnsupportedRequirement)
     {
         Readiness::UnsupportedRequirement
-    } else if entries.iter().any(|e| e.readiness == Readiness::NeedsSetup) {
+    } else if runnable
+        .iter()
+        .any(|e| e.readiness == Readiness::NeedsSetup)
+    {
         Readiness::NeedsSetup
-    } else if entries
+    } else if runnable
         .iter()
         .all(|e| e.readiness == Readiness::ExecutionVerified)
     {
@@ -933,6 +958,7 @@ fn duration(plan: &Plan) -> Duration {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_mcp(
     plan: &Plan,
     entry: &Entry,
@@ -1025,7 +1051,7 @@ fn spawn_component(
         &program.to_string_lossy(),
         &args,
         &plan.setup.workspace,
-        &[plan.root.clone()],
+        std::slice::from_ref(&plan.root),
         &plan.protected_paths,
         &plan.setup.allowed_domains,
     )?;
@@ -1133,10 +1159,10 @@ async fn read_lsp(
             if line == "\r\n" || line == "\n" {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("content-length") {
-                    length = Some(value.trim().parse::<usize>()?);
-                }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = Some(value.trim().parse::<usize>()?);
             }
         }
         let length = length.context("LSP Content-Length missing")?;

@@ -33,6 +33,9 @@ fn fixture(
             title: "Images".into(),
             workspace: directory.path().into(),
             updated_at: now_ms(),
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
         })
         .unwrap();
     let request = TurnRequest {
@@ -43,6 +46,7 @@ fn fixture(
         provider: ProviderConfig::default(),
         permissions: mode,
         attachments: Vec::new(),
+        approved_rules: Vec::new(),
     };
     let (events, receiver) = tokio::sync::mpsc::channel(256);
     let broker = ToolBroker::new(
@@ -53,7 +57,7 @@ fn fixture(
             artifacts,
             ..Default::default()
         },
-        ApprovalGate::default(),
+        ToolSession::for_tests(mode),
         events,
         CancellationToken::new(),
     )
@@ -86,7 +90,11 @@ async fn approve(
                 "explicit-image-model"
             );
             assert!(arguments.get("credential_ref").is_none());
-            broker.approvals.decide(action_id, allow).unwrap();
+            broker
+                .session
+                .approvals()
+                .decide_with(action_id, allow, false)
+                .unwrap();
             return action_id;
         }
     }
@@ -95,7 +103,7 @@ async fn approve(
 async fn approved_image_tool_uses_frozen_saved_provider_actual_output_and_durable_no_replay() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let (directory, broker, mut events) = fixture(PermissionMode::AskForWrites, endpoint);
+    let (directory, broker, mut events) = fixture(PermissionMode::AskForApproval, endpoint);
     let service =
         ImageGenerationService::new(directory.path().into(), broker.artifacts.clone()).unwrap();
     // Changing settings while approval is pending cannot redirect this turn's action.
@@ -204,7 +212,7 @@ async fn image_tool_read_only_denial_and_arbitrary_provider_override_never_dispa
         .contains("read-only")
     );
     assert!(broker.journaled("readonly-image").unwrap().is_none());
-    let (_directory, broker, mut events) = fixture(PermissionMode::AskForWrites, endpoint);
+    let (_directory, broker, mut events) = fixture(PermissionMode::AskForApproval, endpoint);
     let task = broker.clone();
     assert!(
         tokio::task::spawn_blocking(move || task.execute(
@@ -237,7 +245,7 @@ async fn image_tool_read_only_denial_and_arbitrary_provider_override_never_dispa
 async fn image_tool_transport_loss_retains_uncertainty_and_blocks_action_replay() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let (_directory, broker, mut events) = fixture(PermissionMode::AskForWrites, endpoint);
+    let (_directory, broker, mut events) = fixture(PermissionMode::AskForApproval, endpoint);
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         drop(socket);

@@ -2,7 +2,14 @@
 //! This renders offscreen and never inspects a locked desktop or uses a model.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/assets.rs"]
+mod assets;
+mod capture_dir;
 mod document_recovery_fixture;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -55,7 +62,7 @@ fn render() {
     let client = host.0.clone();
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        Arc::new(crate::assets::AppAssets),
         platform::current_headless_renderer,
     );
     cx.allow_parking();
@@ -111,24 +118,18 @@ fn render() {
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.find("new-chat").visible());
+        assert!(window.find("sidebar-new-chat").visible());
         assert!(window.find("document-find-original").visible());
         assert!(window.find(("document-recovered-change", 0usize)).visible());
         assert!(window.find(("document-recovered-change", 1usize)).visible());
         assert!(window.find("document-copy-recovered").visible());
         assert!(
             window.find("document-find-original").bounds().origin.x
-                > window.find("new-chat").bounds().right()
+                > window.find("sidebar-new-chat").bounds().right()
         );
     })
     .unwrap();
-    let output = std::env::var_os("XYLO_RENDER_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../docs/native-preview")
-        });
-    std::fs::create_dir_all(&output).unwrap();
+    let output = capture_dir::fresh("document-recovery-rendering");
     let image = output.join("document-recovery.png");
     let screenshot = cx
         .capture_screenshot(handle)
@@ -180,10 +181,10 @@ fn render() {
         ("Cargo.lock", include_bytes!("Cargo.lock").as_slice()),
     ]
     .into_iter()
-    .map(|(name, bytes)| (name, format!("{:x}", Sha256::digest(bytes))))
+    .map(|(name, bytes)| (name, hex::encode(Sha256::digest(bytes))))
     .collect::<std::collections::BTreeMap<_, _>>();
     let metadata = serde_json::json!({"scope":"Actual production Host, Store and native helper; missing-original XLSX draft with typed text/formula changes. No Office file reconstructed, no model/account or physical desktop acceptance.",
-        "logical_size":[1380,880],"pixel_size":pixel_size,"file":"document-recovery.png","sha256":format!("{:x}",Sha256::digest(std::fs::read(&image).unwrap())),"compiled_sources_sha256":compiled_sources});
+        "logical_size":[1380,880],"pixel_size":pixel_size,"file":"document-recovery.png","sha256":hex::encode(Sha256::digest(std::fs::read(&image).unwrap())),"compiled_sources_sha256":compiled_sources});
     std::fs::write(
         output.join("document-recovery.json"),
         serde_json::to_vec_pretty(&metadata).unwrap(),

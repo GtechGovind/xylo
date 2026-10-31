@@ -1,13 +1,38 @@
+//! SSE framing and per-protocol event decoding into [`StreamEvent`]s. Every
+//! protocol must reach its own terminal event; a stream that merely stops is a
+//! retryable failure, never a successful empty answer.
 use super::*;
-use hermes_core::{
-    FunctionCall, FunctionCallDelta, Message, StreamDelta, ToolCall, ToolCallDelta, UsageStats,
-};
+use crate::model::{FinishReason, NativeContent, StreamEvent};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 
-fn failure(message: impl Into<String>) -> AgentError {
-    AgentError::LlmApi(message.into())
+fn failure(message: impl Into<String>) -> ModelError {
+    ModelError::permanent(message)
 }
+
+/// Stream error events whose code or type means "try again later".
+fn transient_code(value: &Value) -> bool {
+    let error = value.get("error").unwrap_or(value);
+    ["type", "code", "status"].iter().any(|key| {
+        error.get(*key).and_then(Value::as_str).is_some_and(|code| {
+            matches!(
+                code,
+                "overloaded_error"
+                    | "rate_limit_error"
+                    | "rate_limit_exceeded"
+                    | "server_error"
+                    | "api_error"
+                    | "internal_error"
+                    | "internal_server_error"
+                    | "service_unavailable"
+                    | "UNAVAILABLE"
+                    | "RESOURCE_EXHAUSTED"
+                    | "INTERNAL"
+            )
+        })
+    })
+}
+
 #[derive(Default)]
 pub(super) struct SseDecoder {
     pending: Vec<u8>,
@@ -15,12 +40,14 @@ pub(super) struct SseDecoder {
     kind: String,
     total: usize,
 }
+
 pub(super) struct Event {
     pub(super) kind: String,
     pub(super) data: String,
 }
+
 impl SseDecoder {
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Event>, AgentError> {
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Event>, ModelError> {
         self.total = self.total.saturating_add(bytes.len());
         if self.total > 32 * 1024 * 1024 || self.pending.len() + bytes.len() > 8 * 1024 * 1024 {
             return Err(failure("Provider stream exceeded its byte budget"));
@@ -63,49 +90,48 @@ impl SseDecoder {
         self.pending.drain(..used);
         Ok(output)
     }
-    pub fn finish(&self) -> Result<(), AgentError> {
+
+    pub fn finish(&self) -> Result<(), ModelError> {
         if !self.pending.is_empty() || !self.data.is_empty() {
-            return Err(failure("Provider stream ended inside an SSE frame"));
+            return Err(ModelError::transient(
+                "Provider stream ended inside an SSE frame",
+            ));
         }
         Ok(())
     }
 }
-fn delta(
-    content: Option<String>,
-    tools: Option<Vec<ToolCallDelta>>,
-    extra: Option<Value>,
-) -> StreamChunk {
-    StreamChunk {
-        delta: Some(StreamDelta {
-            content,
-            tool_calls: tools,
-            extra,
-        }),
-        finish_reason: None,
-        usage: None,
-    }
-}
-fn text(text: &str) -> StreamChunk {
-    delta(Some(text.into()), None, None)
-}
+
 fn tool(
     index: u32,
     id: Option<String>,
     name: Option<String>,
     arguments: Option<String>,
-) -> StreamChunk {
-    delta(
-        None,
-        Some(vec![ToolCallDelta {
-            index,
-            id,
-            function: Some(FunctionCallDelta { name, arguments }),
-        }]),
-        None,
-    )
+) -> StreamEvent {
+    StreamEvent::ToolCall {
+        index,
+        id,
+        name,
+        arguments,
+    }
 }
-fn native(blocks: Vec<Value>) -> StreamChunk {
-    delta(None, None, Some(json!({"xylo_content_blocks":blocks})))
+
+/// A streamed tool input as JSON: empty input is an empty object, and
+/// `None` means the input stopped before it was valid JSON.
+pub(super) fn tool_input(arguments: &str) -> Option<Value> {
+    if arguments.trim().is_empty() {
+        return Some(json!({}));
+    }
+    serde_json::from_str(arguments).ok()
+}
+
+fn finish_reason(reason: &str) -> Result<FinishReason, ModelError> {
+    match reason {
+        "stop" | "end_turn" | "stop_sequence" => Ok(FinishReason::Stop),
+        "tool_calls" | "tool_use" | "function_call" => Ok(FinishReason::ToolCalls),
+        "length" | "max_tokens" => Ok(FinishReason::Length),
+        "content_filter" | "refusal" => Err(failure("Provider filtered the response")),
+        other => Err(failure(format!("Provider generation stopped ({other})"))),
+    }
 }
 
 pub(super) struct EventState {
@@ -120,9 +146,12 @@ pub(super) struct EventState {
     gemini_parts: Vec<Value>,
     input: u64,
     output: u64,
-    finish_reason: Option<String>,
+    finish_reason: Option<FinishReason>,
     text_emitted: bool,
+    /// A tool input stopped before it was valid JSON.
+    truncated_input: bool,
 }
+
 impl EventState {
     pub fn new(
         protocol: ProviderProtocol,
@@ -143,16 +172,34 @@ impl EventState {
             output: 0,
             finish_reason: None,
             text_emitted: false,
+            truncated_input: false,
         }
     }
+
+    /// Compacts provider indexes (which may skip text blocks) to 0, 1, 2…
     fn index(&mut self, native: u64) -> u32 {
         let next = self.tools.len() as u32;
         *self.tools.entry(native).or_insert(next)
     }
-    pub fn event(&mut self, event: Event) -> Result<Vec<StreamChunk>, AgentError> {
+
+    fn stream_error(&self, value: &Value, fallback: &str) -> ModelError {
+        let message = diagnostics::stream_error(
+            value,
+            &self.error_redactions,
+            fallback,
+            self.request_id.as_deref(),
+        );
+        if transient_code(value) {
+            ModelError::transient(message)
+        } else {
+            ModelError::permanent(message)
+        }
+    }
+
+    pub fn event(&mut self, event: Event) -> Result<Vec<StreamEvent>, ModelError> {
         if event.data == "[DONE]" {
             if self.protocol != ProviderProtocol::ChatCompletions || !self.choice_finished {
-                return Err(failure(
+                return Err(ModelError::transient(
                     "Provider ended a stream without a terminal completion",
                 ));
             }
@@ -162,466 +209,376 @@ impl EventState {
         let value: Value = serde_json::from_str(&event.data)
             .map_err(|error| failure(format!("Invalid provider SSE JSON: {error}")))?;
         if value.get("error").is_some() || event.kind == "error" || value["type"] == "error" {
-            return Err(failure(diagnostics::stream_error(
-                &value,
-                &self.error_redactions,
-                "stream_error",
-                self.request_id.as_deref(),
+            return Err(self.stream_error(&value, "stream_error"));
+        }
+        match self.protocol {
+            ProviderProtocol::ChatCompletions => self.chat(&value),
+            ProviderProtocol::Responses => self.responses(&value, &event.kind),
+            ProviderProtocol::AnthropicMessages => self.anthropic(&value, &event.kind),
+            ProviderProtocol::GeminiGenerateContent => self.gemini(&value),
+            ProviderProtocol::BedrockConverse => {
+                Err(failure("Use the native Bedrock streaming decoder"))
+            }
+        }
+    }
+
+    fn chat(&mut self, value: &Value) -> Result<Vec<StreamEvent>, ModelError> {
+        let mut output = Vec::new();
+        if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+            output.push(StreamEvent::Usage(super::usage(
+                usage["prompt_tokens"].as_u64().unwrap_or(0),
+                usage["completion_tokens"].as_u64().unwrap_or(0),
             )));
         }
+        let Some(choice) = value.pointer("/choices/0") else {
+            return Ok(output);
+        };
+        if let Some(thinking) = choice["delta"]["reasoning_content"].as_str() {
+            output.push(StreamEvent::Reasoning(thinking.into()));
+        }
+        if let Some(content) = choice["delta"]["content"].as_str() {
+            output.push(StreamEvent::Text(content.into()));
+        }
+        for call in choice["delta"]["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let raw = call["index"]
+                .as_u64()
+                .ok_or_else(|| failure("Streaming tool call has no index"))?;
+            let index = self.index(raw);
+            output.push(tool(
+                index,
+                call["id"].as_str().map(str::to_owned),
+                call["function"]["name"].as_str().map(str::to_owned),
+                call["function"]["arguments"].as_str().map(str::to_owned),
+            ));
+        }
+        if let Some(finish) = choice["finish_reason"].as_str() {
+            self.choice_finished = true;
+            output.push(StreamEvent::Finished(finish_reason(finish)?));
+        }
+        Ok(output)
+    }
+
+    fn responses(&mut self, value: &Value, kind: &str) -> Result<Vec<StreamEvent>, ModelError> {
         let mut output = Vec::new();
-        match self.protocol {
-            ProviderProtocol::ChatCompletions => {
-                if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
-                    output.push(StreamChunk {
-                        delta: None,
-                        finish_reason: None,
-                        usage: Some(request::usage(
-                            usage["prompt_tokens"].as_u64().unwrap_or(0),
-                            usage["completion_tokens"].as_u64().unwrap_or(0),
-                        )),
-                    });
-                }
-                if let Some(choice) = value.pointer("/choices/0") {
-                    let content = choice["delta"]["content"].as_str().map(str::to_owned);
-                    let mut tools = Vec::new();
-                    for call in choice["delta"]["tool_calls"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                    {
-                        let raw = call["index"]
-                            .as_u64()
-                            .ok_or_else(|| failure("Streaming tool call has no index"))?;
-                        let index = self.index(raw);
-                        tools.push(ToolCallDelta {
-                            index,
-                            id: call["id"].as_str().map(str::to_owned),
-                            function: Some(FunctionCallDelta {
-                                name: call["function"]["name"].as_str().map(str::to_owned),
-                                arguments: call["function"]["arguments"]
-                                    .as_str()
-                                    .map(str::to_owned),
-                            }),
-                        });
-                    }
-                    let extra = choice["delta"]["reasoning_content"]
+        let kind = value["type"].as_str().unwrap_or(kind);
+        match kind {
+            "response.output_text.delta" => {
+                self.text_emitted = true;
+                output.push(StreamEvent::Text(
+                    value["delta"]
                         .as_str()
-                        .map(|thinking| json!({"thinking":thinking}));
-                    if content.is_some() || !tools.is_empty() || extra.is_some() {
-                        output.push(delta(content, (!tools.is_empty()).then_some(tools), extra));
-                    }
-                    if let Some(finish) = choice["finish_reason"].as_str() {
-                        self.choice_finished = true;
-                        output.push(StreamChunk {
-                            delta: None,
-                            finish_reason: Some(finish.into()),
-                            usage: None,
-                        });
-                    }
+                        .ok_or_else(|| failure("Responses text delta is invalid"))?
+                        .into(),
+                ));
+            }
+            "response.output_item.added" => {
+                let item = &value["item"];
+                let raw = value["output_index"]
+                    .as_u64()
+                    .ok_or_else(|| failure("Responses item has no output index"))?;
+                if item["type"] == "function_call" {
+                    let index = self.index(raw);
+                    output.push(tool(
+                        index,
+                        item["call_id"].as_str().map(str::to_owned),
+                        item["name"].as_str().map(str::to_owned),
+                        None,
+                    ));
                 }
             }
-            ProviderProtocol::Responses => {
-                let kind = value["type"].as_str().unwrap_or(&event.kind);
-                match kind {
-                    "response.output_text.delta" => {
-                        self.text_emitted = true;
-                        output.push(text(
-                            value["delta"]
-                                .as_str()
-                                .ok_or_else(|| failure("Responses text delta is invalid"))?,
+            "response.function_call_arguments.delta" => {
+                let raw = value["output_index"]
+                    .as_u64()
+                    .ok_or_else(|| failure("Responses arguments have no output index"))?;
+                let args = value["delta"]
+                    .as_str()
+                    .ok_or_else(|| failure("Responses arguments delta is invalid"))?;
+                self.tool_arguments.entry(raw).or_default().push_str(args);
+                let index = self.index(raw);
+                output.push(tool(index, None, None, Some(args.into())));
+            }
+            "response.output_item.done" => {
+                let raw = value["output_index"]
+                    .as_u64()
+                    .ok_or_else(|| failure("Responses item has no output index"))?;
+                let item = value["item"].clone();
+                if item["type"] == "function_call" && !self.tool_arguments.contains_key(&raw) {
+                    let index = self.index(raw);
+                    output.push(tool(
+                        index,
+                        item["call_id"].as_str().map(str::to_owned),
+                        item["name"].as_str().map(str::to_owned),
+                        Some(item["arguments"].as_str().unwrap_or("{}").into()),
+                    ));
+                }
+                self.blocks.insert(raw, item);
+            }
+            "response.incomplete"
+                if value
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                    == Some("max_output_tokens") =>
+            {
+                output.extend(self.responses_terminal(value)?);
+            }
+            "response.completed" => output.extend(self.responses_terminal(value)?),
+            "response.failed" | "response.incomplete" => {
+                return Err(self.stream_error(value, kind));
+            }
+            _ => {}
+        }
+        Ok(output)
+    }
+
+    /// The events closing a Responses stream that completed or stopped at
+    /// the output limit.
+    fn responses_terminal(&mut self, value: &Value) -> Result<Vec<StreamEvent>, ModelError> {
+        let mut output = Vec::new();
+        {
+            {
+                let parsed = request::parse_responses(&value["response"])?;
+                if !self.text_emitted && !parsed.text.is_empty() {
+                    output.push(StreamEvent::Text(parsed.text));
+                }
+                if self.tools.is_empty() {
+                    for (index, call) in parsed.calls.into_iter().enumerate() {
+                        output.push(tool(
+                            index as u32,
+                            Some(call.id),
+                            Some(call.name),
+                            Some(call.arguments),
                         ));
                     }
-                    "response.output_item.added" => {
-                        let item = &value["item"];
-                        let raw = value["output_index"]
-                            .as_u64()
-                            .ok_or_else(|| failure("Responses item has no output index"))?;
-                        if item["type"] == "function_call" {
-                            let index = self.index(raw);
-                            output.push(tool(
-                                index,
-                                item["call_id"].as_str().map(str::to_owned),
-                                item["name"].as_str().map(str::to_owned),
-                                None,
-                            ));
-                        }
-                    }
-                    "response.function_call_arguments.delta" => {
-                        let raw = value["output_index"]
-                            .as_u64()
-                            .ok_or_else(|| failure("Responses arguments have no output index"))?;
-                        let args = value["delta"]
-                            .as_str()
-                            .ok_or_else(|| failure("Responses arguments delta is invalid"))?;
-                        self.tool_arguments.entry(raw).or_default().push_str(args);
-                        let index = self.index(raw);
-                        output.push(tool(index, None, None, Some(args.into())));
-                    }
-                    "response.output_item.done" => {
-                        let raw = value["output_index"]
-                            .as_u64()
-                            .ok_or_else(|| failure("Responses item has no output index"))?;
-                        let item = value["item"].clone();
-                        if item["type"] == "function_call"
-                            && !self.tool_arguments.contains_key(&raw)
-                        {
-                            let index = self.index(raw);
-                            output.push(tool(
-                                index,
-                                item["call_id"].as_str().map(str::to_owned),
-                                item["name"].as_str().map(str::to_owned),
-                                Some(item["arguments"].as_str().unwrap_or("{}").into()),
-                            ));
-                        }
-                        self.blocks.insert(raw, item);
-                    }
-                    "response.completed" => {
-                        let response = &value["response"];
-                        let parsed = request::parse_response(
-                            self.protocol,
-                            response,
-                            response["model"].as_str().unwrap_or(""),
-                        )?;
-                        if !self.text_emitted
-                            && let Some(content) = parsed.message.content
-                        {
-                            output.push(text(&content));
-                        }
-                        if self.tools.is_empty() {
-                            for (index, call) in parsed
-                                .message
-                                .tool_calls
-                                .unwrap_or_default()
-                                .into_iter()
-                                .enumerate()
-                            {
-                                output.push(tool(
-                                    index as u32,
-                                    Some(call.id),
-                                    Some(call.function.name),
-                                    Some(call.function.arguments),
-                                ));
-                            }
-                        }
-                        if let Some(blocks) = parsed.message.anthropic_content_blocks {
-                            output.push(native(blocks));
-                        }
-                        output.push(StreamChunk {
-                            delta: None,
-                            finish_reason: parsed.finish_reason,
-                            usage: parsed.usage,
-                        });
-                        self.terminal = true;
-                    }
-                    "response.failed" | "response.incomplete" | "error" => {
-                        return Err(failure(diagnostics::stream_error(
-                            &value,
-                            &self.error_redactions,
-                            kind,
-                            self.request_id.as_deref(),
-                        )));
-                    }
-                    _ => {}
                 }
-            }
-            ProviderProtocol::AnthropicMessages => {
-                let kind = value["type"].as_str().unwrap_or(&event.kind);
-                match kind {
-                    "message_start" => {
-                        let usage = &value["message"]["usage"];
-                        self.input = usage["input_tokens"].as_u64().unwrap_or(0)
-                            + usage["cache_read_input_tokens"].as_u64().unwrap_or(0)
-                            + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-                    }
-                    "content_block_start" => {
-                        let raw = value["index"]
-                            .as_u64()
-                            .ok_or_else(|| failure("Anthropic content block has no index"))?;
-                        let block = value["content_block"].clone();
-                        match block["type"].as_str() {
-                            Some("tool_use") => {
-                                let index = self.index(raw);
-                                output.push(tool(
-                                    index,
-                                    block["id"].as_str().map(str::to_owned),
-                                    block["name"].as_str().map(str::to_owned),
-                                    None,
-                                ));
-                            }
-                            Some("text") => {
-                                if let Some(content) =
-                                    block["text"].as_str().filter(|content| !content.is_empty())
-                                {
-                                    output.push(text(content));
-                                }
-                            }
-                            Some("thinking") => {}
-                            Some("redacted_thinking") => {}
-                            _ => return Err(failure("Unsupported Anthropic content block")),
-                        }
-                        self.blocks.insert(raw, block);
-                    }
-                    "content_block_delta" => {
-                        let raw = value["index"]
-                            .as_u64()
-                            .ok_or_else(|| failure("Anthropic content delta has no index"))?;
-                        let change = &value["delta"];
-                        let block = self
-                            .blocks
-                            .get_mut(&raw)
-                            .ok_or_else(|| failure("Anthropic delta arrived before its block"))?;
-                        match change["type"].as_str() {
-                            Some("text_delta") => {
-                                let content = change["text"]
-                                    .as_str()
-                                    .ok_or_else(|| failure("Invalid Anthropic text delta"))?;
-                                let prior = block["text"].as_str().unwrap_or("").to_owned();
-                                block["text"] = json!(prior + content);
-                                output.push(text(content));
-                            }
-                            Some("thinking_delta") => {
-                                let thinking = change["thinking"]
-                                    .as_str()
-                                    .ok_or_else(|| failure("Invalid Anthropic thinking delta"))?;
-                                let prior = block["thinking"].as_str().unwrap_or("").to_owned();
-                                block["thinking"] = json!(prior + thinking);
-                                output.push(delta(None, None, Some(json!({"thinking":thinking}))));
-                            }
-                            Some("signature_delta") => {
-                                let prior = block["signature"].as_str().unwrap_or("").to_owned();
-                                block["signature"] =
-                                    json!(prior + change["signature"].as_str().unwrap_or(""));
-                            }
-                            Some("input_json_delta") => {
-                                let args = change["partial_json"]
-                                    .as_str()
-                                    .ok_or_else(|| failure("Invalid Anthropic input delta"))?;
-                                self.tool_arguments.entry(raw).or_default().push_str(args);
-                                let index = self.index(raw);
-                                output.push(tool(index, None, None, Some(args.into())));
-                            }
-                            _ => {}
-                        }
-                    }
-                    "content_block_stop" => {
-                        let raw = value["index"]
-                            .as_u64()
-                            .ok_or_else(|| failure("Anthropic stop has no block index"))?;
-                        if let Some(args) = self.tool_arguments.get(&raw) {
-                            let input: Value = serde_json::from_str(args).map_err(|_| {
-                                failure("Anthropic tool input ended before valid JSON")
-                            })?;
-                            self.blocks
-                                .get_mut(&raw)
-                                .ok_or_else(|| failure("Anthropic tool block disappeared"))?["input"] =
-                                input;
-                        } else if let Some(block) = self
-                            .blocks
-                            .get(&raw)
-                            .filter(|block| block["type"] == "tool_use")
-                        {
-                            let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                            let index = self.tools[&raw];
-                            output.push(tool(index, None, None, Some(input.to_string())));
-                        }
-                    }
-                    "message_delta" => {
-                        self.output = value["usage"]["output_tokens"]
-                            .as_u64()
-                            .unwrap_or(self.output);
-                        self.finish_reason = value["delta"]["stop_reason"].as_str().map(|reason| {
-                            match reason {
-                                "end_turn" | "stop_sequence" => "stop",
-                                "tool_use" => "tool_calls",
-                                "max_tokens" => "length",
-                                other => other,
-                            }
-                            .into()
-                        });
-                    }
-                    "message_stop" => {
-                        let finish = self.finish_reason.clone().ok_or_else(|| {
-                            failure("Anthropic stream ended without a stop reason")
-                        })?;
-                        if !matches!(finish.as_str(), "stop" | "tool_calls" | "length") {
-                            return Err(failure(format!(
-                                "Anthropic generation stopped ({finish})"
-                            )));
-                        }
-                        output.push(native(self.blocks.values().cloned().collect()));
-                        output.push(StreamChunk {
-                            delta: None,
-                            finish_reason: Some(finish),
-                            usage: Some(request::usage(self.input, self.output)),
-                        });
-                        self.terminal = true;
-                    }
-                    _ => {}
-                }
-            }
-            ProviderProtocol::GeminiGenerateContent => {
-                if let Some(usage) = value.get("usageMetadata") {
-                    self.input = usage["promptTokenCount"].as_u64().unwrap_or(self.input);
-                    self.output = usage["candidatesTokenCount"].as_u64().unwrap_or(0)
-                        + usage["thoughtsTokenCount"].as_u64().unwrap_or(0);
-                }
-                if let Some(candidate) = value.pointer("/candidates/0") {
-                    for part in candidate["content"]["parts"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                    {
-                        let mut part = part.clone();
-                        if let Some(content) = part["text"].as_str() {
-                            if part["thought"] == true {
-                                output.push(delta(None, None, Some(json!({"thinking":content}))));
-                            } else {
-                                output.push(text(content));
-                            }
-                        }
-                        if let Some(call) = part.get_mut("functionCall") {
-                            let raw = self.tools.len() as u64;
-                            let id = call["id"]
-                                .as_str()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                            call["id"] = json!(id);
-                            let index = self.index(raw);
-                            output.push(tool(
-                                index,
-                                Some(id),
-                                call["name"].as_str().map(str::to_owned),
-                                Some(
-                                    call.get("args")
-                                        .cloned()
-                                        .unwrap_or_else(|| json!({}))
-                                        .to_string(),
-                                ),
-                            ));
-                        }
-                        self.gemini_parts.push(part);
-                    }
-                    if let Some(reason) = candidate["finishReason"].as_str() {
-                        let finish = match reason {
-                            "STOP" => {
-                                if self.tools.is_empty() {
-                                    "stop"
-                                } else {
-                                    "tool_calls"
-                                }
-                            }
-                            "MAX_TOKENS" => "length",
-                            other => {
-                                return Err(failure(format!(
-                                    "Gemini generation stopped ({other})"
-                                )));
-                            }
-                        };
-                        self.finish_reason = Some(finish.into());
-                        self.terminal = true;
-                    }
-                } else if value.get("promptFeedback").is_some() {
-                    return Err(failure("Gemini blocked the prompt"));
-                }
-                if self.terminal {
-                    output.push(native(
-                        self.gemini_parts
-                            .iter()
-                            .map(|part| json!({"type":"xylo_gemini_part","item":part}))
-                            .collect(),
-                    ));
-                    output.push(StreamChunk {
-                        delta: None,
-                        finish_reason: self.finish_reason.clone(),
-                        usage: Some(request::usage(self.input, self.output)),
-                    });
-                }
-            }
-            ProviderProtocol::BedrockConverse => {
-                return Err(failure("Use the native Bedrock streaming decoder"));
+                // The ChatGPT backend streams every output item but sends
+                // `response.completed` with an empty output list. Replay must
+                // use the streamed items then, or the next request carries
+                // tool results without their calls.
+                let items = if parsed.items.is_empty() {
+                    std::mem::take(&mut self.blocks).into_values().collect()
+                } else {
+                    parsed.items
+                };
+                output.push(StreamEvent::Native(NativeContent::Responses(items)));
+                output.push(StreamEvent::Usage(parsed.usage));
+                output.push(StreamEvent::Finished(parsed.finish));
+                self.terminal = true;
             }
         }
         Ok(output)
     }
-    pub fn finish(&self) -> Result<(), AgentError> {
-        if !self.terminal {
-            return Err(failure("Provider stream ended without its terminal event"));
-        }
-        Ok(())
-    }
-}
 
-/// Used by the synchronous Responses facade when the account route mandates SSE.
-#[derive(Default)]
-pub(super) struct Collected {
-    text: String,
-    thinking: String,
-    calls: BTreeMap<u32, ToolCall>,
-    blocks: Option<Vec<Value>>,
-    usage: Option<UsageStats>,
-    finish: Option<String>,
-}
-impl Collected {
-    pub fn push(&mut self, chunk: &StreamChunk) -> Result<(), AgentError> {
-        if let Some(delta) = &chunk.delta {
-            if let Some(text) = &delta.content {
-                self.text.push_str(text);
+    fn anthropic(&mut self, value: &Value, kind: &str) -> Result<Vec<StreamEvent>, ModelError> {
+        let mut output = Vec::new();
+        let kind = value["type"].as_str().unwrap_or(kind);
+        match kind {
+            "message_start" => {
+                let usage = &value["message"]["usage"];
+                self.input = usage["input_tokens"].as_u64().unwrap_or(0)
+                    + usage["cache_read_input_tokens"].as_u64().unwrap_or(0)
+                    + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
             }
-            if let Some(extra) = &delta.extra {
-                if let Some(thinking) = extra["thinking"].as_str() {
-                    self.thinking.push_str(thinking);
+            "content_block_start" => {
+                let raw = value["index"]
+                    .as_u64()
+                    .ok_or_else(|| failure("Anthropic content block has no index"))?;
+                let block = value["content_block"].clone();
+                match block["type"].as_str() {
+                    Some("tool_use") => {
+                        let index = self.index(raw);
+                        output.push(tool(
+                            index,
+                            block["id"].as_str().map(str::to_owned),
+                            block["name"].as_str().map(str::to_owned),
+                            None,
+                        ));
+                    }
+                    Some("text") => {
+                        if let Some(content) =
+                            block["text"].as_str().filter(|content| !content.is_empty())
+                        {
+                            output.push(StreamEvent::Text(content.into()));
+                        }
+                    }
+                    Some("thinking" | "redacted_thinking") => {}
+                    _ => return Err(failure("Unsupported Anthropic content block")),
                 }
-                if let Some(blocks) = extra["xylo_content_blocks"].as_array() {
-                    self.blocks = Some(blocks.clone());
+                self.blocks.insert(raw, block);
+            }
+            "content_block_delta" => {
+                let raw = value["index"]
+                    .as_u64()
+                    .ok_or_else(|| failure("Anthropic content delta has no index"))?;
+                let change = &value["delta"];
+                let block = self
+                    .blocks
+                    .get_mut(&raw)
+                    .ok_or_else(|| failure("Anthropic delta arrived before its block"))?;
+                let mut append = |field: &str, text: &str| {
+                    let prior = block[field].as_str().unwrap_or("").to_owned();
+                    block[field] = json!(prior + text);
+                };
+                match change["type"].as_str() {
+                    Some("text_delta") => {
+                        let content = change["text"]
+                            .as_str()
+                            .ok_or_else(|| failure("Invalid Anthropic text delta"))?;
+                        append("text", content);
+                        output.push(StreamEvent::Text(content.into()));
+                    }
+                    Some("thinking_delta") => {
+                        let thinking = change["thinking"]
+                            .as_str()
+                            .ok_or_else(|| failure("Invalid Anthropic thinking delta"))?;
+                        append("thinking", thinking);
+                        output.push(StreamEvent::Reasoning(thinking.into()));
+                    }
+                    Some("signature_delta") => {
+                        append("signature", change["signature"].as_str().unwrap_or(""));
+                    }
+                    Some("input_json_delta") => {
+                        let args = change["partial_json"]
+                            .as_str()
+                            .ok_or_else(|| failure("Invalid Anthropic input delta"))?;
+                        self.tool_arguments.entry(raw).or_default().push_str(args);
+                        let index = self.index(raw);
+                        output.push(tool(index, None, None, Some(args.into())));
+                    }
+                    _ => {}
                 }
             }
-            for delta in delta.tool_calls.as_deref().unwrap_or(&[]) {
-                let call = self.calls.entry(delta.index).or_insert_with(|| ToolCall {
-                    id: String::new(),
-                    function: FunctionCall {
-                        name: String::new(),
-                        arguments: String::new(),
-                    },
-                    extra_content: None,
+            "content_block_stop" => {
+                let raw = value["index"]
+                    .as_u64()
+                    .ok_or_else(|| failure("Anthropic stop has no block index"))?;
+                if let Some(args) = self.tool_arguments.get(&raw) {
+                    // A tool without arguments streams an empty input; input
+                    // cut off by the output limit is settled at message_stop.
+                    let input = match tool_input(args) {
+                        Some(input) => input,
+                        None => {
+                            self.truncated_input = true;
+                            json!({})
+                        }
+                    };
+                    self.blocks
+                        .get_mut(&raw)
+                        .ok_or_else(|| failure("Anthropic tool block disappeared"))?["input"] =
+                        input;
+                } else if let Some(block) = self
+                    .blocks
+                    .get(&raw)
+                    .filter(|block| block["type"] == "tool_use")
+                {
+                    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                    let index = self.tools[&raw];
+                    output.push(tool(index, None, None, Some(input.to_string())));
+                }
+            }
+            "message_delta" => {
+                self.output = value["usage"]["output_tokens"]
+                    .as_u64()
+                    .unwrap_or(self.output);
+                if let Some(reason) = value["delta"]["stop_reason"].as_str() {
+                    self.finish_reason = Some(finish_reason(reason)?);
+                }
+            }
+            "message_stop" => {
+                let finish = self
+                    .finish_reason
+                    .ok_or_else(|| failure("Anthropic stream ended without a stop reason"))?;
+                if self.truncated_input && finish != FinishReason::Length {
+                    return Err(failure("Anthropic tool input ended before valid JSON"));
+                }
+                output.push(StreamEvent::Native(NativeContent::Anthropic(
+                    self.blocks.values().cloned().collect(),
+                )));
+                output.push(StreamEvent::Usage(super::usage(self.input, self.output)));
+                output.push(StreamEvent::Finished(finish));
+                self.terminal = true;
+            }
+            _ => {}
+        }
+        Ok(output)
+    }
+
+    fn gemini(&mut self, value: &Value) -> Result<Vec<StreamEvent>, ModelError> {
+        let mut output = Vec::new();
+        if let Some(usage) = value.get("usageMetadata") {
+            self.input = usage["promptTokenCount"].as_u64().unwrap_or(self.input);
+            self.output = usage["candidatesTokenCount"].as_u64().unwrap_or(0)
+                + usage["thoughtsTokenCount"].as_u64().unwrap_or(0);
+        }
+        if let Some(candidate) = value.pointer("/candidates/0") {
+            for part in candidate["content"]["parts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let mut part = part.clone();
+                if let Some(content) = part["text"].as_str() {
+                    output.push(if part["thought"] == true {
+                        StreamEvent::Reasoning(content.into())
+                    } else {
+                        StreamEvent::Text(content.into())
+                    });
+                }
+                if let Some(call) = part.get_mut("functionCall") {
+                    let raw = self.tools.len() as u64;
+                    let id = call["id"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    call["id"] = json!(id);
+                    let index = self.index(raw);
+                    output.push(tool(
+                        index,
+                        Some(id),
+                        call["name"].as_str().map(str::to_owned),
+                        Some(
+                            call.get("args")
+                                .cloned()
+                                .unwrap_or_else(|| json!({}))
+                                .to_string(),
+                        ),
+                    ));
+                }
+                self.gemini_parts.push(part);
+            }
+            if let Some(reason) = candidate["finishReason"].as_str() {
+                self.finish_reason = Some(match reason {
+                    "STOP" if self.tools.is_empty() => FinishReason::Stop,
+                    "STOP" => FinishReason::ToolCalls,
+                    "MAX_TOKENS" => FinishReason::Length,
+                    other => return Err(failure(format!("Gemini generation stopped ({other})"))),
                 });
-                if let Some(id) = &delta.id {
-                    call.id = id.clone();
-                }
-                if let Some(function) = &delta.function {
-                    if let Some(name) = &function.name {
-                        call.function.name = name.clone();
-                    }
-                    if let Some(args) = &function.arguments {
-                        call.function.arguments.push_str(args);
-                    }
-                }
+                self.terminal = true;
+            }
+        } else if value.get("promptFeedback").is_some() {
+            return Err(failure("Gemini blocked the prompt"));
+        }
+        if self.terminal {
+            output.push(StreamEvent::Native(NativeContent::Gemini(
+                self.gemini_parts.clone(),
+            )));
+            output.push(StreamEvent::Usage(super::usage(self.input, self.output)));
+            if let Some(finish) = self.finish_reason {
+                output.push(StreamEvent::Finished(finish));
             }
         }
-        if let Some(usage) = &chunk.usage {
-            self.usage = Some(usage.clone());
-        }
-        if let Some(finish) = &chunk.finish_reason {
-            self.finish = Some(finish.clone());
+        Ok(output)
+    }
+
+    pub fn finish(&self) -> Result<(), ModelError> {
+        if !self.terminal {
+            return Err(ModelError::transient(
+                "Provider stream ended without its terminal event",
+            ));
         }
         Ok(())
-    }
-    pub fn response(self, model: &str) -> Result<LlmResponse, AgentError> {
-        if self.finish.is_none() {
-            return Err(failure("Provider did not complete"));
-        }
-        let mut message = Message::assistant(self.text);
-        message.reasoning_content = (!self.thinking.is_empty()).then_some(self.thinking);
-        message.anthropic_content_blocks = self.blocks;
-        let calls = self.calls.into_values().collect::<Vec<_>>();
-        if !calls.is_empty() {
-            message.tool_calls = Some(calls);
-        }
-        Ok(LlmResponse {
-            message,
-            usage: self.usage,
-            model: model.into(),
-            finish_reason: self.finish,
-        })
     }
 }

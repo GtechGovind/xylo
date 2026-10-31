@@ -3,6 +3,12 @@
 //! establish WindowServer presentation, physical input latency or dropped frames.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/assets.rs"]
+mod assets;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -28,18 +34,36 @@ mod xylo {
             cx.notify();
         }
         pub(crate) fn performance_git_fixture(&mut self, count: usize, cx: &mut Context<Self>) {
-            use xylo_runtime::workspace::git::{GitStatus,GitChange,ChangeGroup};
+            use xylo_runtime::workspace::git::{ChangeGroup, GitChange, GitStatus};
             let root = std::path::PathBuf::from("/synthetic-performance-project");
-            let changes = (0..count).map(|index| GitChange { path: format!("src/group-{}/file-{index}.rs",index%50).into(), original:None, index:'M', worktree:'M' }).collect();
-            self.git_panel = work_panel::GitPanel::prepare(root, GitStatus {branch:"main".into(), changes, truncated:false},Default::default());
-            self.git_panel.selected = Some(("src/group-0/file-0.rs".into(),ChangeGroup::Unstaged));
-            self.diff_lines = (0..count).map(|index|format!("+ added line {index}" )).collect();
-            self.settings.ui.work_panel_open=true;
-            self.settings.ui.work_panel="changes".into();
+            let changes = (0..count)
+                .map(|index| GitChange {
+                    path: format!("src/group-{}/file-{index}.rs", index % 50).into(),
+                    original: None,
+                    index: 'M',
+                    worktree: 'M',
+                })
+                .collect();
+            self.git_panel = work_panel::GitPanel::prepare(
+                root,
+                GitStatus {
+                    branch: "main".into(),
+                    changes,
+                    truncated: false,
+                },
+                Default::default(),
+            );
+            self.git_panel.selected = Some(("src/group-0/file-0.rs".into(), ChangeGroup::Unstaged));
+            self.git_panel.diff_lines = (0..count)
+                .map(|index| format!("+ added line {index}"))
+                .collect();
+            self.settings.ui.work_panel_open = true;
+            self.settings.ui.work_panel = "changes".into();
             cx.notify();
         }
-        pub(crate) fn performance_git_scroll(&mut self, index:usize,cx:&mut Context<Self>) {
-            self.diff_scroll.scroll_to_item(index,gpui_kit::ScrollStrategy::Top);
+        pub(crate) fn performance_git_scroll(&mut self, index: usize, cx: &mut Context<Self>) {
+            self.diff_scroll
+                .scroll_to_item(index, gpui_kit::ScrollStrategy::Top);
             cx.notify();
         }
         pub(crate) fn performance_scroll(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -66,17 +90,27 @@ mod xylo {
         pub(crate) fn performance_long_stream(&mut self, cx: &mut Context<Self>) {
             let turn = self.turns.entry(self.session).or_default();
             turn.apply(EngineEvent::Started);
-            let mut text = "A long live response with **formatting** and Unicode αβ.\n\n".repeat(2048);
+            let mut text =
+                "A long live response with **formatting** and Unicode αβ.\n\n".repeat(2048);
             let mut end = 102400.min(text.len());
-            while !text.is_char_boundary(end) { end -= 1; }
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
             text.truncate(end);
             turn.apply(EngineEvent::Delta { text });
             self.sync_history_list(cx);
             self.histories[&self.session].list.scroll_to_end();
             cx.notify();
         }
-        pub(crate) fn performance_composer_edit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-            self.composer.update(cx, |input, cx| input.set_value(format!("Follow-up message {index} αβ"), window, cx));
+        pub(crate) fn performance_composer_edit(
+            &mut self,
+            index: usize,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            self.composer.update(cx, |input, cx| {
+                input.set_value(format!("Follow-up message {index} αβ"), window, cx)
+            });
             self.sync_history_list(cx);
             cx.notify();
         }
@@ -145,7 +179,7 @@ fn measure() -> Result<()> {
     let cold = Instant::now();
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        Arc::new(crate::assets::AppAssets),
         platform::current_headless_renderer,
     );
     cx.update(|cx| {
@@ -248,15 +282,26 @@ fn measure() -> Result<()> {
             window.render_frame(cx);
         })?;
         if index >= 10 {
-            record(&mut metrics, "long_stream_100k_composer_edit_and_cpu_frame", start);
+            record(
+                &mut metrics,
+                "long_stream_100k_composer_edit_and_cpu_frame",
+                start,
+            );
         }
     }
     // Additional current-design stress case; historical comparable metrics above stay unchanged.
-    view.update(&mut cx, |view,cx|view.performance_git_fixture(5000,cx));
-    for index in 0..(samples+10) {
-        let start=Instant::now();
-        cx.update_window(handle, |_,window,cx| { view.update(cx,|view,cx|view.performance_git_scroll((index*31)%5000,cx)); window.render_frame(cx); })?;
-        if index>=10 { record(&mut metrics,"git_5000_changes_scroll_and_cpu_frame",start); }
+    view.update(&mut cx, |view, cx| view.performance_git_fixture(5000, cx));
+    for index in 0..(samples + 10) {
+        let start = Instant::now();
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.performance_git_scroll((index * 31) % 5000, cx)
+            });
+            window.render_frame(cx);
+        })?;
+        if index >= 10 {
+            record(&mut metrics, "git_5000_changes_scroll_and_cpu_frame", start);
+        }
     }
     let metrics: BTreeMap<_, _> = metrics
         .into_iter()

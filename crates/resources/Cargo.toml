@@ -11,8 +11,9 @@ serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+tracing.workspace = true
 fs2 = "0.4"
-sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 libc = "0.2"
 
 [dev-dependencies]

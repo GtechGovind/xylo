@@ -32,7 +32,8 @@ pub(super) fn parse_yaml<T: serde::de::DeserializeOwned>(input: &str) -> Result<
             max_replay_stack_depth: 8,
         },
     };
-    serde_saphyr::from_str_with_options(input, options).context("Invalid or over-budget YAML metadata")
+    serde_saphyr::from_str_with_options(input, options)
+        .context("Invalid or over-budget YAML metadata")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,7 +73,6 @@ pub struct ExtensionComponent {
     pub description: String,
     pub readiness: Readiness,
     pub requirements: Vec<String>,
-    #[serde(default)]
     pub evidence: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,6 +98,8 @@ pub struct SkillMetadata {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoadedSkill {
     pub id: String,
+    /// One-line description from the component manifest, for display.
+    pub description: String,
     pub body: String,
     pub package_root: PathBuf,
     pub allowed_tools: Vec<String>,
@@ -187,8 +189,8 @@ fn apply_codex_metadata(path: &Path, metadata: &mut Frontmatter) -> Result<()> {
         std::fs::metadata(&sidecar)?.len() <= 256 * 1024,
         "Skill host metadata exceeds 256 KiB"
     );
-    let value: Value = parse_yaml(&std::fs::read_to_string(sidecar)?)
-        .context("Invalid agents/openai.yaml")?;
+    let value: Value =
+        parse_yaml(&std::fs::read_to_string(sidecar)?).context("Invalid agents/openai.yaml")?;
     let object = value
         .as_object()
         .context("Skill host metadata must be a mapping")?;
@@ -288,6 +290,36 @@ pub(super) fn tool_names(value: Option<&serde_json::Value>) -> Vec<String> {
         _ => Vec::new(),
     }
 }
+/// Claude Code tool aliases the host maps onto its own tools when a skill or
+/// agent restricts its child's tools.
+const TOOL_ALIASES: &[&str] = &["Read", "Write", "Edit", "Glob", "Grep", "Bash"];
+
+/// Why an `allowed-tools`/`tools` entry cannot be honored, if it cannot. The
+/// host accepts the aliases above and exact host tool names (lowercase
+/// snake_case); parameter patterns such as `Bash(git:*)` would widen or
+/// narrow permissions in ways the host cannot enforce, so they are refused
+/// here, at install, rather than when the skill is invoked.
+fn unsupported_tool(name: &str) -> Option<String> {
+    if TOOL_ALIASES.contains(&name) {
+        return None;
+    }
+    if name.contains(['(', ')', '*', ':']) {
+        return Some(format!(
+            "Unsupported allowed-tools pattern: {name}; list whole tools without parameter patterns"
+        ));
+    }
+    let host_name = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    (!host_name).then(|| {
+        format!(
+            "Unsupported allowed-tools entry: {name}; use {} or an exact Xylo tool name",
+            TOOL_ALIASES.join(", ")
+        )
+    })
+}
 pub(super) fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let relative = Path::new(relative);
     ensure!(
@@ -341,6 +373,11 @@ fn component(root: &Path, path: &Path, kind: ComponentKind) -> Result<ExtensionC
     if meta.hooks.is_some() {
         requirements.push("Skill-scoped hooks require lifecycle setup".into());
     }
+    requirements.extend(
+        tool_names(meta.allowed_tools.as_ref().or(meta.tools.as_ref()))
+            .iter()
+            .filter_map(|name| unsupported_tool(name)),
+    );
     Ok(ExtensionComponent {
         name,
         kind,
@@ -405,7 +442,7 @@ pub(super) fn inspect(
     } else {
         Value::Null
     };
-    let mut name = manifest["name"].as_str().unwrap_or(&fallback).to_string();
+    let mut name = manifest["name"].as_str().unwrap_or(fallback).to_string();
     let version = manifest["version"]
         .as_str()
         .unwrap_or("unversioned")

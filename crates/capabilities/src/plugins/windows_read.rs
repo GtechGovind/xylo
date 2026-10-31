@@ -455,5 +455,5 @@ fn is_volume_root_name(name: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "windows_read_tests.rs"]
+#[path = "windows_read/tests.rs"]
 mod tests;

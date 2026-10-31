@@ -2,6 +2,10 @@
 //! and editor proposals are temporary; no external service or model is used.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -45,7 +49,8 @@ mod xylo {
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
                 // Drive the native receiver's bounded-backlog yield timer.
-                cx.executor().advance_clock(std::time::Duration::from_millis(2));
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(2));
                 cx.run_until_parked();
                 if cx.update(|cx| condition(f.view.read(cx), cx)) {
                     return;

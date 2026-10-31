@@ -1,5 +1,10 @@
 //! Reviewed native component plugins with a durable, application-owned catalog.
 //! Management controls are intentionally absent from agent tool discovery.
+//!
+//! Agents can only run installed packages. Capabilities (workspace reads,
+//! artifact writes, HTTPS hosts) are the grants the user recorded when
+//! reviewing the package; nothing in a tool call can widen them, and there is
+//! no path for running an unreviewed workspace component.
 
 mod catalog;
 mod runtime;
@@ -97,6 +102,7 @@ pub async fn execute_management(
     }
 }
 
+/// Agent-facing plugin tools: list the catalog or run an installed package.
 pub async fn execute_tool(
     config: &CapabilityConfig,
     name: &str,
@@ -148,20 +154,41 @@ pub async fn execute_tool(
             )
             .await
         }
-        "plugin_run" => runtime::legacy(config, args, cancel).await,
         _ => bail!("Unknown plugin tool"),
     }
 }
 
-/// Compatibility entry point; explicit-grant local component execution.
-pub async fn execute(
+/// What the user reviews before an installed plugin runs: the reviewed
+/// package identity plus the grants and budgets that will actually apply.
+/// Grants come only from the catalog; the model's arguments cannot add any.
+pub async fn approval_presentation(
     config: &CapabilityConfig,
     args: &Value,
     cancel: CancellationToken,
-) -> Result<ToolObservation> {
-    runtime::legacy(config, args, cancel).await
+) -> Result<Value> {
+    let id = required_str(args, "id")?.to_owned();
+    let config = config.clone();
+    let catalog = xylo_resources::spawn_blocking(move || catalog::list(&config, &cancel)).await??;
+    let plugin = catalog
+        .plugins
+        .into_iter()
+        .find(|plugin| plugin.manifest.id == id)
+        .ok_or_else(|| anyhow::anyhow!("Plugin is not installed"))?;
+    Ok(json!({
+        "request": args,
+        "plugin": {
+            "id": plugin.manifest.id,
+            "name": plugin.manifest.name,
+            "version": plugin.manifest.version,
+            "package_sha256": plugin.package_sha256,
+            "enabled": plugin.enabled,
+        },
+        "effective_grants": plugin.grants,
+        "budgets": plugin.manifest.budgets,
+    }))
 }
 
+/// Agent-visible plugin tool definitions.
 pub fn definitions() -> Vec<ToolDefinition> {
     vec![
         definition(
@@ -176,13 +203,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
             "Run an enabled installed component by its reviewed package identity. Uses only its stored user grants and package budgets; updates and permission revocation are fenced while running.",
             json!({"id":{"type":"string"},"input":{"type":"string","maxLength":1048576},"package_sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"}}),
             &["id", "package_sha256"],
-            true,
-        ),
-        definition(
-            "plugin_run",
-            "Run a workspace component with explicit grants and bounded resources. No ambient WASI, process or network access. Prefer reviewed installed plugins.",
-            json!({"path":{"type":"string"},"input":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"},"maxItems":32},"memory_mib":{"type":"integer","minimum":8,"maximum":256},"fuel":{"type":"integer","minimum":1,"maximum":100000000},"timeout_seconds":{"type":"integer","minimum":1,"maximum":60}}),
-            &["path"],
             true,
         ),
     ]

@@ -7,8 +7,6 @@ mod chatgpt;
 pub use chatgpt::*;
 mod sign_in_service;
 pub use sign_in_service::*;
-#[cfg(test)]
-mod tests;
 
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -401,24 +399,10 @@ impl ProviderCredential {
             }
             Self::None | Self::Aws { .. } => {}
         }
+        validate_custom_headers(extra)?;
         for (name, value) in extra {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .context("Invalid custom provider header name")?;
-            ensure!(
-                !matches!(
-                    name.as_str(),
-                    "host"
-                        | "content-length"
-                        | "connection"
-                        | "transfer-encoding"
-                        | "authorization"
-                        | "api-key"
-                        | "x-api-key"
-                        | "x-goog-api-key"
-                        | "x-amz-security-token"
-                ),
-                "Provider authentication/transport headers cannot be overridden; use the OS credential store"
-            );
             headers.insert(
                 name,
                 HeaderValue::from_str(value).context("Invalid custom provider header value")?,
@@ -427,3 +411,66 @@ impl ProviderCredential {
         Ok(headers)
     }
 }
+
+/// Fragments that mark a header name as carrying a secret. Matching is by
+/// substring on the lowercased name, so `proxy-authorization`, `x-auth-token`,
+/// `cookie`, `x-session-id` and vendor variants are all refused.
+const SECRET_HEADER_FRAGMENTS: &[&str] = &[
+    "auth",
+    "token",
+    "key",
+    "secret",
+    "cookie",
+    "session",
+    "signature",
+    "password",
+    "credential",
+    "bearer",
+];
+
+/// Headers the HTTP client owns; overriding them breaks or smuggles requests.
+const TRANSPORT_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "connection",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "keep-alive",
+    "proxy-connection",
+];
+
+/// Custom headers are stored in plain settings and turn snapshots, so only
+/// non-secret metadata (tenant, project, version and routing headers) may go
+/// there. Credentials belong in the secret vault. The same rule applies to
+/// chat and image providers.
+pub fn validate_custom_headers(headers: &BTreeMap<String, String>) -> Result<()> {
+    ensure!(headers.len() <= 16, "Use at most 16 custom headers");
+    for (name, value) in headers {
+        let parsed = HeaderName::from_bytes(name.as_bytes())
+            .with_context(|| format!("Invalid custom header name {name:?}"))?;
+        let lower = parsed.as_str();
+        ensure!(
+            lower.len() <= 128 && value.len() <= 4096,
+            "Custom header {name:?} is too long"
+        );
+        ensure!(
+            !TRANSPORT_HEADERS.contains(&lower) && !lower.starts_with("proxy-"),
+            "The {name:?} header is managed by the connection and cannot be set"
+        );
+        ensure!(
+            !lower.starts_with("x-amz-")
+                && !SECRET_HEADER_FRAGMENTS
+                    .iter()
+                    .any(|fragment| lower.contains(fragment)),
+            "The {name:?} header looks like a credential; save secrets as the connection's key, not as a custom header"
+        );
+        HeaderValue::from_str(value)
+            .with_context(|| format!("Invalid value for custom header {name:?}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

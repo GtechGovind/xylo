@@ -1,0 +1,1 @@
+Most actions run without asking. The user is asked only for actions the application assesses as potentially unsafe: destructive or irreversible commands, writes outside the workspace, access to credentials or secrets, uploads, force pushes and privilege escalation. Prefer the safe form of an action when one exists.

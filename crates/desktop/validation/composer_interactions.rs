@@ -1,6 +1,10 @@
 //! Production composer controls with no live account, inference, or device use.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -66,6 +70,8 @@ mod xylo {
                 });
                 window.render_frame(cx);
                 window.click("nav-connections", cx);
+                window.render_frame(cx);
+                window.click("connector-add", cx);
                 assert!(view.read(cx).page == super::Page::Connectors);
                 window.render_frame(cx);
                 assert!(window.find("transport-stdio").visible());
@@ -81,7 +87,8 @@ mod xylo {
                     view.navigate(super::Page::Files, cx);
                 });
                 window.render_frame(cx);
-                assert!(window.find("files-open-project").visible());
+                // One way to open a project from the empty Files pane.
+                assert!(window.try_find("files-open-project").is_none());
                 assert!(window.find("editor-open-project").visible());
             })
             .unwrap();
@@ -219,33 +226,42 @@ mod xylo {
         ) {
             let (window, view) = open(cx);
             cx.update_window(window, |_, window, cx| {
-                view.update(cx, |view, cx| model(view, cx));
+                view.update(cx, model);
                 window.render_frame(cx);
                 let permission = window.find("composer-permissions").bounds();
-                let context = window.find("composer-context").bounds();
                 let model = window.find("composer-model").bounds();
                 let send = window.find("send-prompt").bounds();
                 let input = window.find_by_label("Message").bounds();
                 assert!(send.bottom() - input.top() <= px(88.), "A one-line composer should not reserve a large blank input region: input={input:?}, send={send:?}");
                 assert!(
-                    permission.origin.x < context.origin.x
-                        && context.origin.x < model.origin.x
-                        && model.origin.x < send.origin.x
+                    window.try_find("composer-context").is_none(),
+                    "The context ring stays hidden until the chat uses 5% of the window"
+                );
+                assert!(permission.origin.x < model.origin.x && model.origin.x < send.origin.x);
+                view.update(cx, |view, cx| {
+                    view.turns.entry(view.session).or_default().context =
+                        Some(xylo_core::ContextUsage {
+                            capacity: 100_000,
+                            messages: 17_000,
+                            ..Default::default()
+                        });
+                    cx.notify();
+                });
+                window.render_frame(cx);
+                let context = window.find("composer-context").bounds();
+                let model = window.find("composer-model").bounds();
+                assert!(
+                    permission.origin.x < context.origin.x && context.origin.x < model.origin.x,
+                    "The ring sits just before the model control"
                 );
                 assert!(
                     window.try_find("composer-reasoning").is_none(),
                     "Effort belongs in the unified control, not another toolbar selector"
                 );
                 window.click("composer-model", cx);
-                assert!(window.try_find("composer-model-options").is_some());
-                assert!(window.try_find(("composer-effort", 1usize)).is_some());
-                window.click(("composer-effort", 1usize), cx);
-                assert_eq!(
-                    view.read(cx).settings.provider.reasoning_effort.as_deref(),
-                    Some("high")
-                );
-                window.click("composer-effort-default", cx);
-                assert_eq!(view.read(cx).settings.provider.reasoning_effort, None);
+                // The picker lists models directly with an inline reasoning menu.
+                assert!(window.try_find("composer-model-list").is_some());
+                assert!(window.try_find("composer-effort").is_some());
             })
             .unwrap();
         }
@@ -264,7 +280,8 @@ mod xylo {
                 let surface=window.find_by_label("Message").bounds();
                 let mut right=surface.left()-px(4.);
                 for id in ["composer-context-actions","composer-permissions","composer-context","composer-model","record-voice-composer","send-prompt"] {
-                    let item=window.find(id).bounds();
+                    // The context ring is hidden until the chat uses 5% of the window.
+                    let Some(item)=window.try_find(id).map(|node|node.bounds()) else { assert_eq!(id,"composer-context"); continue; };
                     assert!(item.left()>=right && item.right()<=surface.right()+px(4.),"{id} clips or overlaps in the actual split workspace: {item:?}, surface {surface:?}");right=item.right();
                 }
             }).unwrap();
@@ -273,15 +290,15 @@ mod xylo {
         fn unified_model_switching_honors_explicit_unsupported_metadata(cx: &mut TestAppContext) {
             let (window, view) = open(cx);
             cx.update_window(window, |_, window, cx| {
-                view.update(cx, |view, cx| model(view, cx));
+                view.update(cx, model);
                 window.render_frame(cx);
                 window.click("composer-model", cx);
-                window.click("composer-model-options", cx);
                 window.click(("composer-model-choice", 1usize), cx);
                 assert_eq!(view.read(cx).settings.provider.model, "future-fast");
                 window.render_frame(cx);
+                window.click("composer-model", cx);
                 assert!(
-                    window.try_find(("composer-effort", 0usize)).is_none(),
+                    window.try_find("composer-effort").is_none(),
                     "Unsupported models cannot expose effort choices"
                 );
             })
@@ -313,15 +330,20 @@ mod xylo {
         }
         #[gpui_kit::test]
         fn shortened_legacy_diff_cannot_be_approved_by_keyboard(cx: &mut TestAppContext) {
-            let (_, view) = open(cx);
-            view.update(cx, |view, cx| {
-                let id = uuid::Uuid::new_v4();
-                view.turns.entry(view.session).or_default().apply(EngineEvent::ApprovalRequired {
-                    action_id:id, name:"file_edit".into(), arguments:serde_json::json!({"path":"large.txt","diff":"shortened", "diff_truncated":true}), rule:None
+            let (window, view) = open(cx);
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    let id = uuid::Uuid::new_v4();
+                    view.turns.entry(view.session).or_default().apply(EngineEvent::ApprovalRequired {
+                        parent_id: None, rule_key: None, reason: None, action_id:id, name:"file_edit".into(), arguments:serde_json::json!({"path":"large.txt","diff":"shortened", "diff_truncated":true}), rule:None
+                    });
+                    // The shortcut applies: chat page, card shown, composer focused.
+                    view.composer.update(cx, |input, cx| input.focus(window, cx));
+                    view.allow_pending(window, cx);
+                    assert!(view.turns[&view.session].tools[0].approval, "A legacy shortened action must remain unapproved");
                 });
-                view.allow_pending(cx);
-                assert!(view.turns[&view.session].tools[0].approval, "A legacy shortened action must remain unapproved");
-            });
+            })
+            .unwrap();
         }
         #[gpui_kit::test]
         fn split_preserves_readable_chat_and_restores_saved_panel_preference(
@@ -411,7 +433,7 @@ mod xylo {
                 view.update(cx, |view, cx| {
                     let turn = view.turns.entry(view.session).or_default();
                     turn.apply(EngineEvent::Started);
-                    turn.apply(EngineEvent::ApprovalRequired {action_id:uuid::Uuid::new_v4(), name:"file_write".into(), arguments:presentation.clone(), rule:None});
+                    turn.apply(EngineEvent::ApprovalRequired {parent_id: None, rule_key: None, reason: None, action_id:uuid::Uuid::new_v4(), name:"file_write".into(), arguments:presentation.clone(), rule:None});
                     view.invalidate_live_history(); view.sync_history_list(cx); cx.notify();
                 });
                 window.render_frame(cx);
@@ -434,7 +456,7 @@ mod xylo {
                 view.update(cx, |view, cx| {
                     let turn = view.turns.entry(view.session).or_default();
                     turn.apply(EngineEvent::Started);
-                    turn.apply(EngineEvent::ApprovalRequired {action_id:id, name:"shell_command".into(), arguments:arguments.clone(), rule:None});
+                    turn.apply(EngineEvent::ApprovalRequired {parent_id: None, rule_key: None, reason: None, action_id:id, name:"shell_command".into(), arguments:arguments.clone(), rule:None});
                     view.invalidate_live_history(); view.sync_history_list(cx); cx.notify();
                 });
                 window.render_frame(cx);
@@ -444,7 +466,7 @@ mod xylo {
                 window.render_frame(cx);
                 assert!(window.try_find(("approval-full", 0usize)).is_some());
                 view.update(cx, |view, cx| {
-                    view.turns.get_mut(&view.session).unwrap().apply(EngineEvent::ToolFinished { action_id:id, name:"shell_command".into(), result:"done".into(), success:true });
+                    view.turns.get_mut(&view.session).unwrap().apply(EngineEvent::ToolFinished { parent_id: None, action_id:id, name:"shell_command".into(), result:"done".into(), success:true });
                     view.expanded_tools.insert(id);
                     view.invalidate_live_history(); view.sync_history_list(cx); cx.notify();
                 });
@@ -474,6 +496,7 @@ mod xylo {
                         .or_default()
                         .apply(EngineEvent::Started);
                     let turn = xylo_core::TurnRequest {
+                        approved_rules: Vec::new(),
                         session_id: view.session,
                         turn_id: uuid::Uuid::new_v4(),
                         workspace: view.workspace.clone().unwrap(),
@@ -515,10 +538,7 @@ mod xylo {
                         "Routine queued status must not add a duplicate footer"
                     );
                     assert!(window.find("steer-prompt").visible());
-                    assert_eq!(
-                        window.find("send-prompt").label().as_deref(),
-                        Some("Queue message")
-                    );
+                    assert_eq!(window.find("send-prompt").label(), Some("Queue message"));
                 }
                 view.update(cx, |view, cx| {
                     view.session = uuid::Uuid::new_v4();
@@ -553,10 +573,7 @@ mod xylo {
                 });
                 window.render_frame(cx);
                 assert!(window.try_find("send-prompt").is_some());
-                assert_eq!(
-                    window.find("send-prompt").label().as_deref(),
-                    Some("Queue message")
-                );
+                assert_eq!(window.find("send-prompt").label(), Some("Queue message"));
                 assert!(
                     window.try_find("steer-prompt").is_some(),
                     "Busy composer needs an explicit Steer control"

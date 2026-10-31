@@ -11,6 +11,8 @@ mod memory_facts;
 pub use memory_facts::*;
 mod memory_forms;
 pub use memory_forms::*;
+mod schema;
+pub use schema::DatabaseReset;
 mod store;
 pub use store::*;
 pub mod action_review;
@@ -24,19 +26,19 @@ pub use memory::*;
 mod connectors;
 pub use connectors::*;
 pub mod attachments;
+pub mod extensions;
 mod history_search;
 pub mod image_generation;
 mod learning;
 pub mod providers;
-pub mod extensions;
 pub mod sandbox;
 pub use history_search::*;
 pub use learning::*;
-
-#[cfg(test)]
-mod tests;
 
 mod extension_receipts;
 
 mod turn_queue;
 pub use turn_queue::*;
+
+#[cfg(test)]
+mod tests;

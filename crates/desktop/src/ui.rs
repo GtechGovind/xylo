@@ -8,11 +8,9 @@
 //! a single indigo accent (trust, focus) marks the one thing to act on, with
 //! mint reserved for success so progress reads at a glance. Display text is a
 //! tight sans; generous radii soften every control the user touches.
-/// The complete shared icon catalog; extras are embedded through `crate::assets`.
-pub use gpui_kit::assets::IconName as Glyph;
-use gpui_kit::component::{Icon, IconName};
+use crate::icons::AppIcon;
+use gpui_kit::component::Icon;
 use gpui_kit::{prelude::*, *};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Xylo's mark drawn directly in Rust for the window icon: a white prompt
@@ -179,92 +177,49 @@ pub fn diff_added_bg() -> u32 {
 pub fn diff_removed_bg() -> u32 {
     color(0xfdeceb, 0x3a2224)
 }
-/// Modal scrim.
-pub fn scrim() -> u32 {
-    color(0x0f1117, 0x000000)
-}
 
 // ---------------------------------------------------------------------------
 // Typography
 // ---------------------------------------------------------------------------
 
-static SERIF: OnceLock<SharedString> = OnceLock::new();
+/// Line height for text clipped to one line. Toolkit buttons use 1.25, and a
+/// clipped line box that short cuts off descenders (g, y, p) at 13 px; 1.45
+/// keeps the whole glyph inside the box.
+pub const SINGLE_LINE_HEIGHT: f32 = 1.45;
 
-/// Pick the installed serif face closest to an editorial book face once, so
-/// text runs never repeat a failed font lookup.
-pub fn install_fonts(cx: &App) {
-    if SERIF.get().is_some() {
-        return;
+/// One line of text that ends in an ellipsis when it does not fit, with a line
+/// box tall enough for descenders. Use it instead of `truncate()` for every
+/// clipped label; place it in a row that centers items vertically so the
+/// taller line box does not shift the text.
+pub trait SingleLine: Styled + Sized {
+    fn single_line(self) -> Self {
+        self.truncate().line_height(relative(SINGLE_LINE_HEIGHT))
     }
-    let installed = cx.text_system().all_font_names();
-    let candidates = [
-        "Iowan Old Style",
-        "Charter",
-        "Georgia",
-        "Palatino",
-        "New York",
-        "Noto Serif",
-        "Source Serif 4",
-        "Source Serif Pro",
-        "Libre Baskerville",
-        "Liberation Serif",
-        "DejaVu Serif",
-        "Cambria",
-        "Times New Roman",
-    ];
-    let chosen = candidates
-        .iter()
-        .find(|name| installed.iter().any(|installed| installed == *name))
-        .map(|name| SharedString::from(*name));
-    let _ = SERIF
-        .set(chosen.unwrap_or_else(|| gpui_kit::component::Theme::global(cx).font_family.clone()));
 }
-/// Installed book serif, kept available for editorial surfaces.
-#[allow(dead_code)]
-pub fn serif() -> SharedString {
-    SERIF
-        .get()
-        .cloned()
-        .unwrap_or_else(|| SharedString::from("Georgia"))
-}
+impl<T: Styled> SingleLine for T {}
+
 pub fn mono(cx: &App) -> SharedString {
     gpui_kit::component::Theme::global(cx)
         .mono_font_family
         .clone()
 }
 
-/// Large serif display text.
+/// Large display text.
 pub fn display(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(30.))
-        .line_height(relative(1.2))
+        .line_height(relative(1.3))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(crate::ui::text()))
         .child(text.into())
 }
-/// Serif page title, used at the top of settings and tool pages.
+/// Page title, used at the top of settings and tool pages.
 pub fn title(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(24.))
-        .line_height(relative(1.25))
+        .line_height(relative(1.3))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(crate::ui::text()))
-        .child(text.into())
-}
-/// Sans section heading inside a page.
-pub fn section_title(text: impl Into<SharedString>) -> Div {
-    div()
-        .text_size(px(15.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(crate::ui::text()))
-        .child(text.into())
-}
-/// Small uppercase-style caption used above groups of rows.
-pub fn eyebrow(text: impl Into<SharedString>) -> Div {
-    div()
-        .text_size(px(11.5))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(muted()))
         .child(text.into())
 }
 pub fn subtitle(text: impl Into<SharedString>) -> Div {
@@ -295,10 +250,6 @@ pub fn heading(title_text: impl Into<SharedString>, description: impl Into<Share
 // ---------------------------------------------------------------------------
 // Icons
 // ---------------------------------------------------------------------------
-
-pub fn icon(name: impl Into<Icon>) -> Icon {
-    Icon::new(name).size(px(16.))
-}
 
 /// Asset path of Xylo's own mark; `crate::assets::AppAssets` serves its bytes.
 pub const XYLO_MARK: &str = "icons/xylo-mark.svg";
@@ -375,10 +326,6 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_
         .hover(|d| d.bg(rgb(hover())))
         .active(|d| d.bg(rgb(pressed())))
 }
-/// Alias of [`button`] for readability at call sites that mix variants.
-pub fn ghost(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_kit::base::Button {
-    button(id, label)
-}
 /// Outlined action on raised surfaces.
 pub fn secondary(
     id: impl Into<ElementId>,
@@ -401,51 +348,6 @@ pub fn primary(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui
         .hover(|d| d.bg(rgb(color(0x2b2f3a, 0xd3d7e2))))
         .active(|d| d.bg(rgb(color(0x3b4049, 0xb9bfcc))))
 }
-/// Brand-coloured call to action (send, confirm, upgrade).
-pub fn brand_button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-) -> gpui_kit::base::Button {
-    button_base(id, label)
-        .self_start()
-        .flex_shrink_0()
-        .bg(rgb(brand()))
-        .text_color(rgb(brand_foreground()))
-        .hover(|d| d.bg(rgb(brand_hover())))
-}
-/// Destructive confirmation.
-pub fn danger_button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-) -> gpui_kit::base::Button {
-    button_base(id, label)
-        .bg(rgb(danger_bg()))
-        .text_color(rgb(danger()))
-        .border_color(rgb(danger_bg()))
-        .hover(|d| d.bg(rgb(color(0xfbdfdb, 0x4a2b2b))))
-}
-/// Compact toolbar action with an accessible name independent of its glyph.
-pub fn icon_button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    name: impl Into<Icon>,
-) -> gpui_kit::base::Button {
-    let label: SharedString = label.into();
-    focus_ring(gpui_kit::base::Button::new(id))
-        .accessibility_label(label.clone())
-        .tooltip(move |_, cx| cx.new(|_| XyloTooltip(label.clone())).into())
-        .size(px(32.))
-        .flex_shrink_0()
-        .rounded(px(8.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(rgb(muted()))
-        .cursor_pointer()
-        .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
-        .active(|style| style.bg(rgb(pressed())))
-        .child(icon(name).size(px(18.)))
-}
 /// Rounded chip used for composer controls and filters: icon, label, caret.
 pub fn pill(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_kit::base::Button {
     let label: SharedString = label.into();
@@ -466,11 +368,7 @@ pub fn pill(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_ki
         .active(|style| style.bg(rgb(pressed())))
         .child(label)
 }
-/// Outlined chip, used for suggestion prompts on the home screen.
-pub fn chip(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_kit::base::Button {
-    chip_with(id, None, label)
-}
-/// [`chip`] with a leading glyph.
+/// Outlined suggestion chip with an optional leading glyph.
 pub fn chip_with(
     id: impl Into<ElementId>,
     glyph: Option<Icon>,
@@ -512,13 +410,11 @@ pub fn send_button(
         .flex()
         .items_center()
         .justify_center()
-        .bg(rgb(if disabled {
-            color(0xcfd4e0, 0x353b4a)
-        } else {
-            brand()
-        }))
+        // Disabled stays discoverable: a neutral fill with the arrow at
+        // secondary-text contrast; the brand fill marks a sendable message.
+        .bg(rgb(if disabled { hover() } else { brand() }))
         .text_color(rgb(if disabled {
-            color(0xffffff, 0x8f97a6)
+            text_secondary()
         } else {
             brand_foreground()
         }))
@@ -550,7 +446,7 @@ pub fn stop_button(
         .text_color(rgb(color(0xffffff, 0x15171d)))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(color(0x2b2f3a, 0xd3d7e2))))
-        .child(icon(IconName::Square).size(px(11.)))
+        .child(crate::icons::small(AppIcon::Stop))
 }
 /// Segmented choice (theme, timeouts, modes).
 pub fn segment(
@@ -598,14 +494,14 @@ pub fn segments() -> Div {
 pub fn nav_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
-    name: impl Into<Icon>,
+    name: AppIcon,
 ) -> gpui_kit::base::Button {
     nav_item(id, label, name, false)
 }
 pub fn nav_item(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
-    name: impl Into<Icon>,
+    name: AppIcon,
     active: bool,
 ) -> gpui_kit::base::Button {
     let label: SharedString = label.into();
@@ -628,12 +524,12 @@ pub fn nav_item(
         .cursor_pointer()
         .hover(|d| d.bg(rgb(hover())).text_color(rgb(text())))
         .active(|d| d.bg(rgb(pressed())))
-        .child(
-            icon(name)
-                .size(px(16.))
-                .text_color(rgb(if active { text() } else { muted() })),
-        )
-        .child(div().flex_1().min_w_0().truncate().child(label))
+        .child(crate::icons::icon(name).text_color(rgb(if active {
+            crate::icons::hover_color()
+        } else {
+            crate::icons::rest_color()
+        })))
+        .child(div().flex_1().min_w_0().single_line().child(label))
 }
 /// Sidebar row for a conversation: title only, quietly truncated.
 pub fn recent_item(
@@ -659,7 +555,7 @@ pub fn recent_item(
         .items_center()
         .gap_2()
         .justify_start()
-        .child(div().flex_1().min_w_0().truncate().child(label))
+        .child(div().flex_1().min_w_0().single_line().child(label))
 }
 /// Caption above a group of sidebar rows.
 pub fn sidebar_label(label: impl Into<SharedString>) -> Div {
@@ -668,7 +564,7 @@ pub fn sidebar_label(label: impl Into<SharedString>) -> Div {
         .h(px(28.))
         .flex_shrink_0()
         .min_w_0()
-        .overflow_hidden()
+        .single_line()
         .flex()
         .items_center()
         .text_size(px(11.5))
@@ -693,27 +589,6 @@ pub fn card() -> Div {
         .flex_col()
         .gap_3()
 }
-/// Flat tinted surface on the canvas: no border, no shadow.
-/// (Named `flat_card` because `gpui::surface` exists on macOS.)
-pub fn flat_card() -> Div {
-    div()
-        .p(px(16.))
-        .rounded(px(12.))
-        .bg(rgb(well()))
-        .flex()
-        .flex_col()
-        .gap_3()
-}
-/// Floating surface for menus and popovers.
-pub fn popover_surface() -> Div {
-    div()
-        .rounded(px(12.))
-        .bg(rgb(panel()))
-        .border_1()
-        .border_color(rgb(border()))
-        .shadow_lg()
-        .p(px(6.))
-}
 /// Hairline separator.
 pub fn divider() -> Div {
     div().w_full().h(px(1.)).bg(rgb(border())).flex_shrink_0()
@@ -735,7 +610,6 @@ pub fn kbd(text: impl Into<SharedString>) -> Div {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BadgeTone {
     Neutral,
-    Brand,
     Success,
     Warning,
     Danger,
@@ -744,7 +618,6 @@ pub enum BadgeTone {
 pub fn badge(text: impl Into<SharedString>, tone: BadgeTone) -> Div {
     let (background, foreground) = match tone {
         BadgeTone::Neutral => (well(), text_secondary()),
-        BadgeTone::Brand => (brand_soft(), accent_text()),
         BadgeTone::Success => (success_bg(), success()),
         BadgeTone::Warning => (warning_bg(), warning()),
         BadgeTone::Danger => (danger_bg(), danger()),
@@ -761,7 +634,7 @@ pub fn badge(text: impl Into<SharedString>, tone: BadgeTone) -> Div {
         .text_color(rgb(foreground))
         .child(text.into())
 }
-/// Centered empty state with a serif title.
+/// Centered empty state with a title and description.
 pub fn empty_state(
     title_text: impl Into<SharedString>,
     description: impl Into<SharedString>,
@@ -783,54 +656,13 @@ pub fn empty_state(
         )
         .child(subtitle(description).max_w(px(420.)))
 }
-/// A settings row: title and description on the left, the control on the right.
-pub fn setting_row(title_text: impl Into<SharedString>, detail: impl Into<SharedString>) -> Div {
-    div()
-        .w_full()
-        .py(px(14.))
-        .px(px(18.))
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_3()
-        .child(
-            div()
-                .flex_1()
-                .flex_basis(px(220.))
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap(px(3.))
-                .child(
-                    div()
-                        .text_size(px(13.5))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(text()))
-                        .child(title_text.into()),
-                )
-                .child(subtitle(detail)),
-        )
-}
-/// Group of [`setting_row`]s separated by hairlines.
-pub fn setting_group() -> Div {
-    div()
-        .w_full()
-        .rounded(px(12.))
-        .bg(rgb(panel()))
-        .border_1()
-        .border_color(rgb(border()))
-        .flex()
-        .flex_col()
-        .overflow_hidden()
-}
 /// Inline notice: a tinted band with an icon and message.
 pub fn notice(tone: BadgeTone, message: impl Into<SharedString>) -> Div {
     let (background, foreground, glyph) = match tone {
-        BadgeTone::Success => (success_bg(), success(), IconName::CircleCheck),
-        BadgeTone::Warning => (warning_bg(), warning(), IconName::TriangleAlert),
-        BadgeTone::Danger => (danger_bg(), danger(), IconName::CircleAlert),
-        BadgeTone::Brand => (brand_soft(), accent_text(), IconName::Info),
-        BadgeTone::Neutral => (well(), text_secondary(), IconName::Info),
+        BadgeTone::Success => (success_bg(), success(), AppIcon::Success),
+        BadgeTone::Warning => (warning_bg(), warning(), AppIcon::Warning),
+        BadgeTone::Danger => (danger_bg(), danger(), AppIcon::Error),
+        BadgeTone::Neutral => (well(), text_secondary(), AppIcon::Info),
     };
     div()
         .w_full()
@@ -845,9 +677,8 @@ pub fn notice(tone: BadgeTone, message: impl Into<SharedString>) -> Div {
         .line_height(relative(1.5))
         .text_color(rgb(foreground))
         .child(
-            icon(glyph)
-                .size(px(15.))
-                .mt(px(2.))
+            crate::icons::small(glyph)
+                .mt(px(3.))
                 .text_color(rgb(foreground)),
         )
         .child(div().flex_1().min_w_0().child(message.into()))
@@ -884,15 +715,19 @@ impl Render for XyloTooltip {
 pub struct XyloSwitch {
     id: ElementId,
     label: SharedString,
+    /// Render only the track; the label stays the accessible name.
+    label_hidden: bool,
     checked: bool,
     disabled: bool,
-    change: Option<std::rc::Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
+    change: Option<SwitchHandler>,
 }
+type SwitchHandler = std::rc::Rc<dyn Fn(&bool, &mut Window, &mut App)>;
 impl XyloSwitch {
     pub fn new(id: impl Into<ElementId>) -> Self {
         Self {
             id: id.into(),
             label: "".into(),
+            label_hidden: false,
             checked: false,
             disabled: false,
             change: None,
@@ -900,6 +735,12 @@ impl XyloSwitch {
     }
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.label = label.into();
+        self
+    }
+    /// Shows only the track, for rows whose own text names the setting. The
+    /// label is still the switch's accessible name.
+    pub fn hide_label(mut self) -> Self {
+        self.label_hidden = true;
         self
     }
     pub fn checked(mut self, checked: bool) -> Self {
@@ -920,6 +761,7 @@ impl RenderOnce for XyloSwitch {
         let checked = self.checked;
         let disabled = self.disabled;
         let change = self.change;
+        let visible_label = (!self.label_hidden).then(|| self.label.clone());
         gpui_kit::base::Switch::new(self.id)
             .checked(checked)
             .disabled(disabled)
@@ -954,7 +796,7 @@ impl RenderOnce for XyloSwitch {
                             .shadow_sm(),
                     ),
             )
-            .child(self.label)
+            .children(visible_label)
             .on_change(move |checked, _, window, cx| {
                 if let Some(change) = &change {
                     change(&checked, window, cx);
@@ -1040,3 +882,7 @@ pub fn sync_toolkit_theme(cx: &mut App) {
         theme.font_size = px(14.);
     });
 }
+
+#[cfg(test)]
+#[path = "ui/tests.rs"]
+mod tests;

@@ -1,7 +1,7 @@
 //! SigV4 for the two fixed, read-only Bedrock catalog endpoints. Inference uses
 //! the native Converse adapter. No credential process, shell, or env mutation.
 use super::*;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -67,15 +67,15 @@ fn sign_get(
         .collect::<String>();
     let signed_headers = headers.keys().cloned().collect::<Vec<_>>().join(";");
     let canonical = format!(
-        "GET\n{}\n{query}\n{canonical_headers}\n{signed_headers}\n{:x}",
+        "GET\n{}\n{query}\n{canonical_headers}\n{signed_headers}\n{}",
         url.path(),
-        Sha256::digest([])
+        hex::encode(Sha256::digest([]))
     );
     let short = &date[..8];
     let scope = format!("{short}/{region}/{service}/aws4_request");
     let to_sign = format!(
-        "AWS4-HMAC-SHA256\n{date}\n{scope}\n{:x}",
-        Sha256::digest(canonical)
+        "AWS4-HMAC-SHA256\n{date}\n{scope}\n{}",
+        hex::encode(Sha256::digest(canonical))
     );
     let date_key = hmac(format!("AWS4{secret}").as_bytes(), short.as_bytes());
     let region_key = hmac(&date_key, region.as_bytes());
@@ -123,28 +123,6 @@ pub(super) fn catalog_headers(
         BTreeMap::new(),
     )
 }
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn official_iam_list_users_signature_matches_aws_reference_vector() {
-        // AWS IAM SigV4 example (2015-08-30), public synthetic credentials.
-        let headers = sign_get(
-            &Url::parse("https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08").unwrap(),
-            "us-east-1",
-            "iam",
-            "AKIDEXAMPLE",
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            None,
-            "20150830T123600Z",
-            BTreeMap::from([(
-                "content-type".into(),
-                "application/x-www-form-urlencoded; charset=utf-8".into(),
-            )]),
-        )
-        .unwrap();
-        assert!(headers["authorization"].to_str().unwrap().ends_with(
-            "Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
-        ));
-    }
-}
+mod tests;

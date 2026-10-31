@@ -22,7 +22,7 @@ struct Usage {
     receipts: u64,
 }
 fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 fn directory(manager: &Manager, id: Uuid) -> PathBuf {
     manager

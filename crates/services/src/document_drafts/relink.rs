@@ -26,13 +26,6 @@ pub struct DocumentDraftRelinkReceipt {
     pub previous_revision: i64,
     pub updated_at: i64,
 }
-fn initialize_relinks(conn: &mut Connection) -> Result<()> {
-    initialize(conn)?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS document_draft_relinks(operation_id TEXT PRIMARY KEY,request TEXT NOT NULL CHECK(json_valid(request)),receipt TEXT NOT NULL CHECK(json_valid(receipt)));
-CREATE TRIGGER IF NOT EXISTS document_relink_immutable_update BEFORE UPDATE ON document_draft_relinks BEGIN SELECT RAISE(ABORT,'Document relink receipt is immutable');END;
-CREATE TRIGGER IF NOT EXISTS document_relink_immutable_delete BEFORE DELETE ON document_draft_relinks BEGIN SELECT RAISE(ABORT,'Document relink receipt is immutable');END;")?;
-    Ok(())
-}
 fn receipt(conn: &Connection, id: Uuid) -> Result<Option<DocumentDraftRelinkReceipt>> {
     let json: Option<String> = conn
         .query_row(
@@ -146,8 +139,7 @@ pub fn verify_document_relink_source(
         hash.update(&buffer[..n]);
     }
     ensure!(
-        bytes == request.source.bytes
-            && format!("{:x}", hash.finalize()) == request.source.revision,
+        bytes == request.source.bytes && hex::encode(hash.finalize()) == request.source.revision,
         "The selected original differs from the saved version"
     );
     Ok(())
@@ -164,7 +156,6 @@ impl Store {
             "Invalid saved document location request"
         );
         self.call(move |conn| {
-            initialize_relinks(conn)?;
             let result = receipt(conn, operation_id)?;
             ensure!(
                 result.as_ref().is_none_or(|r| r.request.key == key),
@@ -187,7 +178,6 @@ impl Store {
         validate_request(&request)?;
         let cancel = cancel.clone();
         self.call(move |conn| {
-            initialize_relinks(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // A durable receipt always wins, even after a cancellation or a
             // subsequent destination edit. Replay never touches either row.

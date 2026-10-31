@@ -1,8 +1,12 @@
 //! Supervised native task worker. Stdout is exclusively versioned JSONL; logs go
 //! to stderr. One process executes one root task at a time.
+//!
+//! The host sends `Unlock` with the secret-vault key before any `Run`; the
+//! worker never opens the OS credential store itself. `SetPermissions`
+//! updates the live permission mode every broker reads at each tool call.
 
-mod steering;
 mod credentials;
+mod steering;
 use anyhow::{Context, Result, ensure};
 use std::{
     path::PathBuf,
@@ -18,15 +22,18 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use xylo_core::*;
-use xylo_engine::{HermesEngine, tools::ApprovalGate};
+use xylo_engine::{
+    AgentEngine,
+    tools::{PermissionCell, ToolSession},
+};
 use xylo_runtime::AppPaths;
-use xylo_services::Store;
+use xylo_services::{CredentialVault, Store, VaultKey};
 
 struct ActiveTask {
     session_id: uuid::Uuid,
     turn_id: uuid::Uuid,
     cancel: CancellationToken,
-    engine: Arc<HermesEngine>,
+    engine: Arc<AgentEngine>,
     handle: tokio::task::JoinHandle<()>,
     busy: Arc<AtomicBool>,
     credentials: Arc<credentials::CredentialBroker>,
@@ -41,9 +48,8 @@ async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--version") {
         println!(
-            "Xylo worker {} / Hermes {}",
-            env!("CARGO_PKG_VERSION"),
-            HERMES_REVISION
+            "Xylo worker {} (protocol {PROTOCOL_VERSION})",
+            env!("CARGO_PKG_VERSION")
         );
         return Ok(());
     }
@@ -53,8 +59,9 @@ async fn main() -> Result<()> {
         ))?,
         None => AppPaths::discover()?,
     };
-    let store = Store::open(&paths.database)?;
-    let gate = ApprovalGate::default();
+    let store = Store::open_existing(&paths.database)?;
+    let permissions = PermissionCell::default();
+    let mut session: Option<ToolSession> = None;
     let (output, mut pending) = mpsc::channel::<Envelope<EngineEvent>>(EVENT_QUEUE_CAPACITY);
     let sequence = Arc::new(AtomicU64::new(1));
     let writer = tokio::spawn(async move {
@@ -71,17 +78,7 @@ async fn main() -> Result<()> {
         }
         Ok::<_, anyhow::Error>(())
     });
-    send(
-        &output,
-        &sequence,
-        uuid_nil(),
-        None,
-        EngineEvent::Ready {
-            engine: "Hermes Ultra".into(),
-            revision: HERMES_REVISION.into(),
-        },
-    )
-    .await?;
+    send(&output, &sequence, uuid_nil(), None, ready()).await?;
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut line = Vec::new();
     let mut active: Option<ActiveTask> = None;
@@ -103,6 +100,7 @@ async fn main() -> Result<()> {
                 EngineEvent::Error {
                     message: "Command exceeds protocol size limit".into(),
                     retryable: false,
+                    kind: ErrorKind::Internal,
                 },
             )
             .await?;
@@ -119,6 +117,7 @@ async fn main() -> Result<()> {
                     EngineEvent::Error {
                         message: format!("Invalid worker command: {error}"),
                         retryable: false,
+                        kind: ErrorKind::Internal,
                     },
                 )
                 .await?;
@@ -134,6 +133,7 @@ async fn main() -> Result<()> {
                 EngineEvent::Error {
                     message: error.to_string(),
                     retryable: false,
+                    kind: ErrorKind::Internal,
                 },
             )
             .await?;
@@ -141,11 +141,16 @@ async fn main() -> Result<()> {
         }
         let request_id = envelope.request_id;
         let session_id = envelope.session_id;
-        if let WorkerCommand::ProviderCredentialUpdated { request_id: renewal_id, result } = &envelope.payload {
+        if let WorkerCommand::ProviderCredentialUpdated {
+            request_id: renewal_id,
+            result,
+        } = &envelope.payload
+        {
             if let Some(task) = &active
                 && !task.cancel.is_cancelled()
             {
-                task.credentials.reply(request_id, session_id, *renewal_id, result.clone());
+                task.credentials
+                    .reply(request_id, session_id, *renewal_id, result.clone());
             }
             continue;
         }
@@ -156,21 +161,28 @@ async fn main() -> Result<()> {
             command => (command, None),
         };
         match command {
-            WorkerCommand::RunAuthorized { .. } | WorkerCommand::ProviderCredentialUpdated { .. } => unreachable!(),
+            WorkerCommand::RunAuthorized { .. }
+            | WorkerCommand::ProviderCredentialUpdated { .. } => unreachable!(),
             WorkerCommand::Hello => {
-                send(
-                    &output,
-                    &sequence,
-                    request_id,
-                    session_id,
-                    EngineEvent::Ready {
-                        engine: "Hermes Ultra".into(),
-                        revision: HERMES_REVISION.into(),
-                    },
-                )
-                .await?
+                send(&output, &sequence, request_id, session_id, ready()).await?
             }
             WorkerCommand::Run { turn } => {
+                let Some(tools) = session.clone() else {
+                    send(
+                        &output,
+                        &sequence,
+                        request_id,
+                        session_id,
+                        EngineEvent::Error {
+                            message: "Worker is locked: the host must send Unlock before Run"
+                                .into(),
+                            retryable: false,
+                            kind: ErrorKind::Internal,
+                        },
+                    )
+                    .await?;
+                    continue;
+                };
                 if active
                     .as_ref()
                     .is_some_and(|task| task.busy.load(Ordering::Acquire))
@@ -183,92 +195,109 @@ async fn main() -> Result<()> {
                         EngineEvent::Error {
                             message: "Worker is busy; steer or cancel the current turn".into(),
                             retryable: true,
+                            kind: ErrorKind::Internal,
                         },
                     )
                     .await?;
                     continue;
                 }
+                // The previous turn already reported its result; whatever it
+                // still does (generating a title) is best-effort and yields.
+                if let Some(previous) = active.take() {
+                    previous.handle.abort();
+                }
                 let cancel = CancellationToken::new();
-                let credentials = Arc::new(credentials::CredentialBroker::new(output.clone(), sequence.clone(), request_id, turn.session_id));
-                let engine = HermesEngine::new(store.clone(), paths.clone(), gate.clone());
+                let credentials = Arc::new(credentials::CredentialBroker::new(
+                    output.clone(),
+                    sequence.clone(),
+                    request_id,
+                    turn.session_id,
+                ));
+                // The admitted turn carries the mode current at admission;
+                // later changes arrive as SetPermissions.
+                permissions.set(turn.permissions);
+                let engine = AgentEngine::new(store.clone(), paths.clone(), tools);
                 let engine = Arc::new(match credential {
-                    Some(credential) => engine.with_provider_credential(credential).with_provider_credential_resolver(credentials.clone()),
+                    Some(credential) => engine
+                        .with_provider_credential(credential)
+                        .with_provider_credential_resolver(credentials.clone()),
                     None => engine,
                 });
                 let run_engine = engine.clone();
                 let run_cancel = cancel.clone();
-                let run_output = output.clone();
-                let run_sequence = sequence.clone();
                 let run_store = store.clone();
-                let terminal_store = store.clone();
                 let task_session = turn.session_id;
                 let task_turn = turn.turn_id;
                 let busy = Arc::new(AtomicBool::new(true));
-                let run_busy = busy.clone();
+                let ending = RunEnding {
+                    busy: busy.clone(),
+                    store: store.clone(),
+                    session: task_session,
+                    turn: task_turn,
+                    output: output.clone(),
+                    sequence: sequence.clone(),
+                    request_id,
+                    session_id,
+                };
                 let handle = tokio::spawn(async move {
-                    let result = async {
-                        let registered_turn = turn.clone();
-                        tokio::task::spawn_blocking(move || {
-                            run_store.register_user_turn(&registered_turn)
-                        })
-                        .await??;
-                        let (events, mut incoming) = mpsc::channel(EVENT_QUEUE_CAPACITY);
-                        let forward_output = run_output.clone();
-                        let forward_sequence = run_sequence.clone();
-                        let id = turn.session_id;
-                        let forwarding = tokio::spawn(async move {
-                            let mut terminal = None;
-                            while let Some(event) = incoming.recv().await {
-                                if matches!(
-                                    event,
-                                    EngineEvent::Completed { .. }
-                                        | EngineEvent::Cancelled
-                                        | EngineEvent::Error { .. }
-                                ) {
-                                    terminal = Some(event);
-                                    continue;
-                                }
-                                send(
-                                    &forward_output,
-                                    &forward_sequence,
-                                    request_id,
-                                    Some(id),
-                                    event,
-                                )
-                                .await?;
-                            }
-                            Ok::<_, anyhow::Error>(terminal)
-                        });
-                        let completion = run_engine.run(turn, events, run_cancel).await;
-                        let terminal = forwarding.await??;
-                        completion?;
-                        terminal.context("Task ended without a final result")
-                    }
-                    .await;
-                    // Completion becomes visible only after engine cleanup and
-                    // event forwarding finish. A new turn can start as soon as
-                    // the caller receives that terminal event, without racing
-                    // JoinHandle::is_finished on the final send.
-                    run_busy.store(false, Ordering::Release);
-                    if let Err(error) = steering::finish(
-                        terminal_store,
-                        task_session,
-                        task_turn,
-                        &run_output,
-                        &run_sequence,
-                    )
+                    let registered_turn = turn.clone();
+                    let registered = tokio::task::spawn_blocking(move || {
+                        run_store.register_user_turn(&registered_turn)
+                    })
                     .await
-                    {
-                        tracing::error!(%error,"Persist undelivered guidance outcome");
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result);
+                    if let Err(error) = registered {
+                        let _ = ending.end(failure(error)).await;
+                        return;
                     }
-                    let event = match result {
-                        Ok(event) => event,
-                        Err(error) => EngineEvent::Error {
-                            message: format!("{error:#}"),
-                            retryable: true,
-                        },
+                    let (events, mut incoming) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+                    let forward_ending = ending.clone();
+                    let forwarding = tokio::spawn(async move {
+                        let mut ended = false;
+                        while let Some(event) = incoming.recv().await {
+                            if is_terminal(&event) {
+                                if !ended {
+                                    forward_ending.end(event).await?;
+                                    ended = true;
+                                }
+                                continue;
+                            }
+                            send(
+                                &forward_ending.output,
+                                &forward_ending.sequence,
+                                request_id,
+                                Some(forward_ending.session),
+                                event,
+                            )
+                            .await?;
+                        }
+                        Ok::<_, anyhow::Error>(ended)
+                    });
+                    let completion = run_engine.run(turn, events, run_cancel).await;
+                    let ended = match forwarding.await {
+                        Ok(Ok(ended)) => ended,
+                        Ok(Err(error)) => {
+                            tracing::error!(%error, "Forward task events");
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "Task event forwarding stopped");
+                            false
+                        }
                     };
-                    let _ = send(&run_output, &run_sequence, request_id, session_id, event).await;
+                    match (ended, completion) {
+                        (true, Ok(())) => {}
+                        (true, Err(error)) => {
+                            tracing::warn!(%error, "Task failed after its final result");
+                        }
+                        (false, completion) => {
+                            let error = completion.err().unwrap_or_else(|| {
+                                anyhow::anyhow!("Task ended without a final result")
+                            });
+                            let _ = ending.end(failure(error)).await;
+                        }
+                    }
                 });
                 active = Some(ActiveTask {
                     session_id: task_session,
@@ -295,18 +324,31 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
-            WorkerCommand::Steer { .. } => {
-                send(
-                    &output,
-                    &sequence,
-                    request_id,
-                    session_id,
-                    EngineEvent::Status {
-                        text: "Use acknowledged guidance to update this task".into(),
-                    },
-                )
-                .await?;
-            }
+            WorkerCommand::SetPermissions { mode } => permissions.set(mode),
+            WorkerCommand::Unlock { key } => match unlock(&paths, &key) {
+                Ok(vault) => {
+                    // A repeated Unlock replaces the vault; close the old
+                    // session's connections, which hold the old secrets.
+                    if let Some(previous) = session.take() {
+                        previous.shutdown().await;
+                    }
+                    session = Some(ToolSession::new(permissions.clone(), vault));
+                }
+                Err(error) => {
+                    send(
+                        &output,
+                        &sequence,
+                        request_id,
+                        session_id,
+                        EngineEvent::Error {
+                            message: format!("Could not unlock the secret vault: {error:#}"),
+                            retryable: false,
+                            kind: ErrorKind::Authentication,
+                        },
+                    )
+                    .await?
+                }
+            },
             WorkerCommand::SteerDurable { guidance } => {
                 let receipt = steering::receive(store.clone(), active.as_ref(), guidance).await?;
                 send(
@@ -323,15 +365,23 @@ async fn main() -> Result<()> {
                 allow,
                 remember,
             } => {
-                if let Err(error) = gate.decide_with(action_id, allow, remember) {
+                let decided = session
+                    .as_ref()
+                    .context("Worker is locked; no action is waiting for approval")
+                    .and_then(|tools| tools.approvals().decide_with(action_id, allow, remember));
+                if let Err(error) = decided {
+                    // Answered on the Approve's own request: the host forwards
+                    // non-Run errors to the session, and the active run's id
+                    // would make this look like the turn's terminal error.
                     send(
                         &output,
                         &sequence,
                         request_id,
                         session_id,
                         EngineEvent::Error {
-                            message: error.to_string(),
+                            message: format!("Approval for action {action_id} failed: {error:#}"),
                             retryable: false,
+                            kind: ErrorKind::Internal,
                         },
                     )
                     .await?;
@@ -349,9 +399,80 @@ async fn main() -> Result<()> {
             task.handle.abort();
         }
     }
+    if let Some(tools) = session {
+        tools.shutdown().await;
+    }
     drop(output);
     writer.await??;
     Ok(())
+}
+
+/// Reports the end of one run: marks the worker free, settles guidance that
+/// never reached the turn, then sends the terminal event. The terminal event
+/// leaves as soon as the engine produces it; only best-effort work (a title)
+/// may still follow, and the next `Run` aborts it.
+#[derive(Clone)]
+struct RunEnding {
+    busy: Arc<AtomicBool>,
+    store: Store,
+    session: uuid::Uuid,
+    turn: uuid::Uuid,
+    output: mpsc::Sender<Envelope<EngineEvent>>,
+    sequence: Arc<AtomicU64>,
+    request_id: uuid::Uuid,
+    session_id: Option<uuid::Uuid>,
+}
+
+impl RunEnding {
+    async fn end(&self, terminal: EngineEvent) -> Result<()> {
+        // Cleared first so a new turn can start as soon as the host has the
+        // terminal event.
+        self.busy.store(false, Ordering::Release);
+        if let Err(error) = steering::finish(
+            self.store.clone(),
+            self.session,
+            self.turn,
+            &self.output,
+            &self.sequence,
+        )
+        .await
+        {
+            tracing::error!(%error, "Persist undelivered guidance outcome");
+        }
+        send(
+            &self.output,
+            &self.sequence,
+            self.request_id,
+            self.session_id,
+            terminal,
+        )
+        .await
+    }
+}
+
+fn is_terminal(event: &EngineEvent) -> bool {
+    matches!(
+        event,
+        EngineEvent::Completed { .. } | EngineEvent::Cancelled | EngineEvent::Error { .. }
+    )
+}
+
+fn failure(error: anyhow::Error) -> EngineEvent {
+    EngineEvent::Error {
+        message: format!("{error:#}"),
+        retryable: true,
+        kind: ErrorKind::Internal,
+    }
+}
+
+fn ready() -> EngineEvent {
+    EngineEvent::Ready {
+        version: env!("CARGO_PKG_VERSION").into(),
+    }
+}
+
+fn unlock(paths: &AppPaths, key: &WorkerCredential) -> Result<CredentialVault> {
+    CredentialVault::unlocked(&paths.data, VaultKey::try_from(key)?)
 }
 
 fn uuid_nil() -> uuid::Uuid {

@@ -1,6 +1,10 @@
 //! Real native controls and durable action/receipt/form storage, without models.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 mod recovery_fixture;
 #[path = "../src/state.rs"]
 mod state;
@@ -579,8 +583,22 @@ mod xylo {
             })
             .unwrap();
             assert_eq!(
+                cx.update(|cx| fixture.view.read(cx).validation_review_blocking()),
+                2
+            );
+            click(cx, &fixture, "review-dismiss-stuck");
+            assert!(cx.has_pending_prompt());
+            cx.simulate_prompt_answer("Dismiss and continue");
+            cx.run_until_parked();
+            assert_eq!(
+                cx.update(|cx| fixture.view.read(cx).validation_review_blocking()),
+                1,
+                "A blocked action no longer gates the chat once dismissed"
+            );
+            assert_eq!(
                 fixture.profile.store.action(native).unwrap().unwrap().state,
-                "outcome_unknown"
+                "outcome_unknown",
+                "Dismissing records nothing"
             );
             shutdown(cx, &fixture);
         }

@@ -124,9 +124,22 @@ pub(super) fn open_writer(database: &Path, root: &Path) -> Result<Connection> {
             "Project cache is not a regular file"
         );
     }
+    remove_stale_caches(directory, database)?;
     let mut conn = Connection::open(database)?;
     conn.busy_timeout(Duration::from_secs(2))?;
-    let fresh = check_format(&conn)?;
+    let fresh = match check_format(&conn) {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            // The catalogue is rebuildable and holds no user data, so an
+            // unrecognized one is deleted and built again.
+            tracing::debug!(%error, "Discarding an unrecognized project cache");
+            drop(conn);
+            remove_database(database)?;
+            conn = Connection::open(database)?;
+            conn.busy_timeout(Duration::from_secs(2))?;
+            check_format(&conn)?
+        }
+    };
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-4096; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA wal_autocheckpoint=1000; PRAGMA journal_size_limit=8388608;")?;
     let tx = conn.transaction()?;
     tx.execute_batch("
@@ -155,9 +168,51 @@ pub(super) fn open_writer(database: &Path, root: &Path) -> Result<Connection> {
     tx.commit()?;
     Ok(conn)
 }
+/// Deletes a project's caches written by other format versions; they share
+/// the root hash prefix of the current file name.
+fn remove_stale_caches(directory: &Path, database: &Path) -> Result<()> {
+    let name = database
+        .file_name()
+        .context("Project cache location is missing")?
+        .to_string_lossy()
+        .into_owned();
+    let Some((hash, _)) = name.split_once('.') else {
+        return Ok(());
+    };
+    let prefix = format!("{hash}.");
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let candidate = entry.file_name().to_string_lossy().into_owned();
+        if candidate.starts_with(&prefix) && !candidate.starts_with(&name) {
+            remove_file(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes a catalogue with its SQLite side files.
+fn remove_database(database: &Path) -> Result<()> {
+    remove_file(database)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut side = database.as_os_str().to_owned();
+        side.push(suffix);
+        remove_file(Path::new(&side))?;
+    }
+    Ok(())
+}
+
+fn remove_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).with_context(|| format!("Remove {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Inspect before any schema/journal mutation. Empty version-zero files are the
-/// only resumable initialization state; an unknown populated format fails
-/// closed instead of guessing a migration or deleting the user's old cache.
+/// only resumable initialization state; any other format is unrecognized (the
+/// writer deletes and rebuilds it, readers wait for that).
 fn check_format(conn: &Connection) -> Result<bool> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let tables: Vec<String> = {
@@ -171,11 +226,11 @@ fn check_format(conn: &Connection) -> Result<bool> {
     }
     ensure!(
         version == paths::FORMAT_VERSION,
-        "This project catalogue format is unsupported; its saved cache has been preserved"
+        "This project catalogue format is unrecognized"
     );
     ensure!(
         tables == ["entries", "meta"],
-        "This project catalogue layout is unsupported; its saved cache has been preserved"
+        "This project catalogue layout is unrecognized"
     );
     for (sql, expected) in [
         (
@@ -205,7 +260,7 @@ fn check_format(conn: &Connection) -> Result<bool> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         ensure!(
             columns == expected,
-            "This project catalogue layout is unsupported; its saved cache has been preserved"
+            "This project catalogue layout is unrecognized"
         );
     }
     Ok(false)
@@ -232,6 +287,21 @@ fn open_existing_writer(database: &Path) -> Result<Connection> {
     conn.execute_batch("PRAGMA cache_size=-2048; PRAGMA mmap_size=0; PRAGMA temp_store=FILE;")?;
     Ok(conn)
 }
+/// Reads a non-negative SQLite integer into an unsigned Rust integer. rusqlite
+/// has no unsigned 64-bit or `usize` conversions because SQLite integers are i64.
+pub(super) fn unsigned<T: TryFrom<i64>>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<T> {
+    let value: i64 = row.get(index)?;
+    T::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
+
+/// Converts an in-memory count or limit to an SQLite integer parameter.
+pub(super) fn sql_int(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 pub(super) fn metadata(conn: &Connection, root: &Path, delta: &Delta) -> Result<FileIndex> {
     conn.query_row(
         "SELECT revision,files,dirs,unreadable,indexing,watching FROM meta WHERE id=1",
@@ -239,10 +309,10 @@ pub(super) fn metadata(conn: &Connection, root: &Path, delta: &Delta) -> Result<
         |row| {
             Ok(FileIndex {
                 root: root.to_owned(),
-                revision: row.get(0)?,
-                file_count: row.get(1)?,
-                directory_count: row.get(2)?,
-                unreadable: row.get(3)?,
+                revision: unsigned(row, 0)?,
+                file_count: unsigned(row, 1)?,
+                directory_count: unsigned(row, 2)?,
+                unreadable: unsigned(row, 3)?,
                 indexing: row.get(4)?,
                 changed: delta.changed.clone(),
                 removed: delta.removed.clone(),
@@ -585,9 +655,9 @@ pub(super) fn files(
                     paths::encode(&directory),
                     kind,
                     path,
-                    limit + 1 - rows.len()
+                    sql_int(limit + 1 - rows.len())
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, unsigned(row, 2)?)),
             )?;
             for entry in page {
                 rows.push(entry?);

@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
         serde_json::to_string_pretty(&json!({
             "schema_version":1,"package_sha256":plugin.package_sha256,
             "component_sha256": inspected.manifest.sha256,
-            "manifest_sha256":format!("{:x}",Sha256::digest(std::fs::read(&manifest)?)),
+            "manifest_sha256":hex::encode(Sha256::digest(std::fs::read(&manifest)?)),
             "checks":["compiled_rust_component","actual_reviewed_install","unicode_statistics",
                 "committed_artifact_bytes","no_clobber_repeat","write_grant_revocation",
                 "read_grant_revocation","workspace_escape_refused","source_unchanged"],

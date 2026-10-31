@@ -45,6 +45,8 @@ pub(super) struct PluginUi {
     picking: bool,
     confirming: bool,
     pub notice: String,
+    /// When the latest request began, for the slow caption.
+    pending_since: Option<std::time::Instant>,
 }
 impl PluginUi {
     pub fn new(window: &mut Window, cx: &mut Context<Xylo>) -> Self {
@@ -71,7 +73,12 @@ impl PluginUi {
             picking: false,
             confirming: false,
             notice: String::new(),
+            pending_since: None,
         }
+    }
+    /// Whether a request for `tool` is in flight, so only its button spins.
+    fn pending_tool(&self, tool: &str) -> bool {
+        self.pending.values().any(|request| request.tool == tool)
     }
     pub fn busy(&self) -> bool {
         !self.pending.is_empty() || self.picking || self.confirming
@@ -122,6 +129,7 @@ impl Xylo {
             .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
             .and_then(|host| host.capability(id, name.into(), args.clone()));
         if result.is_ok() {
+            self.plugins.pending_since = Some(self.arm_slow_hint(cx));
             self.plugins.pending.insert(
                 id,
                 Request {
@@ -137,8 +145,11 @@ impl Xylo {
         }
         self.result(result, cx);
     }
+    /// Opening Plugins loads installed packages and native modules, searches
+    /// the cached plugin directory and refreshes it in the background.
     pub(super) fn refresh_plugins(&mut self, cx: &mut Context<Self>) {
         self.extension_request("extension_snapshot", json!({}), cx);
+        self.extension_directory_open(cx);
         self.plugin_request("helper_plugin_list", json!({}), RequestKind::List, cx);
     }
     pub(super) fn plugin_owns_request(&self, id: Uuid) -> bool {

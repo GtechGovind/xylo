@@ -71,9 +71,9 @@ pub(crate) fn cancellable<T>(
 ) -> Result<T> {
     ensure!(!cancel.is_cancelled(), "Memory operation cancelled");
     let stopped = cancel.clone();
-    conn.progress_handler(1000, Some(move || stopped.is_cancelled()));
+    conn.progress_handler(1000, Some(move || stopped.is_cancelled()))?;
     let result = run(conn);
-    conn.progress_handler(0, None::<fn() -> bool>);
+    conn.progress_handler(0, None::<fn() -> bool>)?;
     if result.is_err() && cancel.is_cancelled() {
         anyhow::bail!("Memory operation cancelled");
     }
@@ -84,27 +84,6 @@ pub(crate) fn validate_scope(scope: &str) -> Result<()> {
         !scope.trim().is_empty() && scope.len() <= 8192 && !scope.contains('\0'),
         "Choose a valid project for memory"
     );
-    Ok(())
-}
-pub(crate) fn initialize(conn: &Connection) -> Result<()> {
-    let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='memory_fact_links')",[],|row|row.get(0))?;
-    if exists {
-        return Ok(());
-    }
-    conn.execute_batch("SAVEPOINT fact_metadata_setup")?;
-    let setup=conn.execute_batch("CREATE TABLE IF NOT EXISTS memory_fact_links(id TEXT PRIMARY KEY,scope TEXT NOT NULL,parent TEXT);
-CREATE INDEX IF NOT EXISTS memory_fact_parents ON memory_fact_links(scope,parent,id);
-CREATE INDEX IF NOT EXISTS memory_fact_versions ON memories(scope,json_extract(json,'$.created_at') DESC,id DESC);
-CREATE TABLE IF NOT EXISTS memory_fact_scopes(scope TEXT PRIMARY KEY,revision INTEGER NOT NULL CHECK(revision>=0),generation INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS memory_fact_deleted(id TEXT PRIMARY KEY,scope TEXT NOT NULL,deleted_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS memory_fact_receipts(operation_id TEXT PRIMARY KEY,request TEXT NOT NULL,receipt TEXT NOT NULL,created_at INTEGER NOT NULL);
-INSERT OR IGNORE INTO memory_fact_links(id,scope,parent) SELECT id,scope,json_extract(json,'$.supersedes') FROM memories;
-INSERT OR IGNORE INTO memory_fact_scopes(scope,revision) SELECT DISTINCT scope,1 FROM memories;");
-    if let Err(error) = setup {
-        let _ = conn.execute_batch("ROLLBACK TO fact_metadata_setup; RELEASE fact_metadata_setup;");
-        return Err(error.into());
-    }
-    conn.execute_batch("RELEASE fact_metadata_setup")?;
     Ok(())
 }
 pub(crate) fn revision(conn: &Connection, scope: &str) -> Result<i64> {
@@ -160,6 +139,17 @@ pub(crate) fn delete_selected(conn: &Connection, scope: &str, id: Uuid) -> Resul
         crate::memory::delete_vectors(conn, &id.to_string())?;
         conn.execute("DELETE FROM memories_fts WHERE id=?1", [id.to_string()])?;
         let removed = conn.execute("DELETE FROM memories WHERE id=?1", [id.to_string()])?;
+        // Later versions inherit the deleted version's parent so the chain
+        // stays connected, and the deleted version leaves no link behind.
+        conn.execute(
+            "UPDATE memory_fact_links SET parent=(SELECT parent FROM memory_fact_links WHERE id=?1) WHERE scope=?2 AND parent=?1",
+            params![id.to_string(), scope],
+        )?;
+        conn.execute(
+            "DELETE FROM memory_fact_links WHERE id=?1",
+            [id.to_string()],
+        )?;
+        purge_deleted(conn)?;
         conn.execute(
             "INSERT OR IGNORE INTO memory_fact_deleted(id,scope,deleted_at) VALUES(?1,?2,?3)",
             params![id.to_string(), scope, now_ms()],
@@ -170,6 +160,40 @@ pub(crate) fn delete_selected(conn: &Connection, scope: &str, id: Uuid) -> Resul
     }
     Ok(())
 }
+/// How long a deleted version's id stays reserved against re-saving. Retried
+/// saves arrive within seconds; the window only bounds the table.
+const DELETED_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+fn purge_deleted(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM memory_fact_deleted WHERE deleted_at<?1",
+        [now_ms().saturating_sub(DELETED_RETENTION_MS)],
+    )?;
+    Ok(())
+}
+
+/// Removes the links of every id in `memory_delete_targets`. Surviving later
+/// versions are re-parented to their nearest surviving ancestor first.
+fn unlink_targets(conn: &Connection, scope: &str) -> Result<()> {
+    let limit: i64 = conn.query_row("SELECT count(*) FROM memory_delete_targets", [], |row| {
+        row.get(0)
+    })?;
+    for _ in 0..=limit {
+        let moved = conn.execute(
+            "UPDATE memory_fact_links SET parent=(SELECT p.parent FROM memory_fact_links p WHERE p.id=memory_fact_links.parent) WHERE scope=?1 AND parent IN(SELECT id FROM memory_delete_targets) AND id NOT IN(SELECT id FROM memory_delete_targets)",
+            [scope],
+        )?;
+        if moved == 0 {
+            break;
+        }
+    }
+    conn.execute(
+        "DELETE FROM memory_fact_links WHERE scope=?1 AND id IN(SELECT id FROM memory_delete_targets)",
+        [scope],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn reject_deleted(conn: &Connection, id: Uuid) -> Result<()> {
     let deleted: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM memory_fact_deleted WHERE id=?1)",
@@ -208,7 +232,7 @@ pub(crate) fn scoped_anchor(conn: &Connection, scope: &str, id: Uuid) -> Result<
     );
     Ok(())
 }
-/// UNION (rather than UNION ALL) terminates even if legacy metadata is cyclic.
+/// UNION (rather than UNION ALL) also terminates on a cyclic chain.
 pub(crate) const CONNECTED:&str="WITH RECURSIVE connected(id) AS (
 SELECT id FROM memory_fact_links WHERE scope=?1 AND id=?2
 UNION SELECT l.parent FROM memory_fact_links l JOIN connected c ON l.id=c.id WHERE l.scope=?1 AND l.parent IS NOT NULL
@@ -228,7 +252,7 @@ impl Store {
         let cancel = cancel.clone();
         let limit = limit.clamp(1, 100);
         self.call(move|conn| cancellable(conn,&cancel,|conn|{
-            ensure!(!cancel.is_cancelled(),"Memory inspection cancelled");initialize(conn)?;
+            ensure!(!cancel.is_cancelled(),"Memory inspection cancelled");
             let tx=conn.transaction()?;let revision=revision(&tx,&scope)?;
             ensure!(before.as_ref().is_none_or(|cursor|cursor.revision==revision),"Memory changed while browsing; refresh version history");
             if let Some(id)=anchor {scoped_anchor(&tx,&scope,id)?;}
@@ -256,7 +280,7 @@ impl Store {
         self.call(move |conn| {
             cancellable(conn, &cancel, |conn| {
                 ensure!(!cancel.is_cancelled(), "Memory deletion preview cancelled");
-                initialize(conn)?;
+
                 let tx = conn.transaction()?;
                 targets(&tx, &scope, &kind)?;
                 let (versions, active) = counts(&tx)?;
@@ -300,7 +324,7 @@ fn targets(conn: &Connection, scope: &str, kind: &FactDeleteKind) -> Result<()> 
     Ok(())
 }
 fn counts(conn: &Connection) -> Result<(usize, usize)> {
-    Ok(conn.query_row("SELECT count(*),coalesce(sum(active),0) FROM memories WHERE id IN(SELECT id FROM memory_delete_targets)",[],|row|Ok((row.get(0)?,row.get(1)?)))?)
+    Ok(conn.query_row("SELECT count(*),coalesce(sum(active),0) FROM memories WHERE id IN(SELECT id FROM memory_delete_targets)",[],|row|Ok((crate::store::row_usize(row,0)?,crate::store::row_usize(row,1)?)))?)
 }
 impl SqliteMemory {
     pub fn delete_facts(
@@ -311,7 +335,7 @@ impl SqliteMemory {
         validate_scope(&request.preview.scope)?;
         let cancel = cancel.clone();
         self.store().call(move|conn| cancellable(conn,&cancel,|conn|{
-            initialize(conn)?;let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let encoded=serde_json::to_string(&request)?;
             if let Some((original,receipt))=tx.query_row("SELECT request,receipt FROM memory_fact_receipts WHERE operation_id=?1",[request.operation_id.to_string()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).optional()? {
                 ensure!(original==encoded,"Deletion identity was reused for a different request");return serde_json::from_str(&receipt).context("Read memory deletion receipt");
@@ -324,6 +348,8 @@ impl SqliteMemory {
             crate::memory::delete_vector_targets(&tx)?;
             tx.execute("DELETE FROM memories_fts WHERE id IN(SELECT id FROM memory_delete_targets)",[])?;
             tx.execute("DELETE FROM memories WHERE scope=?1 AND id IN(SELECT id FROM memory_delete_targets)",[&preview.scope])?;
+            unlink_targets(&tx,&preview.scope)?;
+            purge_deleted(&tx)?;
             tx.execute("INSERT OR IGNORE INTO memory_fact_deleted(id,scope,deleted_at) SELECT id,?1,?2 FROM memory_delete_targets",params![preview.scope,now_ms()])?;
             let revision=if removed>0 {advance_deletion(&tx,&preview.scope)?}else{preview.revision};
             let receipt=FactDeletion{operation_id:request.operation_id,scope:preview.scope.clone(),kind:preview.kind.clone(),removed,revision};
@@ -335,5 +361,4 @@ impl SqliteMemory {
 }
 
 #[cfg(test)]
-#[path = "memory_facts_tests.rs"]
 mod tests;

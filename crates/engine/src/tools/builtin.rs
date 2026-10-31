@@ -1,17 +1,76 @@
-//! Small, explicit native tools. Workspace boundaries are checked before I/O.
+//! Small, explicit native tools. Paths are resolved and checked against the
+//! project before any I/O; leaving the project needs an explicit [`Access`].
 
 use super::{ToolBroker, code};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
+    sync::{Condvar, LazyLock, Mutex},
     time::Duration,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xylo_core::{MemoryRecord, ToolDefinition, now_ms};
+use xylo_services::sandbox::{self, Network};
+
+/// What the permission decision granted one call.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Access {
+    /// Paths outside the project were approved (or the mode allows them).
+    pub(super) outside: bool,
+    /// Commands run inside the OS sandbox.
+    pub(super) sandboxed: bool,
+    /// The command asked for, and was granted, internet access.
+    pub(super) network: bool,
+}
+
+/// Told to the model when the sandbox blocked a command's connections.
+fn network_hint(denied: &[String]) -> String {
+    format!(
+        "The sandbox blocked internet access to {}. If the command needs the network (package installs, downloads, git fetch, pull, clone or push), run it again with network: true and a justification.",
+        denied.join(", ")
+    )
+}
+
+/// The justification of a command that asks for internet access, or `None`
+/// for an offline command. Malformed requests are rejected before any intent.
+pub(super) fn network_request(args: &Value) -> Result<Option<&str>> {
+    let requested = match args.get("network") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(requested)) => *requested,
+        Some(_) => bail!("network must be true or false"),
+    };
+    if !requested {
+        return Ok(None);
+    }
+    let justification = args
+        .get("justification")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .context("A command that sets network: true needs a justification for the user")?;
+    ensure!(
+        justification.chars().count() <= 500,
+        "Keep the justification under 500 characters"
+    );
+    Ok(Some(justification))
+}
+
+static NETWORK_PARAMETER: LazyLock<Value> = LazyLock::new(
+    || json!({"type":"boolean","description":"Request internet access for this command: package installs, downloads, and git fetch, pull, clone or push. Requires justification"}),
+);
+static JUSTIFICATION_PARAMETER: LazyLock<Value> = LazyLock::new(
+    || json!({"type":"string","maxLength":500,"description":"Required with network: one sentence telling the user why the command needs the internet"}),
+);
+
+/// Largest diff shown for approval; the write itself is never shortened.
+const APPROVAL_DIFF_BYTES: usize = 128 * 1024;
+const WRITE_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn definitions() -> Vec<ToolDefinition> {
-    vec![
+    let mut tools = vec![
         def(
             "agent_delegate",
             "Delegate a bounded, self-contained subtask (for example a broad search or an independent investigation) to a supervised child agent with this task's provider and permissions. Give it full context; it returns its findings",
@@ -28,14 +87,14 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ),
         def(
             "file_edit",
-            "Replace exact text in an existing workspace file after approval. old_string must match the current file exactly once, including whitespace and indentation: read the file first and copy the text without line-number prefixes. Set replace_all to change every occurrence. Prefer this to file_write for changing existing files",
+            "Replace exact text in an existing file. old_string must match the current file exactly once, including whitespace and indentation: read the file first and copy the text without line-number prefixes. Set replace_all to change every occurrence. Prefer this to file_write for changing existing files",
             json!({"path":{"type":"string"},"old_string":{"type":"string","description":"Exact existing text to replace"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace every occurrence instead of requiring exactly one"}}),
             &["path", "old_string", "new_string"],
             true,
         ),
         def(
             "file_write",
-            "Create a file, or replace a file's entire contents, inside the workspace after approval. For changes to an existing file use file_edit",
+            "Create a file, or replace a file's entire contents. For changes to an existing file use file_edit",
             json!({"path":{"type":"string"},"content":{"type":"string","description":"Complete new file contents"}}),
             &["path", "content"],
             true,
@@ -77,15 +136,15 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ),
         def(
             "run_command",
-            "Run a program directly with an argument array (no shell) in the workspace after approval. Non-zero exit codes are returned with stdout and stderr; inspect them and continue",
-            json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200}}),
+            "Run a program directly with an argument array (no shell) in the workspace sandbox, which has no internet access unless network is true. Non-zero exit codes are returned with stdout and stderr; inspect them and continue",
+            json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200},"network":NETWORK_PARAMETER.clone(),"justification":JUSTIFICATION_PARAMETER.clone()}),
             &["program", "args"],
             true,
         ),
         def(
             "shell_command",
-            "Run a command line through the platform shell in the workspace after approval. Use for pipes, redirection, chained commands and shell built-ins. Returns exit_code, stdout and stderr; a non-zero exit is reported, not hidden",
-            json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200}}),
+            "Run a command line through bash in the workspace sandbox, which has no internet access unless network is true. Use for pipes, redirection, chained commands and shell built-ins. Returns exit_code, stdout and stderr; a non-zero exit is reported, not hidden",
+            json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200},"network":NETWORK_PARAMETER.clone(),"justification":JUSTIFICATION_PARAMETER.clone()}),
             &["command"],
             true,
         ),
@@ -166,7 +225,12 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
             &["name", "arguments"],
             false,
         ),
-    ]
+    ];
+    // The OS sandbox is not qualified on Windows, so commands are not offered.
+    if cfg!(windows) {
+        tools.retain(|tool| !matches!(tool.name.as_str(), "run_command" | "shell_command"));
+    }
+    tools
 }
 
 fn def(
@@ -188,14 +252,25 @@ pub(super) fn handles(name: &str) -> bool {
     definitions().iter().any(|d| d.name == name)
 }
 
-fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+pub(super) fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .with_context(|| format!("Missing text parameter {key}"))
 }
 
-pub(crate) fn workspace_path(root: &Path, requested: &str, writing: bool) -> Result<PathBuf> {
-    let root = std::fs::canonicalize(root)?;
+/// Where a requested path resolves.
+pub(super) enum Resolved {
+    /// Inside the project, or a saved full tool result.
+    Project(PathBuf),
+    /// Outside the project.
+    Outside(PathBuf),
+}
+
+/// Canonicalizes `requested` (relative to the project) and says whether it
+/// stays inside the project. A path being created resolves through its
+/// existing parent, so a symlinked parent cannot hide the real target.
+pub(super) fn resolve(broker: &ToolBroker, requested: &str, writing: bool) -> Result<Resolved> {
+    let root = std::fs::canonicalize(&broker.request.workspace)?;
     let path = if Path::new(requested).is_absolute() {
         PathBuf::from(requested)
     } else {
@@ -210,65 +285,164 @@ pub(crate) fn workspace_path(root: &Path, requested: &str, writing: bool) -> Res
     } else {
         bail!("Path does not exist: {}", path.display());
     };
-    ensure!(
-        canonical.starts_with(&root),
-        "Path leaves the selected workspace"
-    );
-    Ok(canonical)
+    if canonical.starts_with(&root) {
+        return Ok(Resolved::Project(canonical));
+    }
+    // Reads may also open saved full tool results referenced by `full_result`.
+    if !writing
+        && let Ok(artifacts) = std::fs::canonicalize(&broker.artifacts)
+        && canonical.starts_with(&artifacts)
+        && canonical.is_file()
+    {
+        return Ok(Resolved::Project(canonical));
+    }
+    Ok(Resolved::Outside(canonical))
 }
 
-/// Reads may also open saved full tool results referenced by `full_result`.
-fn readable_path(broker: &ToolBroker, requested: &str) -> Result<PathBuf> {
-    let error = match workspace_path(&broker.request.workspace, requested, false) {
-        Ok(path) => return Ok(path),
-        Err(error) => error,
-    };
-    let saved = Path::new(requested);
-    if saved.is_absolute()
-        && let (Ok(saved), Ok(artifacts)) = (
-            std::fs::canonicalize(saved),
-            std::fs::canonicalize(&broker.artifacts),
-        )
-        && saved.starts_with(&artifacts)
-        && saved.is_file()
-    {
-        return Ok(saved);
+/// A resolved path the call may use under `access`.
+fn permitted(
+    broker: &ToolBroker,
+    requested: &str,
+    writing: bool,
+    access: Access,
+) -> Result<PathBuf> {
+    match resolve(broker, requested, writing)? {
+        Resolved::Project(path) => Ok(path),
+        Resolved::Outside(path) if access.outside => Ok(path),
+        Resolved::Outside(_) => bail!("Path leaves the selected workspace"),
     }
-    Err(error)
 }
 
 /// A writing path that is invalid is rejected before anything is changed.
-pub(super) fn write_target(root: &Path, requested: &str) -> Result<PathBuf> {
-    let target = workspace_path(root, requested, true)
+/// Xylo's own data directory and executables, repository metadata and the
+/// project's agent configuration are never writable by tools.
+pub(super) fn write_target(
+    broker: &ToolBroker,
+    requested: &str,
+    access: Access,
+) -> Result<PathBuf> {
+    // Git hooks and config run code at the next git command, and agent
+    // directories hold instructions and permissions other tools trust; this
+    // matches the command sandbox's `denyWrite` list. `.git` is refused at
+    // any depth, since a nested repository runs its hooks just the same, the
+    // agent directories at the project root like the sandbox. Names compare
+    // ignoring ASCII case, as the default macOS and Windows file systems do.
+    const PROTECTED_AT_ANY_DEPTH: &[&str] = &[".git"];
+    const PROTECTED_AT_ROOT: &[&str] = &[".agents", ".claude", ".codex"];
+    let target = permitted(broker, requested, true, access)
         .map_err(|error| code::unapplied(format!("{error:#}")))?;
+    let root = std::fs::canonicalize(&broker.request.workspace)
+        .map_err(|error| code::unapplied(format!("{error:#}")))?;
+    // Outside the project every component counts, so another repository's
+    // `.git` is refused even when outside writes are approved.
+    let relative = target.strip_prefix(&root).unwrap_or(&target);
+    let protected = |names: &[&str], component: std::path::Component| {
+        names
+            .iter()
+            .any(|name| component.as_os_str().eq_ignore_ascii_case(name))
+    };
+    if relative
+        .components()
+        .any(|component| protected(PROTECTED_AT_ANY_DEPTH, component))
+        || (target.starts_with(&root)
+            && relative
+                .components()
+                .next()
+                .is_some_and(|component| protected(PROTECTED_AT_ROOT, component)))
+    {
+        return Err(code::unapplied(format!(
+            "Tools cannot modify repository metadata or agent configuration: {}",
+            relative.display()
+        )));
+    }
+    if let Some(data) = broker.artifacts.parent()
+        && let Ok(data) = std::fs::canonicalize(data)
+        && target.starts_with(data)
+    {
+        return Err(code::unapplied(
+            "Tools cannot modify Xylo's application data",
+        ));
+    }
     xylo_services::sandbox::ensure_writable_target(&target)
         .map_err(|e| code::unapplied(e.to_string()))?;
     Ok(target)
 }
 
-/// Approval presentation retains the complete diff and original request for
-/// inspection. Invalid edits are rejected before an intent exists.
-pub(super) fn change_preview(root: &Path, name: &str, args: &Value) -> Result<Value> {
-    let path = write_target(root, text(args, "path")?)?;
+/// Serializes writes to one file across every broker of the process. The
+/// lock is held from preview to write, so a second edit plans against the
+/// first edit's result instead of overwriting it.
+pub(super) struct EditLock(PathBuf);
+
+static EDITING: LazyLock<(Mutex<HashSet<PathBuf>>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashSet::new()), Condvar::new()));
+
+impl EditLock {
+    pub(super) fn acquire(path: &Path, cancel: &CancellationToken) -> Result<Self> {
+        let (held, released) = &*EDITING;
+        let mut paths = held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while paths.contains(path) {
+            ensure!(
+                !cancel.is_cancelled(),
+                "Task cancelled while waiting to edit the file"
+            );
+            paths = released
+                .wait_timeout(paths, Duration::from_millis(50))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        paths.insert(path.to_owned());
+        Ok(Self(path.to_owned()))
+    }
+}
+
+impl Drop for EditLock {
+    fn drop(&mut self) {
+        let (held, released) = &*EDITING;
+        held.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+        released.notify_all();
+    }
+}
+
+/// The approval and start presentation of a file change: a bounded diff
+/// against the current content. The request repeats only the path and
+/// options, never the content, so the event stays small.
+pub(super) fn change_preview(
+    broker: &ToolBroker,
+    name: &str,
+    args: &Value,
+    access: Access,
+) -> Result<Value> {
+    let root = &broker.request.workspace;
+    let path = write_target(broker, text(args, "path")?, access)?;
     let shown = code::display(root, &path);
     let mut preview = match name {
         "file_edit" => {
             let plan = code::plan_edit(&path, &shown, args)?;
-            let mut preview = code::approval_diff(&shown, &plan.original, &plan.updated);
+            let mut preview =
+                code::approval_diff(&shown, &plan.original, &plan.updated, APPROVAL_DIFF_BYTES);
             preview["replacements"] = json!(plan.replacements);
+            preview["request"] =
+                json!({"path":text(args, "path")?,"replace_all":args.get("replace_all")});
             preview
         }
         _ => {
             let content = text(args, "content")?;
-            ensure!(content.len() <= 2 * 1024 * 1024, "Write exceeds 2 MiB");
+            ensure!(content.len() <= WRITE_BYTES, "Write exceeds 2 MiB");
             let existing = code::existing_text(&path);
-            let mut preview = code::approval_diff(&shown, existing.as_deref().unwrap_or(""), content);
+            let mut preview = code::approval_diff(
+                &shown,
+                existing.as_deref().unwrap_or(""),
+                content,
+                APPROVAL_DIFF_BYTES,
+            );
             preview["created"] = json!(!path.exists());
+            preview["request"] = json!({"path":text(args, "path")?,"bytes":content.len()});
             preview
         }
     };
     preview["path"] = json!(shown);
-    preview["request"] = args.clone();
     Ok(preview)
 }
 
@@ -299,16 +473,29 @@ fn todo_list(args: &Value) -> Result<Value> {
     Ok(json!({"checklist": lines.join("\n"), "items": todos.len()}))
 }
 
-pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<Value> {
+pub(super) fn execute(
+    broker: &ToolBroker,
+    name: &str,
+    args: &Value,
+    access: Access,
+) -> Result<Value> {
     let root = &broker.request.workspace;
     let scope = root.to_string_lossy();
+    let directory = || {
+        permitted(
+            broker,
+            args.get("path").and_then(Value::as_str).unwrap_or("."),
+            false,
+            access,
+        )
+    };
     let value = match name {
         "file_read" => {
-            let path = readable_path(broker, text(args, "path")?)?;
+            let path = permitted(broker, text(args, "path")?, false, access)?;
             code::read(&path, &code::display(root, &path), args)?
         }
         "file_edit" => {
-            let path = write_target(root, text(args, "path")?)?;
+            let path = write_target(broker, text(args, "path")?, access)?;
             let shown = code::display(root, &path);
             let plan = code::plan_edit(&path, &shown, args)?;
             code::write_atomic(&path, &plan.updated)?;
@@ -318,9 +505,9 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
             result
         }
         "file_write" => {
-            let path = write_target(root, text(args, "path")?)?;
+            let path = write_target(broker, text(args, "path")?, access)?;
             let content = text(args, "content")?;
-            if content.len() > 2 * 1024 * 1024 {
+            if content.len() > WRITE_BYTES {
                 return Err(code::unapplied("Write exceeds 2 MiB"));
             }
             let shown = code::display(root, &path);
@@ -333,27 +520,9 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
             result["created"] = json!(created);
             result
         }
-        "files_list" => code::list(&workspace_path(
-            root,
-            args.get("path").and_then(Value::as_str).unwrap_or("."),
-            false,
-        )?)?,
-        "find_files" => {
-            let base = workspace_path(
-                root,
-                args.get("path").and_then(Value::as_str).unwrap_or("."),
-                false,
-            )?;
-            code::find(root, &base, args, &broker.cancel)?
-        }
-        "search_project" => {
-            let base = workspace_path(
-                root,
-                args.get("path").and_then(Value::as_str).unwrap_or("."),
-                false,
-            )?;
-            code::search(root, &base, args, &broker.cancel)?
-        }
+        "files_list" => code::list(&directory()?)?,
+        "find_files" => code::find(root, &directory()?, args, &broker.cancel)?,
+        "search_project" => code::search(root, &directory()?, args, &broker.cancel)?,
         "todo_write" => todo_list(args)?,
         "memory_search" => json!(
             broker
@@ -399,7 +568,15 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
                     argv.push("--cached".into());
                 }
                 if let Some(path) = args.get("path").and_then(Value::as_str) {
-                    let path = workspace_path(root, path, false)?;
+                    let path = permitted(
+                        broker,
+                        path,
+                        false,
+                        Access {
+                            outside: false,
+                            ..access
+                        },
+                    )?;
                     argv.push("--".into());
                     argv.push(path.to_string_lossy().into_owned());
                 }
@@ -421,6 +598,11 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
             json!({"output": if result.stdout.is_empty() { "No changes".to_owned() } else { result.stdout }, "truncated": result.truncated})
         }
         "run_command" | "shell_command" => {
+            if cfg!(windows) {
+                return Err(code::unapplied(
+                    "Commands are not supported on Windows yet; nothing was run",
+                ));
+            }
             let (program, argv) = if name == "shell_command" {
                 let command = text(args, "command")?;
                 ensure!(!command.trim().is_empty(), "command is empty");
@@ -449,23 +631,60 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
                 .parent()
                 .map(|p| vec![p.to_path_buf()])
                 .unwrap_or_default();
-            let result = broker
-                .runtime
-                .block_on(xylo_runtime::process::run_sandboxed(
-                    &program.to_string_lossy(),
-                    &argv,
-                    root,
-                    &[],
-                    &protected,
-                    Duration::from_secs(timeout),
-                    broker.cancel.child_token(),
-                ))?;
-            let output = json!({
+            let program = program.to_string_lossy();
+            let timeout = Duration::from_secs(timeout);
+            let (result, denied) = broker.runtime.block_on(async {
+                if access.sandboxed {
+                    // An approved network request keeps every filesystem rule;
+                    // only outbound connections to public hosts are opened.
+                    let network = if access.network {
+                        Network::Unrestricted
+                    } else {
+                        Network::None
+                    };
+                    let prepared = sandbox::prepare_coding_with_network(
+                        &program,
+                        &argv,
+                        root,
+                        &[],
+                        &protected,
+                        network,
+                    )
+                    .map_err(|error| {
+                        anyhow::Error::new(xylo_runtime::process::NotStarted(format!("{error:#}")))
+                    })?;
+                    // Start failures and refused connections come from the
+                    // launcher's private status file, never from the output.
+                    let sandboxed = xylo_runtime::process::run_prepared_sandboxed(
+                        prepared,
+                        root,
+                        timeout,
+                        broker.cancel.child_token(),
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>((sandboxed.result, sandboxed.network_denials))
+                } else {
+                    let result = xylo_runtime::process::run(
+                        &program,
+                        &argv,
+                        root,
+                        timeout,
+                        broker.cancel.child_token(),
+                    )
+                    .await?;
+                    Ok((result, Vec::new()))
+                }
+            })?;
+            let mut output = json!({
                 "exit_code": result.code,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "output_truncated": result.truncated,
             });
+            let hint = (!denied.is_empty()).then(|| network_hint(&denied));
+            if let Some(hint) = &hint {
+                output["network_hint"] = json!(hint);
+            }
             // A process that ran to completion has a known outcome, whatever its
             // exit code. Only the status distinguishes success from failure.
             if result.code != Some(0) {
@@ -473,7 +692,7 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
                     "status":"failed",
                     "exit_code": result.code,
                     "summary": output,
-                    "next_actions":["Read stdout and stderr, fix the cause, then rerun"],
+                    "next_actions":[hint.as_deref().unwrap_or("Read stdout and stderr, fix the cause, then rerun")],
                     "artifacts":[]
                 }));
             }
@@ -485,26 +704,4 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    #[test]
-    fn approval_preserves_full_change_and_original_arguments() {
-        let workspace = tempfile::tempdir().unwrap();
-        let content = format!("{}\nFINAL_ACTION_SENTINEL\n", "long change line\n".repeat(3000));
-        let args = json!({"path":"new.txt", "content":content});
-        let preview = change_preview(workspace.path(), "file_write", &args).unwrap();
-        assert!(preview["diff"].as_str().unwrap().contains("+FINAL_ACTION_SENTINEL"));
-        assert_eq!(preview["diff_truncated"], false);
-        assert_eq!(preview["request"], args);
-        assert!(!workspace.path().join("new.txt").exists());
-    }
-    #[test]
-    fn paths_cannot_escape_through_parent_or_symlink() {
-        let workspace = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), workspace.path().join("escape")).unwrap();
-        assert!(workspace_path(workspace.path(), "../outside", true).is_err());
-        assert!(workspace_path(workspace.path(), "escape/file", true).is_err());
-        assert!(workspace_path(workspace.path(), "new.rs", true).is_ok());
-    }
-}
+mod tests;

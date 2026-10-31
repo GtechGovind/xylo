@@ -49,7 +49,7 @@ impl Configuration {
         ToolDefinition {
             name: "image_generate".into(),
             description: format!(
-                "Generate one image with the image provider explicitly saved by the user, after write approval. No automatic provider fallback or retry. A new request may incur a charge.{selection}"
+                "Generate one image with the image provider explicitly saved by the user. No automatic provider fallback or retry. A new request may incur a charge.{selection}"
             ),
             writes: true,
             parameters: json!({"type":"object","properties":{"prompt":{"type":"string","minLength":1,"maxLength":16384},"size":{"type":"string","enum":["auto","256x256","512x512","1024x1024","1024x1536","1536x1024"],"default":"1024x1024"}},"required":["prompt"],"additionalProperties":false}),
@@ -112,14 +112,27 @@ pub(super) fn execute(broker: &ToolBroker, id: Uuid, arguments: &Value) -> Resul
         .parent()
         .context("Missing application data directory")?;
     let service = ImageGenerationService::new(data.to_path_buf(), broker.artifacts.clone())?;
-    let secret=provider.credential_ref.as_deref().map(|reference|{
-        CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?.get(reference)?.context("Saved image provider credential is unavailable")
-    }).transpose().map_err(|_|DefinitiveFailure("Read the selected image credential from the OS credential store before trying again. No request was dispatched.".into()))?;
+    let secret = provider
+        .credential_ref
+        .as_deref()
+        .map(|reference| {
+            broker
+                .session
+                .vault()
+                .get(reference)?
+                .context("Saved image provider credential is unavailable")
+        })
+        .transpose()
+        .map_err(|_| {
+            DefinitiveFailure(
+                "The saved image provider credential is unavailable. Reconnect it on the Images page. No request was dispatched.".into(),
+            )
+        })?;
     let receipt = broker.runtime.block_on(async {
-        let resources = xylo_runtime::resources::ResourceManager::new();
+        let resources = xylo_resources::ResourceManager::new();
         let _lease = resources
             .acquire(
-                xylo_runtime::resources::TaskDemand {
+                xylo_resources::TaskDemand {
                     memory_bytes: 384 * 1024 * 1024,
                     cpu_share: 1.0,
                 },

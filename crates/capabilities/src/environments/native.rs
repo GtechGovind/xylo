@@ -71,9 +71,18 @@ pub(super) fn spec(
     timeout: u64,
     limit: usize,
 ) -> Result<ProcessSpec> {
+    // Clients get the baseline environment plus only what reaches their
+    // own agent or daemon; provider keys and other app variables never do.
+    let mut env = BTreeMap::new();
     let executable = match &record.profile.target {
-        EnvironmentTarget::Ssh { executable, .. }
-        | EnvironmentTarget::Container { executable, .. } => executable.clone(),
+        EnvironmentTarget::Ssh { executable, .. } => {
+            process::inherit(&mut env, &["SSH_AUTH_SOCK"]);
+            executable.clone()
+        }
+        EnvironmentTarget::Container { executable, .. } => {
+            process::inherit(&mut env, &["DOCKER_HOST", "CONTAINER_HOST"]);
+            executable.clone()
+        }
     };
     ensure!(
         process::validate_executable(&executable)? == executable,
@@ -83,7 +92,7 @@ pub(super) fn spec(
         executable,
         args,
         cwd: manager.root.clone(),
-        env: BTreeMap::new(),
+        env,
         timeout: Duration::from_secs(timeout),
         output_limit: limit,
     })
@@ -116,10 +125,10 @@ pub(super) async fn socket(
     let installation = manager.installation(cancel).await?;
     // The long user data path cannot fit sockaddr_un on macOS. This private
     // per-installation directory contains only multiplex control sockets.
-    let suffix = format!(
-        "{:x}",
-        Sha256::digest(format!("{}:{installation}", manager.root.display()))
-    );
+    let suffix = hex::encode(Sha256::digest(format!(
+        "{}:{installation}",
+        manager.root.display()
+    )));
     let root = PathBuf::from("/tmp").join(format!(
         "xylo-{}-{}",
         unsafe { libc::geteuid() },

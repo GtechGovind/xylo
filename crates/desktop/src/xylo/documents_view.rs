@@ -41,25 +41,21 @@ impl Xylo {
         .detach();
     }
     pub(in super::super) fn documents_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut panel = card()
-            .gap_3()
-            .w_full()
-            .min_w_0()
-            .child(div().text_lg().child("Documents"))
-            .child(
-                div().flex().gap_2().child(
-                    button("document-open", "Open document")
-                        .disabled(!self.workspace_ready)
-                        .on_click(cx.listener(|view, _, _, cx| view.document_pick(cx))),
-                ),
-            );
-        panel = panel.child(
+        // One way to open each kind of file: Open… takes documents and PDFs.
+        let mut panel = card().gap_3().w_full().min_w_0().child(
             div()
                 .flex()
                 .flex_wrap()
                 .gap_2()
                 .child(
-                    button("document-new-word", "New Word document")
+                    secondary("document-open", "Open…")
+                        .disabled(!self.workspace_ready)
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.pick_asset(super::native_tools::Asset::Document, window, cx)
+                        })),
+                )
+                .child(
+                    button("document-new-word", "New document")
                         .disabled(!self.workspace_ready || !self.documents.reads.is_empty())
                         .on_click(cx.listener(|view, _, _, cx| view.document_create(false, cx))),
                 )
@@ -67,21 +63,10 @@ impl Xylo {
                     button("document-new-sheet", "New spreadsheet")
                         .disabled(!self.workspace_ready || !self.documents.reads.is_empty())
                         .on_click(cx.listener(|view, _, _, cx| view.document_create(true, cx))),
-                )
-                .child(
-                    button("document-open-pdf", "Open PDF")
-                        .disabled(!self.workspace_ready)
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.pick_asset(super::native_tools::Asset::Document, window, cx)
-                        })),
-                )
-                .child(
-                    button("document-preview-install", "Add PDF preview")
-                        .on_click(cx.listener(|view, _, _, cx| view.open_assets(2, cx))),
                 ),
         );
         if !self.documents.notice.is_empty() {
-            panel = panel.child(subtitle(self.documents.notice.clone()));
+            panel = panel.child(notice(BadgeTone::Neutral, self.documents.notice.clone()));
         }
         panel = panel.child(self.document_recovery_status(cx));
         let Some(source) = &self.documents.source else {

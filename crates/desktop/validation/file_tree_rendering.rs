@@ -2,6 +2,13 @@
 //! No account, model task, user project, or physical desktop is accessed.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/assets.rs"]
+mod assets;
+mod capture_dir;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -106,7 +113,7 @@ fn run() {
     let host = xylo_runtime::host::HostClient::spawn_at(paths).unwrap();
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        Arc::new(crate::assets::AppAssets),
         platform::current_headless_renderer,
     );
     cx.allow_parking();
@@ -130,6 +137,8 @@ fn run() {
     let deadline = Instant::now() + Duration::from_secs(15);
     let wait = |cx: &mut HeadlessAppContext, target: Option<&std::path::Path>| {
         loop {
+            // Drive the native receiver's bounded-backlog yield timer.
+            cx.advance_clock(Duration::from_millis(2));
             cx.run_until_parked();
             let ready = cx.update(|cx| {
                 let state = view.read(cx);
@@ -197,10 +206,7 @@ fn run() {
         }
         serde_json::json!({"scope":"Controlled native GPU/font fixture using real temporary Host/project, no inference or user files", "rows":rows})
     }).unwrap();
-    let output = std::env::var_os("XYLO_RENDER_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "target/native-file-tree-preview".into());
-    std::fs::create_dir_all(&output).unwrap();
+    let output = capture_dir::fresh("file-tree-rendering");
     cx.capture_screenshot(handle)
         .unwrap()
         .save(output.join("file-tree-fixture.png"))

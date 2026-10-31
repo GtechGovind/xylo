@@ -42,45 +42,6 @@ pub enum MemoryFormSave {
     Conflict(MemoryFormSnapshot),
 }
 
-fn initialize(conn: &Connection) -> Result<()> {
-    let ready:bool=conn.query_row("SELECT count(*)=5 FROM sqlite_schema WHERE name IN('memory_forms','memory_form_usage','memory_form_insert','memory_form_update','memory_form_delete')",[],|row|row.get(0))?;
-    let schema: Option<String> = conn
-        .query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_forms'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let latest = schema.as_ref().is_some_and(|sql| sql.contains("6291456"));
-    if ready && latest {
-        return Ok(());
-    }
-    conn.execute_batch("SAVEPOINT memory_form_setup")?;
-    if schema.is_some() && !latest {
-        let migration=conn.execute_batch("DROP TRIGGER IF EXISTS memory_form_insert;DROP TRIGGER IF EXISTS memory_form_update;DROP TRIGGER IF EXISTS memory_form_delete;
-ALTER TABLE memory_forms RENAME TO memory_forms_previous_bound;
-CREATE TABLE memory_forms(scope TEXT PRIMARY KEY,json TEXT NOT NULL CHECK(length(CAST(json AS BLOB))<=6291456),revision INTEGER NOT NULL CHECK(revision>0),updated_at INTEGER NOT NULL,mutation_id TEXT NOT NULL,expected INTEGER NOT NULL);
-INSERT INTO memory_forms SELECT scope,json,revision,updated_at,mutation_id,expected FROM memory_forms_previous_bound;
-DROP TABLE memory_forms_previous_bound;");
-        if let Err(error) = migration {
-            let _ = conn.execute_batch("ROLLBACK TO memory_form_setup;RELEASE memory_form_setup");
-            return Err(error.into());
-        }
-    }
-    let setup=conn.execute_batch("CREATE TABLE IF NOT EXISTS memory_forms(scope TEXT PRIMARY KEY,json TEXT NOT NULL CHECK(length(CAST(json AS BLOB))<=6291456),revision INTEGER NOT NULL CHECK(revision>0),updated_at INTEGER NOT NULL,mutation_id TEXT NOT NULL,expected INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS memory_form_usage(singleton INTEGER PRIMARY KEY CHECK(singleton=1),bytes INTEGER NOT NULL DEFAULT 0,rows INTEGER NOT NULL DEFAULT 0);
-INSERT OR IGNORE INTO memory_form_usage(singleton) VALUES(1);
-CREATE TRIGGER IF NOT EXISTS memory_form_insert AFTER INSERT ON memory_forms BEGIN UPDATE memory_form_usage SET bytes=bytes+length(CAST(new.json AS BLOB)),rows=rows+1 WHERE singleton=1; END;
-CREATE TRIGGER IF NOT EXISTS memory_form_update AFTER UPDATE ON memory_forms BEGIN UPDATE memory_form_usage SET bytes=bytes-length(CAST(old.json AS BLOB))+length(CAST(new.json AS BLOB)) WHERE singleton=1; END;
-CREATE TRIGGER IF NOT EXISTS memory_form_delete AFTER DELETE ON memory_forms BEGIN UPDATE memory_form_usage SET bytes=bytes-length(CAST(old.json AS BLOB)),rows=rows-1 WHERE singleton=1; END;
-UPDATE memory_form_usage SET bytes=(SELECT coalesce(sum(length(CAST(json AS BLOB))),0) FROM memory_forms),rows=(SELECT count(*) FROM memory_forms) WHERE singleton=1;");
-    if let Err(error) = setup {
-        let _ = conn.execute_batch("ROLLBACK TO memory_form_setup; RELEASE memory_form_setup");
-        return Err(error.into());
-    }
-    conn.execute_batch("RELEASE memory_form_setup")?;
-    Ok(())
-}
 fn validate(scope: &str, form: &MemoryFormState) -> Result<String> {
     crate::memory_facts::validate_scope(scope)?;
     ensure!(
@@ -182,8 +143,6 @@ impl Store {
         crate::memory_facts::validate_scope(scope)?;
         let scope = scope.to_owned();
         self.call(move |conn| {
-            initialize(conn)?;
-            crate::memory_facts::initialize(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let Some((mut snapshot, _, _, _)) = read(&tx, &scope)? else {
                 tx.commit()?;
@@ -248,7 +207,6 @@ impl Store {
         let json = validate(&write.scope, &write.form)?;
         ensure!(write.expected_revision >= 0, "Invalid memory form revision");
         self.call(move |conn| {
-            initialize(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let stored = read(&tx, &write.scope)?;
             let current = stored
@@ -298,5 +256,4 @@ impl Store {
 }
 
 #[cfg(test)]
-#[path = "memory_forms_tests.rs"]
 mod tests;

@@ -25,9 +25,6 @@ struct Pending {
     paths: BTreeMap<PathBuf, bool>,
 }
 
-#[cfg(test)]
-#[path = "monitor_tests.rs"]
-mod tests;
 /// Event storms allocate at most 4,096 path identities. Overflow changes the
 /// operation to one streamed repair rather than dropping changes silently.
 pub(super) struct DirtyPaths {
@@ -210,7 +207,7 @@ impl Job {
             index::remove(&mut self.conn, None, Some(current), &mut delta, &self.stop)?;
         }
         ensure!(!self.stop.is_cancelled(), "Project refresh cancelled");
-        ensure!(self.conn.execute("UPDATE meta SET indexing=0,revision=revision+1,unreadable=?1 WHERE id=1 AND epoch=?2",rusqlite::params![unreadable,current])?==1,"The project changed; refresh files again");
+        ensure!(self.conn.execute("UPDATE meta SET indexing=0,revision=revision+1,unreadable=?1 WHERE id=1 AND epoch=?2",rusqlite::params![super::index::sql_int(unreadable),current])?==1,"The project changed; refresh files again");
         self.progress.publish(&self.conn, &delta, true)?;
         Ok(())
     }
@@ -290,11 +287,84 @@ impl Job {
         }
         if delta.any() || unreadable != 0 || subtree_scan {
             ensure!(!self.stop.is_cancelled(), "Project refresh cancelled");
-            ensure!(self.conn.execute("UPDATE meta SET revision=revision+1,unreadable=?1,indexing=0 WHERE id=1 AND epoch=?2",rusqlite::params![unreadable,current])?==1,"The project changed; refresh files again");
+            ensure!(self.conn.execute("UPDATE meta SET revision=revision+1,unreadable=?1,indexing=0 WHERE id=1 AND epoch=?2",rusqlite::params![super::index::sql_int(unreadable),current])?==1,"The project changed; refresh files again");
             self.progress.publish(&self.conn, &delta, true)?;
         }
         Ok(())
     }
+}
+
+/// Keeps a native project watcher alive on a thread of its own.
+///
+/// Registering and releasing a native watcher are blocking calls into the
+/// operating system's file event service, which can take seconds while that
+/// service is busy. They never run on the async runtime: a runtime worker held
+/// by them stalls unrelated host work, and runtime shutdown would wait for
+/// them. Dropping the handle releases the watcher in the background without
+/// waiting for the release to finish.
+struct NativeWatch {
+    _release: std::sync::mpsc::Sender<()>,
+}
+impl NativeWatch {
+    /// Runs `register` on a new thread. The receiver reports whether
+    /// recursive native watching is active; it reports an error when the
+    /// thread could not be started.
+    fn start<W: 'static>(
+        register: impl FnOnce() -> Option<W> + Send + 'static,
+    ) -> (Self, tokio::sync::oneshot::Receiver<bool>) {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (ready, registered) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("xylo-project-watch".into())
+            .spawn(move || {
+                let watcher = register();
+                if ready.send(watcher.is_some()).is_ok() && watcher.is_some() {
+                    // Returns once the handle is dropped.
+                    let _ = released.recv();
+                }
+                drop(watcher);
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "Project change watching is unavailable");
+        }
+        (Self { _release: release }, registered)
+    }
+}
+
+/// Watches `root` recursively and its parent non-recursively, so that the
+/// project folder itself being renamed or removed is noticed. `None` means
+/// recursive native watching is unavailable.
+fn register(
+    root: &Path,
+    cache: PathBuf,
+    dirty: Arc<DirtyPaths>,
+) -> Option<notify::RecommendedWatcher> {
+    let callback_root = root.to_owned();
+    let mut watcher =
+        notify::recommended_watcher(move |event| dirty.observe(event, &callback_root, &cache))
+            .ok()?;
+    watcher.watch(root, RecursiveMode::Recursive).ok()?;
+    if let Some(parent) = root.parent() {
+        let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
+    }
+    Some(watcher)
+}
+
+/// How long the first scan waits for native watcher registration before it
+/// starts without it. Registration normally takes milliseconds.
+const REGISTRATION_GRACE: Duration = Duration::from_millis(250);
+
+/// Waits for a pending watcher registration and reports whether recursive
+/// native watching is now active. Never completes once the result is known.
+async fn registration_result(
+    registration: &mut Option<tokio::sync::oneshot::Receiver<bool>>,
+) -> bool {
+    let Some(receiver) = registration.as_mut() else {
+        return std::future::pending().await;
+    };
+    let registered = receiver.await.unwrap_or(false);
+    *registration = None;
+    registered
 }
 
 pub(super) async fn run(
@@ -314,6 +384,7 @@ pub(super) async fn run(
         dirty,
         events.clone(),
         stop.clone(),
+        register,
     )
     .await;
     if !stop.is_cancelled()
@@ -325,7 +396,8 @@ pub(super) async fn run(
         }
     }
 }
-async fn observe(
+#[allow(clippy::too_many_arguments)]
+async fn observe<W: 'static>(
     root: PathBuf,
     cache: PathBuf,
     database: PathBuf,
@@ -333,24 +405,29 @@ async fn observe(
     dirty: Arc<DirtyPaths>,
     events: async_channel::Sender<WorkspaceEvent>,
     stop: CancellationToken,
+    register: impl FnOnce(&Path, PathBuf, Arc<DirtyPaths>) -> Option<W> + Send + 'static,
 ) -> Result<()> {
     tokio::fs::create_dir_all(&cache).await?;
     let cache = tokio::fs::canonicalize(cache).await?;
-    let callback_root = root.clone();
-    let callback_cache = cache.clone();
-    let callback_dirty = dirty.clone();
-    let mut watcher = notify::recommended_watcher(move |event| {
-        callback_dirty.observe(event, &callback_root, &callback_cache)
-    })
-    .ok();
-    let mut native = watcher
-        .as_mut()
-        .is_some_and(|watcher| watcher.watch(&root, RecursiveMode::Recursive).is_ok());
-    if !native {
-        drop(watcher.take());
-    }
-    if let (Some(watcher), Some(parent)) = (watcher.as_mut(), root.parent()) {
-        let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
+    let (watch, registered) = NativeWatch::start({
+        let root = root.clone();
+        let cache = cache.clone();
+        let dirty = dirty.clone();
+        move || register(&root, cache, dirty)
+    });
+    let mut watch = Some(watch);
+    // A watcher that is live before the first scan starts misses nothing.
+    // When registration is slow, the scan starts anyway so the catalogue is
+    // not held hostage by the file event service; a late watcher then
+    // triggers one repair that covers changes made before it was live.
+    let mut registration = Some(registered);
+    let mut native = tokio::select! {
+        _ = stop.cancelled() => return Ok(()),
+        registered = registration_result(&mut registration) => registered,
+        _ = tokio::time::sleep(REGISTRATION_GRACE) => false,
+    };
+    if registration.is_none() && !native {
+        watch = None;
     }
     let initialize_root = root.clone();
     let conn = tokio::task::spawn_blocking(move || index::open_writer(&database, &initialize_root))
@@ -398,7 +475,7 @@ async fn observe(
         }
         if native && dirty.watch_failed.load(Ordering::Acquire) {
             native = false;
-            drop(watcher.take());
+            watch = None;
             job.conn
                 .execute("UPDATE meta SET watching=0 WHERE id=1", [])?;
             job.progress.publish(
@@ -431,6 +508,15 @@ async fn observe(
                 _=stop.cancelled()=>break,
                 _=dirty.incoming.recv()=>{},
                 _=tokio::time::sleep(Duration::from_secs(if had_error{60}else{300}))=>dirty.repair(),
+                registered=registration_result(&mut registration)=>{
+                    if registered {
+                        native = true;
+                        job.conn.execute("UPDATE meta SET watching=1 WHERE id=1", [])?;
+                        dirty.repair();
+                    } else {
+                        watch = None;
+                    }
+                },
             }
         }
         tokio::select! {
@@ -438,10 +524,12 @@ async fn observe(
             _=tokio::time::sleep(Duration::from_millis(150))=>{},
         }
     }
-    drop(watcher);
+    drop(watch);
     Ok(())
 }
 
 #[cfg(test)]
-#[path = "monitor/review_tests.rs"]
+mod tests;
+
+#[cfg(test)]
 mod review_tests;
