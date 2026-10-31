@@ -1,145 +1,192 @@
+//! The chat page: one centred reading column (760 px) holding the history
+//! messages and the live turn (rendered by `transcript`), and the composer at
+//! the same width underneath. The transcript fades into the page above the
+//! composer and keeps a fixed bottom inset, so its last line is never hidden.
+//!
+//! Messages: the person's turns sit right-aligned on a neutral raised surface
+//! that hugs its text; answers are full-width text on the page with an action
+//! row (copy, retry, read aloud, time) that is always shown for the latest
+//! answer and appears on hover for earlier ones. Hover actions are overlaid,
+//! never reserving layout space.
 use super::*;
-use gpui_kit::base::{Disableable, Selectable};
+use crate::icons::{self, AppIcon};
+use gpui_kit::base::Disableable;
+use gpui_kit::base::TestSupportExt;
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 #[path = "tool_result_view.rs"]
 mod tool_result_view;
-use gpui_kit::base::TestSupportExt;
-use gpui_kit::component::{
-    IconName,
-    button::{Button as MenuButton, ButtonVariants},
-    menu::{DropdownMenu, PopupMenuItem},
-};
+#[path = "chat/tools.rs"]
+mod tools;
+#[path = "transcript.rs"]
+mod transcript;
 
-/// Assistant turns are prefixed by the product mark in the left gutter, the
-/// way a reply reads in a modern assistant: no name label, no bubble.
-fn assistant_row(body: AnyElement) -> AnyElement {
+/// The composer's prompt on the home screen, where nothing has been said yet.
+const HOME_PLACEHOLDER: &str = "How can I help you today?";
+/// The composer's prompt inside a conversation.
+const REPLY_PLACEHOLDER: &str = "Reply to Xylo…";
+/// Width of the reading column, shared by the transcript and the composer.
+const COLUMN_WIDTH: f32 = 760.;
+/// Space kept under the last transcript row so the fade never covers it;
+/// at least [`FADE_HEIGHT`].
+const BOTTOM_INSET: f32 = 32.;
+/// Height of the fade between the transcript and the composer.
+const FADE_HEIGHT: f32 = 28.;
+const _: () = assert!(BOTTOM_INSET >= FADE_HEIGHT);
+/// Space under an answer, holding its overlaid action row (one 28 px icon
+/// button high) clear of the answer's last line.
+const ANSWER_GAP: f32 = 30.;
+
+/// Placeholder messages while a conversation's first page loads: a request
+/// and a reply, twice, so the layout the reader is about to see is already
+/// there.
+fn history_skeleton() -> AnyElement {
+    use crate::motion::{skeleton_block, skeleton_paragraph};
+    let exchange = |reply_lines: usize, request_width: f32| {
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(22.))
+            .child(
+                div().w_full().flex().justify_end().child(
+                    skeleton_block(relative(request_width), px(38.))
+                        .map_element(|block| block.rounded(px(18.))),
+                ),
+            )
+            .child(skeleton_paragraph(reply_lines).pt(px(4.)))
+    };
     div()
+        .id("history-skeleton")
+        .test_support()
+        .aria_label("Loading conversation")
         .w_full()
-        .min_w_0()
+        .py(px(14.))
         .flex()
-        .items_start()
-        .gap(px(12.))
-        .child(
-            div()
-                .flex_shrink_0()
-                .w(px(20.))
-                .pt(px(6.))
-                .child(brand_glyph(16.)),
-        )
-        .child(div().flex_1().min_w_0().child(body))
+        .flex_col()
+        .gap(px(30.))
+        .child(exchange(4, 0.42))
+        .child(exchange(3, 0.3))
         .into_any_element()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ActivityPosition {
-    Standalone,
-    Start,
-    Continuation,
+/// How a saved reply that did not finish is labelled after a reload.
+fn reply_status_label(status: MessageStatus) -> Option<&'static str> {
+    match status {
+        MessageStatus::Complete => None,
+        MessageStatus::Interrupted => Some("Stopped · the reply ended early"),
+        MessageStatus::Failed => Some("Failed · the reply is incomplete"),
+    }
 }
 
-fn activity_eligible(tool: &crate::state::ToolCard) -> bool {
-    !tool.approval
-        && tool.success != Some(false)
-        && tool.presentation.error.is_none()
-        && !matches!(tool.name.as_str(), "todo_write" | "image_generate")
-}
-
-/// O(1), immediate neighbors only; never projects, filters, or mutates list rows.
-fn adjacent_activity(tools: &[crate::state::ToolCard], i: usize) -> ActivityPosition {
-    let Some(tool) = tools.get(i).filter(|tool| activity_eligible(tool)) else {
-        return ActivityPosition::Standalone;
+/// When an answer was written: the time today, the date before that.
+fn time_label(at_ms: i64, now_ms: i64) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+    let (Some(at), Some(now)) = (
+        Local.timestamp_millis_opt(at_ms).single(),
+        Local.timestamp_millis_opt(now_ms).single(),
+    ) else {
+        return String::new();
     };
-    let _ = tool;
-    if i.checked_sub(1)
-        .and_then(|i| tools.get(i))
-        .is_some_and(activity_eligible)
-    {
-        ActivityPosition::Continuation
-    } else if i
-        .checked_add(1)
-        .and_then(|i| tools.get(i))
-        .is_some_and(activity_eligible)
-    {
-        ActivityPosition::Start
+    if at.date_naive() == now.date_naive() {
+        at.format("%-I:%M %p").to_string()
+    } else if at.year() == now.year() {
+        at.format("%b %-d, %-I:%M %p").to_string()
     } else {
-        ActivityPosition::Standalone
+        at.format("%b %-d %Y, %-I:%M %p").to_string()
     }
 }
 
-#[cfg(test)]
-mod activity_tests {
-    use super::{ActivityPosition, adjacent_activity};
-    use uuid::Uuid;
-
-    fn tool(name: &str) -> crate::state::ToolCard {
-        crate::state::ToolCard {
-            id: Uuid::nil(),
-            name: name.into(),
-            input: serde_json::json!({}),
-            result: None,
-            presentation: Default::default(),
-            approval: false,
-            rule: None,
-            success: None,
-            started_at: 0,
-            finished_at: None,
+/// Markdown as it should sound: code blocks are skipped and markup symbols
+/// dropped, so "Read aloud" speaks the prose and not the syntax.
+fn speakable_text(markdown: &str) -> String {
+    let mut spoken = Vec::new();
+    let mut in_code = false;
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code || trimmed.is_empty() || trimmed.chars().all(|ch| "|-: ".contains(ch)) {
+            continue;
+        }
+        let line = trimmed
+            .trim_start_matches(['#', '>', '-', '*', '+'])
+            .trim_start();
+        let mut text = String::with_capacity(line.len());
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '*' | '_' | '`' | '#' | '|' => {}
+                // A link reads as its label: "[label](target)" → "label".
+                '[' => {
+                    for inner in chars.by_ref() {
+                        if inner == ']' {
+                            break;
+                        }
+                        text.push(inner);
+                    }
+                    if chars.peek() == Some(&'(') {
+                        for skipped in chars.by_ref() {
+                            if skipped == ')' {
+                                break;
+                            }
+                        }
+                    }
+                }
+                other => text.push(other),
+            }
+        }
+        let text = text.trim();
+        if !text.is_empty() {
+            spoken.push(text.to_owned());
         }
     }
+    spoken.join("\n")
+}
 
-    #[test]
-    fn adjacent_activity_boundaries_and_runs() {
-        assert_eq!(adjacent_activity(&[], 0), ActivityPosition::Standalone);
-        assert_eq!(
-            adjacent_activity(&[tool("file_read")], 0),
-            ActivityPosition::Standalone
-        );
-        let tools = [
-            tool("file_read"),
-            tool("search_project"),
-            tool("run_command"),
-        ];
-        assert_eq!(adjacent_activity(&tools, 0), ActivityPosition::Start);
-        assert_eq!(adjacent_activity(&tools, 1), ActivityPosition::Continuation);
-        assert_eq!(adjacent_activity(&tools, 2), ActivityPosition::Continuation);
-        assert_eq!(adjacent_activity(&tools, 3), ActivityPosition::Standalone);
-        assert_eq!(
-            adjacent_activity(&tools, usize::MAX),
-            ActivityPosition::Standalone
-        );
-    }
+/// A stable key for an answer's text, to tell which answer is being read.
+fn text_key(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
 
-    #[test]
-    fn adjacent_activity_exclusions_break_runs() {
-        let mut approval = tool("file_edit");
-        approval.approval = true;
-        let mut failure = tool("run_command");
-        failure.success = Some(false);
-        let mut error = tool("file_read");
-        error.presentation.error = Some("failed".into());
-        for excluded in [
-            approval,
-            failure,
-            error,
-            tool("todo_write"),
-            tool("image_generate"),
-        ] {
-            let tools = [
-                tool("file_read"),
-                excluded,
-                tool("search_project"),
-                tool("git_status"),
-            ];
-            assert_eq!(adjacent_activity(&tools, 0), ActivityPosition::Standalone);
-            assert_eq!(adjacent_activity(&tools, 1), ActivityPosition::Standalone);
-            assert_eq!(adjacent_activity(&tools, 2), ActivityPosition::Start);
-            assert_eq!(adjacent_activity(&tools, 3), ActivityPosition::Continuation);
-        }
+/// Image files attach as images; every other file is referenced by path in
+/// the message, where the agent can read it.
+pub(super) fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif"
+            )
+        })
+}
+
+/// A reveal-on-hover style shared by every overlaid action: hidden at rest,
+/// shown while its message (including the gap holding the actions) is
+/// hovered.
+fn reveal_on_hover<E: Styled + InteractiveElement>(element: E, always: bool) -> E {
+    if always {
+        element
+    } else {
+        element
+            .opacity(0.)
+            .group_hover("chat-message", |style| style.opacity(1.))
     }
 }
 
-#[derive(Default)]
-struct ComposerModelPicker {
-    choosing: bool,
-    models: std::sync::Arc<Vec<ProviderConfig>>,
+/// A small icon action of a message; keyboard focus always reveals it.
+fn message_action(
+    id: impl Into<ElementId>,
+    glyph: AppIcon,
+    label: &'static str,
+    always: bool,
+) -> gpui_kit::base::Button {
+    reveal_on_hover(icons::icon_button(id, glyph, label), always).focus(|style| style.opacity(1.))
 }
 
 impl Xylo {
@@ -147,7 +194,11 @@ impl Xylo {
         if self.recovery.open {
             return self.recovery_panel(cx);
         }
-        if self.messages.is_empty() && !self.running() && !self.history_loading() {
+        if self.messages.is_empty()
+            && !self.running()
+            && !self.history_loading()
+            && !self.has_live_transcript()
+        {
             let home = self.chat_home(cx);
             if self.recovery_blocks_submit() {
                 return div()
@@ -161,22 +212,69 @@ impl Xylo {
             return home;
         }
         self.sync_history_list(cx);
-        let state = self.histories.get(&self.session).unwrap().list.clone();
+        let Some(history) = self.histories.get(&self.session) else {
+            return div().into_any_element();
+        };
+        let state = history.list.clone();
+        let jump = self.running() && history.reader_scrolled_away();
         let weak = cx.entity().downgrade();
-        let history = list(state, move |index, _, cx| {
-            weak.update(cx, |view, cx| view.chat_row(index, cx))
+        let list = list(state, move |index, window, cx| {
+            weak.update(cx, |view, cx| view.chat_row(index, window, cx))
                 .unwrap_or_else(|_| div().into_any_element())
         })
-        .flex_1()
-        .min_h_0()
-        .w_full();
+        .size_full()
+        .pb(px(BOTTOM_INSET));
+        let canvas_color: Hsla = rgb(bg()).into();
+        // Escape stops the task only while the transcript or composer has focus.
+        let pane = div()
+            .track_focus(&self.transcript_focus)
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(list)
+            .child(
+                // The transcript dissolves into the page above the composer.
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(FADE_HEIGHT))
+                    .bg(linear_gradient(
+                        0.,
+                        linear_color_stop(canvas_color, 0.),
+                        linear_color_stop(canvas_color.opacity(0.), 1.),
+                    )),
+            )
+            .when(jump, |pane| {
+                pane.child(
+                    div()
+                        .absolute()
+                        .bottom(px(10.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(crate::motion::fade_slide_in(
+                            "jump-to-latest-enter",
+                            pill("jump-to-latest", "Jump to latest")
+                                .accessibility_label("Jump to the latest output")
+                                .bg(rgb(panel()))
+                                .border_color(rgb(border_strong()))
+                                .shadow_sm()
+                                .on_click(cx.listener(|view, _, _, cx| view.jump_to_latest(cx))),
+                            8.,
+                        )),
+                )
+            });
         div()
             .size_full()
             .flex()
             .flex_col()
             .min_h_0()
             .child(self.recovery_banner(cx))
-            .child(history)
+            .child(pane)
             .child(self.history_later_footer(cx))
             .child(
                 div()
@@ -184,207 +282,541 @@ impl Xylo {
                     .flex()
                     .justify_center()
                     .px(px(28.))
-                    .pt(px(6.))
                     .pb(px(20.))
                     .flex_shrink_0()
                     .child(self.prompt_box(cx)),
             )
             .into_any_element()
     }
-    fn chat_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let content = if index == 0 {
-            let history = self.histories.get(&self.session).unwrap();
-            div()
-                .flex()
-                .justify_center()
-                .py_2()
-                .child(if history.loading {
-                    subtitle("Loading conversation…").into_any_element()
-                } else if history.has_more {
-                    secondary("older-messages", "Load earlier messages")
-                        .h(px(30.))
-                        .rounded_full()
-                        .text_size(px(12.5))
-                        .on_click(cx.listener(|view, _, _, cx| view.load_older(cx)))
-                        .into_any_element()
-                } else {
-                    div().into_any_element()
-                })
-                .into_any_element()
-        } else if let Some(message) = self.messages.get(index - 1) {
-            let user = message.role == "user";
-            let content = message.content.clone();
-            let body = div()
-                .id(("message-body", index))
-                .test_support()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .text_size(px(15.))
-                .line_height(relative(if user { 1.5 } else { 1.7 }))
-                .text_color(rgb(text()))
-                .when(user, |row| {
-                    row.max_w(px(640.))
-                        .px(px(16.))
-                        .py(px(10.))
-                        .rounded(px(18.))
-                        .bg(rgb(brand_soft()))
-                })
-                .when(!user, |row| row.w_full())
-                .when(self.history_message_highlight(message.id), |row| {
-                    row.border_1().border_color(rgb(brand()))
-                })
-                .when(!message.content.is_empty(), |row| {
-                    row.child(
-                        TextView::markdown(
-                            SharedString::from(message.id.to_string()),
-                            message.content.clone(),
-                        )
-                        .selectable(true),
-                    )
-                })
-                .when(!message.attachments.is_empty(), |row| {
-                    row.child(self.message_images(message, cx))
-                });
-            let copy = focus_ring(gpui_kit::base::Button::new(("copy-message", index)))
-                .accessibility_label("Copy message")
-                .tooltip(|_, cx| cx.new(|_| XyloTooltip("Copy".into())).into())
-                .opacity(0.)
-                .group_hover("chat-message", |style| style.opacity(1.))
-                .focus(|style| style.opacity(1.))
-                .size(px(26.))
-                .rounded(px(7.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(rgb(muted()))
-                .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
-                .child(icon(IconName::Copy).size(px(13.)))
-                .on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(content.clone()))
-                });
-            let body = if user {
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .gap(px(4.))
-                    .child(body)
-                    .child(div().pr(px(4.)).child(copy))
-                    .into_any_element()
-            } else {
-                assistant_row(
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.))
-                        .child(body)
-                        .child(div().flex().child(copy))
-                        .into_any_element(),
-                )
-            };
-            div()
-                .id(("chat-message", index))
-                .test_support()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .group("chat-message")
-                .child(body)
-                .into_any_element()
-        } else if let Some(turn) = self.turns.get(&self.session) {
-            let offset = index - self.messages.len() - 1;
-            let latest_plan = turn.tools.iter().rposition(|t| t.name == "todo_write");
-            let streamed = !turn.text.is_empty() && (turn.running || turn.status == "Cancelled");
-            if let Some(tool) = turn.tools.get(offset) {
-                // Presentation only: keep the direct list-index mapping and every tool row.
-                let activity = adjacent_activity(&turn.tools, offset);
-                // Runs of quiet activity are grouped under one caption and a
-                // hairline; standalone or attention-worthy cards stand alone.
-                let grouped = activity != ActivityPosition::Standalone;
-                div()
-                    .w_full()
-                    .pl(px(32.))
-                    .when(grouped, |section| {
-                        section.child(
-                            div()
-                                .w_full()
-                                .when(activity == ActivityPosition::Start, |run| {
-                                    run.child(
-                                        div()
-                                            .pb(px(6.))
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.))
-                                            .child(
-                                                icon(Glyph::ListChecks)
-                                                    .size(px(13.))
-                                                    .text_color(rgb(faint())),
-                                            )
-                                            .child(eyebrow("Working through the task")),
-                                    )
-                                })
-                                .child(
-                                    div()
-                                        .border_l_2()
-                                        .border_color(rgb(border()))
-                                        .pl(px(10.))
-                                        .child(self.tool_row(
-                                            offset,
-                                            tool,
-                                            latest_plan == Some(offset),
-                                            cx,
-                                        )),
-                                ),
-                        )
-                    })
-                    .when(!grouped, |section| {
-                        section.py(px(4.)).child(self.tool_row(
-                            offset,
-                            tool,
-                            latest_plan == Some(offset),
-                            cx,
-                        ))
-                    })
-                    .into_any_element()
-            } else if offset == turn.tools.len() && streamed {
-                assistant_row(
-                    div()
-                        .w_full()
-                        .pt(px(4.))
-                        .text_size(px(15.))
-                        .line_height(relative(1.7))
-                        .text_color(rgb(text()))
-                        .child(
-                            TextView::markdown("streamed-answer", turn.text.clone())
-                                .selectable(true),
-                        )
-                        .into_any_element(),
-                )
-            } else if turn.running {
-                turn_status(turn)
-            } else if let Some(error) = &turn.error {
-                self.turn_error(error, cx)
-            } else {
-                div().into_any_element()
+    /// Applies one engine event to its chat's turn. A new turn first moves the
+    /// previous reply into the message list so the transcript stays in order.
+    pub(super) fn engine_event(
+        &mut self,
+        session: Uuid,
+        event: EngineEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.log(match &event {
+            EngineEvent::Delta { .. } => String::new(),
+            EngineEvent::ToolStarted { name, .. } => format!("Tool started: {name}"),
+            EngineEvent::ToolFinished { name, success, .. } => {
+                format!("Tool finished: {name}, success={success}")
             }
-        } else {
-            div().into_any_element()
+            EngineEvent::ApprovalRequired { name, .. } => format!("Approval required: {name}"),
+            other => format!("{other:?}"),
+        });
+        // A schedule the agent created or changed shows on the Scheduled page
+        // without waiting for a restart.
+        if let EngineEvent::ToolFinished {
+            name,
+            success: true,
+            ..
+        } = &event
+            && name.starts_with("schedule_")
+        {
+            self.refresh_schedules(cx);
+        }
+        let running = self.turns.get(&session).is_some_and(|turn| turn.running);
+        let opens_turn = matches!(event, EngineEvent::Started)
+            || (!running
+                && matches!(
+                    event,
+                    EngineEvent::Phase {
+                        phase: TurnPhase::Preparing
+                    }
+                ));
+        if opens_turn {
+            self.archive_finished_turn(session);
+            if session == self.session {
+                self.refresh_composer_placeholder(cx);
+            }
+        }
+        let finished_tool = match &event {
+            EngineEvent::ToolFinished { action_id, .. } => Some(*action_id),
+            _ => None,
         };
+        let completed = matches!(event, EngineEvent::Completed { .. });
+        let review_changed = matches!(
+            &event,
+            EngineEvent::Started
+                | EngineEvent::Completed { .. }
+                | EngineEvent::Cancelled
+                | EngineEvent::Error { .. }
+                | EngineEvent::ToolFinished { .. }
+        );
+        self.turns.entry(session).or_default().apply(event);
+        if let Some(action) = finished_tool
+            && session == self.session
+        {
+            // The reducer already parsed the result once for its card.
+            let artifacts: Vec<PathBuf> = self
+                .turns
+                .get(&session)
+                .and_then(|turn| turn.tool(action))
+                .and_then(|tool| tool.presentation.parsed_output.clone())
+                .and_then(|value| value.get("artifacts").and_then(|v| v.as_array()).cloned())
+                .into_iter()
+                .flatten()
+                .filter_map(|path| path.as_str().map(PathBuf::from))
+                .collect();
+            for path in artifacts {
+                self.record_artifact(path);
+            }
+        }
+        if completed {
+            if session != self.session
+                && let Some(history) = self.histories.get_mut(&session)
+            {
+                history.stale = true;
+            }
+            let _ = self.host.as_ref().map(|h| h.list_conversations());
+        }
+        if session == self.session && review_changed {
+            self.recovery_activate(window, cx);
+            self.refresh_action_reviews(cx);
+        }
+        cx.notify();
+    }
+    /// Rows after the history messages: the turn's work summary, one row per
+    /// transcript segment, and its activity or outcome row.
+    pub(super) fn live_row_count(&self) -> usize {
+        let turn = self.turns.get(&self.session);
+        let segments = turn.map_or(0, |turn| turn.segments.len());
+        let active =
+            self.sending_turn() || turn.is_some_and(|turn| turn.running || turn.outcome.is_some());
+        if segments == 0 && !active {
+            0
+        } else {
+            segments + 2
+        }
+    }
+    pub(super) fn has_live_transcript(&self) -> bool {
+        self.live_row_count() > 0
+    }
+    /// A message was sent to an idle chat and the host has not started it yet.
+    pub(super) fn sending_turn(&self) -> bool {
+        !self.running() && self.draft_send_pending()
+    }
+    /// Moves a finished turn's reply into the message list, as history stores
+    /// it, so the next turn renders after it.
+    pub(super) fn archive_finished_turn(&mut self, session: Uuid) {
+        let Some(turn) = self.turns.get_mut(&session) else {
+            return;
+        };
+        if turn.running || (turn.segments.is_empty() && turn.outcome.is_none()) {
+            return;
+        }
+        // A retried turn resumes under the same id; its partial reply is not history.
+        let reply = turn.reply().filter(|_| !turn.resend);
+        let finished_at = turn.finished_at;
+        turn.archive();
+        if let Some((text, status)) = reply {
+            if session == self.session {
+                let mut reply = message(session, "assistant", text);
+                reply.status = status;
+                if let Some(at) = finished_at {
+                    reply.created_at = at;
+                }
+                self.messages.push(reply);
+            } else if let Some(history) = self.histories.get_mut(&session) {
+                history.stale = true;
+            }
+        }
+        if session == self.session {
+            self.invalidate_live_history();
+        }
+    }
+    /// Runs the failed turn again under its own id: the engine resumes it from
+    /// its checkpoint and the host's user-message registration is idempotent,
+    /// so the prompt is not repeated in the transcript.
+    pub(super) fn retry_last_message(&mut self, cx: &mut Context<Self>) {
+        if self.running() || self.sending_turn() || self.recovery_blocks_submit() {
+            return;
+        }
+        if let Err(error) = self.settings.provider.validate() {
+            self.error = Some(error.to_string());
+            self.settings_open = true;
+            self.navigate(Page::Providers, cx);
+            return;
+        }
+        let Some(turn) = self.turns.get_mut(&self.session) else {
+            return;
+        };
+        let Some(mut request) = turn
+            .request
+            .clone()
+            .filter(|_| turn.failure().is_some_and(|failure| failure.retryable) && !turn.resend)
+        else {
+            self.error = Some("This task can no longer be retried. Send the message again.".into());
+            cx.notify();
+            return;
+        };
+        turn.resend = true;
+        turn.render_revision = turn.render_revision.wrapping_add(1);
+        // The same prompt and images, with the connection fixed since the failure.
+        request.provider = self.settings.provider.clone();
+        request.permissions = self.settings.permissions;
+        request.approved_rules = Vec::new();
+        self.engine_command(WorkerCommand::Run { turn: request }, cx);
+        self.invalidate_live_history();
+        self.sync_history_list(cx);
+        cx.notify();
+    }
+    /// The prompt "Retry" under the latest answer asks again: the person's
+    /// last message, when it was text only and nothing else is in flight or
+    /// typed.
+    fn retry_prompt(&self, cx: &App) -> Option<String> {
+        if self.running()
+            || self.sending_turn()
+            || !self.composer.read(cx).value().trim().is_empty()
+        {
+            return None;
+        }
+        self.messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .filter(|message| message.attachments.is_empty() && !message.content.trim().is_empty())
+            .map(|message| message.content.clone())
+    }
+    /// Asks the latest question again through the normal send path, so drafts,
+    /// admission and the queue treat it like any other message.
+    fn retry_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.retry_prompt(cx) else {
+            return;
+        };
+        self.composer
+            .update(cx, |input, cx| input.set_value(prompt, window, cx));
+        self.draft_changed(cx);
+        self.submit(window, cx);
+    }
+    /// Puts a sent message back in the composer to edit and send again. A
+    /// draft already being typed is kept above it.
+    fn edit_message(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.composer.read(cx).value().trim_end().to_owned();
+        let value = if draft.is_empty() {
+            text
+        } else {
+            format!("{draft}\n\n{text}")
+        };
+        self.composer.update(cx, |input, cx| {
+            input.set_value(value, window, cx);
+            input.focus(window, cx);
+        });
+        self.draft_changed(cx);
+        cx.notify();
+    }
+    /// Whether the answer with this text is the one being read aloud (its
+    /// speech is still being made or playing).
+    fn reading_answer(&self, markdown: &str) -> bool {
+        self.reading_aloud == Some(text_key(markdown))
+            && (self.speech.playing || self.speech.busy())
+    }
+    /// Reads an answer aloud with the selected voice, or stops it when it is
+    /// the one being read.
+    fn read_aloud(&mut self, markdown: &str, cx: &mut Context<Self>) {
+        if self.reading_answer(markdown) {
+            self.reading_aloud = None;
+            self.stop_speech(cx);
+            cx.notify();
+            return;
+        }
+        self.reading_aloud = Some(text_key(markdown));
+        self.speech_speak_text(speakable_text(markdown), cx);
+    }
+    fn chat_row(&self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let is_message = index > 0 && index <= self.messages.len();
+        let content = if index == 0 {
+            self.history_header(cx)
+        } else if let Some(message) = self.messages.get(index - 1) {
+            self.message_row(index, message, cx)
+        } else {
+            self.live_row(index - 1 - self.messages.len(), window, cx)
+        };
+        let user = is_message && self.messages[index - 1].role == "user";
         div()
             .w_full()
             .flex()
             .justify_center()
             .px(px(28.))
-            .py(px(2.))
-            .when(index > 0 && index <= self.messages.len(), |row| {
-                row.py(px(14.))
+            .when(is_message && user, |row| row.pt(px(2.)).pb(px(10.)))
+            .when(is_message && !user, |row| row.pt(px(4.)))
+            .child(div().w_full().max_w(px(COLUMN_WIDTH)).child(content))
+            .into_any_element()
+    }
+    /// The first list row: placeholder messages while a conversation loads,
+    /// a spinner row while an earlier page loads, or the control that asks
+    /// for one.
+    fn history_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let history = self.histories.get(&self.session);
+        let loading = history.is_some_and(|history| history.loading);
+        if loading && self.messages.is_empty() && !self.has_live_transcript() {
+            return history_skeleton();
+        }
+        div()
+            .flex()
+            .justify_center()
+            .py_2()
+            .child(if loading {
+                div()
+                    .id("history-loading-older")
+                    .test_support()
+                    .h(px(30.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(12.5))
+                    .text_color(rgb(muted()))
+                    .child(crate::motion::spinner_inline())
+                    .child(if history.is_some_and(|history| history.loading_older()) {
+                        "Loading earlier messages…"
+                    } else {
+                        "Updating conversation…"
+                    })
+                    .into_any_element()
+            } else if history.is_some_and(|history| history.has_more) {
+                secondary("older-messages", "Load earlier messages")
+                    .h(px(30.))
+                    .rounded_full()
+                    .text_size(px(12.5))
+                    .on_click(cx.listener(|view, _, _, cx| view.load_older(cx)))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
             })
-            .child(div().w_full().max_w(px(760.)).child(content))
+            .into_any_element()
+    }
+    fn message_row(
+        &self,
+        index: usize,
+        message: &ChatMessage,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if message.role == "user" {
+            return div()
+                .id(("chat-message", index))
+                .test_support()
+                .w_full()
+                .min_w_0()
+                .group("chat-message")
+                .child(self.user_message(index, message, cx))
+                .into_any_element();
+        }
+        // The hover group spans the gap below the answer, where its action
+        // row is overlaid, so moving onto the actions keeps them shown.
+        div()
+            .w_full()
+            .min_w_0()
+            .relative()
+            .pb(px(ANSWER_GAP))
+            .group("chat-message")
+            .child(
+                div()
+                    .id(("chat-message", index))
+                    .test_support()
+                    .w_full()
+                    .min_w_0()
+                    .child(self.answer_message(index, message, cx)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .bottom_0()
+                    .child(self.answer_actions(
+                        index,
+                        message.content.clone(),
+                        message.created_at,
+                        reply_status_label(message.status),
+                        index == self.messages.len() && !self.has_live_transcript(),
+                        cx,
+                    )),
+            )
+            .into_any_element()
+    }
+    /// The person's message: a neutral bubble that hugs its text, at most 80%
+    /// of the column, with copy and edit beside it on hover.
+    fn user_message(
+        &self,
+        index: usize,
+        message: &ChatMessage,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let copy_text = message.content.clone();
+        let edit_text = message.content.clone();
+        let bubble = div()
+            .id(("message-body", index))
+            .test_support()
+            .min_w_0()
+            .max_w(relative(0.8))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px(px(14.))
+            .py(px(8.))
+            .rounded(px(18.))
+            .bg(rgb(well()))
+            .text_size(px(15.))
+            .line_height(relative(1.5))
+            .text_color(rgb(text()))
+            .when(self.history_message_highlight(message.id), |row| {
+                row.border_1().border_color(rgb(brand()))
+            })
+            .when(!message.content.is_empty(), |row| {
+                row.child(
+                    TextView::markdown(
+                        SharedString::from(message.id.to_string()),
+                        message.content.clone(),
+                    )
+                    .selectable(true),
+                )
+            })
+            .when(!message.attachments.is_empty(), |row| {
+                row.child(self.message_images(message, cx))
+            });
+        let actions = div()
+            .id(("message-actions", index))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .child(
+                message_action(("copy-message", index), AppIcon::Copy, "Copy", false).on_click(
+                    move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()))
+                    },
+                ),
+            )
+            .when(!message.content.trim().is_empty(), |row| {
+                row.child(
+                    message_action(("edit-message", index), AppIcon::Edit, "Edit", false).on_click(
+                        cx.listener(move |view, _, window, cx| {
+                            view.edit_message(edit_text.clone(), window, cx)
+                        }),
+                    ),
+                )
+            });
+        div()
+            .w_full()
+            .flex()
+            .justify_end()
+            .items_end()
+            .gap(px(4.))
+            .child(actions)
+            .child(bubble)
+            .into_any_element()
+    }
+    /// An answer from history: text on the page.
+    fn answer_message(
+        &self,
+        index: usize,
+        message: &ChatMessage,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(("message-body", index))
+            .test_support()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_size(px(15.))
+            .line_height(relative(1.7))
+            .text_color(rgb(text()))
+            .when(self.history_message_highlight(message.id), |row| {
+                row.border_1().border_color(rgb(brand()))
+            })
+            .when(!message.content.is_empty(), |row| {
+                row.child(
+                    TextView::markdown(
+                        SharedString::from(message.id.to_string()),
+                        message.content.clone(),
+                    )
+                    .selectable(true),
+                )
+            })
+            .when(!message.attachments.is_empty(), |row| {
+                row.child(self.message_images(message, cx))
+            })
+            .into_any_element()
+    }
+    /// Copy, Retry (latest answer only), Read aloud and when it was written.
+    /// The latest answer shows the row; earlier ones reveal it on hover.
+    fn answer_actions(
+        &self,
+        index: usize,
+        text: String,
+        at_ms: i64,
+        note: Option<&'static str>,
+        latest: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let copy_text = text.clone();
+        let reading = self.reading_answer(&text);
+        // Another answer (or a recording) is using the speaker.
+        let speech_busy = (self.speech.busy() || self.speech.playing) && !reading;
+        let retry = latest && self.retry_prompt(cx).is_some();
+        // The glyph sits 6 px inside its hit area; pull the row left so the
+        // first icon lines up with the answer text.
+        div()
+            .id(("message-actions", index))
+            .ml(px(-6.))
+            .flex()
+            .items_center()
+            .child(
+                message_action(("copy-message", index), AppIcon::Copy, "Copy", latest).on_click(
+                    move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()))
+                    },
+                ),
+            )
+            .when(retry, |row| {
+                row.child(
+                    message_action(("retry-message", index), AppIcon::Retry, "Retry", true)
+                        .on_click(cx.listener(|view, _, window, cx| view.retry_answer(window, cx))),
+                )
+            })
+            .child(
+                message_action(
+                    ("read-aloud", index),
+                    if reading {
+                        AppIcon::Stop
+                    } else {
+                        AppIcon::ReadAloud
+                    },
+                    if reading {
+                        "Stop reading"
+                    } else {
+                        "Read aloud"
+                    },
+                    latest || reading,
+                )
+                .disabled(speech_busy)
+                .on_click(cx.listener(move |view, _, _, cx| view.read_aloud(&text, cx))),
+            )
+            .child(reveal_on_hover(
+                div()
+                    .id(("message-time", index))
+                    .pl(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .single_line()
+                    .text_size(px(12.))
+                    .text_color(rgb(faint()))
+                    .child(time_label(at_ms, now_ms()))
+                    .when_some(note, |row, note| {
+                        row.child("·").child(
+                            div()
+                                .id(("message-status", index))
+                                .test_support()
+                                .text_color(rgb(muted()))
+                                .child(note),
+                        )
+                    }),
+                latest || note.is_some(),
+            ))
             .into_any_element()
     }
     /// Records the decision immediately so the card responds before the worker
@@ -401,9 +833,15 @@ impl Xylo {
             .get_mut(&self.session)
             .and_then(|turn| turn.tools.iter_mut().find(|t| t.id == id))
         {
-            // A restored legacy preview may have already lost its tail upstream.
-            // Neither pointer nor keyboard approval can bypass full inspection.
-            if allow && card.input.get("diff_truncated").and_then(Value::as_bool) == Some(true) {
+            // The engine shortens very large change previews; a change nobody
+            // could inspect in full is never approved by pointer or keyboard.
+            if allow
+                && card
+                    .input
+                    .get("diff_truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            {
                 return;
             }
             card.approval = false;
@@ -425,8 +863,29 @@ impl Xylo {
         self.sync_history_list(cx);
         cx.notify();
     }
-    /// Keyboard: allow the oldest pending action in this chat.
-    pub(super) fn allow_pending(&mut self, cx: &mut Context<Self>) {
+    /// ⌘⇧↩ approves only what the person is looking at: the chat page with
+    /// nothing layered above it, its transcript on screen, and focus in the
+    /// composer or the transcript (the same rule as Escape).
+    fn approval_shortcut_applies(&self, window: &Window, cx: &App) -> bool {
+        self.page == Page::Chat
+            && !self.settings_open
+            && !self.recovery.open
+            && !self.model_picker.open
+            && !self.history_search.is_open()
+            && self.has_live_transcript()
+            && (self
+                .composer
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+                || self.transcript_focus.contains_focused(window, cx))
+    }
+    /// Keyboard: allow the oldest pending action in this chat, when its card
+    /// is in front of the person.
+    pub(super) fn allow_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.approval_shortcut_applies(window, cx) {
+            return;
+        }
         let pending = self
             .turns
             .get(&self.session)
@@ -443,360 +902,11 @@ impl Xylo {
             .and_then(|turn| turn.pending_approvals().next().map(|t| t.id));
         match pending {
             Some(id) => self.decide_action(id, false, false, cx),
-            None if self.running() => self.engine_command(WorkerCommand::Cancel, cx),
+            None if self.running() || self.sending_turn() => {
+                self.engine_command(WorkerCommand::Cancel, cx)
+            }
             None => {}
         }
-    }
-    fn tool_row(
-        &self,
-        i: usize,
-        tool: &crate::state::ToolCard,
-        latest_plan: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if tool.name == "todo_write" && tool.success != Some(false) {
-            return plan_card(i, tool, latest_plan);
-        }
-        let id = tool.id;
-        let expanded = self.expanded_tools.contains(&id);
-        let cached = &tool.presentation;
-        let summary = ActionSummary {
-            verb: cached.verb.clone(),
-            target: cached.target.clone(),
-            meta: cached.meta.clone().map(|text| (text, Tone::Muted)),
-            question: cached.question.clone(),
-        };
-        let (state, state_word): (AnyElement, &str) = if tool.approval {
-            (
-                icon(IconName::TriangleAlert)
-                    .size(px(13.))
-                    .text_color(rgb(warning()))
-                    .into_any_element(),
-                "needs approval",
-            )
-        } else {
-            match tool.success {
-                None => (
-                    Spinner::new()
-                        .small()
-                        .color(rgb(muted()).into())
-                        .into_any_element(),
-                    "in progress",
-                ),
-                Some(true) => (
-                    icon(Glyph::Check)
-                        .size(px(13.))
-                        .text_color(rgb(success()))
-                        .into_any_element(),
-                    "done",
-                ),
-                Some(false) => (
-                    icon(IconName::CircleX)
-                        .size(px(13.))
-                        .text_color(rgb(danger()))
-                        .into_any_element(),
-                    "failed",
-                ),
-            }
-        };
-        let glyph = tool_glyph(&tool.name);
-        let header = focus_ring(gpui_kit::base::Button::new(("tool-detail", i)))
-            .accessibility_label(format!(
-                "{} {}, {state_word}. {}",
-                summary.verb,
-                summary.target,
-                if expanded {
-                    "Hide details"
-                } else {
-                    "Show details"
-                }
-            ))
-            .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .justify_start()
-            .gap(px(8.))
-            .px(px(8.))
-            .h(px(30.))
-            .rounded(px(8.))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(hover())))
-            .child(
-                icon(glyph)
-                    .size(px(14.))
-                    .flex_shrink_0()
-                    .text_color(rgb(if tool.approval { warning() } else { muted() })),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(text_secondary()))
-                    .child(summary.verb.clone()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_size(px(12.5))
-                    .font_family(mono(cx))
-                    .text_color(rgb(muted()))
-                    .child(summary.target.clone()),
-            )
-            .when_some(summary.meta.clone(), |row, (meta, tone)| {
-                row.child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(11.5))
-                        .text_color(rgb(tone.color()))
-                        .child(meta),
-                )
-            })
-            .child(div().flex_shrink_0().child(state))
-            .child(
-                icon(if expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size(px(12.))
-                .text_color(rgb(faint())),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.expanded_tools.remove(&id) {
-                    this.expanded_tools.insert(id);
-                }
-                this.invalidate_live_history();
-                this.sync_history_list(cx);
-                cx.notify();
-            }));
-        let framed = tool.approval
-            || expanded
-            || cached.error.is_some()
-            || (tool.name == "image_generate" && tool.success == Some(true));
-        let mut card = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_0()
-            .rounded(px(10.))
-            .when(framed, |card| {
-                card.border_1()
-                    .border_color(rgb(border()))
-                    .bg(rgb(panel()))
-                    .p(px(4.))
-            })
-            .when(tool.approval, |card| {
-                card.p(px(14.))
-                    .gap_3()
-                    .rounded(px(14.))
-                    .bg(rgb(panel()))
-                    .border_1()
-                    .border_color(rgb(border_strong()))
-                    .shadow_sm()
-            })
-            .child(header);
-        if tool.name == "image_generate" && tool.success == Some(true) {
-            card = card.child(self.generated_tool_image_card(tool, cx));
-        }
-        if tool.approval {
-            card = card.child(self.approval_panel(i, tool, &summary, cx));
-        } else if expanded {
-            card = card.child(self.structured_tool_details(i, tool, cx));
-        }
-        if let Some(error) = &cached.error {
-            card = card.child(
-                div()
-                    .px_3()
-                    .pb_2()
-                    .text_size(px(11.))
-                    .text_color(rgb(danger()))
-                    .child(error.clone()),
-            );
-        }
-        card.into_any_element()
-    }
-    fn full_action_inspector(
-        &self,
-        i: usize,
-        tool: &crate::state::ToolCard,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = tool.id;
-        let expanded = self.raw_tool_details.contains(&id);
-        let full = serde_json::to_string_pretty(&tool.input).unwrap_or_default();
-        let diff = tool
-            .input
-            .get("diff")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let copy = full.clone();
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        button(
-                            ("approval-inspect", i),
-                            if expanded {
-                                "Hide full action"
-                            } else {
-                                "Inspect full action"
-                            },
-                        )
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            if !view.raw_tool_details.remove(&id) {
-                                view.raw_tool_details.insert(id);
-                            }
-                            view.invalidate_live_history();
-                            view.sync_history_list(cx);
-                            cx.notify();
-                        })),
-                    )
-                    .child(button(("approval-copy", i), "Copy full action").on_click(
-                        move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                        },
-                    )),
-            )
-            .when(expanded, |body| {
-                body.when_some(diff, |body, diff| {
-                    let copy = diff.clone();
-                    body.child(
-                        button(("approval-copy-diff", i), "Copy full diff").on_click(
-                            move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                            },
-                        ),
-                    )
-                    .child(full_code_block(("approval-full-diff", i), &diff))
-                })
-                .child(full_code_block(("approval-full", i), &full))
-            })
-            .into_any_element()
-    }
-    fn approval_panel(
-        &self,
-        i: usize,
-        tool: &crate::state::ToolCard,
-        summary: &ActionSummary,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = tool.id;
-        let incomplete = tool.input.get("diff_truncated").and_then(Value::as_bool) == Some(true);
-        let shortcut = if cfg!(target_os = "macos") {
-            "⌘⇧↩ allow · Esc deny"
-        } else {
-            "Ctrl+Shift+Enter allow · Esc deny"
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap_2()
-                    .child(icon(Glyph::ShieldCheck).size(px(16.)).mt(px(1.)).text_color(rgb(accent_text())))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(14.))
-                            .line_height(relative(1.45))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(text()))
-                            .child(summary.question.clone()),
-                    ),
-            )
-            .child(approval_preview(i, tool))
-            .child(self.full_action_inspector(i, tool, cx))
-            .when(incomplete, |panel| panel.child(subtitle("This saved change was shortened before inspection. Deny it and ask for a fresh action to review the complete change.")))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(primary(("allow", i), "Allow once").disabled(incomplete).on_click(
-                        cx.listener(move |this, _, _, cx| this.decide_action(id, true, false, cx)),
-                    ))
-                    .child(secondary(("deny", i), "Deny").on_click(
-                        cx.listener(move |this, _, _, cx| this.decide_action(id, false, false, cx)),
-                    ))
-                    .child(div().flex_1())
-                    .child(subtitle(shortcut)),
-            )
-            .child(subtitle("Allow once approves only this action."))
-            .when_some(tool.rule.clone(), |panel, rule| {
-                panel.child(
-                    div().flex().flex_col().gap_2().pt_3()
-                        .border_t_1().border_color(rgb(border()))
-                        .child(subtitle(format!("Persistent permission for this chat session: {rule}. Allows this action and future matching actions without asking again. Resets when the worker session ends; does not apply to other chats or override read-only mode.")))
-                        .child(secondary(("allow-always", i), format!("Always allow {rule}"))
-                            .self_start()
-                            .disabled(incomplete)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.decide_action(id, true, true, cx)
-                            }))),
-                )
-            })
-            .into_any_element()
-    }
-    fn turn_error(&self, error: &str, _cx: &mut Context<Self>) -> AnyElement {
-        let details = error.to_owned();
-        div()
-            .w_full()
-            .pl(px(32.))
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_start()
-                    .gap_3()
-                    .p(px(14.))
-                    .rounded(px(12.))
-                    .bg(rgb(danger_bg()))
-                    .child(icon(IconName::CircleAlert).size(px(16.)).mt(px(2.)).text_color(rgb(danger())))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(text()))
-                                    .child("The task stopped with an error"),
-                            )
-                            .child(body_text(product_error(error)))
-                            .child(subtitle(
-                                "Progress so far is saved. Send a message to continue or adjust the request.",
-                            )),
-                    )
-                    .child(
-                        button("copy-turn-error", "Copy details")
-                            .text_size(px(12.))
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(details.clone()))
-                            }),
-                    ),
-            )
-            .into_any_element()
     }
     fn can_populate_chat_starter(&self, cx: &Context<Self>) -> bool {
         self.messages.is_empty()
@@ -837,7 +947,8 @@ impl Xylo {
                 .to_string_lossy()
                 .into_owned()
         });
-        // Context line under the composer: where we are and which model answers.
+        // Context line under the composer: where we are. The model picker in
+        // the composer already names the model, so only a missing one is noted.
         let mut context = div()
             .flex()
             .flex_wrap()
@@ -850,31 +961,16 @@ impl Xylo {
             (None, _) => {
                 context = context.child("No project open");
             }
-            (Some(name), false) => {
+            (Some(name), ready) => {
                 context = context
-                    .child(
-                        icon(IconName::Folder)
-                            .size(px(13.))
-                            .text_color(rgb(faint())),
-                    )
+                    .child(icons::small(AppIcon::Folder).text_color(rgb(icons::rest_color())))
                     .child(name.clone())
-                    .child("· loading project…");
-            }
-            (Some(name), true) => {
-                context = context
-                    .child(
-                        icon(IconName::Folder)
-                            .size(px(13.))
-                            .text_color(rgb(faint())),
-                    )
-                    .child(name.clone());
+                    .when(!ready, |context| context.child("· loading project…"));
             }
         }
-        context = context.child("·").child(if configured {
-            self.settings.provider.model.clone()
-        } else {
-            "No model set up".to_owned()
-        });
+        if !configured {
+            context = context.child("·").child("No model set up");
+        }
         if self.workspace.is_none() || !configured {
             context = context.child(
                 button(
@@ -910,7 +1006,7 @@ impl Xylo {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(760.))
+                    .max_w(px(COLUMN_WIDTH))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -934,11 +1030,11 @@ impl Xylo {
                                 .gap_2()
                                 .pt(px(6.))
                                 .children([
-                                    (Glyph::Lightbulb, "Explain this project", "Explain this project using read-only inspection. Summarize its architecture, key entry points, and how to run its tests. Do not edit files."),
-                                    (Glyph::Eye, "Review my changes", "Review the current project changes using read-only inspection. Look for bugs, regressions, and missing tests. Do not edit files."),
-                                    (Glyph::ListChecks, "Plan before editing", "Inspect this project and help me plan a change before making any edits. Ask what I want to change, then propose a plan and wait for my approval before editing files."),
+                                    (AppIcon::Skills, "Explain this project", "Explain this project using read-only inspection. Summarize its architecture, key entry points, and how to run its tests. Do not edit files."),
+                                    (AppIcon::Changes, "Review my changes", "Review the current project changes using read-only inspection. Look for bugs, regressions, and missing tests. Do not edit files."),
+                                    (AppIcon::Plan, "Plan before editing", "Inspect this project and help me plan a change before making any edits. Ask what I want to change, then propose a plan and wait for my approval before editing files."),
                                 ].into_iter().enumerate().map(|(index, (glyph, label, prompt))| {
-                                    chip_with(("chat-home-starter", index), Some(icon(glyph)), label)
+                                    chip_with(("chat-home-starter", index), Some(icons::small(glyph)), label)
                                         .on_click(cx.listener(move |view, _, window, cx| {
                                             view.populate_chat_starter(prompt, window, cx);
                                         }))
@@ -948,494 +1044,213 @@ impl Xylo {
             )
             .into_any_element()
     }
-    fn model_switcher(
-        &self,
-        label: String,
-        picking: Entity<ComposerModelPicker>,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        MenuButton::new("composer-model-options")
-            .ghost()
-            .label(label)
-            .max_w(px(240.))
-            .child(icon(IconName::ChevronRight).size(px(12.)))
-            .on_click(cx.listener(move |view, _, _, cx| {
-                picking.update(cx, |state, cx| {
-                    state.choosing = true;
-                    state.models = std::sync::Arc::new(
-                        view.settings
-                            .providers
-                            .iter()
-                            .filter(|provider| !provider.model.is_empty())
-                            .cloned()
-                            .collect(),
-                    );
-                    cx.notify();
-                });
-                cx.notify();
-            }))
-            .into_any_element()
-    }
-
-    fn composer_model_choices(
-        &self,
-        picking: Entity<ComposerModelPicker>,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let back = picking.clone();
-        let mut list = div()
-            .id("composer-model-list")
-            .w(px(260.))
-            .max_h(px(300.))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                MenuButton::new("composer-model-back")
-                    .ghost()
-                    .label("Models")
-                    .icon(IconName::ArrowLeft)
-                    .justify_start()
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        back.update(cx, |value, cx| {
-                            value.choosing = false;
-                            cx.notify();
-                        });
-                        cx.notify();
-                    })),
-            );
-        // This view exists only while the picker is open. Large registries are
-        // never copied on the composer frame path.
-        let models = picking.read(cx).models.clone();
-        for (index, provider) in models.iter().enumerate() {
-            let models = models.clone();
-            let picking = picking.clone();
-            let checked = providers::same_connection(&provider, &self.settings.provider)
-                && provider.model == self.settings.provider.model;
-            list = list.child(
-                MenuButton::new(("composer-model-choice", index))
-                    .ghost()
-                    .w_full()
-                    .justify_start()
-                    .label(format!("{} · {}", provider.model, provider.name))
-                    .selected(checked)
-                    .bg(rgb(if checked { selected() } else { panel() }))
-                    .tooltip(format!("{} · {}", provider.model, provider.name))
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        let provider = &models[index];
-                        let Some(provider) = view
-                            .settings
-                            .providers
-                            .iter()
-                            .find(|current| {
-                                current.model == provider.model
-                                    && providers::same_connection(current, &provider)
-                            })
-                            .cloned()
-                        else {
-                            view.error =
-                                Some("The model catalog changed. Reopen the model picker.".into());
-                            cx.notify();
-                            return;
-                        };
-                        view.settings.provider = provider.clone();
-                        view.provider_form(&provider, window, cx);
-                        let settings = view.settings.clone();
-                        view.host_call(cx, |host| host.save_settings(settings));
-                        picking.update(cx, |value, cx| {
-                            value.choosing = false;
-                            cx.notify();
-                        });
-                        cx.notify();
-                    })),
-            );
-        }
-        list.child(
-            MenuButton::new("composer-manage-models")
-                .ghost()
-                .label("Manage models…")
-                .justify_start()
-                .on_click(cx.listener(|view, _, _, cx| {
-                    view.settings_open = true;
-                    view.navigate(Page::Providers, cx);
-                })),
-        )
-        .into_any_element()
-    }
-
+    /// The composer's "+" menu: attach files or images, or transcribe an
+    /// audio file into the message. Pasting and saved drafts live where they
+    /// already work (⌘V and the sidebar).
     fn composer_context_actions(&self, cx: &Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
-        MenuButton::new("composer-context-actions")
-            .accessibility_label("Add context")
-            .ghost()
-            .icon(IconName::Plus)
-            .tooltip("Add context")
+        icons::menu_trigger("composer-context-actions", AppIcon::Add, "Add context")
+            .tooltip("Add files or audio")
             .disabled(self.attachments.importing_for(self.session))
             .dropdown_menu(move |menu, _, _| {
                 let attach = weak.clone();
-                let paste = weak.clone();
-                let drafts = weak.clone();
-                menu.item(
-                    PopupMenuItem::new("Attach images…").on_click(move |_, window, cx| {
+                let transcribe = weak.clone();
+                menu.item(PopupMenuItem::new("Attach files or images…").on_click(
+                    move |_, window, cx| {
                         let _ = attach.update(cx, |view, cx| view.attachment_picker(window, cx));
-                    }),
-                )
-                .item(PopupMenuItem::new("Paste image").on_click(move |_, _, cx| {
-                    let _ = paste.update(cx, |view, cx| view.attachment_paste_files(cx));
-                }))
-                .separator()
-                .item(
-                    PopupMenuItem::new("Saved drafts").on_click(move |_, _, cx| {
-                        let _ = drafts.update(cx, |view, cx| view.open_saved_drafts(cx));
-                    }),
-                )
+                    },
+                ))
+                .item(PopupMenuItem::new("Transcribe audio file…").on_click(
+                    move |_, window, cx| {
+                        let _ = transcribe
+                            .update(cx, |view, cx| view.transcribe_audio_file(window, cx));
+                    },
+                ))
             })
             .into_any_element()
     }
-
-    fn unified_model_control(&self, label: String, cx: &Context<Self>) -> AnyElement {
-        use gpui_kit::component::popover::Popover;
-        let provider = &self.settings.provider;
-        let effort = provider.effective_reasoning_effort().or(provider
-            .default_reasoning_effort
-            .as_deref()
-            .filter(|value| provider.supported_reasoning_efforts().contains(value)));
-        let effort_label = effort.map(Self::effort_caption).unwrap_or_else(|| {
-            if provider.supported_reasoning_efforts().is_empty() {
-                String::new()
-            } else {
-                "Default".into()
+    /// Picks an audio file and transcribes it on this computer; the text then
+    /// waits above the composer to be inserted.
+    fn transcribe_audio_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |view, cx| {
+            let mut picker = rfd::AsyncFileDialog::new()
+                .set_title("Transcribe audio file")
+                .add_filter("Audio", &["wav", "mp3", "m4a", "flac", "ogg"]);
+            if let Some(workspace) = workspace {
+                picker = picker.set_directory(workspace);
             }
-        });
-        let weak = cx.entity().downgrade();
-        let mut trigger_layout = div().min_w_0().max_w(px(250.)).flex_shrink(1.);
-        Popover::new("composer-model-popover")
-            .bg(rgb(panel()))
-            .border_1()
-            .border_color(rgb(border()))
-            .rounded(px(16.))
-            .trigger_style(trigger_layout.style().clone())
-            .anchor(Anchor::BottomRight)
-            .offset(px(8.))
-            .trigger(
-                MenuButton::new("composer-model")
-                    .ghost()
-                    .label(label)
-                    .h(px(30.))
-                    .rounded_full()
-                    .text_size(px(12.5))
-                    .text_color(rgb(text_secondary()))
-                    .max_w(px(250.))
-                    .w_full()
-                    .min_w_0()
-                    .flex_shrink(1.)
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .whitespace_nowrap()
-                            .text_color(rgb(accent_text()))
-                            .child(effort_label),
-                    )
-                    .child(icon(IconName::ChevronDown).size(px(12.)))
-                    .tooltip("Model and reasoning"),
-            )
-            .content(move |_, window, cx| {
-                let picking = window.use_keyed_state("composer-model-choosing", cx, |_, _| {
-                    ComposerModelPicker::default()
-                });
-                weak.update(cx, |view, cx| view.composer_model_panel(picking, cx))
-                    .unwrap_or_else(|_| div().into_any_element())
+            if let Some(file) = picker.pick_file().await {
+                let path = file.path().to_path_buf();
+                let _ = view.update_in(cx, |view, _, cx| view.speech_transcribe_path(path, cx));
+            }
+        })
+        .detach();
+    }
+    /// Adds paths that are not images to the message as references the agent
+    /// can open.
+    pub(super) fn reference_files_in_composer(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let references = paths
+            .iter()
+            .map(|path| {
+                let shown = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .unwrap_or(path);
+                format!("`{}`", shown.display())
             })
-            .into_any_element()
-    }
-
-    fn effort_caption(value: &str) -> String {
-        match value {
-            "none" => "None".into(),
-            "minimal" => "Minimal".into(),
-            "low" => "Low".into(),
-            "medium" => "Medium".into(),
-            "high" => "High".into(),
-            "xhigh" => "Extra high".into(),
-            other => {
-                let mut chars = other.chars();
-                chars
-                    .next()
-                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                    .unwrap_or_default()
-            }
-        }
-    }
-
-    fn composer_model_panel(
-        &self,
-        picking: Entity<ComposerModelPicker>,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        if picking.read(cx).choosing {
-            return self.composer_model_choices(picking, cx);
-        }
-        let provider = &self.settings.provider;
-        let efforts = provider.supported_reasoning_efforts();
-        let active = provider.effective_reasoning_effort().or(provider
-            .default_reasoning_effort
-            .as_deref()
-            .filter(|value| efforts.contains(value)));
-        let title = active.map(Self::effort_caption).unwrap_or_else(|| {
-            if efforts.is_empty() {
-                "Model".into()
-            } else {
-                "Provider default".into()
-            }
+            .collect::<Vec<_>>()
+            .join(" ");
+        let draft = self.composer.read(cx).value().trim_end().to_owned();
+        let value = if draft.is_empty() {
+            references
+        } else {
+            format!("{draft} {references}")
+        };
+        self.composer.update(cx, |input, cx| {
+            input.set_value(value, window, cx);
+            input.focus(window, cx);
         });
-        let mut surface = div()
-            .id("composer-model-panel")
-            .w(px(260.))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_2()
-            .child(
+        self.draft_changed(cx);
+        cx.notify();
+    }
+    /// Moves a finished transcription into the message.
+    fn insert_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let transcript = std::mem::take(&mut self.speech.transcript);
+        let draft = self.composer.read(cx).value().trim_end().to_owned();
+        let value = if draft.is_empty() {
+            transcript
+        } else {
+            format!("{draft} {transcript}")
+        };
+        self.composer.update(cx, |input, cx| {
+            input.set_value(value, window, cx);
+            input.focus(window, cx);
+        });
+        self.draft_changed(cx);
+        cx.notify();
+    }
+    /// Speech work for the composer: a transcription waiting to be inserted,
+    /// or a calm progress line while audio is transcribed or synthesized.
+    fn speech_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.speech.transcript.is_empty() {
+            return Some(
                 div()
-                    .relative()
-                    .h(px(32.))
+                    .id("composer-transcript")
+                    .test_support()
+                    .mb_2()
+                    .px(px(12.))
+                    .py(px(6.))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .gap_2()
+                    .gap(px(8.))
+                    .rounded(px(12.))
+                    .bg(rgb(panel()))
+                    .border_1()
+                    .border_color(rgb(border()))
+                    .child(icons::small(AppIcon::Mic).text_color(rgb(icons::rest_color())))
                     .child(
                         div()
                             .flex_1()
-                            .text_center()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(accent_text()))
-                            .child(title),
+                            .min_w_0()
+                            .single_line()
+                            .text_size(px(13.))
+                            .text_color(rgb(text_secondary()))
+                            .child(self.speech.transcript.clone()),
                     )
-                    .when(!efforts.is_empty(), |row| {
-                        row.child(
-                            MenuButton::new("composer-effort-default")
-                                .absolute()
-                                .right_0()
-                                .top_0()
-                                .ghost()
-                                .icon(IconName::RefreshCw)
-                                .accessibility_label("Use provider default reasoning")
-                                .tooltip("Use provider default")
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    view.settings.provider.reasoning_effort = None;
-                                    view.settings.remember_model(view.settings.provider.clone());
-                                    let settings = view.settings.clone();
-                                    view.host_call(cx, |host| host.save_settings(settings));
-                                    cx.notify();
-                                })),
-                        )
-                    }),
-            )
-            .child(div().flex().justify_center().child(self.model_switcher(
-                if provider.model.is_empty() {
-                    "Select model".into()
-                } else {
-                    provider.model.clone()
-                },
-                picking,
-                cx,
-            )));
-        if !efforts.is_empty() {
-            let source = provider.clone();
-            let mut levels = div()
-                .id("composer-effort-levels")
-                .w_full()
+                    .child(
+                        tools::detail_action("insert-transcript", "Insert").on_click(
+                            cx.listener(|view, _, window, cx| view.insert_transcript(window, cx)),
+                        ),
+                    )
+                    .child(
+                        icons::icon_button("dismiss-transcript", AppIcon::Close, "Discard")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.speech.transcript.clear();
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let processing =
+            self.speech.busy() && !self.speech.playing && !self.speech_recording_active();
+        (processing && !self.speech.notice.is_empty()).then(|| {
+            div()
+                .id("composer-speech-status")
+                .test_support()
+                .mb_2()
+                .px(px(4.))
                 .flex()
                 .items_center()
-                .gap_1()
-                .rounded_full()
-                .bg(rgb(hover()))
-                .p_1();
-            for (index, effort) in efforts.iter().enumerate() {
-                let effort = (*effort).to_owned();
-                let selected = active == Some(effort.as_str());
-                let caption = Self::effort_caption(&effort);
-                let source = source.clone();
-                levels = levels.child(
-                    MenuButton::new(("composer-effort", index))
-                        .ghost()
+                .gap(px(8.))
+                .text_size(px(12.5))
+                .text_color(rgb(muted()))
+                .child(crate::motion::spinner_inline())
+                .child(
+                    div()
                         .flex_1()
                         .min_w_0()
-                        .h(px(30.))
-                        .px_1()
-                        .rounded_full()
-                        .accessibility_label(format!("Reasoning: {caption}"))
-                        .tooltip(caption.clone())
-                        .selected(selected)
-                        .bg(rgb(hover()))
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .size(px(if selected { 22. } else { 4. }))
-                                .rounded_full()
-                                .bg(rgb(if selected { text() } else { muted() })),
-                        )
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            if view.settings.provider.model != source.model
-                                || !providers::same_connection(&view.settings.provider, &source)
-                                || !view
-                                    .settings
-                                    .provider
-                                    .supported_reasoning_efforts()
-                                    .contains(&effort.as_str())
-                            {
-                                return;
-                            }
-                            view.settings.provider.reasoning_effort = Some(effort.clone());
-                            view.settings.remember_model(view.settings.provider.clone());
-                            let settings = view.settings.clone();
-                            view.host_call(cx, |host| host.save_settings(settings));
-                            cx.notify();
-                        })),
-                );
-            }
-            surface = surface.child(levels);
+                        .single_line()
+                        .child(self.speech.notice.clone()),
+                )
+                .child(
+                    tools::detail_action("cancel-speech", "Cancel")
+                        .on_click(cx.listener(|view, _, _, cx| view.cancel_speech_work(cx))),
+                )
+                .into_any_element()
+        })
+    }
+    /// Cancels the transcription or synthesis in flight: the host stops the
+    /// request, its result is ignored if it still arrives, the strip goes
+    /// away and Read aloud is offered again.
+    fn cancel_speech_work(&mut self, cx: &mut Context<Self>) {
+        self.stop_speech(cx);
+        self.speech.notice.clear();
+        self.reading_aloud = None;
+        cx.notify();
+    }
+    /// The composer's prompt for the page as it is now: the home greeting
+    /// before anything is said, "Reply to Xylo…" inside a conversation.
+    fn composer_placeholder(&self) -> &'static str {
+        if self.messages.is_empty() && !self.has_live_transcript() && !self.draft_send_pending() {
+            HOME_PLACEHOLDER
+        } else {
+            REPLY_PLACEHOLDER
         }
-        surface.into_any_element()
     }
-
-    fn composer_permissions(&self, cx: &Context<Self>) -> AnyElement {
-        let weak = cx.entity().downgrade();
-        let caption = match self.settings.permissions {
-            PermissionMode::AskForWrites => "Ask first",
-            PermissionMode::AcceptEdits => "Accept edits",
-            PermissionMode::Auto => "Edits & commands",
-            PermissionMode::ReadOnly => "Read only",
-        };
-        MenuButton::new("composer-permissions")
-            .ghost()
-            .label(caption)
-            .icon(Glyph::SlidersHorizontal)
-            .max_w(px(170.))
-            .h(px(30.))
-            .rounded_full()
-            .text_size(px(12.5))
-            .text_color(rgb(text_secondary()))
-            .tooltip(format!(
-                "{} · Applies to new tasks",
-                self.settings.permissions.description()
-            ))
-            .dropdown_menu(move |mut menu, _, cx| {
-                let Ok(active) = weak.update(cx, |view, _| view.settings.permissions) else {
-                    return menu;
-                };
-                menu = menu.label("Applies to new tasks");
-                for mode in PermissionMode::ALL {
-                    let view = weak.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(mode.label())
-                            .checked(active == mode)
-                            .on_click(move |_, _, cx| {
-                                let _ = view.update(cx, |view, cx| {
-                                    view.settings.permissions = mode;
-                                    let settings = view.settings.clone();
-                                    view.host_call(cx, |host| host.save_settings(settings));
-                                    cx.notify();
-                                });
-                            }),
-                    );
-                }
-                menu.separator()
-                    .label("Running tasks keep their current permissions")
-            })
-            .into_any_element()
-    }
-
-    fn composer_context(&self, cx: &Context<Self>) -> AnyElement {
-        // Only read the last measured count on the render path. Estimating long
-        // histories is deferred until the popover opens, rather than per token.
-        let reported = self
-            .turns
-            .get(&self.session)
-            .map(|turn| turn.usage.input_tokens)
-            .filter(|count| *count > 0);
-        let capacity = self.settings.provider.context_tokens;
-        let label = reported
-            .filter(|_| capacity > 0)
-            .map(|used| {
-                let percent = used.saturating_mul(100) / u64::from(capacity);
-                if percent == 0 {
-                    "<1%".to_owned()
-                } else {
-                    format!("{percent}%")
-                }
-            })
-            .unwrap_or_else(|| "Context".into());
-        let weak = cx.entity().downgrade();
-        MenuButton::new("composer-context")
-            .accessibility_label("Context window")
-            .ghost()
-            .h(px(30.))
-            .w(px(28.))
-            .px_0()
-            .child(if let Some(used) = reported.filter(|_| capacity > 0) {
-                gpui_kit::component::progress::ProgressCircle::new("composer-context-usage")
-                    .value((used as f32 / capacity as f32 * 100.).clamp(0., 100.))
-                    .with_size(px(14.))
-                    .color(rgb(muted()))
-                    .accessibility_label(format!(
-                        "Last provider input: {used} of {capacity} configured tokens"
-                    ))
-                    .into_any_element()
-            } else {
-                div()
-                    .size(px(13.))
-                    .rounded_full()
-                    .border_2()
-                    .border_color(rgb(muted()))
-                    .into_any_element()
-            })
-            .tooltip(format!("Context window · {label}"))
-            .dropdown_menu(move |mut menu, _, cx| {
-                let details = weak
-                    .update(cx, |view, cx| {
-                        let visible_characters: usize = view
-                            .messages
-                            .iter()
-                            .map(|message| message.content.chars().count())
-                            .sum();
-                        let draft_characters = view.composer.read(cx).value().chars().count();
-                        let streamed_characters = view
-                            .turns
-                            .get(&view.session)
-                            .map_or(0, |turn| turn.text.chars().count());
-                        let estimate =
-                            (visible_characters + draft_characters + streamed_characters)
-                                .div_ceil(4);
-                        let reported = view
-                            .turns
-                            .get(&view.session)
-                            .map(|turn| turn.usage.input_tokens)
-                            .filter(|count| *count > 0);
-                        (estimate, reported, view.settings.provider.context_tokens)
+    /// Brings the composer's prompt in step with the page. Called where the
+    /// page changes (new chat, opening a conversation, sending, a turn
+    /// starting); the update runs once the current event is handled, outside
+    /// any draw, so the window repaints with it.
+    pub(super) fn refresh_composer_placeholder(&self, cx: &mut Context<Self>) {
+        let wanted = self.composer_placeholder();
+        let composer = self.composer.clone();
+        cx.defer(move |cx| {
+            for window in cx.windows() {
+                let updated = window.update(cx, |_, window, cx| {
+                    composer.update(cx, |input, cx| {
+                        if input.presentation().placeholder().as_ref() != wanted {
+                            input.set_placeholder(wanted, window, cx);
+                        }
                     })
-                    .ok();
-                menu = menu.label("Context window");
-                if let Some((estimate, reported, capacity)) = details {
-                    if let Some(tokens) = reported {
-                        menu = menu.label(format!("Last provider input: {tokens} tokens"));
-                    }
-                    menu = menu.label(format!("Visible conversation + draft: ~{estimate} tokens"));
-                    menu = menu.label(if capacity > 0 {
-                        format!("Configured limit: {capacity} tokens")
-                    } else {
-                        "Context limit unknown".into()
-                    });
-                    menu = menu
-                        .separator()
-                        .label("Estimate excludes hidden system, tool and attachment context.");
+                });
+                if updated.is_ok() {
+                    break;
                 }
-                menu
-            })
-            .into_any_element()
+            }
+        });
     }
+
     fn prompt_box(&self, cx: &mut Context<Self>) -> AnyElement {
         let paste = cx.entity().downgrade();
         let model = if self.settings.provider.model.is_empty() {
@@ -1446,30 +1261,24 @@ impl Xylo {
         let draft_empty = self.composer.read(cx).value().trim().is_empty();
         let has_attachments = !self.draft_attachments().is_empty();
         let running = self.running();
+        let stoppable = running || self.sending_turn();
         div()
             .w_full()
-            .max_w(px(760.))
+            .max_w(px(COLUMN_WIDTH))
             .child(self.pending_messages(cx))
-            .when(!self.speech.transcript.is_empty(), |panel| {
-                panel.child(
-                    button("review-voice-transcript", "Review voice transcript")
-                        .text_size(px(12.))
-                        .on_click(cx.listener(|view, _, _, cx| view.navigate(Page::Voice, cx))),
-                )
-            })
+            .children(self.speech_strip(cx))
             .child(
                 div()
                     .id("image-drop-target")
                     .test_support()
                     .w_full()
-                    .rounded(px(20.))
+                    .rounded(px(18.))
                     .bg(rgb(panel()))
                     .border_1()
                     .border_color(rgb(border_strong()))
                     .shadow_sm()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
                     .px(px(14.))
                     .pt(px(12.))
                     .pb(px(10.))
@@ -1477,7 +1286,7 @@ impl Xylo {
                         view.attach_image_paths(paths.paths().to_vec(), AttachmentSource::Drop, cx)
                     }))
                     .child(
-                        div().min_h(px(44.)).text_size(px(15.)).child(
+                        div().text_size(px(15.)).child(
                             Textarea::new(&self.composer)
                                 .on_paste(move |item, _, cx| {
                                     paste.update(cx, |view, cx| view.attachment_paste_item(item, cx)).unwrap_or(false)
@@ -1490,31 +1299,37 @@ impl Xylo {
                     )
                     .when(
                         has_attachments || self.attachments.importing_for(self.session),
-                        |surface| surface.child(self.attachment_strip(cx)),
+                        |surface| surface.child(div().pb_2().child(self.attachment_strip(cx))),
                     )
-                    .when(!self.attachments.notice.is_empty(), |surface| {
-                        surface.child(subtitle(self.attachments.notice.clone()))
-                    })
+                    // While images import, the strip's own progress row says so.
+                    .when(
+                        !self.attachments.notice.is_empty()
+                            && !self.attachments.importing_for(self.session),
+                        |surface| {
+                            surface.child(
+                                div().pb_2().child(subtitle(self.attachments.notice.clone())),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(4.))
+                            .gap(px(6.))
                             .when(running && (!draft_empty || has_attachments), |row| row.flex_wrap())
                             .min_h(px(32.))
                             .child(self.composer_context_actions(cx))
                             .child(self.composer_permissions(cx))
                             .child(div().flex_1().min_w_0())
-                            .child(self.composer_context(cx))
+                            .children(self.composer_context(cx))
                             .child(self.unified_model_control(model, cx))
                             .child(self.speech_capture_button(cx))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(6.))
+                                    .gap(px(8.))
                                     .flex_shrink_0()
-                                    .ml(px(4.))
                                     .when(running && !draft_empty, |row| {
                                         row.child(pill("steer-prompt", "Steer")
                                             .accessibility_label("Steer current task")
@@ -1523,7 +1338,7 @@ impl Xylo {
                                             .tooltip(|_,cx| cx.new(|_| XyloTooltip("Update the active task at its next safe step. Images can be queued for the next turn.".into())).into())
                                             .on_click(cx.listener(|view,_,window,cx| view.steer_composer(window,cx))))
                                     })
-                                    .when(running, |row| {
+                                    .when(stoppable, |row| {
                                         row.child(
                                             stop_button("cancel-task", "Stop the task")
                                                 .tooltip(|_, cx| cx.new(|_| XyloTooltip("Stop".into())).into())
@@ -1554,16 +1369,13 @@ impl Xylo {
                                             .when(running, |button| button.w(px(66.)).rounded_full())
                                             .tooltip({ let queued = running; move |_, cx| cx.new(|_| XyloTooltip(if queued { "Queue for after this task finishes" } else { "Send message" }.into())).into() })
                                             .child(if pending {
-                                                Spinner::new()
-                                                    .small()
+                                                crate::motion::spinner(icons::SMALL)
                                                     .color(rgb(brand_foreground()).into())
                                                     .into_any_element()
                                             } else if running {
                                                 div().text_size(px(12.5)).font_weight(FontWeight::MEDIUM).child("Queue").into_any_element()
                                             } else {
-                                                icon(IconName::ArrowUp)
-                                                    .size(px(18.))
-                                                    .into_any_element()
+                                                icons::icon(AppIcon::Send).into_any_element()
                                             })
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.submit(window, cx)
@@ -1573,15 +1385,25 @@ impl Xylo {
                             ),
                     ),
             )
+            .when_some(self.composer_hint(), |surface, hint| {
+                surface.child(
+                    div()
+                        .id("composer-hint")
+                        .test_support()
+                        .pt_1()
+                        .px_2()
+                        .text_size(px(12.))
+                        .text_color(rgb(muted()))
+                        .child(hint.to_owned()),
+                )
+            })
             .when(self.draft_needs_attention(), |surface| {
                 surface.child(div().pt_1().child(self.draft_status_footer(cx)))
             })
             .into_any_element()
     }
 }
-use crate::state::{ToolCard, TurnState};
-use gpui_kit::component::{Icon, Sizable, spinner::Spinner};
-use serde_json::Value;
+use crate::state::ToolCard;
 
 /// Time-of-day greeting addressed to the person, as the home screen title.
 fn greeting() -> String {
@@ -1601,341 +1423,9 @@ fn greeting() -> String {
     }
 }
 
-/// A glyph for each kind of action so a run of tool calls scans at a glance.
-fn tool_glyph(name: &str) -> Glyph {
-    match name {
-        "file_read" | "read_file" => Glyph::FileSearch,
-        "file_write" | "file_edit" | "write_file" | "edit_file" => Glyph::FilePen,
-        "run_command" | "shell_command" | "terminal" => Glyph::Terminal,
-        "search_project" | "grep" | "glob" | "find" => Glyph::Search,
-        "git_status" | "git_diff" | "git_log" | "git_commit" => Glyph::GitBranch,
-        "web_fetch" | "web_search" | "browser" => Glyph::Globe,
-        "todo_write" => Glyph::ListChecks,
-        "image_generate" => Glyph::Image,
-        "memory" | "memory_write" | "memory_read" => Glyph::Brain,
-        _ => Glyph::Wrench,
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Tone {
-    Muted,
-}
-impl Tone {
-    fn color(self) -> u32 {
-        match self {
-            Tone::Muted => muted(),
-        }
-    }
-}
-/// One-line, human description of an action for its card and approval.
-struct ActionSummary {
-    verb: String,
-    target: String,
-    meta: Option<(String, Tone)>,
-    question: String,
-}
-fn text_arg<'a>(value: &'a Value, key: &str) -> &'a str {
-    value.get(key).and_then(Value::as_str).unwrap_or_default()
-}
-/// The command line an action runs, for display only.
-fn command_line(tool: &ToolCard) -> String {
-    match tool.name.as_str() {
-        "shell_command" => text_arg(&tool.input, "command").to_owned(),
-        _ => {
-            let mut line = text_arg(&tool.input, "program").to_owned();
-            for arg in tool
-                .input
-                .get("args")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-            {
-                line.push(' ');
-                if arg.is_empty() || arg.contains([' ', '"', '\'']) {
-                    line.push_str(&format!("\"{}\"", arg.replace('"', "\\\"")));
-                } else {
-                    line.push_str(arg);
-                }
-            }
-            line
-        }
-    }
-}
-fn elapsed_label(turn: &TurnState) -> String {
-    let seconds = turn
-        .started_at
-        .map(|start| ((now_ms() - start).max(0) / 1000) as u64)
-        .unwrap_or(0);
-    if seconds >= 60 {
-        format!("{}m {:02}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{seconds}s")
-    }
-}
-/// Live progress for a running turn: what it is doing, for how long, and how to stop it.
-fn turn_status(turn: &TurnState) -> AnyElement {
-    let waiting = turn.pending_approvals().count();
-    let (indicator, label): (AnyElement, String) = if waiting > 0 {
-        (
-            icon(IconName::TriangleAlert)
-                .size(px(15.))
-                .text_color(rgb(warning()))
-                .into_any_element(),
-            if waiting == 1 {
-                "Waiting for your approval".into()
-            } else {
-                format!("Waiting for your approval on {waiting} actions")
-            },
-        )
-    } else {
-        (
-            brand_glyph(16.).into_any_element(),
-            if turn.status.is_empty() || turn.status == "Working" {
-                "Working…".into()
-            } else {
-                turn.status.clone()
-            },
-        )
-    };
-    div()
-        .w_full()
-        .flex()
-        .items_start()
-        .gap(px(12.))
-        .py(px(6.))
-        .child(
-            div()
-                .flex_shrink_0()
-                .w(px(20.))
-                .pt(px(2.))
-                .flex()
-                .justify_center()
-                .child(indicator),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .text_size(px(14.))
-                        .text_color(rgb(text_secondary()))
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .text_size(px(12.))
-                        .text_color(rgb(faint()))
-                        .child(elapsed_label(turn))
-                        .child("·")
-                        .child(kbd("Esc"))
-                        .child(if waiting > 0 { "to deny" } else { "to stop" }),
-                ),
-        )
-        .into_any_element()
-}
-/// The agent's checklist; only the newest version is shown in full.
-fn plan_card(i: usize, tool: &ToolCard, latest: bool) -> AnyElement {
-    let items: Vec<(String, String)> = tool
-        .input
-        .get("todos")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|item| {
-            (
-                text_arg(item, "content").to_owned(),
-                text_arg(item, "status").to_owned(),
-            )
-        })
-        .collect();
-    let done = items.iter().filter(|(_, s)| s == "completed").count();
-    let heading = div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .child(
-            icon(Glyph::ListChecks)
-                .size(px(15.))
-                .text_color(rgb(accent_text())),
-        )
-        .child(
-            div()
-                .text_size(px(13.5))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(text()))
-                .child(if latest { "Plan" } else { "Updated plan" }),
-        )
-        .child(div().flex_1())
-        .child(badge(
-            format!("{done} of {} done", items.len()),
-            if done == items.len() && !items.is_empty() {
-                BadgeTone::Success
-            } else {
-                BadgeTone::Neutral
-            },
-        ));
-    if !latest {
-        return div()
-            .id(("plan", i))
-            .px(px(8.))
-            .h(px(30.))
-            .flex()
-            .items_center()
-            .child(heading.opacity(0.7))
-            .into_any_element();
-    }
-    let mut list = div().flex().flex_col().gap(px(6.));
-    for (index, (content, status)) in items.into_iter().enumerate() {
-        let (glyph, tone, weight): (Icon, u32, FontWeight) = match status.as_str() {
-            "completed" => (icon(IconName::CircleCheck), success(), FontWeight::NORMAL),
-            "in_progress" => (icon(Glyph::LoaderCircle), accent_text(), FontWeight::MEDIUM),
-            _ => (icon(Glyph::CircleDashed), faint(), FontWeight::NORMAL),
-        };
-        list = list.child(
-            div()
-                .id(("plan-item", i * 1000 + index))
-                .flex()
-                .items_start()
-                .gap(px(10.))
-                .text_size(px(13.5))
-                .line_height(relative(1.5))
-                .child(glyph.size(px(15.)).mt(px(2.)).text_color(rgb(tone)))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .font_weight(weight)
-                        .text_color(rgb(if status == "completed" {
-                            muted()
-                        } else {
-                            text()
-                        }))
-                        .child(content),
-                ),
-        );
-    }
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(12.))
-        .p(px(14.))
-        .rounded(px(12.))
-        .bg(rgb(panel()))
-        .border_1()
-        .border_color(rgb(border()))
-        .child(heading)
-        .child(list)
-        .into_any_element()
-}
-/// Unified diff with added and removed lines tinted; long diffs scroll.
-fn diff_view(id: impl Into<ElementId>, diff: &str) -> AnyElement {
-    const LINES: usize = 600;
-    let mut body = div().flex().flex_col().min_w_full();
-    let mut shown = 0;
-    for line in diff.lines().take(LINES) {
-        shown += 1;
-        let (background, foreground) = if line.starts_with("+++") || line.starts_with("---") {
-            (None, muted())
-        } else if line.starts_with('+') {
-            (Some(diff_added_bg()), success())
-        } else if line.starts_with('-') {
-            (Some(diff_removed_bg()), danger())
-        } else if line.starts_with("@@") {
-            (None, accent())
-        } else {
-            (None, text())
-        };
-        body = body.child(
-            div()
-                .px_2()
-                .whitespace_nowrap()
-                .when_some(background, |row, color| row.bg(rgb(color)))
-                .text_color(rgb(foreground))
-                .child(if line.is_empty() {
-                    " ".to_owned()
-                } else {
-                    line.to_owned()
-                }),
-        );
-    }
-    if diff.lines().count() > shown {
-        body = body.child(
-            div()
-                .px_2()
-                .text_color(rgb(muted()))
-                .child("… diff preview shortened; use full inspection or copy controls"),
-        );
-    }
-    div()
-        .id(id)
-        .w_full()
-        .max_h(px(360.))
-        .overflow_scroll()
-        .py_1()
-        .rounded(px(10.))
-        .bg(rgb(code_bg()))
-        .border_1()
-        .border_color(rgb(border()))
-        .font_family("monospace")
-        .text_size(px(12.5))
-        .line_height(relative(1.55))
-        .child(body)
-        .into_any_element()
-}
-/// Selectable, scrollable preview; full action inspection is explicit.
-fn code_block(id: impl Into<ElementId>, text: &str) -> AnyElement {
-    full_code_block(id, &truncate(text, 6000))
-}
-fn full_code_block(id: impl Into<ElementId>, text: &str) -> AnyElement {
-    let id: ElementId = id.into();
-    let mut run = 0;
-    let mut longest = 2;
-    for ch in text.chars() {
-        run = if ch == '`' { run + 1 } else { 0 };
-        longest = longest.max(run);
-    }
-    let fence = "`".repeat(longest + 1);
-    // Markdown parses asynchronously; reserve the inspection viewport before
-    // its first measured frame, and never shrink it to zero in a flex card.
-    let height = (text.lines().count().max(1) as f32 * 20. + 24.).min(360.);
-    div()
-        .w_full()
-        .h(px(height))
-        .flex_shrink_0()
-        .max_h(px(360.))
-        .id(id.clone())
-        .test_support()
-        .overflow_scroll()
-        .rounded_md()
-        .child(TextView::markdown(id, format!("{fence}\n{text}\n{fence}")).selectable(true))
-        .into_any_element()
-}
-fn approval_preview(i: usize, tool: &ToolCard) -> AnyElement {
-    match tool.name.as_str() {
-        "file_write" | "file_edit" => {
-            let diff = text_arg(&tool.input, "diff");
-            if diff.trim().is_empty() {
-                subtitle("No textual change.").into_any_element()
-            } else {
-                diff_view(("approval-diff", i), diff)
-            }
-        }
-        "run_command" | "shell_command" => code_block(
-            ("approval-command", i),
-            &format!("$ {}", command_line(tool)),
-        ),
-        _ => code_block(
-            ("approval-input", i),
-            &serde_json::to_string_pretty(&tool.input).unwrap_or_default(),
-        ),
-    }
-}
+#[cfg(test)]
+#[path = "chat/tests.rs"]
+mod tests;
+#[cfg(test)]
+#[path = "chat/transcript_flow_tests.rs"]
+mod transcript_flow_tests;

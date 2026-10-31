@@ -200,18 +200,18 @@ pub(crate) fn plan_edit(path: &Path, shown: &str, args: &Value) -> Result<EditPl
         return Err(unapplied("old_string and new_string are identical"));
     }
     let original = read_text(path, shown)?;
-    // Models usually send LF; keep CRLF files consistent instead of failing.
-    let (old, new) = if !original.contains(old)
-        && original.contains("\r\n")
-        && old.contains('\n')
-        && !old.contains("\r\n")
-    {
-        (
-            old.replace('\n', "\r\n"),
-            new.replace("\r\n", "\n").replace('\n', "\r\n"),
-        )
+    // Models usually send LF. In a CRLF file, match LF text against CRLF and
+    // write every new line break as CRLF, even when old_string is one line.
+    let crlf = original.contains("\r\n");
+    let old = if crlf && !original.contains(old) && old.contains('\n') && !old.contains("\r\n") {
+        old.replace('\n', "\r\n")
     } else {
-        (old.to_owned(), new.to_owned())
+        old.to_owned()
+    };
+    let new = if crlf {
+        new.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        new.to_owned()
     };
     let count = original.matches(old.as_str()).count();
     if count == 0 {
@@ -247,15 +247,16 @@ pub(crate) fn existing_text(path: &Path) -> Option<String> {
 
 /// Unified diff for approval and results, bounded for events and context.
 pub(crate) fn diff(shown: &str, before: &str, after: &str) -> Value {
-    diff_with_limit(shown, before, after, Some(DIFF_BYTES))
+    diff_with_limit(shown, before, after, DIFF_BYTES)
 }
 
-/// Approval inspection must retain the complete planned change.
-pub(crate) fn approval_diff(shown: &str, before: &str, after: &str) -> Value {
-    diff_with_limit(shown, before, after, None)
+/// The diff shown for approval, bounded to `limit` bytes so the event stays
+/// well inside the protocol line limit; `diff_truncated` tells the reviewer.
+pub(crate) fn approval_diff(shown: &str, before: &str, after: &str, limit: usize) -> Value {
+    diff_with_limit(shown, before, after, limit)
 }
 
-fn diff_with_limit(shown: &str, before: &str, after: &str, limit: Option<usize>) -> Value {
+fn diff_with_limit(shown: &str, before: &str, after: &str, limit: usize) -> Value {
     use similar::{Algorithm, ChangeTag, TextDiff};
     let changes = TextDiff::configure()
         .algorithm(Algorithm::Patience)
@@ -274,9 +275,9 @@ fn diff_with_limit(shown: &str, before: &str, after: &str, limit: Option<usize>)
         .context_radius(3)
         .header(&format!("a/{shown}"), &format!("b/{shown}"))
         .to_string();
-    let truncated = limit.is_some_and(|limit| unified.len() > limit);
+    let truncated = unified.len() > limit;
     if truncated {
-        let mut cut = limit.unwrap();
+        let mut cut = limit;
         while !unified.is_char_boundary(cut) {
             cut -= 1;
         }
@@ -613,159 +614,21 @@ fn executable(path: &Path) -> Option<PathBuf> {
     path.is_file().then(|| path.to_path_buf())
 }
 
-/// The platform shell invocation for a model-written command line.
+/// The shell invocation for a model-written command line. Commands are not
+/// offered on Windows, where the OS sandbox is not qualified yet.
 pub(crate) fn shell_invocation(command: &str, cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
-    #[cfg(windows)]
-    {
-        let script = format!(
-            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $ErrorActionPreference='Continue'; & {{ {command} }}; if ($LASTEXITCODE) {{ exit $LASTEXITCODE }} elseif (-not $?) {{ exit 1 }}"
-        );
-        Ok((
-            resolve_program("powershell", cwd)?,
-            vec![
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-Command".into(),
-                script,
-            ],
-        ))
-    }
-    #[cfg(not(windows))]
-    {
-        let shell = resolve_program("bash", cwd).or_else(|_| resolve_program("sh", cwd))?;
-        Ok((shell, vec!["-c".into(), command.to_owned()]))
-    }
+    let shell = resolve_program("bash", cwd).or_else(|_| resolve_program("sh", cwd))?;
+    Ok((shell, vec!["-c".into(), command.to_owned()]))
 }
 
-/// Human name of the shell `shell_invocation` uses.
+/// What `shell_command` runs in, as the model should understand it.
 pub(crate) fn shell_name() -> &'static str {
     if cfg!(windows) {
-        "PowerShell (Windows PowerShell 5.1 syntax)"
+        "none (commands are not supported on Windows yet)"
     } else {
         "bash (falls back to sh)"
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ranged_reads_number_lines_and_report_continuation() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("a.txt");
-        let body: String = (1..=50).map(|n| format!("line {n}\n")).collect();
-        std::fs::write(&file, body).unwrap();
-        let first = read(&file, "a.txt", &json!({"limit": 10})).unwrap();
-        assert_eq!(first["end_line"], 10);
-        assert_eq!(first["total_lines"], 50);
-        assert_eq!(first["next_offset"], 11);
-        assert!(
-            first["content"]
-                .as_str()
-                .unwrap()
-                .starts_with("     1\tline 1\n")
-        );
-        let tail = read(&file, "a.txt", &json!({"offset": 45})).unwrap();
-        assert_eq!(tail["start_line"], 45);
-        assert_eq!(tail["truncated"], false);
-        assert!(read(&file, "a.txt", &json!({"offset": 51})).is_err());
-    }
-
-    #[test]
-    fn large_reads_stop_on_the_byte_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("big.txt");
-        std::fs::write(&file, format!("{}\n", "x".repeat(100)).repeat(5000)).unwrap();
-        let value = read(&file, "big.txt", &json!({})).unwrap();
-        assert!(value["content"].as_str().unwrap().len() <= READ_BYTES);
-        assert_eq!(value["truncated"], true);
-    }
-
-    #[test]
-    fn edits_require_a_unique_exact_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("a.rs");
-        std::fs::write(&file, "fn a() {}\nfn b() {}\nfn a() {}\n").unwrap();
-        let error = plan_edit(
-            &file,
-            "a.rs",
-            &json!({"old_string":"fn a() {}","new_string":"x"}),
-        )
-        .err()
-        .unwrap();
-        assert!(error.downcast_ref::<Unapplied>().is_some());
-        assert!(error.to_string().contains("2 places"));
-        let all = plan_edit(
-            &file,
-            "a.rs",
-            &json!({"old_string":"fn a() {}","new_string":"fn c() {}","replace_all":true}),
-        )
-        .unwrap();
-        assert_eq!(all.replacements, 2);
-        assert_eq!(all.updated, "fn c() {}\nfn b() {}\nfn c() {}\n");
-        let missing = plan_edit(
-            &file,
-            "a.rs",
-            &json!({"old_string":"nope","new_string":"x"}),
-        );
-        assert!(missing.err().unwrap().downcast_ref::<Unapplied>().is_some());
-    }
-
-    #[test]
-    fn edits_keep_crlf_line_endings() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("w.txt");
-        std::fs::write(&file, "one\r\ntwo\r\nthree\r\n").unwrap();
-        let plan = plan_edit(
-            &file,
-            "w.txt",
-            &json!({"old_string":"one\ntwo","new_string":"uno\ndos"}),
-        )
-        .unwrap();
-        assert_eq!(plan.updated, "uno\r\ndos\r\nthree\r\n");
-    }
-
-    #[test]
-    fn search_and_find_respect_ignore_files_and_filters() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::create_dir_all(root.join("target")).unwrap();
-        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
-        std::fs::write(root.join("src/lib.rs"), "fn needle() {}\n").unwrap();
-        std::fs::write(root.join("src/notes.md"), "needle\n").unwrap();
-        std::fs::write(root.join("target/out.rs"), "fn needle() {}\n").unwrap();
-        let cancel = CancellationToken::new();
-        let hits = search(
-            root,
-            root,
-            &json!({"query":"needle","glob":"*.rs"}),
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(hits["matches"], 1);
-        assert!(hits["results"].as_str().unwrap().contains("src/lib.rs:1:"));
-        let files = find(root, root, &json!({"pattern":"*.rs"}), &cancel).unwrap();
-        assert_eq!(files["files"], json!(["src/lib.rs"]));
-        let none = search(root, root, &json!({"query":"absent"}), &cancel).unwrap();
-        assert_eq!(none["results"], "No matches");
-    }
-
-    #[test]
-    fn missing_programs_are_definitive() {
-        let dir = tempfile::tempdir().unwrap();
-        let error = resolve_program("definitely-not-a-real-program-xyz", dir.path())
-            .err()
-            .unwrap();
-        assert!(error.downcast_ref::<Unapplied>().is_some());
-    }
-
-    #[test]
-    fn diffs_count_changes() {
-        let value = diff("a.txt", "a\nb\nc\n", "a\nB\nc\nd\n");
-        assert_eq!(value["added"], 2);
-        assert_eq!(value["removed"], 1);
-        assert!(value["diff"].as_str().unwrap().contains("+B"));
-    }
-}
+mod tests;

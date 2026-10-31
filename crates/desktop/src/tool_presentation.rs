@@ -1,4 +1,9 @@
 //! Bounded, semantic tool output prepared when the engine updates a card.
+//!
+//! The user sees only human-readable presentation: a diff, a command and its
+//! output, a file excerpt, search hits or a short plain summary. Model-facing
+//! envelopes (skill instructions, raw JSON) never reach the screen; the raw
+//! input and output stay available to copy from the card.
 use serde_json::Value;
 
 #[derive(Clone, Debug, Default)]
@@ -9,9 +14,53 @@ pub struct ToolPresentation {
     pub question: String,
     pub error: Option<String>,
     pub body: ToolBody,
-    pub raw_input: String,
-    pub raw_result: Option<String>,
+    /// The complete arguments, pretty-printed once when the card changes.
+    pub pretty_input: std::sync::Arc<str>,
     pub parsed_output: Option<std::sync::Arc<Value>>,
+    /// Extra context shown on hover, such as a skill's description.
+    pub tooltip: Option<String>,
+}
+impl ToolPresentation {
+    /// Whether the row has a readable body to expand into.
+    pub fn expandable(&self) -> bool {
+        !matches!(self.body, ToolBody::Empty)
+    }
+}
+/// "code-review" or "pkg:code_review" as "Code review".
+pub fn humanize_skill(id: &str) -> String {
+    let name = id.rsplit(':').next().unwrap_or(id).replace(['-', '_'], " ");
+    let mut chars = name.trim().chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
+}
+/// The first few lines of human-readable text, as a short summary.
+fn first_lines(text: &str) -> String {
+    const LINES: usize = 6;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let shown = lines.by_ref().take(LINES).collect::<Vec<_>>().join("\n");
+    let summary = short(&shown, 600);
+    if lines.next().is_some() {
+        format!("{summary}\n…")
+    } else {
+        summary
+    }
+}
+/// Text for a one-line label: every run of whitespace, line breaks included,
+/// becomes one space. GPUI breaks a label at `\n` even when it truncates.
+pub fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+/// The first non-empty line, with an ellipsis when more lines follow.
+fn first_line(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or_default();
+    if lines.next().is_some() {
+        format!("{first} …")
+    } else {
+        first.to_owned()
+    }
 }
 #[derive(Clone, Debug, Default)]
 pub enum ToolBody {
@@ -175,11 +224,14 @@ impl ToolPresentation {
             "git_diff" => "Git diff",
             "memory_search" => "Recall",
             "memory_remember" => "Remember",
-            "extension_skill" => "Use skill",
-            "extension_resource" => "Read resource",
+            "extension_skill" => "Using skill",
+            "extension_resource" => "Read skill file",
             "extension_component" => "Run plugin",
             _ => name,
         };
+        let pretty_input: std::sync::Arc<str> = serde_json::to_string_pretty(input)
+            .unwrap_or_default()
+            .into();
         let mut target = [
             "query", "pattern", "path", "task", "command", "program", "name", "url",
         ]
@@ -191,18 +243,24 @@ impl ToolPresentation {
             target = ".".into();
         }
         if name == "extension_skill" {
-            target = text(input, "id")
-                .rsplit(':')
-                .next()
-                .unwrap_or("")
-                .to_owned();
+            target = humanize_skill(text(input, "id"));
         }
         if name == "extension_component" {
-            target = input.get("input").and_then(|value| value.get("entry")).and_then(Value::as_str).unwrap_or_else(|| match text(input, "component") { "mcpServers" => "MCP servers", "lspServers" => "Language servers", "hooks" => "Hooks", other => other }).to_owned();
+            target = input
+                .get("input")
+                .and_then(|value| value.get("entry"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| match text(input, "component") {
+                    "mcpServers" => "MCP servers",
+                    "lspServers" => "Language servers",
+                    "hooks" => "Hooks",
+                    other => other,
+                })
+                .to_owned();
         }
         let mut shown = Self {
             verb: verb.replace('_', " "),
-            target: short(&target, 160),
+            target: short(&one_line(&target), 160),
             question: match name {
                 "file_write" | "file_edit" => "Allow this change to your project?",
                 "run_command" | "shell_command" => "Allow this command in your project?",
@@ -212,11 +270,7 @@ impl ToolPresentation {
                 _ => "Allow this action?",
             }
             .into(),
-            raw_input: short(
-                &serde_json::to_string_pretty(input).unwrap_or_default(),
-                8000,
-            ),
-            raw_result: result.map(|raw| short(raw, 12000)),
+            pretty_input,
             ..Default::default()
         };
         if success == Some(false) {
@@ -230,21 +284,18 @@ impl ToolPresentation {
                 .or_else(|| output.get("error").and_then(Value::as_str))
                 .or_else(|| readable(output))
                 .or_else(|| result.filter(|_| parsed.is_none()));
-            shown.error = Some(short(
-                error.unwrap_or("The action could not finish. Open Raw details for diagnostics."),
-                500,
-            ));
+            shown.error = Some(short(error.unwrap_or("The action could not finish."), 500));
         }
         shown.body = match name {
+            // A skill's instructions and resources are for the model; the row
+            // names the skill and its description is the tooltip.
             "extension_skill" => {
-                if !text(output, "instructions").is_empty() {
-                    ToolBody::Markdown(short(text(output, "instructions"), 8000))
-                } else {
-                    readable(output)
-                        .map(|text| ToolBody::Markdown(short(text, 8000)))
-                        .unwrap_or(ToolBody::Empty)
-                }
+                shown.tooltip = Some(text(output, "description"))
+                    .filter(|description| !description.is_empty())
+                    .map(|description| short(description, 300));
+                ToolBody::Empty
             }
+            "extension_resource" => ToolBody::Empty,
             "extension_component" => {
                 shown.meta = Some(short(text(input, "operation"), 40));
                 if let Some(results) = output.get("results").and_then(Value::as_array) {
@@ -259,10 +310,7 @@ impl ToolPresentation {
                         .collect::<Vec<_>>();
                     ToolBody::Message(short(&rows.join("\n"), 8000))
                 } else if result.is_some() {
-                    ToolBody::Message(
-                        "Component status available. Open Raw details for its configuration."
-                            .into(),
-                    )
+                    ToolBody::Message("Component status available.".into())
                 } else {
                     ToolBody::Empty
                 }
@@ -411,7 +459,9 @@ impl ToolPresentation {
                         .collect::<Vec<_>>()
                         .join(" ")
                 };
-                shown.target = short(&command, 160);
+                // The row is one line: a multi-line script shows its first
+                // line; the detail view keeps the whole command.
+                shown.target = short(&first_line(&command), 160);
                 let exit = output.get("exit_code").and_then(Value::as_i64);
                 shown.meta = exit.map(|code| format!("exit {code}"));
                 let (stdout, more_out) = lines(text(output, "stdout"), false, 0);
@@ -432,18 +482,21 @@ impl ToolPresentation {
                     }
                 }
             }
+            // A helper's final answer is its whole report; the engine bounds it.
             "agent_delegate" => readable(output)
-                .map(|text| ToolBody::Markdown(short(text, 16000)))
+                .map(|text| ToolBody::Markdown(short(text, 64 * 1024)))
                 .unwrap_or(ToolBody::Empty),
             "file_write" | "file_edit" | "git_diff" if !text(output, "diff").is_empty() => {
                 ToolBody::Diff(short(text(output, "diff"), 12000))
             }
             "image_generate" => ToolBody::Empty,
+            // Unknown tools get a short plain summary, never the envelope.
             _ => readable(output)
-                .map(|text| ToolBody::Message(short(text, 4000)))
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| ToolBody::Message(first_lines(text)))
                 .unwrap_or_else(|| {
                     if result.is_some() {
-                        ToolBody::Message("Result available in Raw details".into())
+                        ToolBody::Message("Done".into())
                     } else {
                         ToolBody::Empty
                     }
@@ -459,170 +512,5 @@ impl ToolPresentation {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{ToolBody, ToolPresentation};
-    use serde_json::json;
-    fn prepare(name: &str, input: Value, summary: Value) -> ToolPresentation {
-        ToolPresentation::prepare(
-            name,
-            &input,
-            Some(&json!({"status":"success","summary":summary}).to_string()),
-            Some(true),
-        )
-    }
-    use serde_json::Value;
-    #[test]
-    fn portable_tools_show_skill_and_component_names_without_raw_envelopes() {
-        let skill = prepare(
-            "extension_skill",
-            json!({"id":"extension-abcd:review"}),
-            json!({"instructions":"Review the diff."}),
-        );
-        assert_eq!(skill.verb, "Use skill");
-        assert_eq!(skill.target, "review");
-        assert!(matches!(skill.body, ToolBody::Markdown(ref text) if text == "Review the diff."));
-        let component = prepare(
-            "extension_component",
-            json!({"component":"mcpServers","operation":"call"}),
-            json!({"results":[{"entry":"search","output":{"content":[{"type":"text","text":"Three matches found"}]}}]}),
-        );
-        assert_eq!(component.verb, "Run plugin");
-        assert_eq!(component.meta.as_deref(), Some("call"));
-        assert!(
-            matches!(component.body, ToolBody::Message(ref text) if text == "search: Three matches found")
-        );
-        let hook = prepare(
-            "extension_component",
-            json!({"component":"hooks","operation":"event"}),
-            json!({"results":[{"entry":"After tools","output":{"stdout":"Checks passed","stderr":""}}]}),
-        );
-        assert!(matches!(hook.body, ToolBody::Message(ref text) if text.contains("Checks passed")));
-        let lsp = prepare(
-            "extension_component",
-            json!({"component":"lspServers","operation":"request"}),
-            json!({"results":[{"entry":"rust","output":{"result":{"contents":{"kind":"markdown","value":"A workspace value"}}}}]}),
-        );
-        assert!(
-            matches!(lsp.body, ToolBody::Message(ref text) if text.contains("A workspace value"))
-        );
-    }
-    #[test]
-    fn directory_listing_is_names_and_types_without_envelopes() {
-        let shown = prepare(
-            "files_list",
-            json!({"path":"crates"}),
-            json!({"entries":["core/","Cargo.toml"]}),
-        );
-        assert_eq!(shown.verb, "List");
-        assert_eq!(shown.target, "crates");
-        let ToolBody::Files { entries, remaining } = shown.body else {
-            panic!("Expected semantic file rows")
-        };
-        assert!(entries[0].directory);
-        assert_eq!(entries[0].name, "core");
-        assert_eq!(remaining, 0);
-    }
-    #[test]
-    fn read_preserves_real_line_numbers_and_bounds_large_unicode_content() {
-        let content = (700..1700)
-            .map(|line| format!("{line:>6}\tlet café = {line};\n"))
-            .collect::<String>();
-        let shown = prepare(
-            "file_read",
-            json!({"path":"src/main.rs"}),
-            json!({"path":"src/main.rs","start_line":700,"end_line":1699,"total_lines":2000,"content":content}),
-        );
-        assert_eq!(shown.meta.as_deref(), Some("700–1699 · 2000 lines"));
-        let ToolBody::Excerpt { lines, remaining } = shown.body else {
-            panic!("Expected bounded excerpt")
-        };
-        assert_eq!(lines[0].number, Some(700));
-        assert_eq!(lines[0].text, "let café = 700;");
-        assert!(lines.len() <= 24);
-        assert_eq!(remaining, 976);
-    }
-    #[test]
-    fn search_groups_matches_by_file_and_keeps_colons_in_content() {
-        let shown = prepare(
-            "search_project",
-            json!({"query":"fn"}),
-            json!({"matches":3,"files":2,"results":"src/a.rs:12:fn a() { x: 1 }\nsrc/b.rs:9:fn b() {}\nsrc/a.rs:20:fn c() {}\n"}),
-        );
-        let ToolBody::Search { groups, remaining } = shown.body else {
-            panic!("Expected grouped matches")
-        };
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].matches.len(), 2);
-        assert_eq!(groups[0].matches[0].number, Some(12));
-        assert!(groups[0].matches[0].text.contains("x: 1"));
-        assert_eq!(remaining, 0);
-    }
-    #[test]
-    fn commands_show_actual_exit_and_output_while_errors_are_readable() {
-        let shown = prepare(
-            "run_command",
-            json!({"program":"cargo","args":["check"]}),
-            json!({"exit_code":1,"stdout":"Checking xylo","stderr":"error: missing import"}),
-        );
-        let ToolBody::Command {
-            command,
-            exit,
-            stderr,
-            ..
-        } = shown.body
-        else {
-            panic!("Expected command output")
-        };
-        assert_eq!(command, "cargo check");
-        assert_eq!(exit, Some(1));
-        assert_eq!(stderr[0].text, "error: missing import");
-        let error = ToolPresentation::prepare(
-            "files_list",
-            &json!({"path":"missing"}),
-            Some("{\"status\":\"failed\",\"error\":\"Directory does not exist\"}"),
-            Some(false),
-        );
-        assert_eq!(error.error.as_deref(), Some("Directory does not exist"));
-        assert!(!error.error.unwrap().starts_with('{'));
-    }
-    #[test]
-    fn delegate_result_is_readable_markdown_and_unknown_json_stays_in_diagnostics() {
-        let delegate = prepare(
-            "agent_delegate",
-            json!({"task":"Review navigation"}),
-            json!({"response":"## Findings\nUse a sidebar."}),
-        );
-        assert!(
-            matches!(delegate.body,ToolBody::Markdown(ref text) if text.starts_with("## Findings"))
-        );
-        let unknown = prepare(
-            "custom_tool",
-            json!({"internal":"argument"}),
-            json!({"opaque":{"protocol":true}}),
-        );
-        assert!(matches!(unknown.body,ToolBody::Message(ref text) if !text.contains("protocol")));
-        assert!(unknown.raw_result.unwrap().contains("protocol"));
-    }
-    #[test]
-    fn search_context_stays_with_its_file_and_pending_tools_have_no_fake_counts() {
-        let shown = prepare(
-            "search_project",
-            json!({"query":"main","context":1}),
-            json!({"matches":1,"files":1,"results":"src/a-b.rs-10-before\nsrc/a-b.rs:11:main\nsrc/a-b.rs-12-after\n--\n"}),
-        );
-        let ToolBody::Search { groups, .. } = shown.body else {
-            panic!("Expected grouped context")
-        };
-        assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0]
-                .matches
-                .iter()
-                .map(|line| line.number)
-                .collect::<Vec<_>>(),
-            vec![Some(10), Some(11), Some(12)]
-        );
-        let pending = ToolPresentation::prepare("files_list", &json!({"path":"src"}), None, None);
-        assert!(pending.meta.is_none());
-    }
-}
+#[path = "tool_presentation/tests.rs"]
+mod tests;

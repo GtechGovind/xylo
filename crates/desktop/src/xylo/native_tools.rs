@@ -16,6 +16,7 @@ pub(super) struct NativeUi {
 }
 impl NativeUi {
     #[cfg(test)]
+    #[allow(dead_code)] // Used by the separate native validation crate.
     pub(super) fn pending_id(&self, label: &str) -> Option<Uuid> {
         self.pending
             .iter()
@@ -55,8 +56,10 @@ impl Xylo {
             }
             self.error = None;
         }
-        if let Err(error) = &result {
-            if self.asset_error(name, &error.to_string(), cx) { return; }
+        if let Err(error) = &result
+            && self.asset_error(name, &error.to_string(), cx)
+        {
+            return;
         }
         self.result(result, cx);
     }
@@ -119,7 +122,9 @@ impl Xylo {
                 if self.update_error(id, &error, cx) {
                     return;
                 }
-                if self.asset_error(name, &error, cx) { return; }
+                if self.asset_error(name, &error, cx) {
+                    return;
+                }
                 self.native.message = format!("{label} could not finish.");
                 self.error = Some(error);
                 return;

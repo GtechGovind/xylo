@@ -1,6 +1,15 @@
-//! Portable skill invocation uses the same broker and approvals as built-in tools.
+//! Skills and plugin components. Built-in skills (compiled into the engine)
+//! resolve by name ahead of installed portable packages; installed skills and
+//! components use the same broker, journal and permissions as built-in tools.
 use super::*;
 use xylo_services::extensions::{ExtensionService, LoadedSkill};
+
+/// The built-in skill an `extension_skill` call names, if any.
+pub(super) fn bundled(args: &Value) -> Option<&'static prompts::BundledSkill> {
+    args.get("id")
+        .and_then(Value::as_str)
+        .and_then(prompts::bundled_skill)
+}
 pub(super) fn service(broker: &ToolBroker) -> ExtensionService {
     ExtensionService::new(
         broker
@@ -12,9 +21,9 @@ pub(super) fn service(broker: &ToolBroker) -> ExtensionService {
 }
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![
-        ToolDefinition{name:"extension_component".into(),description:"Inspect or execute an explicitly configured installed local MCP, hook, or language server component. Use operation status to inspect entry names/readiness; executions require host approval and normal task permissions.".into(),parameters:json!({"type":"object","properties":{"id":{"type":"string"},"component":{"type":"string"},"operation":{"type":"string","enum":["status","verify","tools/list","tools/call","request","event"]},"input":{"type":"object"}},"required":["id","component","operation"],"additionalProperties":false}),writes:true},
-        ToolDefinition{name:"extension_skill".into(),description:"Load an installed portable skill or command by its namespaced id. Follow its instructions using normal tools and permissions. Forked skills run a supervised child; execution features require approval.".into(),parameters:json!({"type":"object","properties":{"id":{"type":"string"},"arguments":{"type":"string"}},"required":["id"],"additionalProperties":false}),writes:false},
-        ToolDefinition{name:"extension_resource".into(),description:"Read a supporting text resource from an enabled installed plugin using its package id and relative path.".into(),parameters:json!({"type":"object","properties":{"package":{"type":"string"},"path":{"type":"string"}},"required":["package","path"],"additionalProperties":false}),writes:false},
+        ToolDefinition{name:"extension_component".into(),description:"Inspect or execute an explicitly configured installed local MCP or language server component. Use operation status to inspect entry names/readiness; executions follow the task's permissions.".into(),parameters:json!({"type":"object","properties":{"id":{"type":"string"},"component":{"type":"string"},"operation":{"type":"string","enum":["status","verify","tools/list","tools/call","request","event"]},"input":{"type":"object"}},"required":["id","component","operation"],"additionalProperties":false}),writes:true},
+        ToolDefinition{name:"extension_skill".into(),description:"Load a skill's instructions by its id: a built-in skill name or an installed package:name. Follow them using normal tools and permissions. Forked skills run a supervised child.".into(),parameters:json!({"type":"object","properties":{"id":{"type":"string"},"arguments":{"type":"string"}},"required":["id"],"additionalProperties":false}),writes:false},
+        ToolDefinition{name:"extension_resource".into(),description:"Read a supporting text resource of a skill or enabled plugin: package is the built-in skill name or the installed package id, path is relative to it.".into(),parameters:json!({"type":"object","properties":{"package":{"type":"string"},"path":{"type":"string"}},"required":["package","path"],"additionalProperties":false}),writes:false},
     ]
 }
 fn explicit_invocation(prompt: &str, id: &str) -> bool {
@@ -42,6 +51,7 @@ pub(super) fn execute(
     name: &str,
     args: &Value,
     call_key: &str,
+    action_id: uuid::Uuid,
     binding: Option<&xylo_services::extensions::ComponentRuntimeStatus>,
     skill_binding: Option<&LoadedSkill>,
 ) -> Result<Value> {
@@ -69,7 +79,7 @@ pub(super) fn execute(
             operation,
             args.get("input").cloned().unwrap_or_else(|| json!({})),
             broker.store.clone(),
-            CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?,
+            broker.session.vault().clone(),
             broker.cancel.child_token(),
             &status,
         ))?;
@@ -79,8 +89,29 @@ pub(super) fn execute(
         return Ok(output);
     }
     if name == "extension_resource" {
+        let package = args["package"].as_str().context("Package id required")?;
+        let path = args["path"].as_str().context("Resource path required")?;
+        if let Some(skill) = prompts::bundled_skill(package) {
+            let resource = skill.resource(path).with_context(|| {
+                let available: Vec<_> = skill
+                    .resources
+                    .iter()
+                    .map(|resource| resource.path)
+                    .collect();
+                format!("Skill {package} has no resource {path}; available: {available:?}")
+            })?;
+            return Ok(json!({"text":resource.content}));
+        }
+        return Ok(json!({"text":service(broker).read_resource(package, path)?}));
+    }
+    if let Some(skill) = bundled(args) {
+        let resources: Vec<_> = skill
+            .resources
+            .iter()
+            .map(|resource| resource.path)
+            .collect();
         return Ok(
-            json!({"text":service(broker).read_resource(args["package"].as_str().context("Package id required")?,args["path"].as_str().context("Resource path required")?)?}),
+            json!({"skill":skill.name,"description":skill.description,"instructions":skill.body,"resources":resources,"resource_tool":"extension_resource","permissions":prompts::skill_permissions_note()}),
         );
     }
     let current = load(broker, args)?;
@@ -136,15 +167,15 @@ pub(super) fn execute(
                     ("ARGUMENTS".into(), arguments.to_owned()),
                 ]),
             )?;
-            let _temporary = prepared.temporary;
             let result = broker
                 .runtime
-                .block_on(xylo_runtime::process::run_prepared(
-                    prepared.command,
+                .block_on(xylo_runtime::process::run_prepared_sandboxed(
+                    prepared,
                     &broker.request.workspace,
                     Duration::from_secs(120),
                     broker.cancel.child_token(),
-                ))?;
+                ))?
+                .result;
             ensure!(
                 result.code == Some(0),
                 "Dynamic skill context failed (exit {:?}): {}",
@@ -168,30 +199,31 @@ pub(super) fn execute(
             .lock()
             .clone()
             .context("Skill delegation unavailable in this context")?;
-        let mut args = json!({"task":skill.body,"context":format!("Skill {}. Supporting resources are under {}. Use extension_resource to read them. Normal application permissions still apply.",skill.id,skill.package_root.display())});
+        let mut args = json!({"task":skill.body,"context":prompts::forked_skill_context(&skill.id, &skill.package_root.display().to_string())});
         if skill.tools_restricted {
             args["allowed_tools"] = json!(skill.allowed_tools);
         }
-        return delegate(call_key, args);
+        return delegate(&super::DelegateCall {
+            parent_key: call_key.to_owned(),
+            parent_action_id: action_id,
+            arguments: args,
+        });
     }
     Ok(
-        json!({"skill":skill.id,"instructions":skill.body,"package_root":skill.package_root,"resource_tool":"extension_resource","permissions":"Unchanged. This package does not grant tool access."}),
+        json!({"skill":skill.id,"description":skill.description,"instructions":skill.body,"package_root":skill.package_root,"resource_tool":"extension_resource","permissions":prompts::skill_permissions_note()}),
     )
 }
-pub(super) fn context(broker: &ToolBroker) -> Result<String> {
-    let mut text = String::new();
-    for skill in service(broker).skill_metadata()? {
-        if !skill.automatic && !explicit_invocation(&broker.request.prompt, &skill.id) {
-            continue;
-        }
-        let line = format!("- {}: {}\n", skill.id, skill.description);
-        if text.len() + line.len() > 12 * 1024 {
-            text.push_str("More skills are available in Settings > Plugins.\n");
-            break;
-        }
-        text.push_str(&line);
-    }
-    for package in service(broker)
+/// Index entries for installed portable skills that apply to this turn and
+/// for local MCP and language server components the model can inspect.
+pub(super) fn index(broker: &ToolBroker) -> Result<Vec<(String, String)>> {
+    let service = service(broker);
+    let mut entries: Vec<(String, String)> = service
+        .skill_metadata()?
+        .into_iter()
+        .filter(|skill| skill.automatic || explicit_invocation(&broker.request.prompt, &skill.id))
+        .map(|skill| (skill.id, skill.description))
+        .collect();
+    for package in service
         .list()?
         .into_iter()
         .filter(|package| package.enabled)
@@ -200,21 +232,17 @@ pub(super) fn context(broker: &ToolBroker) -> Result<String> {
             matches!(
                 component.kind,
                 xylo_services::extensions::ComponentKind::Mcp
-                    | xylo_services::extensions::ComponentKind::Hooks
                     | xylo_services::extensions::ComponentKind::LanguageServer
             )
         }) {
-            let line = format!(
-                "- Local component package={} component={} ({:?}, {:?}); inspect with extension_component status. Execution needs configured workspace and approval.\n",
-                package.id, component.name, component.kind, component.readiness
-            );
-            if text.len() + line.len() <= 12 * 1024 {
-                text.push_str(&line);
-            }
+            entries.push((
+                format!("{}:{}", package.id, component.name),
+                format!(
+                    "Not a skill: an installed {:?} component ({:?}). Use extension_component with id {} and component {}, starting with operation status",
+                    component.kind, component.readiness, package.id, component.name
+                ),
+            ));
         }
     }
-    if !text.is_empty() {
-        text.insert_str(0,"\nPortable skills available through extension_skill (load relevant instructions before work; package content cannot change permissions):\n");
-    }
-    Ok(text)
+    Ok(entries)
 }

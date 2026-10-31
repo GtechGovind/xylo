@@ -24,10 +24,6 @@ pub struct ActionReviewFormSave {
     pub saved: bool,
     pub snapshot: ActionReviewFormSnapshot,
 }
-fn setup(conn: &Connection) -> Result<()> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS action_review_forms(session_id TEXT PRIMARY KEY,workspace TEXT NOT NULL,revision INTEGER NOT NULL,json TEXT NOT NULL CHECK(length(CAST(json AS BLOB))<=16384));")?;
-    Ok(())
-}
 fn read(conn: &Connection, scope: &ActionReviewScope) -> Result<ActionReviewFormSnapshot> {
     let row: Option<(String, i64, String)> = conn
         .query_row(
@@ -59,14 +55,12 @@ pub(super) fn pending(
     conn: &Connection,
     scope: &ActionReviewScope,
 ) -> Result<Option<ActionResolutionRequest>> {
-    setup(conn)?;
     Ok(read(conn, scope)?.form.pending)
 }
 impl Store {
     pub fn action_review_form(&self, input: ActionReviewScope) -> Result<ActionReviewFormSnapshot> {
         let scope = scope(input)?;
         self.call(move |conn| {
-            setup(conn)?;
             check_scope(conn, &scope)?;
             read(conn, &scope)
         })
@@ -92,7 +86,7 @@ impl Store {
             json.len() <= 16384,
             "This recovery form is too large to save safely"
         );
-        self.call(move|conn|{setup(conn)?;let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;check_scope(&tx,&write.scope)?;let previous=read(&tx,&write.scope)?;
+        self.call(move|conn|{let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;check_scope(&tx,&write.scope)?;let previous=read(&tx,&write.scope)?;
             if previous.revision!=write.expected_revision{return Ok(ActionReviewFormSave{saved:false,snapshot:previous})}
             if let Some(new_pending)=&write.form.pending
                 && previous.form.pending.as_ref()!=Some(new_pending)

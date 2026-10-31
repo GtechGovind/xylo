@@ -1,4 +1,9 @@
 //! Bounded native process execution. No shell is used for local helpers.
+//!
+//! Native helpers (ssh, docker/podman, llama-server, whisper, cmake) never
+//! inherit the application environment, which can hold provider API keys.
+//! Each starts from an empty environment plus [`baseline_environment`] and the
+//! variables its spec adds explicitly (for example `SSH_AUTH_SOCK` for ssh).
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -10,6 +15,57 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Parent variables every native helper may inherit: executable lookup, the
+/// user's identity and locale, and the temporary directory. `LC_*` locale
+/// categories are added by [`baseline_environment`].
+const BASELINE: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "TMPDIR",
+    #[cfg(windows)]
+    "SYSTEMROOT",
+    #[cfg(windows)]
+    "WINDIR",
+    #[cfg(windows)]
+    "TEMP",
+    #[cfg(windows)]
+    "TMP",
+    #[cfg(windows)]
+    "USERPROFILE",
+    #[cfg(windows)]
+    "LOCALAPPDATA",
+    #[cfg(windows)]
+    "APPDATA",
+    #[cfg(windows)]
+    "PATHEXT",
+    #[cfg(windows)]
+    "COMSPEC",
+];
+
+/// The allowlisted subset of this process's environment that native helpers
+/// start with.
+pub fn baseline_environment() -> BTreeMap<String, String> {
+    std::env::vars()
+        .filter(|(name, _)| BASELINE.contains(&name.as_str()) || name.starts_with("LC_"))
+        .collect()
+}
+
+/// Copy the named parent variables, when set, into `environment`. Callers use
+/// this for the few variables one helper genuinely needs, such as
+/// `SSH_AUTH_SOCK` for ssh or `DOCKER_HOST` for container clients.
+pub fn inherit(environment: &mut BTreeMap<String, String>, names: &[&str]) {
+    for name in names {
+        if let Ok(value) = std::env::var(name) {
+            environment.insert((*name).to_owned(), value);
+        }
+    }
+}
+
+/// A native helper invocation. `env` is added on top of
+/// [`baseline_environment`]; nothing else is inherited.
 #[derive(Clone, Debug)]
 pub struct ProcessSpec {
     pub executable: PathBuf,
@@ -69,6 +125,8 @@ fn command(spec: &ProcessSpec) -> Result<Command> {
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(baseline_environment())
         .envs(&spec.env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -307,38 +365,4 @@ impl Drop for WindowsJob {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn capture_is_bounded_and_timeout_terminates() {
-        let root = tempfile::tempdir().unwrap();
-        let spec = ProcessSpec {
-            executable: PathBuf::from("/bin/sh"),
-            args: vec!["-c".into(), "yes data | head -c 65536".into()],
-            cwd: root.path().into(),
-            env: BTreeMap::new(),
-            timeout: Duration::from_secs(5),
-            output_limit: 1024,
-        };
-        let result = run(spec.clone(), CancellationToken::new()).await.unwrap();
-        assert!(result.success && result.truncated);
-        assert_eq!(result.stdout.len(), 1024);
-        let spec = ProcessSpec {
-            args: vec!["-c".into(), "sleep 30".into()],
-            timeout: Duration::from_millis(50),
-            ..spec
-        };
-        assert!(
-            run(spec, CancellationToken::new())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("exceeded")
-        );
-    }
-    #[test]
-    fn relative_helpers_are_rejected() {
-        assert!(validate_executable(std::path::Path::new("ssh")).is_err());
-    }
-}
+mod tests;

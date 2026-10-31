@@ -1,5 +1,10 @@
-//! Compact native tool bodies. Parsing and bounding happen in the state reducer.
+//! A call's detail view: only the human-readable presentation (file rows, an
+//! excerpt, search hits, the full command and its output, a diff), then the
+//! copy actions. Raw input and output are copied, never rendered. Parsing and
+//! bounding happen in the state reducer.
+use super::tools::{detail_action, diff_view};
 use super::*;
+use crate::icons::{self, AppIcon};
 use crate::state::tool_presentation::{OutputLine, ToolBody};
 use gpui_kit::base::TestSupportExt;
 
@@ -22,6 +27,7 @@ fn output_lines(lines: &[OutputLine], cx: &Context<Xylo>) -> AnyElement {
                 .w_full()
                 .min_w_0()
                 .flex()
+                .items_center()
                 .gap_3()
                 .when_some(line.number, |row, number| {
                     row.child(
@@ -36,9 +42,7 @@ fn output_lines(lines: &[OutputLine], cx: &Context<Xylo>) -> AnyElement {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
+                        .single_line()
                         .child(line.text.clone()),
                 ),
         );
@@ -50,10 +54,30 @@ fn remaining(count: usize) -> AnyElement {
         .pt_1()
         .text_size(px(10.))
         .text_color(rgb(muted()))
-        .child(format!("{count} more · output preview in Raw details"))
+        .child(format!("{count} more"))
         .into_any_element()
 }
 impl Xylo {
+    /// Copies a call's complete arguments as JSON.
+    fn copy_tool_input(&self, id: Uuid, cx: &mut Context<Self>) {
+        if let Some(tool) = self.turns.get(&self.session).and_then(|turn| turn.tool(id)) {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                tool.presentation.pretty_input.to_string(),
+            ));
+        }
+    }
+    /// Copies a call's complete result, read at click time so rendering never
+    /// clones large outputs.
+    fn copy_tool_result(&self, id: Uuid, cx: &mut Context<Self>) {
+        if let Some(result) = self
+            .turns
+            .get(&self.session)
+            .and_then(|turn| turn.tool(id))
+            .and_then(|tool| tool.result.as_ref())
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(result.clone()));
+        }
+    }
     pub(super) fn structured_tool_details(
         &self,
         i: usize,
@@ -93,21 +117,18 @@ impl Xylo {
                             .gap_2()
                             .py(px(2.))
                             .child(
-                                icon(if entry.directory {
-                                    IconName::Folder
+                                icons::small(if entry.directory {
+                                    AppIcon::Folder
                                 } else {
-                                    IconName::File
+                                    AppIcon::File
                                 })
-                                .size(px(12.))
                                 .text_color(rgb(muted())),
                             )
                             .child(
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
+                                    .single_line()
                                     .text_size(px(11.))
                                     .child(entry.name.clone()),
                             ),
@@ -156,7 +177,7 @@ impl Xylo {
                                     .gap_2()
                                     .text_size(px(11.))
                                     .text_color(rgb(muted()))
-                                    .child(icon(IconName::File).size(px(11.)))
+                                    .child(icons::small(AppIcon::File))
                                     .child(group.path.clone()),
                             )
                             .child(output_lines(&group.matches, cx)),
@@ -189,6 +210,7 @@ impl Xylo {
                                     .mono_font_family
                                     .clone(),
                             )
+                            .whitespace_normal()
                             .child(format!("$ {command}")),
                     );
                 if !stdout.is_empty() {
@@ -210,7 +232,7 @@ impl Xylo {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(muted()))
-                            .child("Output shortened · output preview in Raw details"),
+                            .child("Output shortened · Copy output for all of it"),
                     );
                 }
                 body = body.child(command_body);
@@ -237,96 +259,26 @@ impl Xylo {
                 )
             }
         }
-        let raw = self.raw_tool_details.contains(&tool.id);
+        let has_output = tool.result.is_some();
         let id = tool.id;
-        body = body.child(
-            button(
-                ("tool-raw-toggle", i),
-                if raw {
-                    "Hide raw details"
-                } else {
-                    "Raw details"
-                },
-            )
-            .text_size(px(10.))
-            .text_color(rgb(muted()))
-            .self_start()
-            .on_click(cx.listener(move |view, _, _, cx| {
-                if !view.raw_tool_details.remove(&id) {
-                    view.raw_tool_details.insert(id);
-                }
-                view.invalidate_live_history();
-                view.sync_history_list(cx);
-                cx.notify();
-            })),
-        );
-        if raw {
-            body = body.child(
-                div()
-                    .id(("tool-raw-input", i))
-                    .test_support()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(muted()))
-                            .child("Arguments preview"),
+        body.child(
+            div()
+                .ml(px(-8.))
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    detail_action(("tool-copy-input", i), "Copy input")
+                        .on_click(cx.listener(move |view, _, _, cx| view.copy_tool_input(id, cx))),
+                )
+                .when(has_output, |row| {
+                    row.child(
+                        detail_action(("tool-copy-output", i), "Copy output").on_click(
+                            cx.listener(move |view, _, _, cx| view.copy_tool_result(id, cx)),
+                        ),
                     )
-                    .child(button(("tool-copy-input", i), "Copy full arguments")
-                        .text_size(px(10.))
-                        .on_click({
-                            let input = serde_json::to_string_pretty(&tool.input).unwrap_or_default();
-                            move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(input.clone()))
-                        }))
-                    .child(code_block(
-                        ("raw-arguments", i),
-                        &tool.presentation.raw_input,
-                    )),
-            );
-            if let Some(result) = &tool.presentation.raw_result {
-                body = body.child(
-                    div()
-                        .id(("tool-raw-result", i))
-                        .test_support()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(10.))
-                                        .text_color(rgb(muted()))
-                                        .child("Result preview"),
-                                )
-                                .child(
-                                    button(("tool-copy-raw", i), "Copy full result")
-                                        .text_size(px(10.))
-                                        .on_click(cx.listener(move |view, _, _, cx| {
-                                            if let Some(result) = view
-                                                .turns
-                                                .get(&view.session)
-                                                .and_then(|turn| {
-                                                    turn.tools.iter().find(|tool| tool.id == id)
-                                                })
-                                                .and_then(|tool| tool.result.as_ref())
-                                            {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    result.clone(),
-                                                ));
-                                            }
-                                        })),
-                                ),
-                        )
-                        .child(code_block(("raw-result", i), result)),
-                );
-            }
-        }
-        body.into_any_element()
+                }),
+        )
+        .into_any_element()
     }
 }

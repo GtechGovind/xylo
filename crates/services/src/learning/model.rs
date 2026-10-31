@@ -1,4 +1,4 @@
-use crate::{SkillEvaluation, SkillVersion};
+use crate::SkillVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -42,16 +42,6 @@ pub struct LearningEvaluation {
     pub evaluated_at: i64,
     /// Outcome/template consistency is not a task-quality or model benchmark.
     pub limitation: String,
-}
-impl LearningEvaluation {
-    pub(super) fn legacy(&self) -> SkillEvaluation {
-        SkillEvaluation {
-            passed: self.passed,
-            score: self.score,
-            cases: self.cases.len().max(1),
-            evidence: serde_json::to_string(self).expect("finite evaluation serializes"),
-        }
-    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LearnedSkill {

@@ -1,9 +1,11 @@
+//! The Files pane of the work panel (project tree and editor) and the
+//! Artifacts page.
 use super::*;
+use crate::icons::{self, AppIcon};
 
 impl Xylo {
     pub(super) fn files_page(&self, cx: &mut Context<Self>) -> AnyElement {
         use super::file_browser::{RowContent, TreeRow};
-        use gpui_kit::component::{Icon, IconName};
         let weak = cx.entity().downgrade();
         let rows = uniform_list(
             "file-list-rows",
@@ -22,6 +24,7 @@ impl Xylo {
                             let is_selected =
                                 row.key.is_some() && row.key == view.file_browser.tree.selected;
                             let padding = 6. + row.depth as f32 * 14.;
+                            let loading = matches!(row.content, RowContent::Loading);
                             let (label, detail, glyph, directory) = match &row.content {
                                 RowContent::Entry(entry) => {
                                     let label = if entry.is_dir {
@@ -36,9 +39,13 @@ impl Xylo {
                                         label,
                                         name.clone(),
                                         Some(if entry.is_dir {
-                                            IconName::Folder
+                                            if row.expanded {
+                                                AppIcon::FolderOpen
+                                            } else {
+                                                AppIcon::Folder
+                                            }
                                         } else {
-                                            IconName::FileText
+                                            AppIcon::File
                                         }),
                                         entry.is_dir,
                                     )
@@ -78,9 +85,13 @@ impl Xylo {
                                         .pr_2()
                                         .flex()
                                         .items_center()
+                                        .gap_1p5()
                                         .min_w_0()
                                         .text_xs()
                                         .text_color(rgb(muted()))
+                                        .when(loading, |row| {
+                                            row.child(crate::motion::spinner_inline())
+                                        })
                                         .tooltip({
                                             let detail = SharedString::from(detail.clone());
                                             move |_, cx| {
@@ -88,7 +99,7 @@ impl Xylo {
                                                     .into()
                                             }
                                         })
-                                        .child(div().flex_1().min_w_0().truncate().child(detail))
+                                        .child(div().flex_1().min_w_0().single_line().child(detail))
                                         .into_any_element(),
                                 );
                             };
@@ -120,32 +131,21 @@ impl Xylo {
                                         .items_center()
                                         .text_color(rgb(faint()))
                                         .when(directory, |caret| {
-                                            caret.child(
-                                                Icon::new(if row.expanded {
-                                                    IconName::ChevronDown
-                                                } else {
-                                                    IconName::ChevronRight
-                                                })
-                                                .size(px(12.)),
-                                            )
+                                            caret.child(icons::small(if row.expanded {
+                                                AppIcon::ChevronDown
+                                            } else {
+                                                AppIcon::ChevronRight
+                                            }))
                                         }),
                                 );
                             if let Some(glyph) = glyph {
-                                button = button.child(
-                                    Icon::new(if directory && row.expanded {
-                                        Glyph::FolderOpen
-                                    } else {
-                                        glyph.into()
-                                    })
-                                    .size(px(14.))
-                                    .text_color(rgb(
-                                        if directory { accent_text() } else { muted() },
-                                    )),
-                                );
+                                button = button.child(icons::icon(glyph).text_color(rgb(
+                                    if directory { accent_text() } else { muted() },
+                                )));
                             }
                             Some(
                                 button
-                                    .child(div().flex_1().min_w_0().truncate().child(detail))
+                                    .child(div().flex_1().min_w_0().single_line().child(detail))
                                     .when_some(
                                         view.git_panel.statuses.get(&row.path).copied(),
                                         |button, status| {
@@ -202,8 +202,7 @@ impl Xylo {
                     .gap_1()
                     .child(sidebar_label("Files").flex_1().min_w_0())
                     .child(
-                        icon_button("refresh-files", "Refresh files", IconName::RefreshCw)
-                            .size(px(26.))
+                        icons::icon_button("refresh-files", AppIcon::Refresh, "Refresh files")
                             .on_click(cx.listener(|view, _, _, cx| view.refresh_files(cx))),
                     ),
             )
@@ -215,16 +214,6 @@ impl Xylo {
             })
             .when(!self.file_browser.notice.is_empty(), |panel| {
                 panel.child(subtitle(self.file_browser.notice.clone()))
-            })
-            .when(self.workspace.is_none(), |panel| {
-                panel.child(
-                    card()
-                        .p_2()
-                        .child(subtitle("Open a project to browse its files."))
-                        .child(button("files-open-project", "Open project").on_click(
-                            cx.listener(|view, _, window, cx| view.pick_workspace(window, cx)),
-                        )),
-                )
             })
             .child(rows)
             .relative()
@@ -270,20 +259,11 @@ impl Xylo {
                                     ))
                                     .flex_1()
                                     .min_w_0()
-                                    .truncate(),
+                                    .single_line(),
                                 )
                                 .flex_1()
                                 .min_w(px(80.))
                                 .overflow_hidden(),
-                        )
-                        .child(
-                            button("editor-suggest", "Suggest")
-                                .flex_shrink_0()
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.editor.update(cx, |editor, cx| {
-                                        editor.show_completions(window, cx)
-                                    })
-                                })),
                         )
                         .child(
                             primary(
@@ -312,32 +292,32 @@ impl Xylo {
                         .bordered(false),
                 )
                 .into_any_element()
+        } else if self.workspace.is_none() {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap(px(8.))
+                .child(super::work_panel::panel_hint(
+                    "Open a project to browse its files.",
+                ))
+                .child(
+                    secondary("editor-open-project", "Open project…")
+                        .ml(px(14.))
+                        .on_click(
+                            cx.listener(|view, _, window, cx| view.pick_workspace(window, cx)),
+                        ),
+                )
+                .into_any_element()
         } else {
             div()
                 .flex_1()
                 .min_w_0()
-                .p_8()
-                .child(heading(
-                    if self.workspace.is_none() {
-                        "Open a project"
-                    } else if self.file_browser.indexing {
-                        "Discovering project files…"
-                    } else {
-                        "Choose a file"
-                    },
-                    if self.workspace.is_none() {
-                        "Choose a project folder to browse and edit its files."
-                    } else if self.file_browser.indexing {
-                        "Files appear as they are discovered. Select one to start editing."
-                    } else {
-                        "Select a file from the list. Changes save only when you click Save."
-                    },
+                .child(super::work_panel::panel_hint(
+                    "Select a file to view or edit it.",
                 ))
-                .when(self.workspace.is_none(), |panel| {
-                    panel.child(primary("editor-open-project", "Open project").on_click(
-                        cx.listener(|view, _, window, cx| view.pick_workspace(window, cx)),
-                    ))
-                })
                 .into_any_element()
         };
         div()
@@ -349,23 +329,26 @@ impl Xylo {
             .into_any_element()
     }
     pub(super) fn artifacts_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        // The toolbar names the page; the body starts with its content.
         let mut view = div()
             .id("artifact-scroll")
             .size_full()
             .overflow_y_scroll()
-            .p_6()
-            .child(heading(
-                "Artifacts",
-                "Recent files created for you. Open a file to inspect it.",
-            ));
-        view = view
+            .px(px(24.))
+            .pt(px(8.))
+            .pb(px(24.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
             .child(self.documents_panel(cx))
-            .child(self.native_result_card(cx));
+            .child(self.native_result_card(cx))
+            .child(sidebar_label("Recent files"));
         if self.artifacts.is_empty() {
-            view = view.child(card().child(heading(
-                "No artifacts yet",
-                "Ask Xylo in chat to create a document, spreadsheet, image, or other file. Returned files appear here. DOCX and XLSX files open in Xylo; other files open with your default app.",
-            )));
+            view = view.child(
+                subtitle("Files Xylo creates for you appear here.")
+                    .px(px(10.))
+                    .single_line(),
+            );
         }
         for (i, path) in self.artifacts.iter().enumerate() {
             let path = path.clone();
@@ -404,12 +387,12 @@ impl Xylo {
                 button(("artifact", i), label.clone())
                     .w_full()
                     .min_w_0()
-                    .h_auto()
-                    .py_2()
+                    .h(px(52.))
                     .flex()
                     .flex_col()
                     .items_start()
-                    .gap_1()
+                    .justify_center()
+                    .gap(px(2.))
                     .accessibility_label(format!(
                         "Open {label}, {}",
                         if in_xylo {
@@ -422,12 +405,7 @@ impl Xylo {
                         let full_path: SharedString = path.display().to_string().into();
                         move |_, cx| cx.new(|_| crate::ui::XyloTooltip(full_path.clone())).into()
                     })
-                    .child(subtitle(detail).w_full().min_w_0().truncate())
-                    .child(subtitle(if in_xylo {
-                        "Open in Xylo"
-                    } else {
-                        "Open with default app"
-                    }))
+                    .child(subtitle(detail).w_full().min_w_0().single_line())
                     .on_click(cx.listener(move |view, _, window, cx| {
                         if path
                             .extension()

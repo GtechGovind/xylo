@@ -1,6 +1,7 @@
 //! Explicit image generation through the selected image API. Configuration holds
 //! credential references; prompts and provider responses stay out of settings.
 use super::*;
+use crate::motion;
 use gpui_kit::base::Disableable;
 use gpui_kit::{
     TestSupportExt,
@@ -9,6 +10,7 @@ use gpui_kit::{
         menu::{DropdownMenu, PopupMenuItem},
     },
 };
+use std::time::Instant;
 
 /// ChatGPT plan credentials and unrelated provider protocols cannot authorize
 /// generic image endpoints. Reuse the connection, never its chat model.
@@ -41,6 +43,12 @@ fn detach_image_credential(provider: &mut ImageGenerationProvider) {
     provider.credential_ref = Some(format!("image-provider:{}", Uuid::new_v4()));
 }
 
+/// Which image-provider form is open over the list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderForm {
+    Add,
+    Edit,
+}
 pub(super) struct ImageGenerationUi {
     pub(super) name: Entity<InputState>,
     pub(super) endpoint: Entity<InputState>,
@@ -50,6 +58,13 @@ pub(super) struct ImageGenerationUi {
     load_error: bool,
     save_error: bool,
     provider_latest: Option<Uuid>,
+    /// When the latest provider load or save was sent, for the slow-wait
+    /// caption.
+    provider_since: Option<Instant>,
+    /// The provider image tools use, as last read or saved.
+    configured: Option<ImageGenerationProvider>,
+    /// The open add or edit form; the list shows when none is.
+    form: Option<ProviderForm>,
     protocol: ImageGenerationProtocol,
     credential_ref: Option<String>,
     headers: BTreeMap<String, String>,
@@ -83,6 +98,9 @@ impl ImageGenerationUi {
             load_error: false,
             save_error: false,
             provider_latest: None,
+            provider_since: None,
+            configured: None,
+            form: None,
             protocol: ImageGenerationProtocol::OpenAiImages,
             credential_ref: None,
             headers: BTreeMap::new(),
@@ -163,13 +181,14 @@ impl Xylo {
         if result.is_ok() {
             self.image_generation.loaded = true;
             self.image_generation.provider_latest = Some(id);
+            self.image_generation.provider_since = Some(self.arm_slow_hint(cx));
             self.image_generation
                 .provider_requests
                 .insert(id, (snapshot, false));
         }
         if let Err(error) = result {
             self.image_generation.load_error = true;
-            self.image_generation.notice = error.to_string();
+            self.image_generation.notice = product_error(&error.to_string());
         }
         cx.notify();
     }
@@ -206,7 +225,7 @@ impl Xylo {
                 self.image_generation.notice =
                     "Image request history exceeded its display limit.".into()
             }
-            Err(error) => self.image_generation.notice = error,
+            Err(error) => self.image_generation.notice = product_error(&error),
         }
         cx.notify();
         true
@@ -222,6 +241,12 @@ impl Xylo {
         }
         let id = Uuid::new_v4();
         let mut provider = self.image_generation.provider(cx);
+        if provider.model.is_empty() {
+            self.image_generation.save_error = true;
+            self.image_generation.notice = "Enter the image model this provider should use.".into();
+            cx.notify();
+            return;
+        }
         let secret = self
             .image_generation
             .secret
@@ -248,13 +273,14 @@ impl Xylo {
         self.image_generation.save_error = false;
         if result.is_ok() {
             self.image_generation.provider_latest = Some(id);
+            self.image_generation.provider_since = Some(self.arm_slow_hint(cx));
             self.image_generation
                 .provider_requests
                 .insert(id, (provider, true));
             self.image_generation.notice = "Saving image provider…".into();
         } else if let Err(error) = result {
             self.image_generation.save_error = true;
-            self.image_generation.notice = error.to_string();
+            self.image_generation.notice = product_error(&error.to_string());
         }
         cx.notify();
     }
@@ -273,12 +299,16 @@ impl Xylo {
             return true;
         }
         self.image_generation.provider_latest = None;
+        self.image_generation.provider_since = None;
         match result {
             Ok(provider) => {
-                if saving || self.image_generation.provider(cx) == snapshot {
-                    if let Some(provider) = provider {
-                        self.image_generation.apply_provider(provider, window, cx);
-                    }
+                self.image_generation.configured = provider
+                    .clone()
+                    .or_else(|| saving.then(|| snapshot.clone()));
+                if (saving || self.image_generation.provider(cx) == snapshot)
+                    && let Some(provider) = provider
+                {
+                    self.image_generation.apply_provider(provider, window, cx);
                 }
                 if saving {
                     self.image_generation
@@ -288,7 +318,7 @@ impl Xylo {
                 self.image_generation.load_error = false;
                 self.image_generation.save_error = false;
                 self.image_generation.notice = if saving {
-                    "Saved image provider. New image requests in chat use this connection.".into()
+                    "Saved image provider. New image requests in chat use it.".into()
                 } else {
                     String::new()
                 };
@@ -296,7 +326,7 @@ impl Xylo {
             Err(error) => {
                 self.image_generation.load_error = !saving;
                 self.image_generation.save_error = saving;
-                self.image_generation.notice = error;
+                self.image_generation.notice = product_error(&error);
             }
         }
         cx.notify();
@@ -374,49 +404,48 @@ impl Xylo {
             }
         }
     }
-    pub(super) fn image_provider_settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        self.settings_open = true;
-        if !self.image_generation.loaded && !self.image_generation.load_error {
-            self.load_image_generation_provider(cx);
+    /// Opens the form empty, for a new image provider.
+    fn open_image_provider_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ui = &mut self.image_generation;
+        for input in [&ui.name, &ui.endpoint, &ui.model, &ui.secret] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
         }
-        let saving = self
-            .image_generation
-            .provider_requests
-            .values()
-            .any(|(_, saving)| *saving);
-        let loading = self
-            .image_generation
-            .provider_requests
-            .values()
-            .any(|(_, saving)| !*saving);
-        let disabled = saving || loading;
-        let mut content = div()
-            .w_full()
-            .max_w(px(760.))
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                button("image-provider-back", "← Providers").on_click(cx.listener(
-                    |view, _, window, cx| {
-                        view.image_generation
-                            .secret
-                            .update(cx, |input, cx| input.set_value("", window, cx));
-                        view.image_generation.loaded = false;
-                        view.image_generation.load_error = false;
-                        view.navigate(Page::Providers, cx);
-                    },
-                )),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Image generation"),
-            )
-            .child(subtitle(
-                "Configure the connection used by image tools in chat.",
-            ));
+        ui.connection_source = None;
+        ui.protocol = ImageGenerationProtocol::OpenAiImages;
+        ui.credential_ref = None;
+        ui.headers.clear();
+        ui.notice.clear();
+        ui.save_error = false;
+        ui.form = Some(ProviderForm::Add);
+        cx.notify();
+    }
+    /// Opens the form on the configured provider, dropping unsaved edits.
+    fn open_image_provider_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(provider) = self.image_generation.configured.clone() else {
+            return;
+        };
+        self.image_generation
+            .secret
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.image_generation.apply_provider(provider, window, cx);
+        self.image_generation.notice.clear();
+        self.image_generation.save_error = false;
+        self.image_generation.form = Some(ProviderForm::Edit);
+        cx.notify();
+    }
+    /// Leaves the form; unsaved edits and the typed key are discarded.
+    fn close_image_provider_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.image_generation
+            .secret
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.image_generation.form = None;
+        if !self.image_generation.save_error {
+            self.image_generation.notice.clear();
+        }
+        cx.notify();
+    }
+    /// The saved chat connections whose credentials can also generate images.
+    fn image_connection_menu(&self, disabled: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         let mut seen = BTreeSet::new();
         let connections: Vec<_> = self
             .settings
@@ -428,67 +457,206 @@ impl Xylo {
                 seen.insert((provider.endpoint.clone(), provider.credential_ref.clone()))
             })
             .collect();
-        if !connections.is_empty() {
-            let weak = cx.entity().downgrade();
-            content = content.child(
-                MenuButton::new("image-saved-connection")
-                    .label("Use saved connection")
-                    .disabled(disabled)
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for provider in &connections {
-                            let provider = provider.clone();
-                            let view = weak.clone();
-                            menu = menu.item(PopupMenuItem::new(provider.name.clone()).on_click(
-                                move |_, window, cx| {
-                                    let _ = view.update(cx, |view, cx| {
-                                        view.image_generation.secret.update(cx, |input, cx| {
-                                            input.set_value("", window, cx)
-                                        });
-                                        view.image_generation.apply_provider(
-                                            provider.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                        view.image_generation.notice.clear();
-                                        cx.notify();
-                                    });
-                                },
-                            ));
-                        }
-                        menu
-                    }),
-            );
+        if connections.is_empty() {
+            return None;
         }
-        let mut form = div()
-            .border_1()
-            .border_color(rgb(border()))
-            .rounded_lg()
-            .overflow_hidden();
-        for (label, input) in [
-            ("Name", &self.image_generation.name),
-            ("Endpoint", &self.image_generation.endpoint),
-            ("Model", &self.image_generation.model),
-            ("API key", &self.image_generation.secret),
-        ] {
-            form = form.child(
+        let weak = cx.entity().downgrade();
+        Some(
+            MenuButton::new("image-saved-connection")
+                .outline()
+                .h(px(settings_ui::CONTROL_HEIGHT))
+                .px(px(10.))
+                .gap(px(6.))
+                .accessibility_label("Use a saved provider")
+                .child(div().single_line().child("Use a saved provider"))
+                .child(icons::small(AppIcon::ChevronDown).text_color(rgb(icons::rest_color())))
+                .disabled(disabled)
+                .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                    for provider in &connections {
+                        let provider = provider.clone();
+                        let view = weak.clone();
+                        menu = menu.item(PopupMenuItem::new(provider.name.clone()).on_click(
+                            move |_, window, cx| {
+                                let _ = view.update(cx, |view, cx| {
+                                    view.image_generation
+                                        .secret
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                    view.image_generation.apply_provider(
+                                        provider.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                    view.image_generation.notice.clear();
+                                    cx.notify();
+                                });
+                            },
+                        ));
+                    }
+                    menu
+                })
+                .into_any_element(),
+        )
+    }
+    /// Pure render: loading starts from navigation, never from here. The
+    /// configured provider is listed; adding or editing opens a sub-page.
+    pub(super) fn image_provider_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let page = match self.image_generation.form {
+            Some(form) => self.image_provider_form(form, cx),
+            None => self.image_provider_list(cx),
+        };
+        // The id the native validation suite observes.
+        div()
+            .id("image-provider-settings")
+            .test_support()
+            .size_full()
+            .child(page)
+            .into_any_element()
+    }
+    /// Whether a provider load or save is in flight: (saving, loading).
+    fn image_provider_requests(&self) -> (bool, bool) {
+        let requests = self.image_generation.provider_requests.values();
+        let saving = requests.clone().any(|(_, saving)| *saving);
+        let loading = requests.clone().any(|(_, saving)| !*saving);
+        (saving, loading)
+    }
+    fn image_provider_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (_, loading) = self.image_provider_requests();
+        let add = settings_ui::primary_button("add-image-provider", "Add image provider")
+            .on_click(cx.listener(|view, _, window, cx| view.open_image_provider_add(window, cx)));
+        let mut page = settings_ui::settings_page("image-provider-list", "Image generation")
+            .description("The provider image tools in chat use to create pictures.");
+        if self.image_generation.load_error {
+            page = page.child(
                 div()
-                    .p_4()
                     .flex()
                     .items_center()
-                    .gap_4()
-                    .border_b_1()
-                    .border_color(rgb(border()))
-                    .child(div().w(px(110.)).flex_shrink_0().text_sm().child(label))
+                    .gap(px(8.))
                     .child(
-                        div().flex_1().min_w_0().child(
-                            Input::new(input)
-                                .disabled(disabled)
-                                .aria_label(format!("Image provider {label}")),
-                        ),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(settings_ui::inline_error(&self.image_generation.notice)),
+                    )
+                    .child(
+                        settings_ui::secondary_button("image-provider-retry-load", "Retry loading")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.image_generation.loaded = false;
+                                view.image_generation.load_error = false;
+                                view.load_image_generation_provider(cx);
+                                cx.notify();
+                            })),
                     ),
             );
         }
-        let mut protocols = div().flex().gap_2();
+        match &self.image_generation.configured {
+            Some(provider) => {
+                let protocol = match provider.protocol {
+                    ImageGenerationProtocol::OpenAiImages => "OpenAI Images",
+                    ImageGenerationProtocol::GeminiGenerateContent => "Gemini",
+                };
+                let name = if provider.name.is_empty() {
+                    "Image provider".to_owned()
+                } else {
+                    provider.name.clone()
+                };
+                page = page.child(settings_ui::list_container([settings_ui::list_item(
+                    "image-provider-item",
+                    Some(settings_ui::monogram(&name, protocol).into_any_element()),
+                    name,
+                    Some(format!("{} · {protocol}", provider.model).into()),
+                )
+                .trailing(settings_ui::status_pill(settings_ui::Status::Ready))
+                .on_click(
+                    cx.listener(|view, _, window, cx| view.open_image_provider_edit(window, cx)),
+                )
+                .into_any_element()]));
+            }
+            None if loading => {
+                page = page.action(add).child(settings_ui::loading_list(
+                    1,
+                    self.image_generation.provider_since,
+                ));
+            }
+            None => {
+                page = page.child(settings_ui::empty_state(
+                    AppIcon::Image,
+                    "No image provider",
+                    "Add one so image tools in chat can create pictures.",
+                    Some(add.into_any_element()),
+                ));
+            }
+        }
+        page.into_any_element()
+    }
+    fn image_provider_form(&self, form: ProviderForm, cx: &mut Context<Self>) -> AnyElement {
+        let (saving, loading) = self.image_provider_requests();
+        let disabled = saving || loading;
+        let title: SharedString = match (form, &self.image_generation.configured) {
+            (ProviderForm::Edit, Some(provider)) if !provider.name.is_empty() => {
+                provider.name.clone().into()
+            }
+            (ProviderForm::Edit, _) => "Image provider".into(),
+            (ProviderForm::Add, _) => "Add image provider".into(),
+        };
+        let back = settings_ui::crumb("image-provider-back", "Image generation").on_click(
+            cx.listener(|view, _, window, cx| view.close_image_provider_form(window, cx)),
+        );
+        let mut page = settings_ui::settings_page("image-provider-form", title.clone())
+            .description(
+                if form == ProviderForm::Add && self.image_generation.configured.is_some() {
+                    "Saving replaces the current image provider."
+                } else {
+                    "Image tools in chat send their requests here."
+                },
+            )
+            .breadcrumb(settings_ui::breadcrumb([back], title));
+        if let Some(menu) = self.image_connection_menu(disabled, cx) {
+            page = page.action(menu);
+        }
+        let status = if saving {
+            "Saving image provider…"
+        } else {
+            &self.image_generation.notice
+        };
+        let slow = self
+            .image_generation
+            .provider_since
+            .filter(|_| saving)
+            .and_then(settings_ui::slow_caption);
+        if !status.is_empty() {
+            let failed = self.image_generation.save_error;
+            page = page.child(
+                div()
+                    .id("image-provider-status")
+                    .role(Role::Status)
+                    .aria_label(status.to_owned())
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(motion::fade_on_change(
+                        "image-provider-status-text",
+                        &status,
+                        if failed {
+                            settings_ui::inline_error(status)
+                        } else {
+                            notice(BadgeTone::Neutral, status.to_owned())
+                        },
+                    ))
+                    .children(slow),
+            );
+        }
+        let input = |label: &'static str, state: &Entity<InputState>| {
+            settings_ui::field(
+                label,
+                Input::new(state)
+                    .disabled(disabled)
+                    .aria_label(format!("Image provider {label}")),
+                None,
+            )
+            .into_any_element()
+        };
+        let mut protocols = segments();
         for (id, label, protocol) in [
             (
                 "image-api-openai",
@@ -502,12 +670,7 @@ impl Xylo {
             ),
         ] {
             protocols = protocols.child(
-                button(id, label)
-                    .bg(rgb(if self.image_generation.protocol == protocol {
-                        selected()
-                    } else {
-                        panel()
-                    }))
+                segment(id, label, self.image_generation.protocol == protocol)
                     .disabled(disabled)
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.image_generation.protocol = protocol;
@@ -515,72 +678,43 @@ impl Xylo {
                     })),
             );
         }
-        form = form.child(
-            div()
-                .p_4()
-                .flex()
-                .items_center()
-                .gap_4()
-                .child(div().w(px(110.)).text_sm().child("API"))
-                .child(protocols),
-        );
-        content = content.child(form).child(subtitle("Keys stay in the OS credential store. Leave blank to keep a saved key; local servers can use no key."));
-        let status = if saving {
-            "Saving image provider…"
-        } else if loading {
-            "Loading connection…"
-        } else {
-            &self.image_generation.notice
-        };
-        if !status.is_empty() {
-            content = content.child(
-                div()
-                    .id("image-provider-status")
-                    .role(Role::Status)
-                    .aria_label(status.to_owned())
-                    .test_support()
-                    .text_sm()
-                    .text_color(rgb(
-                        if self.image_generation.load_error || self.image_generation.save_error {
-                            danger()
-                        } else {
-                            muted()
-                        },
-                    ))
-                    .child(status.to_owned()),
-            );
-        }
-        if self.image_generation.load_error {
-            content = content.child(
-                button("image-provider-retry-load", "Retry loading").on_click(cx.listener(
-                    |view, _, _, cx| {
-                        view.image_generation.loaded = false;
-                        view.image_generation.load_error = false;
-                        view.load_image_generation_provider(cx);
-                        cx.notify();
-                    },
-                )),
-            );
-        }
-        content = content.child(
-            div().flex().justify_end().child(
-                primary(
-                    "image-save-provider",
-                    if saving { "Saving…" } else { "Save" },
+        let model_missing = self
+            .image_generation
+            .model
+            .read(cx)
+            .value()
+            .trim()
+            .is_empty();
+        let form = settings_ui::form_column([
+            input("Name", &self.image_generation.name),
+            input("Endpoint", &self.image_generation.endpoint),
+            settings_ui::field("API", protocols.self_start(), None).into_any_element(),
+            input("Model", &self.image_generation.model),
+            settings_ui::field(
+                "API key",
+                Input::new(&self.image_generation.secret)
+                    .disabled(disabled)
+                    .aria_label("Image provider API key"),
+                Some(
+                    "Kept in Xylo's secret storage. Leave blank to keep a saved key; local servers can use no key."
+                        .into(),
+                ),
+            )
+            .into_any_element(),
+            settings_ui::form_actions([
+                settings_ui::busy(
+                    settings_ui::primary_button("image-save-provider", "Save image provider")
+                        .disabled(disabled || model_missing)
+                        .on_click(
+                            cx.listener(|view, _, _, cx| view.save_image_generation_provider(cx)),
+                        ),
+                    saving,
                 )
-                .disabled(disabled)
-                .on_click(cx.listener(|view, _, _, cx| view.save_image_generation_provider(cx))),
-            ),
-        );
-        div()
-            .id("image-provider-settings")
-            .test_support()
-            .size_full()
-            .overflow_y_scroll()
-            .p_8()
-            .flex()
-            .justify_center()
-            .child(content)
+                .into_any_element(),
+            ])
+            .into_any_element(),
+        ]);
+        page.child(settings_ui::section("Provider", None, form))
             .into_any_element()
     }
 }
@@ -651,6 +785,7 @@ impl Xylo {
             content: String::new(),
             created_at: tool.finished_at.unwrap_or(tool.started_at),
             attachments: images,
+            status: Default::default(),
         };
         div()
             .max_w(px(440.))
@@ -661,121 +796,5 @@ impl Xylo {
 }
 
 #[cfg(test)]
-mod chat_result_tests {
-    use super::generated_tool_attachments;
-    use uuid::Uuid;
-    use xylo_core::{AttachmentSource, ImageAttachment, MAX_ATTACHMENTS_PER_TURN};
-    fn attachment(session: Uuid) -> ImageAttachment {
-        ImageAttachment {
-            id: Uuid::new_v4(),
-            session_id: session,
-            name: "generated.png".into(),
-            media_type: "image/png".into(),
-            sha256: "a".repeat(64),
-            bytes: 100,
-            width: 16,
-            height: 16,
-            source: AttachmentSource::Generated,
-            imported_at: 0,
-        }
-    }
-    fn tool(images: Vec<ImageAttachment>) -> crate::state::ToolCard {
-        let mut tool = crate::state::ToolCard { presentation:Default::default(), id:Uuid::new_v4(), name:"image_generate".into(), input:serde_json::json!({}), result:Some(serde_json::json!({"summary":{"images":images},"artifacts":["/untrusted/ignored.png"]}).to_string()), approval:false, rule:None, success:Some(true), started_at:0, finished_at:Some(1) };
-        tool.refresh_presentation();
-        tool
-    }
-    #[test]
-    fn generated_chat_images_are_bounded_and_session_scoped() {
-        let session = Uuid::new_v4();
-        let images = (0..10).map(|_| attachment(session)).collect();
-        assert_eq!(
-            generated_tool_attachments(&tool(images), session).len(),
-            MAX_ATTACHMENTS_PER_TURN
-        );
-        assert!(
-            generated_tool_attachments(&tool(vec![attachment(Uuid::new_v4())]), session).is_empty()
-        );
-        let mut invalid = tool(vec![attachment(session)]);
-        invalid.success = Some(false);
-        assert!(generated_tool_attachments(&invalid, session).is_empty());
-    }
-    #[test]
-    fn generated_chat_images_never_use_artifact_paths_as_previews() {
-        let session = Uuid::new_v4();
-        let mut invalid = tool(vec![attachment(session)]);
-        invalid.result=Some(serde_json::json!({"summary":{"images":[{"path":"/untrusted/ignored.png"}]},"artifacts":["/untrusted/ignored.png"]}).to_string());
-        invalid.refresh_presentation();
-        assert!(generated_tool_attachments(&invalid, session).is_empty());
-        invalid.name = "other_tool".into();
-        invalid.result = tool(vec![attachment(session)]).result;
-        invalid.refresh_presentation();
-        assert!(generated_tool_attachments(&invalid, session).is_empty());
-    }
-}
-
-#[cfg(test)]
-mod image_connection_tests {
-    use super::{ApiFamily, CHATGPT_REF, ProviderConfig, compatible_image_connection, detach_image_credential};
-    #[test]
-    fn new_image_key_detaches_from_saved_chat_credentials_and_existing_turn_references() {
-        let chat = ProviderConfig {
-            endpoint: "https://api.example/v1".into(),
-            credential_ref: Some("provider:shared-chat".into()),
-            ..Default::default()
-        };
-        let mut image = compatible_image_connection(&chat).unwrap();
-        let previous = image.credential_ref.clone();
-        detach_image_credential(&mut image);
-        assert_eq!(chat.credential_ref, previous);
-        assert_ne!(image.credential_ref, previous);
-        assert!(
-            image
-                .credential_ref
-                .as_deref()
-                .unwrap()
-                .starts_with("image-provider:")
-        );
-        let admitted_turn_reference = image.credential_ref.clone();
-        detach_image_credential(&mut image);
-        assert_ne!(image.credential_ref, admitted_turn_reference);
-    }
-    #[test]
-    fn saved_image_connections_reuse_only_compatible_api_credentials_and_never_a_chat_model() {
-        for family in [
-            ApiFamily::OpenAiChat,
-            ApiFamily::OpenAiResponses,
-            ApiFamily::Gemini,
-        ] {
-            let provider = ProviderConfig {
-                name: "API fixture".into(),
-                family,
-                endpoint: "https://api.example/v1".into(),
-                model: "a-chat-model".into(),
-                credential_ref: Some("provider:fixture".into()),
-                ..Default::default()
-            };
-            let image = compatible_image_connection(&provider).unwrap();
-            assert!(image.model.is_empty());
-            assert_eq!(image.credential_ref, provider.credential_ref);
-            assert_eq!(image.endpoint, provider.endpoint);
-            for account in [CHATGPT_REF, "account:another-plan"] {
-                let mut account_provider = provider.clone();
-                account_provider.credential_ref = Some(account.into());
-                assert!(compatible_image_connection(&account_provider).is_none());
-            }
-        }
-        for family in [
-            ApiFamily::Anthropic,
-            ApiFamily::Azure,
-            ApiFamily::Bedrock,
-            ApiFamily::Vertex,
-        ] {
-            let provider = ProviderConfig {
-                family,
-                endpoint: "https://api.example/v1".into(),
-                ..Default::default()
-            };
-            assert!(compatible_image_connection(&provider).is_none());
-        }
-    }
-}
+#[path = "image_generation/tests.rs"]
+mod tests;

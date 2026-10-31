@@ -12,7 +12,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use xylo_core::*;
 pub fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 pub fn read_bounded(
     reader: &mut impl Read,
@@ -108,7 +108,7 @@ pub fn verify(
         hash.update(&buffer[..n]);
     }
     ensure!(
-        count == source.bytes && format!("{:x}", hash.finalize()) == source.revision,
+        count == source.bytes && hex::encode(hash.finalize()) == source.revision,
         "Source revision changed; reopen before saving a copy"
     );
     Ok(())

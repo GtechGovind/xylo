@@ -23,13 +23,13 @@ impl Package {
         for i in 0..archive.len() {
             super::check(cancel)?;
             let file = archive.by_index(i)?;
-            let name = file.name();
+            let name = file.name().context("Office part name is not valid UTF-8")?;
             ensure!(
                 !name.to_ascii_lowercase().contains("_xmlsignatures"),
                 "Digitally signed Office packages require a signature-aware editor; native editing is unavailable"
             );
             ensure!(
-                names.insert(name.to_owned())
+                names.insert(name.to_string())
                     && !name.starts_with('/')
                     && !name.contains('\\')
                     && !name.split('/').any(|p| p == ".."),
@@ -70,7 +70,9 @@ impl Package {
         Ok(package)
     }
     pub fn contains(&self, name: &str) -> bool {
-        self.archive.file_names().any(|n| n == name)
+        self.archive
+            .file_names()
+            .any(|candidate| candidate.is_ok_and(|candidate| candidate == name))
     }
     pub fn text(&mut self, name: &str, cancel: &CancellationToken) -> Result<String> {
         let mut file = self
@@ -92,11 +94,15 @@ impl Package {
         cancel: &CancellationToken,
     ) -> Result<()> {
         let mut writer = ZipWriter::new(File::create(path)?);
-        writer.set_raw_comment(self.archive.comment().into());
+        writer.set_raw_comment(self.archive.comment().into())?;
         for i in 0..self.archive.len() {
             super::check(cancel)?;
             let file = self.archive.by_index(i)?;
-            if let Some(replacement) = replacements.get(file.name()) {
+            let name = file
+                .name()
+                .context("Office part name is not valid UTF-8")?
+                .into_owned();
+            if let Some(replacement) = replacements.get(&name) {
                 xml::parse(replacement, cancel)?;
                 let mut options =
                     SimpleFileOptions::default().compression_method(file.compression());
@@ -106,7 +112,7 @@ impl Package {
                 if let Some(mode) = file.unix_mode() {
                     options = options.unix_permissions(mode);
                 }
-                writer.start_file(file.name(), options)?;
+                writer.start_file(name, options)?;
                 writer.write_all(replacement.as_bytes())?;
             } else {
                 writer.raw_copy_file(file)?;

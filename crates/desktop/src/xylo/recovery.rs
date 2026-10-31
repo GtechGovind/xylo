@@ -1,5 +1,12 @@
 //! Operator review observes durable effects; it never re-executes an action.
+//!
+//! Unreviewed interrupted actions gate the chat. An action Xylo cannot let the
+//! user resolve (blocked, or still marked running after [`STUCK_BUSY`]) can be
+//! dismissed: the chat continues with a visible warning and the action stays
+//! listed for review. The form cache is bounded softly, so the gate is never
+//! skipped because the cache is full.
 use super::*;
+use std::time::{Duration, Instant};
 use xylo_runtime::{
     ActionResolutionOutcome, ActionResolutionReceipt, ActionResolutionRequest, ActionReviewCursor,
     ActionReviewDetail, ActionReviewForm, ActionReviewFormSave, ActionReviewFormSnapshot,
@@ -11,6 +18,12 @@ mod forms;
 mod view;
 
 type ScopeKey = (Uuid, PathBuf);
+/// How long an action may stay marked as running before it counts as stuck.
+const STUCK_BUSY: Duration = Duration::from_secs(60);
+/// Re-read interval while any listed action is still running.
+const BUSY_POLL: Duration = Duration::from_secs(5);
+/// Review forms kept for recently visited chats; dirty forms may exceed it.
+const FORM_CACHE: usize = 32;
 fn key(scope: &ActionReviewScope) -> ScopeKey {
     (scope.session_id, scope.workspace.clone())
 }
@@ -97,6 +110,11 @@ pub(super) struct RecoveryUi {
     debounce: Option<Task<()>>,
     flush: Option<DraftFlushAction>,
     notice: String,
+    /// Actions the user chose to continue past, per chat and project.
+    dismissed: BTreeMap<ScopeKey, BTreeSet<Uuid>>,
+    /// When each listed action was first seen running.
+    busy_since: BTreeMap<Uuid, Instant>,
+    busy_poll: Option<Task<()>>,
 }
 impl RecoveryUi {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Xylo>) -> Self {
@@ -127,6 +145,9 @@ impl RecoveryUi {
             debounce: None,
             flush: None,
             notice: String::new(),
+            dismissed: BTreeMap::new(),
+            busy_since: BTreeMap::new(),
+            busy_poll: None,
         }
     }
     fn entry(&self) -> Option<&Entry> {
@@ -137,6 +158,29 @@ impl RecoveryUi {
     }
     fn read_busy(&self) -> bool {
         !self.reads.is_empty()
+    }
+    fn dismissed(&self, action: Uuid) -> bool {
+        self.scope
+            .as_ref()
+            .and_then(|scope| self.dismissed.get(&key(scope)))
+            .is_some_and(|ids| ids.contains(&action))
+    }
+    fn stuck(&self, item: &ActionReviewSummary) -> bool {
+        action_stuck(item, self.busy_since.get(&item.id), Instant::now())
+    }
+    /// Listed actions that still need review before the chat continues.
+    fn blocking_items(&self) -> impl Iterator<Item = &ActionReviewSummary> {
+        self.items.iter().filter(|item| !self.dismissed(item.id))
+    }
+    /// Stuck actions the user may dismiss to continue.
+    fn dismissible_items(&self) -> impl Iterator<Item = &ActionReviewSummary> {
+        self.blocking_items().filter(|item| self.stuck(item))
+    }
+    fn dismissed_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| self.dismissed(item.id))
+            .count()
     }
 }
 impl Xylo {
@@ -166,6 +210,8 @@ impl Xylo {
         self.recovery.cursor = None;
         self.recovery.has_more = false;
         self.recovery.notice.clear();
+        self.recovery.busy_since.clear();
+        self.recovery.busy_poll = None;
         cx.notify();
     }
     pub(super) fn recovery_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -186,31 +232,19 @@ impl Xylo {
             return;
         }
         self.recovery_scope_changed(cx);
-        while self.recovery.entries.len() >= 32 {
-            let remove = self
-                .recovery
-                .entries
-                .iter()
-                .find(|(_, e)| {
-                    !e.dirty
-                        && e.save.is_none()
-                        && e.load.is_none()
-                        && e.form.pending.is_none()
-                        && e.conflict.is_none()
-                })
-                .map(|(key, _)| key.clone());
-            if let Some(remove) = remove {
-                self.recovery.entries.remove(&remove);
-            } else {
-                self.recovery.notice =
-                    "Save your open review notes before opening another chat.".into();
-                return;
-            }
-        }
+        self.evict_recovery_forms();
         self.recovery.scope = Some(scope.clone());
         self.recovery.entries.entry(key(&scope)).or_default();
         self.recovery_load_form(window, cx);
         self.refresh_action_reviews(cx);
+    }
+    /// Drops settled forms beyond [`FORM_CACHE`]. Forms with unsaved or
+    /// pending work stay even past the bound: evicting them would lose a note,
+    /// and refusing to open the chat would silently drop its review gate.
+    fn evict_recovery_forms(&mut self) {
+        for key in evictable_forms(&self.recovery.entries) {
+            self.recovery.entries.remove(&key);
+        }
     }
     fn recovery_read(&mut self, kind: ReadKind, cx: &mut Context<Self>) {
         let Some(scope) = self.recovery.scope.clone() else {
@@ -298,6 +332,7 @@ impl Xylo {
                 self.recovery.requested_cursor = cursor;
                 self.recovery.has_more = page.has_more;
                 self.recovery.loaded = true;
+                self.track_busy_actions(cx);
             }
             Ok(_) => {
                 self.recovery.notice =
@@ -306,6 +341,79 @@ impl Xylo {
             Err(error) => self.recovery.notice = review_error(&error),
         }
         cx.notify();
+    }
+    /// Times running actions and re-reads the page while any is running, so a
+    /// stuck action becomes dismissible instead of blocking forever.
+    fn track_busy_actions(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let busy: BTreeSet<Uuid> = self
+            .recovery
+            .items
+            .iter()
+            .filter(|item| item.busy)
+            .map(|item| item.id)
+            .collect();
+        self.recovery.busy_since.retain(|id, _| busy.contains(id));
+        for id in &busy {
+            self.recovery.busy_since.entry(*id).or_insert(now);
+        }
+        if busy.is_empty() || self.quitting {
+            self.recovery.busy_poll = None;
+            return;
+        }
+        let epoch = self.recovery.epoch;
+        self.recovery.busy_poll = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(BUSY_POLL).await;
+            let _ = view.update(cx, |view, cx| {
+                view.recovery.busy_poll = None;
+                if view.recovery.epoch == epoch && view.recovery.requested_cursor.is_none() {
+                    view.refresh_action_reviews(cx);
+                }
+            });
+        }));
+    }
+    /// Lets the chat continue past actions the user cannot resolve here. The
+    /// actions stay listed for review; nothing is recorded or undone.
+    fn dismiss_stuck_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(scope) = self.recovery.scope.clone() else {
+            return;
+        };
+        let ids: Vec<Uuid> = self
+            .recovery
+            .dismissible_items()
+            .map(|item| item.id)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let detail = if ids.len() == 1 {
+            "Xylo cannot confirm whether this interrupted action finished. Its changes may remain. You can still review it later.".to_owned()
+        } else {
+            format!(
+                "Xylo cannot confirm whether these {} interrupted actions finished. Their changes may remain. You can still review them later.",
+                ids.len()
+            )
+        };
+        self.confirm_destructive(
+            "Continue without a recorded outcome?",
+            &detail,
+            "Dismiss and continue",
+            window,
+            cx,
+            move |view, _, cx| {
+                if view.recovery.scope.as_ref() != Some(&scope) {
+                    return;
+                }
+                view.recovery
+                    .dismissed
+                    .entry(key(&scope))
+                    .or_default()
+                    .extend(ids);
+                view.recovery.open = false;
+                view.error = None;
+                cx.notify();
+            },
+        );
     }
     fn review_select(&mut self, action: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if self.recovery.mutation_busy() {
@@ -723,12 +831,34 @@ impl Xylo {
     }
     pub(super) fn recovery_blocks_submit(&self) -> bool {
         self.recovery.mutation_busy()
-            || !self.recovery.items.is_empty()
+            || self.recovery.blocking_items().next().is_some()
             || self
                 .recovery
                 .entry()
                 .is_some_and(|entry| entry.form.pending.is_some())
     }
+}
+/// The user cannot record an outcome for this action here: it is blocked, or
+/// it has been marked running for at least [`STUCK_BUSY`].
+fn action_stuck(item: &ActionReviewSummary, busy_since: Option<&Instant>, now: Instant) -> bool {
+    item.blocked_reason.is_some()
+        || (item.busy && busy_since.is_some_and(|since| now.duration_since(*since) >= STUCK_BUSY))
+}
+/// Settled forms to drop so one more fits within [`FORM_CACHE`].
+fn evictable_forms(entries: &BTreeMap<ScopeKey, Entry>) -> Vec<ScopeKey> {
+    let excess = (entries.len() + 1).saturating_sub(FORM_CACHE);
+    entries
+        .iter()
+        .filter(|(_, e)| {
+            !e.dirty
+                && e.save.is_none()
+                && e.load.is_none()
+                && e.form.pending.is_none()
+                && e.conflict.is_none()
+        })
+        .map(|(key, _)| key.clone())
+        .take(excess)
+        .collect()
 }
 fn review_error(error: &str) -> String {
     if error.to_ascii_lowercase().contains("cancel") {
@@ -768,7 +898,7 @@ fn review_label(name: &str) -> &'static str {
         "write_file" | "file_write" | "apply_patch" => "Update project files",
         "file_edit" => "Edit a project file",
         "run_command" | "shell_command" | "shell" | "terminal" | "execute" => "Run a command",
-        "environment_execute" | "remote_execute" => "Run a command in an environment",
+        "environment_execute" => "Run a command in an environment",
         "plugin_run_installed" => "Run a plugin",
         "image_generate" => "Create an image",
         "memory_remember" => "Save a memory",
@@ -780,7 +910,7 @@ fn review_label(name: &str) -> &'static str {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Exercised by the separate native validation test target.
 impl Xylo {
     pub(super) fn validation_review_ready(&self) -> bool {
         self.recovery.loaded
@@ -793,6 +923,9 @@ impl Xylo {
         self.recovery
             .entry()
             .is_some_and(|entry| entry.conflict.is_some())
+    }
+    pub(super) fn validation_review_blocking(&self) -> usize {
+        self.recovery.blocking_items().count()
     }
     pub(super) fn validation_review_items(&self) -> Vec<ActionReviewSummary> {
         self.recovery.items.clone()
@@ -836,3 +969,7 @@ impl Xylo {
         self.recovery_activate(window, cx);
     }
 }
+
+#[cfg(test)]
+#[path = "recovery/tests.rs"]
+mod tests;

@@ -2,6 +2,10 @@
 //! No network, container daemon, account, permission dialog or device is used.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -164,8 +168,9 @@ for line in sys.stdin:
             cx.update_window(fixture.window, |_, window, cx| {
                 window.render_frame(cx);
                 window.click("settings", cx);
-                window.click("nav-context", cx);
-                window.click("manage-context-connections", cx);
+                window.click("nav-connections", cx);
+                window.render_frame(cx);
+                window.click("connector-add", cx);
                 fixture.view.update(cx, |view, cx| {
                     Xylo::set_input(&view.connector_name, "Local MCP fixture", window, cx);
                     Xylo::set_input(
@@ -174,7 +179,9 @@ for line in sys.stdin:
                         window,
                         cx,
                     );
-                    view.connector_args.update(cx, |input, cx| input.set_value("first argument\n--readonly", window, cx));
+                    view.connector_args.update(cx, |input, cx| {
+                        input.set_value("first argument\n--readonly", window, cx)
+                    });
                 });
                 window.click("connector-save", cx);
             })
@@ -193,6 +200,9 @@ for line in sys.stdin:
                     title: "Fixture guidance".into(),
                     workspace: fixture.workspace.clone(),
                     updated_at: xylo_core::now_ms(),
+                    title_source: xylo_core::TitleSource::User,
+                    pinned: false,
+                    archived: false,
                 })
                 .unwrap();
             let source = xylo_core::ChatMessage {
@@ -202,6 +212,7 @@ for line in sys.stdin:
                 content: "Use `cargo test --offline` for verification.".into(),
                 created_at: xylo_core::now_ms(),
                 attachments: Vec::new(),
+                status: xylo_core::MessageStatus::Complete,
             };
             store.append_message(&source).unwrap();
             xylo_services::LearningService::new(store.clone())
@@ -218,7 +229,7 @@ for line in sys.stdin:
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].command.as_deref(), Some(server.as_path()));
             assert!(saved[0].credential_ref.is_none());
-            assert_eq!(saved[0].args,vec!["first argument","--readonly"]);
+            assert_eq!(saved[0].args, vec!["first argument", "--readonly"]);
             cx.update_window(fixture.window, |_, window, cx| {
                 window.render_frame(cx);
                 window.click(("connector-tools", 0usize), cx);
@@ -230,14 +241,14 @@ for line in sys.stdin:
                     .any(|tool| tool.name == "fixture_echo")
             });
             cx.update_window(fixture.window, |_, window, cx| {
-                window.click("nav-context", cx);
+                window.click("nav-connections", cx);
                 window.render_frame(cx);
-                assert!(window.find(("context-tools", 0usize)).visible());
-                window.click(("context-tools", 0usize), cx);
+                assert!(window.find(("connector-tools", 0usize)).visible());
+                window.click(("connector-tools", 0usize), cx);
+                // Opening Skills loads its procedures; there is no Refresh.
                 window.click("nav-skills", cx);
                 window.render_frame(cx);
-                assert!(window.find("refresh-learning").visible());
-                window.click("refresh-learning", cx);
+                assert!(window.find("skills-browse-plugins").visible());
             })
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -284,9 +295,9 @@ for line in sys.stdin:
             for state in ["empty", "slow", "error"] {
                 std::fs::write(&mode, state).unwrap();
                 cx.update_window(fixture.window, |_, window, cx| {
-                    window.click("nav-context", cx);
+                    window.click("nav-connections", cx);
                     window.render_frame(cx);
-                    window.click(("context-tools", 0usize), cx);
+                    window.click(("connector-tools", 0usize), cx);
                     assert!(fixture.view.read(cx).connector_loading);
                     window.render_frame(cx);
                     assert!(window.find_by_label("Loading tools…").visible());
@@ -332,21 +343,41 @@ for line in sys.stdin:
                         .iter()
                         .any(|tool| tool.name == "fixture_echo")
             });
-            std::fs::write(&mode,"slow").unwrap();
-            let pid=std::fs::read_to_string(PathBuf::from(format!("{}.pid",server.display()))).unwrap();
-            cx.update_window(fixture.window,|_,window,cx| {
-                window.click("manage-context-connections",cx);
+            std::fs::write(&mode, "slow").unwrap();
+            let pid = std::fs::read_to_string(PathBuf::from(format!("{}.pid", server.display())))
+                .unwrap();
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.click("nav-connections", cx);
                 window.render_frame(cx);
-                window.click(("connector-tools",0usize),cx);
+                window.click(("connector-tools", 0usize), cx);
                 assert!(fixture.view.read(cx).connector_loading);
-                window.click(("connector-remove",0usize),cx);
-            }).unwrap();
-            wait(cx,&fixture.view,|view,_|view.connector_pending.is_none() && view.connectors.is_empty());
-            let deadline=Instant::now()+Duration::from_secs(8);
+                // Remove lives on the connection's own page.
+                window.click(("connector-edit", 0usize), cx);
+                window.render_frame(cx);
+                window.click(("connector-remove", 0usize), cx);
+            })
+            .unwrap();
+            cx.simulate_prompt_answer("Remove connection");
+            wait(cx, &fixture.view, |view, _| {
+                view.connector_pending.is_none() && view.connectors.is_empty()
+            });
+            let deadline = Instant::now() + Duration::from_secs(8);
             loop {
-                let alive=std::process::Command::new("/bin/kill").arg("-0").arg(pid.trim()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap().success();
-                if !alive { break; }
-                assert!(Instant::now()<deadline,"Removing a connection must end its sandboxed inspection descendant");
+                let alive = std::process::Command::new("/bin/kill")
+                    .arg("-0")
+                    .arg(pid.trim())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success();
+                if !alive {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Removing a connection must end its sandboxed inspection descendant"
+                );
                 cx.run_until_parked();
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -355,23 +386,60 @@ for line in sys.stdin:
         }
 
         #[gpui_kit::test]
-        fn connector_inspection_receipts_require_current_request_and_workspace(cx:&mut TestAppContext) {
-            let fixture=open(cx);
-            let other=fixture.base.join("other-project"); std::fs::create_dir(&other).unwrap();
-            cx.update_window(fixture.window,|_,window,cx| { fixture.view.update(cx,|view,cx| {
-                let id=Uuid::new_v4(); let old=Uuid::new_v4(); let original=view.workspace.clone();
-                view.connector_inspected=Some(id);view.connector_inspection_request=Some(old);view.connector_loading=true;
-                view.set_workspace(other,window,cx);
-                assert!(view.connector_inspection_request.is_none()); assert!(!view.connector_loading); assert!(view.connector_tools.is_empty());
-                let current=Uuid::new_v4();view.connector_inspected=Some(id);view.connector_inspection_request=Some(current);view.connector_loading=true;
-                for (request_id,workspace) in [(old,view.workspace.clone()),(current,original)] {
-                    view.event(xylo_runtime::host::HostEvent::ConnectorTools {request_id,workspace,connector_id:id,tools:vec![]},window,cx);
-                    assert!(view.connector_loading); assert_eq!(view.connector_inspection_request,Some(current));
-                }
-                view.event(xylo_runtime::host::HostEvent::ConnectorTools {request_id:current,workspace:view.workspace.clone(),connector_id:id,tools:vec![]},window,cx);
-                assert!(!view.connector_loading);assert!(view.connector_inspection_request.is_none());
-            }); }).unwrap();
-            shutdown(cx,&fixture);
+        fn connector_inspection_receipts_require_current_request_and_workspace(
+            cx: &mut TestAppContext,
+        ) {
+            let fixture = open(cx);
+            let other = fixture.base.join("other-project");
+            std::fs::create_dir(&other).unwrap();
+            cx.update_window(fixture.window, |_, window, cx| {
+                fixture.view.update(cx, |view, cx| {
+                    let id = Uuid::new_v4();
+                    let old = Uuid::new_v4();
+                    let original = view.workspace.clone();
+                    view.connector_inspected = Some(id);
+                    view.connector_inspection_request = Some(old);
+                    view.connector_loading = true;
+                    view.set_workspace(other, window, cx);
+                    assert!(view.connector_inspection_request.is_none());
+                    assert!(!view.connector_loading);
+                    assert!(view.connector_tools.is_empty());
+                    let current = Uuid::new_v4();
+                    view.connector_inspected = Some(id);
+                    view.connector_inspection_request = Some(current);
+                    view.connector_loading = true;
+                    for (request_id, workspace) in
+                        [(old, view.workspace.clone()), (current, original)]
+                    {
+                        view.event(
+                            xylo_runtime::host::HostEvent::ConnectorTools {
+                                request_id,
+                                workspace,
+                                connector_id: id,
+                                tools: vec![],
+                            },
+                            window,
+                            cx,
+                        );
+                        assert!(view.connector_loading);
+                        assert_eq!(view.connector_inspection_request, Some(current));
+                    }
+                    view.event(
+                        xylo_runtime::host::HostEvent::ConnectorTools {
+                            request_id: current,
+                            workspace: view.workspace.clone(),
+                            connector_id: id,
+                            tools: vec![],
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(!view.connector_loading);
+                    assert!(view.connector_inspection_request.is_none());
+                });
+            })
+            .unwrap();
+            shutdown(cx, &fixture);
         }
 
         #[gpui_kit::test]
@@ -383,15 +451,16 @@ for line in sys.stdin:
             let b = Uuid::new_v4();
             cx.update_window(fixture.window, |_, window, cx| {
                 fixture.view.update(cx, |view, cx| {
-                    let request_id=Uuid::new_v4();
-                    view.connector_inspection_request=Some(request_id);
+                    let request_id = Uuid::new_v4();
+                    view.connector_inspection_request = Some(request_id);
                     view.connector_inspected = Some(b);
                     view.connector_loading = true;
                     view.connector_tools.clear();
                     view.connector_error = None;
                     view.event(
                         xylo_runtime::host::HostEvent::ConnectorTools {
-                            request_id, workspace:view.workspace.clone(),
+                            request_id,
+                            workspace: view.workspace.clone(),
                             connector_id: a,
                             tools: vec![xylo_core::ToolDefinition {
                                 name: "stale_tool".into(),
@@ -407,7 +476,8 @@ for line in sys.stdin:
                     assert!(view.connector_tools.is_empty());
                     view.event(
                         xylo_runtime::host::HostEvent::ConnectorTools {
-                            request_id, workspace:view.workspace.clone(),
+                            request_id,
+                            workspace: view.workspace.clone(),
                             connector_id: b,
                             tools: Vec::new(),
                         },
@@ -416,7 +486,7 @@ for line in sys.stdin:
                     );
                     assert!(!view.connector_loading);
                     assert!(view.connector_tools.is_empty());
-                    view.page = Page::Context;
+                    view.page = Page::Connectors;
                     view.settings_open = true;
                     cx.notify();
                 })
@@ -426,14 +496,15 @@ for line in sys.stdin:
                 window.render_frame(cx);
                 assert!(window.find_by_label("No tools returned").visible());
                 fixture.view.update(cx, |view, cx| {
-                    let request_id=Uuid::new_v4();
-                    view.connector_inspection_request=Some(request_id);
+                    let request_id = Uuid::new_v4();
+                    view.connector_inspection_request = Some(request_id);
                     view.connector_inspected = Some(b);
                     view.connector_loading = true;
                     view.connector_error = None;
                     view.event(
                         xylo_runtime::host::HostEvent::ConnectorToolsFailed {
-                            request_id, workspace:view.workspace.clone(),
+                            request_id,
+                            workspace: view.workspace.clone(),
                             connector_id: a,
                             message: "old failure".into(),
                         },
@@ -444,7 +515,8 @@ for line in sys.stdin:
                     assert!(view.connector_error.is_none());
                     view.event(
                         xylo_runtime::host::HostEvent::ConnectorToolsFailed {
-                            request_id, workspace:view.workspace.clone(),
+                            request_id,
+                            workspace: view.workspace.clone(),
                             connector_id: b,
                             message: "Fixture discovery failed".into(),
                         },
@@ -467,10 +539,17 @@ for line in sys.stdin:
         fn inspect(cx: &mut TestAppContext, fixture: &Fixture, path: PathBuf) {
             cx.update_window(fixture.window, |_, window, cx| {
                 window.render_frame(cx);
-                if window.try_find("extensions-native").is_some() { window.click("extensions-native",cx); }
+                if window.try_find("extensions-tab-1").is_some() {
+                    window.click("extensions-tab-1", cx);
+                    window.render_frame(cx);
+                }
+                if window.try_find("extensions-native").is_some() {
+                    window.click("extensions-native", cx);
+                }
                 window.render_frame(cx);
-            }).unwrap();
-            wait(cx,&fixture.view,|view,_|view.validation_plugin_idle());
+            })
+            .unwrap();
+            wait(cx, &fixture.view, |view, _| view.validation_plugin_idle());
             cx.update_window(fixture.window, |_, _, cx| {
                 fixture
                     .view
@@ -510,7 +589,7 @@ for line in sys.stdin:
                 name: id.into(),
                 version: "1.0.0".into(),
                 entrypoint: "component.wat".into(),
-                sha256: format!("{:x}", Sha256::digest(source.as_bytes())),
+                sha256: hex::encode(Sha256::digest(source.as_bytes())),
                 capabilities: permissions.iter().map(|value| (*value).into()).collect(),
                 budgets: PluginBudgets::default(),
             };
@@ -982,7 +1061,12 @@ printf 'isolated remote command completed'
                         .any(|record| record.profile.id == id && record.container_id.is_none())
             });
             assert!(!fixture.base.join("exists").exists());
-            click(cx, &fixture, "environment-remove");
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click(("environment-remove-row", 0usize), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
             cx.simulate_prompt_answer("Remove profile");
             wait(cx, &fixture.view, |view, _| {
                 view.validation_environment_idle()
@@ -1084,7 +1168,7 @@ printf 'isolated remote command completed'
             );
             for artifact in &output.artifacts {
                 let bytes = std::fs::read(&artifact.path).unwrap();
-                assert_eq!(format!("{:x}", Sha256::digest(&bytes)), artifact.sha256);
+                assert_eq!(hex::encode(Sha256::digest(&bytes)), artifact.sha256);
                 assert_eq!(bytes.len() as u64, artifact.stored_bytes);
                 assert!(
                     artifact.complete,
@@ -1407,9 +1491,18 @@ printf 'isolated remote command completed'
             })
             .unwrap();
             wait(cx, &fixture.view, |view, _| {
-                view.validation_environment_idle()
+                view.validation_environment_idle() && view.validation_environment_loaded()
             });
+            // The setup form lives on its own page: open it the way a person
+            // does, from the empty page's first use case (SSH).
             cx.update_window(fixture.window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click(("environment-use-case", 0usize), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.render_frame(cx);
                 fixture.view.update(cx, |view, cx| {
                     view.validation_environment_focus_name(window, cx)
                 });

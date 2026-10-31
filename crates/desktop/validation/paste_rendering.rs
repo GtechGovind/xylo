@@ -2,6 +2,13 @@
 //! Test-only imported production modules also expose fixtures for other targets.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/assets.rs"]
+mod assets;
+mod capture_dir;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -102,7 +109,7 @@ fn main() {
     let client = host.0.clone();
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        Arc::new(crate::assets::AppAssets),
         platform::current_headless_renderer,
     );
     cx.allow_parking();
@@ -176,13 +183,7 @@ fn main() {
     let images = cx.update(|cx| view.read(cx).paste_images());
     assert_eq!(images[0].source, AttachmentSource::Clipboard);
     assert_eq!(images[1].source, AttachmentSource::PastedFile);
-    let output = std::env::var_os("XYLO_RENDER_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../.scratch/ui-fixes/paste-captures")
-        });
-    std::fs::create_dir_all(&output).unwrap();
+    let output = capture_dir::fresh("paste-rendering");
     let mut cases = Vec::new();
     for theme in ["light", "dark"] {
         settings.theme = theme.into();
@@ -225,10 +226,19 @@ fn main() {
     use sha2::Digest;
     let compiled_sources = [
         ("chat.rs", include_bytes!("../src/xylo/chat.rs").as_slice()),
-        ("attachments.rs", include_bytes!("../src/xylo/attachments.rs").as_slice()),
-        ("paste_rendering.rs", include_bytes!("paste_rendering.rs").as_slice()),
+        (
+            "attachments.rs",
+            include_bytes!("../src/xylo/attachments.rs").as_slice(),
+        ),
+        (
+            "paste_rendering.rs",
+            include_bytes!("paste_rendering.rs").as_slice(),
+        ),
         ("Cargo.lock", include_bytes!("Cargo.lock").as_slice()),
-    ].into_iter().map(|(name, bytes)| (name, format!("{:x}", sha2::Sha256::digest(bytes)))).collect::<std::collections::BTreeMap<_, _>>();
+    ]
+    .into_iter()
+    .map(|(name, bytes)| (name, hex::encode(sha2::Sha256::digest(bytes))))
+    .collect::<std::collections::BTreeMap<_, _>>();
     let metadata = serde_json::json!({"schema":1,"scope":"Current production composer, actual native paste shortcut and real isolated Host imports; native GPU/fonts. No account, model, real profile, or device.","clipboard_sources":["clipboard","pasted_file"],"attachment_count":2,"cases":cases,"compiled_sources":compiled_sources});
     std::fs::write(
         output.join("paste-rendering.json"),

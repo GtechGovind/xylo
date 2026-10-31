@@ -2,6 +2,13 @@
 //! Output is a controlled rendering fixture, not a live command/session capture.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/assets.rs"]
+mod assets;
+mod capture_dir;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/terminal_view.rs"]
 mod terminal_view;
 #[path = "../src/terminal_workspace.rs"]
@@ -19,7 +26,7 @@ fn run() {
     use gpui_kit::component::{Theme, ThemeMode};
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
-        std::sync::Arc::new(gpui_kit::assets::Assets),
+        std::sync::Arc::new(crate::assets::AppAssets),
         platform::current_headless_renderer,
     );
     cx.update(|cx| {
@@ -69,23 +76,22 @@ fn run() {
             terminal_view::tests::assert_render_geometry(terminal, window, cx)
         })
         .unwrap();
-    let output = std::env::var_os("XYLO_RENDER_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "target/native-terminal-preview".into());
-    std::fs::create_dir_all(&output).unwrap();
+    let output = capture_dir::fresh("terminal-rendering");
     let capture = cx
         .capture_screenshot(handle)
         .expect("native terminal renderer available");
     for x in [0, capture.width() - 1] {
         assert_eq!(
             &capture.get_pixel(x, capture.height() / 2).0[..3],
-            &[0x11, 0x15, 0x1d],
+            &terminal_view::SURFACE.to_be_bytes()[1..],
             "Single terminal pane must not have a bright focus outline"
         );
     }
     capture.save(output.join("terminal-fixture.png")).unwrap();
     cx.update_window(handle, |_, window, cx| {
-        window.click("term-assist", cx);
+        // "Ask Xylo" lives in the toolbar's "…" menu; open it directly.
+        let terminal = view.read(cx).active_view().unwrap();
+        terminal.update(cx, |terminal, cx| terminal.toggle_assist(window, cx));
         window.render_frame(cx);
     })
     .unwrap();

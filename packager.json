@@ -16,9 +16,6 @@
   "resources": [
     { "src": "crates/services/sandbox-helper", "target": "sandbox-helper" },
     { "src": "LICENSE", "target": "licenses/LICENSE" },
-    { "src": "NOTICE", "target": "licenses/NOTICE" },
-    { "src": "vendor/hermes-ultra/LICENSE", "target": "licenses/Hermes-Ultra-LICENSE" },
-    { "src": "vendor/hermes-ultra/LICENSE-UPSTREAM", "target": "licenses/Hermes-upstream-LICENSE" },
-    { "src": "vendor/hermes-ultra/NOTICE", "target": "licenses/Hermes-NOTICE" }
+    { "src": "NOTICE", "target": "licenses/NOTICE" }
   ]
 }

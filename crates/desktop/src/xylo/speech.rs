@@ -1,10 +1,11 @@
 //! User-driven native speech controls. This module owns request correlation and
 //! retains a recording indicator outside the Voice card through the chat button.
 use super::*;
+use crate::motion;
 use serde_json::{Value, json};
+use std::time::Instant;
 
 pub(super) struct SpeechUi {
-    pub text: Entity<TextareaState>,
     pub transcript: String,
     pub recording_state: String,
     recording_id: Option<Uuid>,
@@ -22,15 +23,15 @@ pub(super) struct SpeechUi {
     playback_request: Option<Uuid>,
     pub playing: bool,
     pub notice: String,
+    /// When the latest transcription or synthesis was sent, for the
+    /// slow-wait caption while speech work runs.
+    processing_since: Option<Instant>,
 }
 impl SpeechUi {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Xylo>) -> Self {
+    // The window and context are unused since the Read aloud text box left
+    // Settings; xylo.rs still passes them.
+    pub(super) fn new(_window: &mut Window, _cx: &mut Context<Xylo>) -> Self {
         Self {
-            text: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .placeholder("Text to read aloud with your selected voice")
-                    .rows(3)
-            }),
             transcript: String::new(),
             recording_state: "idle".into(),
             recording_id: None,
@@ -48,6 +49,7 @@ impl SpeechUi {
             playback_request: None,
             playing: false,
             notice: String::new(),
+            processing_since: None,
         }
     }
     fn capturing(&self) -> bool {
@@ -119,6 +121,9 @@ impl Xylo {
             .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
             .and_then(|host| host.capability(id, name.into(), args));
         if result.is_ok() {
+            if matches!(name, "speech_transcribe" | "speech_synthesize") {
+                self.speech.processing_since = Some(self.arm_slow_hint(cx));
+            }
             self.speech.pending.insert(id, name.into());
             self.error = None;
             self.result(Ok(()), cx);
@@ -368,9 +373,10 @@ impl Xylo {
             "speech_synthesize" => {
                 if let Some(path) = value.get("path").and_then(Value::as_str).map(PathBuf::from) {
                     self.speech.audio = Some(path.clone());
-                    self.record_artifact(path);
+                    self.record_artifact(path.clone());
+                    // Read aloud plays as soon as the audio exists.
+                    self.speech_play(path, cx);
                 }
-                self.speech.notice = "Audio ready. Choose Play to listen.".into();
             }
             "helper_audio_play" | "helper_audio_play_stop" => {
                 self.speech.playing = false;
@@ -428,14 +434,10 @@ impl Xylo {
         } else {
             "Record voice"
         };
-        icon_button(
+        icons::icon_button(
             "record-voice-composer",
+            if active { AppIcon::Stop } else { AppIcon::Mic },
             label,
-            if active {
-                gpui_kit::component::IconName::Square
-            } else {
-                gpui_kit::component::IconName::Mic
-            },
         )
         .on_click(cx.listener(move |view, _, _, cx| {
             if active {
@@ -446,122 +448,43 @@ impl Xylo {
         }))
         .into_any_element()
     }
-    pub(super) fn speech_card(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut panel=card().child(div().font_weight(FontWeight::MEDIUM).child("Voice"))
-            .child(subtitle("Record up to two minutes. Audio stays on this computer and is transcribed with your selected model."))
-            .child(button("speech-download-models","Browse voices and transcription").on_click(cx.listener(|view,_,_,cx|view.open_assets(3,cx))))
-            .child(div().flex().gap_2().child(self.speech_capture_button(cx)).when(self.speech.capturing(),|row|row.child(button("speech-discard","Discard recording").on_click(cx.listener(|view,_,_,cx|view.speech_cancel_recording(cx)))))
-                .child(button("speech-open-audio","Transcribe project audio").on_click(cx.listener(|view,_,window,cx|view.speech_pick_audio(window,cx)))));
-        if self.speech.capturing() {
-            panel = panel.child(subtitle(format!(
-                "Recording {:02}:{:02} · Input level {:.0}%",
-                self.speech.elapsed_ms / 60000,
-                self.speech.elapsed_ms / 1000 % 60,
-                self.speech.peak * 100.
-            )));
-        }
-        if !self.speech.transcript.is_empty() {
-            panel = panel
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .child(self.speech.transcript.clone()),
-                )
-                .child(
-                    button("speech-use-transcript", "Add transcript to message").on_click(
-                        cx.listener(|view, _, window, cx| {
-                            let current = view.composer.read(cx).value().to_string();
-                            let text = if current.trim().is_empty() {
-                                view.speech.transcript.clone()
-                            } else {
-                                format!("{current}\n{}", view.speech.transcript)
-                            };
-                            view.composer
-                                .update(cx, |state, cx| state.set_value(text, window, cx));
-                            view.navigate(Page::Chat, cx);
-                        }),
-                    ),
-                );
-        }
-        if let Some(path) = self.speech.recording.as_ref() {
-            let retry = path.clone();
-            let listen = path.clone();
-            panel = panel.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        button("speech-retry-transcription", "Retry transcription").on_click(
-                            cx.listener(move |view, _, _, cx| {
-                                view.speech_transcribe_path(retry.clone(), cx)
-                            }),
-                        ),
-                    )
-                    .child(button("speech-play-recording", "Play recording").on_click(
-                        cx.listener(move |view, _, _, cx| view.speech_play(listen.clone(), cx)),
-                    )),
-            );
-        }
-        panel = panel.child(Textarea::new(&self.speech.text)).child(
-            primary("speech-create-native", "Create speech").on_click(cx.listener(
-                |view, _, _, cx| {
-                    let text = view.speech.text.read(cx).value().to_string();
-                    view.speech_speak_text(text, cx);
-                },
-            )),
-        );
-        if let Some(path) = self.speech.audio.as_ref() {
-            let path = path.clone();
-            panel = panel.child(
-                button("speech-play-generated", "Play generated audio").on_click(
-                    cx.listener(move |view, _, _, cx| view.speech_play(path.clone(), cx)),
-                ),
-            );
-        }
-        if self.speech.playing {
-            panel = panel.child(
-                button("speech-stop-playback", "Stop playback")
-                    .on_click(cx.listener(|view, _, _, cx| view.speech_stop_playback(cx))),
-            );
-        }
-        if self.speech.processing() {
-            panel = panel.child(
-                button("speech-cancel-processing", "Cancel speech task").on_click(cx.listener(
-                    |view, _, _, _cx| {
-                        if let Some(host) = view.host.as_ref() {
-                            for (id, name) in &view.speech.pending {
-                                if matches!(
-                                    name.as_str(),
-                                    "speech_transcribe" | "speech_synthesize"
-                                ) {
-                                    let _ = host.cancel_capability(*id);
-                                }
-                            }
-                        }
-                    },
-                )),
-            );
-        }
+    /// The Voice settings page: the on-device models dictation and reading
+    /// aloud use. Recording, dictation progress and inserting a transcript all
+    /// live in the composer.
+    pub(super) fn voice_settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut page = settings_ui::settings_page("voice-settings", "Voice")
+            .description("Speech runs on this computer; audio never leaves it.");
         if !self.speech.notice.is_empty() {
-            panel = panel.child(subtitle(self.speech.notice.clone()));
+            page = page.child(motion::fade_on_change(
+                "speech-notice",
+                &self.speech.notice,
+                notice(BadgeTone::Neutral, self.speech.notice.clone()),
+            ));
         }
-        panel.into_any_element()
-    }
-    fn speech_pick_audio(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = self.workspace.clone();
-        cx.spawn_in(window, async move |view, cx| {
-            let mut picker = rfd::AsyncFileDialog::new()
-                .set_title("Choose project audio")
-                .add_filter("Audio", &["wav", "mp3", "m4a", "flac", "ogg"]);
-            if let Some(workspace) = workspace {
-                picker = picker.set_directory(workspace);
-            }
-            if let Some(file) = picker.pick_file().await {
-                let path = file.path().to_path_buf();
-                let _ = view.update_in(cx, |view, _, cx| view.speech_transcribe_path(path, cx));
-            }
-        })
-        .detach();
+        let downloads = |id: &'static str, cx: &mut Context<Self>| {
+            settings_ui::text_button(id, "Open Downloads")
+                .on_click(cx.listener(|view, _, _, cx| view.open_assets(3, cx)))
+                .into_any_element()
+        };
+        page = page.child(settings_ui::section(
+            "Models",
+            Some("Download or replace them in Downloads.".into()),
+            settings_ui::rows([
+                settings_ui::setting_row(
+                    "Dictation",
+                    Some("Whisper turns what you say into English text.".into()),
+                    Some(downloads("speech-download-models", cx)),
+                )
+                .into_any_element(),
+                settings_ui::setting_row(
+                    "Voice",
+                    Some("The voice Xylo uses to read English text aloud.".into()),
+                    Some(downloads("speech-download-voices", cx)),
+                )
+                .into_any_element(),
+            ]),
+        ));
+        page.into_any_element()
     }
 }
 

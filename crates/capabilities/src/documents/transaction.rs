@@ -145,7 +145,7 @@ pub fn file_hash(path: &Path) -> Result<String> {
         );
         hash.update(&bytes[..n]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(hex::encode(hash.finalize()))
 }
 pub fn status(config: &CapabilityConfig, id: Uuid) -> Result<DocumentSaveReceipt> {
     ensure!(!id.is_nil(), "Choose a valid document operation ID");

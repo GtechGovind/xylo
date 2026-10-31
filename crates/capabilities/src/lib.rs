@@ -13,8 +13,6 @@ mod managed_endpoints;
 pub mod models;
 pub mod plugins;
 pub mod process;
-pub mod remote;
-pub mod scheduler;
 mod speech;
 
 use anyhow::{Result, ensure};
@@ -67,7 +65,7 @@ pub struct CapabilityService {
     config: CapabilityConfig,
     browser: browser::BrowserService,
     models: models::ModelService,
-    scheduler: scheduler::Scheduler,
+    scheduler: xylo_scheduler::Scheduler,
 }
 
 impl CapabilityService {
@@ -116,7 +114,7 @@ impl CapabilityService {
         Ok(Self {
             browser: browser::BrowserService::new(config.clone()),
             models: models::ModelService::new(config.clone()),
-            scheduler: scheduler::Scheduler::new(
+            scheduler: xylo_scheduler::Scheduler::new(
                 config.artifacts.join("schedules.json"),
                 config.workspace.clone(),
             )?,
@@ -132,7 +130,7 @@ impl CapabilityService {
         tools.extend(desktop::definitions());
         tools.extend(plugins::definitions());
         tools.extend(environments::definitions());
-        tools.extend(scheduler::definitions());
+        tools.extend(xylo_scheduler::definitions());
         tools
     }
 
@@ -181,7 +179,6 @@ impl CapabilityService {
             n if n.starts_with("environment_") => {
                 environments::execute_tool(&self.config, n, args, cancel).await
             }
-            "remote_execute" => remote::execute(&self.config, args, cancel).await,
             n if n.starts_with("schedule_") => self.scheduler.execute(n, args).await,
             _ => anyhow::bail!("Unknown capability tool: {name}"),
         };
@@ -202,6 +199,24 @@ impl CapabilityService {
             }
             Ok(observation)
         })
+    }
+
+    /// Review details for a capability call, when they differ from its raw
+    /// arguments. Installed plugin runs show the reviewed package identity and
+    /// the catalog grants that will actually apply; `None` means the arguments
+    /// themselves are the presentation.
+    pub async fn approval_presentation(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel: CancellationToken,
+    ) -> Result<Option<Value>> {
+        match name {
+            "plugin_run_installed" => plugins::approval_presentation(&self.config, args, cancel)
+                .await
+                .map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// Only the application helper's control channel calls this entry point.
@@ -283,18 +298,6 @@ impl CapabilityService {
         self.models.shutdown_with_activity_lease(&activity).await?;
         self.browser.shutdown().await?;
         Ok(activity)
-    }
-
-    pub async fn due_schedules(&self) -> Result<Vec<scheduler::ScheduledTask>> {
-        self.scheduler.claim_due().await
-    }
-
-    pub async fn complete_schedule(&self, id: uuid::Uuid) -> Result<()> {
-        self.scheduler.complete(id).await
-    }
-
-    pub async fn renew_schedule(&self, id: uuid::Uuid) -> Result<()> {
-        self.scheduler.renew(id).await
     }
 }
 
@@ -380,123 +383,4 @@ pub(crate) fn output_path(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn output_names_cannot_escape_artifacts() {
-        let cfg = CapabilityConfig::default();
-        assert!(output_path(&cfg, "../escape", "txt").is_err());
-        assert!(output_path(&cfg, "foo/bar", "txt").is_err());
-    }
-    #[test]
-    fn saved_environments_replace_legacy_remote_discovery() {
-        let root = tempfile::tempdir().unwrap();
-        let service = CapabilityService::new(CapabilityConfig {
-            workspace: root.path().canonicalize().unwrap(),
-            artifacts: root.path().join("artifacts"),
-            ..Default::default()
-        })
-        .unwrap();
-        let tools = service.tool_definitions();
-        assert!(tools.iter().all(|tool| tool.name != "remote_execute"));
-        assert!(tools.iter().any(|tool| tool.name == "environment_execute"));
-    }
-
-    #[test]
-    fn configuration_does_not_claim_availability() {
-        assert_eq!(asset_status(None), "configuration_needed");
-        assert_eq!(
-            asset_status(Some(Path::new("/nonexistent-test-asset"))),
-            "asset_missing"
-        );
-    }
-
-    #[test]
-    fn private_management_files_are_not_part_of_the_plugin_input_scope() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = directory.path().canonicalize().unwrap();
-        let private = workspace.join("native-management");
-        std::fs::create_dir(&private).unwrap();
-        std::fs::write(private.join("catalog.json"), "{}").unwrap();
-        std::fs::write(workspace.join("notes.txt"), "Project notes").unwrap();
-        let service = CapabilityService::new(CapabilityConfig {
-            workspace: workspace.clone(),
-            artifacts: workspace.join("artifacts"),
-            management_root: Some(private),
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(input_path(&service.config, "notes.txt").is_ok());
-        assert!(input_path(&service.config, "native-management/catalog.json").is_err());
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(
-                workspace.join("native-management/catalog.json"),
-                workspace.join("alias.json"),
-            )
-            .unwrap();
-            assert!(input_path(&service.config, "alias.json").is_err());
-        }
-    }
-
-    #[test]
-    fn management_storage_cannot_overlap_the_artifact_root() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = directory.path().canonicalize().unwrap();
-        for private in [workspace.clone(), workspace.join("artifacts/private")] {
-            assert!(
-                CapabilityService::new(CapabilityConfig {
-                    workspace: workspace.clone(),
-                    artifacts: workspace.join("artifacts"),
-                    management_root: Some(private),
-                    ..Default::default()
-                })
-                .is_err()
-            );
-        }
-        #[cfg(unix)]
-        {
-            let other = tempfile::tempdir().unwrap();
-            let link = workspace.join("linked-management");
-            std::os::unix::fs::symlink(other.path(), &link).unwrap();
-            assert!(
-                CapabilityService::new(CapabilityConfig {
-                    workspace: workspace.clone(),
-                    artifacts: workspace.join("artifacts"),
-                    management_root: Some(link),
-                    ..Default::default()
-                })
-                .is_err()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn ordinary_tools_cannot_dispatch_application_management_controls() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = directory.path().canonicalize().unwrap();
-        let service = CapabilityService::new(CapabilityConfig {
-            workspace: workspace.clone(),
-            artifacts: workspace.join("artifacts"),
-            management_root: Some(workspace.join("native-management")),
-            ..Default::default()
-        })
-        .unwrap();
-        for name in ["helper_plugin_install", "helper_environment_save"] {
-            assert!(
-                service
-                    .tool_definitions()
-                    .iter()
-                    .all(|tool| tool.name != name)
-            );
-            let error = service
-                .execute(name, &json!({}), CancellationToken::new())
-                .await
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("Unknown capability tool"),
-                "Management control {name} was rejected at the wrong boundary: {error:#}"
-            );
-        }
-    }
-}
+mod tests;

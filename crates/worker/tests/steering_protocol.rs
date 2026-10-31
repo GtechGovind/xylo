@@ -23,6 +23,13 @@ struct Worker {
 }
 impl Worker {
     async fn start(profile: &Path) -> Self {
+        // The host creates the database; workers only open it.
+        xylo_services::Store::open(
+            xylo_runtime::AppPaths::at(profile.to_owned())
+                .unwrap()
+                .database,
+        )
+        .unwrap();
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_xylo-worker"))
             .arg("--data-dir")
             .arg(profile)
@@ -40,6 +47,14 @@ impl Worker {
             output,
         };
         assert!(matches!(worker.event().await, EngineEvent::Ready { .. }));
+        worker
+            .send(
+                Uuid::nil(),
+                WorkerCommand::Unlock {
+                    key: WorkerCredential(Some("00".repeat(32))),
+                },
+            )
+            .await;
         worker
     }
     async fn send(&mut self, session: Uuid, payload: WorkerCommand) {
@@ -174,8 +189,9 @@ fn turn(workspace: &Path, endpoint: String) -> TurnRequest {
             model: "fixture".into(),
             ..Default::default()
         },
-        permissions: PermissionMode::AskForWrites,
+        permissions: PermissionMode::AskForApproval,
         attachments: Vec::new(),
+        approved_rules: Vec::new(),
     }
 }
 fn queue(store: &Store, turn: &TurnRequest) -> SteeringRequest {

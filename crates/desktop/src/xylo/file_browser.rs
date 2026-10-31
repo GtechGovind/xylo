@@ -49,9 +49,9 @@ impl FileBrowserUi {
             .find(|(_, request)| request.directory == path)
             .map(|(id, _)| *id)
     }
-    // The interaction tests and separate native rendering harness wait for the
-    // entire request queue; product rows display their own loading state.
-    #[allow(dead_code)]
+    /// Whether any folder listing is pending. The validation harnesses wait
+    /// for the whole queue; product rows show their own loading state.
+    #[cfg(feature = "validation")]
     pub fn loading(&self) -> bool {
         !self.requests.is_empty() || !self.queue.is_empty()
     }

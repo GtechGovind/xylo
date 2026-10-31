@@ -37,10 +37,9 @@ pub(super) struct Package {
 }
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Registry {
-    #[serde(default)]
     plugins: BTreeMap<String, InstalledPlugin>,
-    #[serde(default)]
     operations: Vec<Operation>,
 }
 
@@ -124,12 +123,26 @@ pub(super) fn lock(
     }
 }
 
+/// The catalog, or an empty one when the stored file does not decode or
+/// validate. Installed plugins are not carried across format changes: an
+/// unreadable catalog grants nothing and is deleted by the next mutation.
 fn read_registry(root: &Path) -> Result<Registry> {
+    Ok(load_registry(root)?.unwrap_or_default())
+}
+
+/// `None` when the stored catalog is unreadable.
+fn load_registry(root: &Path) -> Result<Option<Registry>> {
     let path = root.join("catalog.json");
     if !path.exists() {
-        return Ok(Registry::default());
+        return Ok(Some(Registry::default()));
     }
-    let registry: Registry = serde_json::from_slice(&bounded_read(&path, MAX_REGISTRY)?)?;
+    let bytes = bounded_read(&path, MAX_REGISTRY)?;
+    Ok(serde_json::from_slice::<Registry>(&bytes)
+        .ok()
+        .filter(|registry| validate_registry(registry).is_ok()))
+}
+
+fn validate_registry(registry: &Registry) -> Result<()> {
     ensure!(
         registry.plugins.len() <= MAX_PACKAGES && registry.operations.len() <= MAX_OPERATIONS,
         "Plugin catalog exceeds its record limit"
@@ -146,7 +159,7 @@ fn read_registry(root: &Path) -> Result<Registry> {
             "Plugin catalog package identity is invalid"
         );
     }
-    Ok(registry)
+    Ok(())
 }
 
 fn catalog(registry: &Registry, config: &CapabilityConfig) -> Result<PluginCatalog> {
@@ -544,7 +557,13 @@ pub(super) fn mutate(
     let digest = operation_digest(name, &args)?;
     let root = root(config)?;
     let _catalog = lock(&root.join("catalog.lock"), false, true, cancel)?;
-    let mut registry = read_registry(&root)?;
+    let mut registry = match load_registry(&root)? {
+        Some(registry) => registry,
+        None => {
+            std::fs::remove_file(root.join("catalog.json"))?;
+            Registry::default()
+        }
+    };
     if let Some(previous) = registry
         .operations
         .iter()

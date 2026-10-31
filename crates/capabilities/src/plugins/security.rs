@@ -171,7 +171,7 @@ pub(super) fn checked(cancel: &CancellationToken) -> Result<()> {
 }
 
 pub(super) fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 pub(super) fn is_hash(value: &str) -> bool {
     value.len() == 64

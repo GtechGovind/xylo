@@ -3,6 +3,13 @@
 //! No remote discovery, model inference, account credentials or physical desktop.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/assets.rs"]
+mod assets;
+mod capture_dir;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -40,20 +47,22 @@ mod xylo {
                 action_id: action,
                 name: name.into(),
                 arguments: input,
+                parent_id: None,
             });
             turn.apply(EngineEvent::ToolFinished {
                 action_id: action,
                 name: name.into(),
                 result: serde_json::json!({"status":"success","summary":summary}).to_string(),
                 success: true,
+                parent_id: None,
             });
             let shown = &turn.tools[0].presentation;
             if name == "extension_skill" {
-                assert_eq!(shown.verb, "Use skill");
-                assert_eq!(shown.target, "check-project");
+                assert_eq!(shown.verb, "Using skill");
+                assert_eq!(shown.target, "Check project");
             } else {
                 assert_eq!(shown.verb, "Run plugin");
-                assert_eq!(shown.target, "mcpServers");
+                assert_eq!(shown.target, "MCP servers");
                 assert_eq!(shown.meta.as_deref(), Some("tools/call"));
             }
             self.invalidate_live_history();
@@ -86,7 +95,8 @@ mod xylo {
                 Some(true),
             );
             assert!(
-                matches!(shown.body,ToolBody::Markdown(ref text) if text.chars().count()<=8001)
+                matches!(shown.body, ToolBody::Empty),
+                "A skill's instructions are for the model and never render"
             );
             let result=serde_json::json!({"summary":{"results":(0..100).map(|i|serde_json::json!({"entry":format!("entry-{i}"),"output":{"text":"Long result. ".repeat(1000)}})).collect::<Vec<_>>()}}).to_string();
             let shown = ToolPresentation::prepare(
@@ -156,7 +166,7 @@ fn render() {
     let client = host.0.clone();
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        Arc::new(crate::assets::AppAssets),
         platform::current_headless_renderer,
     );
     cx.allow_parking();
@@ -194,15 +204,14 @@ fn render() {
         }
     };
     wait(&mut cx, &|view| view.capture_ready());
-    let output = std::env::var_os("XYLO_RENDER_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "target/native-preview".into());
-    std::fs::create_dir_all(&output).unwrap();
+    let output = capture_dir::fresh("portable-tool-rendering");
     xylo::Xylo::portable_preview_bounded();
     for theme in ["dark", "light"] {
-        let mut settings = xylo_core::AppSettings::default();
-        settings.theme = theme.into();
-        settings.last_workspace = Some(project.clone());
+        let settings = xylo_core::AppSettings {
+            theme: theme.into(),
+            last_workspace: Some(project.clone()),
+            ..Default::default()
+        };
         client.save_settings(settings).unwrap();
         wait(&mut cx, &|view| view.extension_review_theme() == theme);
         for width in [1000u32, 1380, 1920] {
@@ -216,10 +225,6 @@ fn render() {
                 cx.update_window(handle, |_, window, cx| {
                     view.update(cx, |v, cx| v.portable_card(name, cx));
                     window.render_frame(cx);
-                    assert!(
-                        window.try_find(("tool-raw-toggle", 0usize)).is_none(),
-                        "Cards must start closed"
-                    );
                     assert!(window.find(("tool-detail", 0usize)).visible());
                 })
                 .unwrap();
@@ -229,9 +234,13 @@ fn render() {
                     .unwrap();
                 cx.update_window(handle, |_, window, cx| {
                     window.click(("tool-detail", 0usize), cx);
-                    assert!(window.find(("tool-raw-toggle", 0usize)).visible());
-                    assert!(window.try_find(("tool-raw-input", 0usize)).is_none());
-                    assert!(window.try_find(("tool-raw-result", 0usize)).is_none());
+                    window.render_frame(cx);
+                    assert!(window.try_find(("tool-actions", 0usize)).is_none());
+                    // Copy actions live in the detail; a skill has no detail.
+                    assert_eq!(
+                        window.try_find(("tool-copy-input", 0usize)).is_some(),
+                        name == "extension_component"
+                    );
                 })
                 .unwrap();
                 cx.capture_screenshot(handle)
@@ -241,17 +250,10 @@ fn render() {
                 if name == "extension_component" {
                     cx.update(|cx| view.read(cx).portable_preview_actual_shapes());
                 }
-                if theme == "dark" && width == 1000 {
-                    cx.update_window(handle, |_, window, cx| {
-                        window.click(("tool-raw-toggle", 0usize), cx);
-                        assert!(window.find(("tool-raw-input", 0usize)).visible());
-                    })
-                    .unwrap();
-                    cx.capture_screenshot(handle)
-                        .unwrap()
-                        .save(output.join(format!("{name}-{theme}-{width}-raw.png")))
-                        .unwrap();
-                }
+                cx.update_window(handle, |_, window, _cx| {
+                    assert!(window.try_find(("tool-raw-input", 0usize)).is_none());
+                })
+                .unwrap();
             }
         }
     }

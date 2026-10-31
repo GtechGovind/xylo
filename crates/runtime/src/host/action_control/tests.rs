@@ -13,6 +13,9 @@ fn seed(host: &HostState) -> (ActionReviewScope, Uuid) {
             title: "Observed recovery".into(),
             workspace: scope.workspace.clone(),
             updated_at: now_ms(),
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
         })
         .unwrap();
     let id = Uuid::new_v4();
@@ -233,6 +236,7 @@ async fn wrong_project_turn_admission_preserves_history_checkpoint_and_original_
                     },
                     permissions: PermissionMode::ReadOnly,
                     attachments: vec![],
+                    approved_rules: Vec::new(),
                 },
             },
         )
@@ -251,7 +255,16 @@ async fn wrong_project_turn_admission_preserves_history_checkpoint_and_original_
     );
     assert!(host.workers.lock().await.is_empty());
     assert!(host.helpers.lock().await.is_empty());
-    assert!(events.try_recv().is_err());
+    // Only the admission's own activity line reached the UI.
+    while let Ok(event) = events.try_recv() {
+        assert!(matches!(
+            event,
+            HostEvent::Engine(Envelope {
+                payload: EngineEvent::Phase { .. },
+                ..
+            })
+        ));
+    }
     assert_eq!(
         host.store
             .conversation(scope.session_id)

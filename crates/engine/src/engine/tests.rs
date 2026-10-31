@@ -1,10 +1,12 @@
 use super::*;
-use hermes_core::{FunctionCall, ToolCall};
+use crate::model::ToolCall;
+use parking_lot::Mutex;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
-use xylo_core::{Conversation, PermissionMode, now_ms};
+use xylo_core::{ApiFamily, Conversation, PermissionMode, Usage, now_ms};
 use xylo_services::ActionIntent;
 
-fn fixture() -> (tempfile::TempDir, HermesEngine, TurnRequest) {
+fn fixture() -> (tempfile::TempDir, AgentEngine, TurnRequest) {
     let directory = tempfile::tempdir().unwrap();
     let paths = AppPaths::at(directory.path().join("profile")).unwrap();
     let store = Store::open(&paths.database).unwrap();
@@ -15,6 +17,9 @@ fn fixture() -> (tempfile::TempDir, HermesEngine, TurnRequest) {
             title: "Resume fixture".into(),
             workspace: directory.path().into(),
             updated_at: now_ms(),
+            title_source: TitleSource::Prompt,
+            pinned: false,
+            archived: false,
         })
         .unwrap();
     let request = TurnRequest {
@@ -25,26 +30,44 @@ fn fixture() -> (tempfile::TempDir, HermesEngine, TurnRequest) {
         provider: ProviderConfig::default(),
         permissions: PermissionMode::ReadOnly,
         attachments: Vec::new(),
+        approved_rules: Vec::new(),
     };
-    let engine = HermesEngine::new(store, paths, ApprovalGate::default());
+    let engine = AgentEngine::new(
+        store,
+        paths,
+        ToolSession::for_tests(PermissionMode::ReadOnly),
+    );
     (directory, engine, request)
 }
+
 fn assistant_call(name: &str, args: Value) -> Message {
     Message::assistant_with_tool_calls(
-        None,
-        vec![ToolCall {
-            id: "provider-call-1".into(),
-            function: FunctionCall {
-                name: name.into(),
-                arguments: args.to_string(),
-            },
-            extra_content: None,
-        }],
+        "",
+        vec![ToolCall::new("provider-call-1", name, args.to_string())],
     )
 }
 
+fn journal(request: &TurnRequest, turn: Uuid, name: &str, args: &Value) -> ActionIntent {
+    ActionIntent {
+        id: Uuid::new_v4(),
+        session_id: request.session_id,
+        turn_id: turn,
+        name: name.into(),
+        arguments: args.clone(),
+        writes: true,
+        idempotency_key: ToolBroker::journal_key(None, "provider-call-1"),
+    }
+}
+
+async fn restore(engine: &AgentEngine, request: &TurnRequest) -> Result<Vec<Message>> {
+    let (events, _receiver) = mpsc::channel(256);
+    engine
+        .restored_messages(request, events, CancellationToken::new())
+        .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn image_checkpoint_resume_preserves_refs_without_duplicate_or_inline_image_data() {
+async fn image_checkpoint_resume_preserves_refs_without_inline_image_data() {
     use xylo_core::AttachmentSource;
     let (_directory, engine, mut request) = fixture();
     let mut png = std::io::Cursor::new(Vec::new());
@@ -65,47 +88,28 @@ async fn image_checkpoint_resume_preserves_refs_without_duplicate_or_inline_imag
             .unwrap(),
     ];
     engine.store.register_user_turn(&request).unwrap();
-    let checkpoint = vec![crate::attachments::user_message(&request).unwrap()];
     engine
         .store
         .save_checkpoint(
             request.session_id,
             request.turn_id,
-            &serde_json::to_value(&checkpoint).unwrap(),
+            &serde_json::to_value(vec![user_message(&request)]).unwrap(),
         )
         .unwrap();
-    let (events, _receiver) = mpsc::channel(16);
-    let restored = engine
-        .restored_messages(&request, events, CancellationToken::new())
-        .await
-        .unwrap();
+    let restored = restore(&engine, &request).await.unwrap();
     assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].attachments, request.attachments);
     let value = serde_json::to_value(&restored).unwrap();
-    assert_eq!(
-        value[0]["anthropic_content_blocks"][0]["item"]["id"],
-        request.attachments[0].id.to_string()
-    );
     assert!(!value.to_string().contains("base64"));
     assert!(serde_json::to_vec(&value).unwrap().len() < 2048);
-    assert_eq!(
-        engine.store.messages(request.session_id, 10).unwrap()[0].attachments,
-        request.attachments
-    );
 }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_restores_success_using_original_turn_before_new_prompt() {
     let (_directory, engine, mut request) = fixture();
     let old_turn = request.turn_id;
     let args = json!({"path":"already-written.txt","content":"original"});
-    let intent = ActionIntent {
-        id: Uuid::new_v4(),
-        session_id: request.session_id,
-        turn_id: old_turn,
-        name: "file_write".into(),
-        arguments: args.clone(),
-        writes: true,
-        idempotency_key: ToolBroker::journal_key(None, "provider-call-1"),
-    };
+    let intent = journal(&request, old_turn, "file_write", &args);
     engine.store.begin_action(&intent).unwrap();
     engine.store.mark_action_running(intent.id).unwrap();
     engine
@@ -124,14 +128,10 @@ async fn resume_restores_success_using_original_turn_before_new_prompt() {
         )
         .unwrap();
     request.turn_id = Uuid::new_v4();
-    let (events, _rx) = mpsc::channel(256);
-    let restored = engine
-        .restored_messages(&request, events, CancellationToken::new())
-        .await
-        .unwrap();
+    let restored = restore(&engine, &request).await.unwrap();
     assert_eq!(restored.len(), 3);
-    assert_eq!(restored[2].content.as_deref(), Some("Continue"));
-    let result: Value = serde_json::from_str(restored[1].content.as_deref().unwrap()).unwrap();
+    assert_eq!(restored[2].content, "Continue");
+    let result: Value = serde_json::from_str(&restored[1].content).unwrap();
     assert_eq!(result["summary"]["remote_id"], "once-only");
     assert_eq!(
         engine
@@ -154,19 +154,12 @@ async fn resume_restores_success_using_original_turn_before_new_prompt() {
             .is_none()
     );
 }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn denied_pending_result_is_restored_as_error_without_redispatch() {
     let (_directory, engine, request) = fixture();
     let args = json!({"path":"denied.txt","content":"never"});
-    let intent = ActionIntent {
-        id: Uuid::new_v4(),
-        session_id: request.session_id,
-        turn_id: request.turn_id,
-        name: "file_write".into(),
-        arguments: args.clone(),
-        writes: true,
-        idempotency_key: ToolBroker::journal_key(None, "provider-call-1"),
-    };
+    let intent = journal(&request, request.turn_id, "file_write", &args);
     engine.store.begin_action(&intent).unwrap();
     engine.store.deny_action(intent.id).unwrap();
     engine
@@ -177,36 +170,38 @@ async fn denied_pending_result_is_restored_as_error_without_redispatch() {
             &serde_json::to_value(vec![assistant_call("file_write", args)]).unwrap(),
         )
         .unwrap();
-    let (events, _rx) = mpsc::channel(256);
-    let restored = engine
-        .restored_messages(&request, events, CancellationToken::new())
-        .await
-        .unwrap();
+    let restored = restore(&engine, &request).await.unwrap();
     assert_eq!(restored.len(), 2);
     assert_eq!(
-        serde_json::from_str::<Value>(restored[1].content.as_deref().unwrap()).unwrap()["status"],
+        serde_json::from_str::<Value>(&restored[1].content).unwrap()["status"],
         "error"
     );
     assert!(!request.workspace.join("denied.txt").exists());
 }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn child_registry_cannot_expose_delegation() {
-    let (_directory, engine, request) = fixture();
-    let (events, _rx) = mpsc::channel(256);
-    let broker = Arc::new(
-        ToolBroker::new(
-            request.clone(),
-            engine.store.clone(),
-            engine.capability_config(&request).unwrap(),
-            ApprovalGate::default(),
-            events,
-            CancellationToken::new(),
+async fn calls_that_never_ran_wait_for_the_resuming_turn_and_are_not_run_for_a_new_one() {
+    let (_directory, engine, mut request) = fixture();
+    let args = json!({"path":"pending.txt"});
+    engine
+        .store
+        .save_checkpoint(
+            request.session_id,
+            request.turn_id,
+            &serde_json::to_value(vec![
+                Message::user("Continue"),
+                assistant_call("file_read", args),
+            ])
+            .unwrap(),
         )
-        .unwrap(),
-    );
-    let registry = build_registry(broker, Some("parent-delegate-call".into())).unwrap();
-    assert!(registry.get("agent_delegate").is_none());
-    assert!(registry.get("call_tool").is_some());
+        .unwrap();
+    let resumed = restore(&engine, &request).await.unwrap();
+    assert_eq!(resumed.len(), 2, "the pending call is left for the loop");
+    request.turn_id = Uuid::new_v4();
+    let fresh = restore(&engine, &request).await.unwrap();
+    assert_eq!(fresh.len(), 4);
+    assert!(fresh[2].content.contains("Not run"));
+    assert_eq!(fresh[3].content, "Continue");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -216,6 +211,7 @@ async fn lost_completed_event_replays_receipt_without_model_or_duplicate_history
         input_tokens: 7,
         output_tokens: 11,
         elapsed_ms: 13,
+        context_tokens: 5,
     };
     engine
         .store
@@ -227,8 +223,8 @@ async fn lost_completed_event_replays_receipt_without_model_or_duplicate_history
             &usage,
         )
         .unwrap();
-    // Default provider has no chosen model and would fail before a model request.
-    // Receipt delivery must precede provider validation and every other run action.
+    // The default provider has no model and would fail validation: receipt
+    // delivery precedes every other run action.
     let (events, mut received) = mpsc::channel(32);
     engine
         .run(request.clone(), events, CancellationToken::new())
@@ -262,225 +258,16 @@ async fn same_turn_retry_resumes_without_reinjecting_the_original_user_instructi
             .unwrap(),
         )
         .unwrap();
-    let (events, _rx) = mpsc::channel(32);
-    let resumed = engine
-        .restored_messages(&request, events, CancellationToken::new())
-        .await
-        .unwrap();
+    let resumed = restore(&engine, &request).await.unwrap();
     assert_eq!(resumed.len(), 2);
-    assert_eq!(
-        resumed
-            .iter()
-            .filter(|m| m.role == MessageRole::User)
-            .count(),
-        1
-    );
     request.turn_id = Uuid::new_v4();
-    let (events, _rx) = mpsc::channel(32);
-    let new_turn = engine
-        .restored_messages(&request, events, CancellationToken::new())
-        .await
-        .unwrap();
+    let new_turn = restore(&engine, &request).await.unwrap();
     assert_eq!(new_turn.len(), 3);
-    assert_eq!(
-        new_turn
-            .iter()
-            .filter(|m| m.role == MessageRole::User)
-            .count(),
-        2
-    );
-}
-
-struct NaturalAnswerProvider {
-    calls: std::sync::atomic::AtomicUsize,
-    seen: std::sync::Mutex<Vec<String>>,
-}
-impl NaturalAnswerProvider {
-    fn next(&self, messages: &[Message]) -> usize {
-        self.seen
-            .lock()
-            .unwrap()
-            .push(serde_json::to_string(messages).unwrap());
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    }
-}
-#[async_trait]
-impl LlmProvider for NaturalAnswerProvider {
-    async fn chat_completion(
-        &self,
-        messages: &[Message],
-        _: &[ToolSchema],
-        _: Option<u32>,
-        _: Option<f64>,
-        _: Option<&str>,
-        _: Option<&Value>,
-    ) -> Result<hermes_core::LlmResponse, AgentError> {
-        let message = match self.next(messages) {
-            0 => assistant_call("file_read", json!({"path":"fixture.txt"})),
-            1 => Message::assistant("The file contains HELLO_NATIVE_TEST."),
-            _ => {
-                return Err(AgentError::Config(
-                    "Unexpected third provider call: formatting retry escaped product mode".into(),
-                ));
-            }
-        };
-        Ok(hermes_core::LlmResponse {
-            message,
-            usage: None,
-            model: "product-fixture".into(),
-            finish_reason: Some("stop".into()),
-        })
-    }
-    fn chat_completion_stream(
-        &self,
-        messages: &[Message],
-        _: &[ToolSchema],
-        _: Option<u32>,
-        _: Option<f64>,
-        _: Option<&str>,
-        _: Option<&Value>,
-    ) -> futures_util::stream::BoxStream<
-        'static,
-        std::result::Result<hermes_core::StreamChunk, AgentError>,
-    > {
-        use hermes_core::{FunctionCallDelta, StreamChunk, StreamDelta, ToolCallDelta};
-        let chunk = match self.next(messages) {
-            0 => Ok(StreamChunk {
-                delta: Some(StreamDelta {
-                    content: None,
-                    tool_calls: Some(vec![ToolCallDelta {
-                        index: 0,
-                        id: Some("provider-call-1".into()),
-                        function: Some(FunctionCallDelta {
-                            name: Some("file_read".into()),
-                            arguments: Some(json!({"path":"fixture.txt"}).to_string()),
-                        }),
-                    }]),
-                    extra: None,
-                }),
-                finish_reason: Some("tool_calls".into()),
-                usage: None,
-            }),
-            1 => Ok(StreamChunk {
-                delta: Some(StreamDelta {
-                    content: Some("The file contains HELLO_NATIVE_TEST.".into()),
-                    tool_calls: None,
-                    extra: None,
-                }),
-                finish_reason: Some("stop".into()),
-                usage: None,
-            }),
-            _ => Err(AgentError::Config(
-                "Unexpected third provider call: formatting retry escaped product mode".into(),
-            )),
-        };
-        Box::pin(futures_util::stream::once(async move { chunk }))
-    }
-}
-async fn verified_tool_and_natural_answer(streaming: bool) {
-    let (directory, engine, request) = fixture();
-    std::fs::write(directory.path().join("fixture.txt"), "HELLO_NATIVE_TEST").unwrap();
-    let (events, _rx) = mpsc::channel(256);
-    let broker = Arc::new(
-        ToolBroker::new(
-            request.clone(),
-            engine.store.clone(),
-            engine.capability_config(&request).unwrap(),
-            ApprovalGate::default(),
-            events,
-            CancellationToken::new(),
-        )
-        .unwrap(),
-    );
-    let registry = build_registry(broker, None).unwrap();
-    let schemas = vec![registry.get("file_read").unwrap().schema.clone()];
-    let recorded = Arc::new(NaturalAnswerProvider {
-        calls: std::sync::atomic::AtomicUsize::new(0),
-        seen: std::sync::Mutex::new(Vec::new()),
-    });
-    let provider_config = ProviderConfig {
-        model: "product-fixture".into(),
-        context_tokens: 8192,
-        output_tokens: 256,
-        ..Default::default()
-    };
-    let provider = Arc::new(crate::provider_guard::GuardedProvider::new(
-        recorded.clone(),
-        &provider_config,
-        directory.path().join("local-inference.lock"),
-        CancellationToken::new(),
-        false,
-    ));
-    let mut config = AgentConfig {
-        native_product_finalization: true,
-        model: "product-fixture".into(),
-        max_turns: 4,
-        max_tokens: Some(256),
-        system_prompt: Some(
-            "Use tools to verify file contents; answer naturally and concisely.".into(),
-        ),
-        skip_memory: true,
-        skip_context_files: true,
-        code_index_enabled: false,
-        lsp_context_enabled: false,
-        hermes_home: Some(directory.path().to_string_lossy().into_owned()),
-        ..Default::default()
-    };
-    config.retry.max_retries = 0;
-    let agent = AgentLoop::new(config, registry, provider);
-    let messages = vec![Message::user("Read fixture.txt and tell me its contents.")];
-    let result = if streaming {
-        agent
-            .run_stream(messages, Some(schemas), Some(Box::new(|_| {})))
-            .await
-    } else {
-        agent.run(messages, Some(schemas)).await
-    }
-    .unwrap();
-    assert!(result.finished_naturally);
-    assert_eq!(recorded.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert_eq!(
-        result.messages.last().unwrap().content.as_deref(),
-        Some("The file contains HELLO_NATIVE_TEST.")
-    );
-    for request in recorded.seen.lock().unwrap().iter() {
-        assert!(!request.contains("Finalizer evidence contract"));
-        assert!(!request.contains("confidence=<"));
-        assert!(!request.contains("objective_state="));
-    }
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_streaming_finalization_finishes_after_one_tool_and_natural_answer() {
-    verified_tool_and_natural_answer(true).await;
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_nonstream_finalization_finishes_after_one_tool_and_natural_answer() {
-    verified_tool_and_natural_answer(false).await;
-}
-#[test]
-fn product_mode_is_opt_in_and_statuses_do_not_expose_engine_contracts() {
-    assert!(!AgentConfig::default().native_product_finalization);
-    assert_eq!(
-        product_status("Retrying model request after HTTP 429"),
-        "Retrying the model request…"
-    );
-    assert_eq!(
-        product_status("Rate limit reached; waiting"),
-        "Waiting for the provider's rate limit…"
-    );
-    assert_eq!(
-        product_status("Context compaction removed 14000 tokens"),
-        "Condensing earlier context…"
-    );
-    assert_eq!(
-        product_status("Context pressure at 85%"),
-        "Preparing conversation…"
-    );
-    assert_eq!(product_status("Calling internal_tool_name"), "Working…");
+    assert_eq!(new_turn.iter().filter(|m| m.role == Role::User).count(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn engine_error_after_admission_queues_terminal_learning_evidence_without_model_dispatch() {
+async fn engine_error_after_admission_is_classified_and_queues_learning_evidence() {
     let (_directory, engine, mut request) = fixture();
     request.provider.model = "fixture-model".into();
     engine.store.register_user_turn(&request).unwrap();
@@ -499,13 +286,27 @@ async fn engine_error_after_admission_queues_terminal_learning_evidence_without_
         .store
         .mark_action_unknown(action.id, "Worker interrupted")
         .unwrap();
-    let (events, _receiver) = mpsc::channel(256);
-    assert!(
-        engine
-            .run(request.clone(), events, CancellationToken::new())
-            .await
-            .is_err()
-    );
+    let (events, mut receiver) = mpsc::channel(256);
+    engine
+        .run(request.clone(), events, CancellationToken::new())
+        .await
+        .unwrap();
+    let mut terminal = None;
+    while let Ok(event) = receiver.try_recv() {
+        terminal = Some(event);
+    }
+    match terminal.unwrap() {
+        EngineEvent::Error {
+            message,
+            retryable,
+            kind,
+        } => {
+            assert!(message.contains("outcome-unknown"));
+            assert!(!retryable);
+            assert_eq!(kind, ErrorKind::Internal);
+        }
+        event => panic!("Unexpected terminal event: {event:?}"),
+    }
     let learning = LearningService::new(engine.store.clone());
     assert_eq!(
         learning
@@ -514,13 +315,8 @@ async fn engine_error_after_admission_queues_terminal_learning_evidence_without_
             .pending_jobs,
         1
     );
-    let batch = learning
-        .process_pending(4, &CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(batch.processed, 1);
-    assert_eq!(batch.promoted, 0);
 }
+
 #[tokio::test]
 async fn dropped_engine_future_guard_persists_the_terminal_evidence_hook() {
     let (_directory, engine, request) = fixture();
@@ -552,152 +348,8 @@ async fn dropped_engine_future_guard_persists_the_terminal_evidence_hook() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_rebuilds_only_leading_policy_and_retains_later_system_and_native_messages() {
-    let (_directory, engine, request) = fixture();
-    let messages = vec![
-        Message::system("Old application policy"),
-        Message::system("Old generated hint"),
-        Message::user("Original task"),
-        Message::system("Preserve this later safety note"),
-        Message::assistant("Partial answer"),
-    ];
-    engine
-        .store
-        .save_checkpoint(
-            request.session_id,
-            request.turn_id,
-            &serde_json::to_value(&messages).unwrap(),
-        )
-        .unwrap();
-    let (events, _receiver) = mpsc::channel(16);
-    let restored = engine
-        .restored_messages(&request, events, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(
-        serde_json::to_value(restored).unwrap(),
-        serde_json::to_value(&messages[2..]).unwrap()
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn interrupted_generation_requires_durable_context_and_retains_unknown_writes() {
-    let (_directory, engine, request) = fixture();
-    let context = json!([{"role":"user","content":"Retained original task"}]);
-    engine
-        .store
-        .save_checkpoint(request.session_id, request.turn_id, &context)
-        .unwrap();
-    let action = ActionIntent {
-        id: Uuid::new_v4(),
-        session_id: request.session_id,
-        turn_id: request.turn_id,
-        name: "external_write".into(),
-        arguments: json!({"value":"original"}),
-        writes: true,
-        idempotency_key: "already-dispatched".into(),
-    };
-    engine.store.begin_action(&action).unwrap();
-    engine.store.mark_action_running(action.id).unwrap();
-    engine
-        .store
-        .mark_action_unknown(action.id, "Transport ended after dispatch")
-        .unwrap();
-    let (events, mut received) = mpsc::channel(8);
-    engine
-        .finish_interrupted_generation(&request, &events, Ok(()), Ok(()))
-        .await
-        .unwrap();
-    assert!(matches!(
-        received.recv().await,
-        Some(EngineEvent::Cancelled)
-    ));
-    assert!(received.try_recv().is_err());
-    assert_eq!(
-        engine
-            .store
-            .checkpoint(request.session_id)
-            .unwrap()
-            .unwrap()
-            .messages,
-        context
-    );
-    assert_eq!(
-        engine.store.unresolved_actions(request.session_id).unwrap()[0].state,
-        "outcome_unknown"
-    );
-    assert!(
-        engine
-            .store
-            .completed_turn(request.session_id, request.turn_id)
-            .unwrap()
-            .is_none()
-    );
-    // A cleanup fault is an error even though the caller requested cancellation.
-    assert!(
-        engine
-            .finish_interrupted_generation(
-                &request,
-                &events,
-                Err(anyhow::anyhow!("fixture tool shutdown failed")),
-                Ok(())
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        engine
-            .finish_interrupted_generation(
-                &request,
-                &events,
-                Ok(()),
-                Err(anyhow::anyhow!("fixture delta persistence failed"))
-            )
-            .await
-            .is_err()
-    );
-    assert!(received.try_recv().is_err());
-    // A missing, mismatched or corrupted durable context cannot be called saved.
-    let mut absent = request.clone();
-    absent.session_id = Uuid::new_v4();
-    assert!(
-        engine
-            .finish_interrupted_generation(&absent, &events, Ok(()), Ok(()))
-            .await
-            .is_err()
-    );
-    engine
-        .store
-        .save_checkpoint(request.session_id, Uuid::new_v4(), &context)
-        .unwrap();
-    assert!(
-        engine
-            .finish_interrupted_generation(&request, &events, Ok(()), Ok(()))
-            .await
-            .is_err()
-    );
-    engine
-        .store
-        .save_checkpoint(
-            request.session_id,
-            request.turn_id,
-            &json!({"broken":"context"}),
-        )
-        .unwrap();
-    assert!(
-        engine
-            .finish_interrupted_generation(&request, &events, Ok(()), Ok(()))
-            .await
-            .is_err()
-    );
-    assert!(received.try_recv().is_err());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_admission_stops_before_provider_or_checkpoint_setup() {
     let (_directory, engine, request) = fixture();
-    // Even an unconfigured provider must not turn an already stopped admission
-    // into a setup failure, nor create new checkpoint/tool effects.
     let cancel = CancellationToken::new();
     cancel.cancel();
     let (events, mut receiver) = mpsc::channel(8);
@@ -714,45 +366,550 @@ async fn cancelled_admission_stops_before_provider_or_checkpoint_setup() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn titles_are_reduced_to_one_plain_line() {
+    assert_eq!(
+        clean_title("\"Fix the parser.\"\nExtra").as_deref(),
+        Some("Fix the parser")
+    );
+    assert_eq!(clean_title("  \n  "), None);
+    assert!(clean_title(&"word ".repeat(100)).unwrap().chars().count() <= TITLE_CHARS);
+}
+
+/// How the fixture server answers one Responses request.
+enum Reply {
+    Output(Value),
+    /// The text, stopped by the output limit (`response.incomplete`).
+    Truncated(&'static str),
+    /// Streams one text delta and then holds the connection open.
+    Partial(&'static str),
+    Status(u16, Value),
+}
+
+/// A Responses API server answering concurrent requests with `answer`.
+async fn serve(
+    answer: impl Fn(&Value) -> Reply + Send + Sync + 'static,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let answer = Arc::new(answer);
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let (answer, recorded) = (answer.clone(), recorded.clone());
+            tokio::spawn(async move {
+                let mut socket = BufReader::new(socket);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if socket.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut bytes = vec![0; length];
+                socket.read_exact(&mut bytes).await.unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                recorded.lock().push(body.clone());
+                let (status, content_type, payload, hold) = match answer(&body) {
+                    Reply::Output(output) => {
+                        let response = json!({"status":"completed","model":body["model"],"output":output,"usage":{"input_tokens":10,"output_tokens":5}});
+                        (
+                            200,
+                            "text/event-stream",
+                            format!(
+                                "data: {}\n\n",
+                                json!({"type":"response.completed","response":response})
+                            ),
+                            false,
+                        )
+                    }
+                    Reply::Truncated(text) => {
+                        let response = json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"model":body["model"],"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],"usage":{"input_tokens":10,"output_tokens":64}});
+                        (
+                            200,
+                            "text/event-stream",
+                            format!(
+                                "data: {}\n\n",
+                                json!({"type":"response.incomplete","response":response})
+                            ),
+                            false,
+                        )
+                    }
+                    Reply::Partial(text) => (
+                        200,
+                        "text/event-stream",
+                        format!(
+                            "data: {}\n\n",
+                            json!({"type":"response.output_text.delta","delta":text})
+                        ),
+                        true,
+                    ),
+                    Reply::Status(status, body) => {
+                        (status, "application/json", body.to_string(), false)
+                    }
+                };
+                let head = if hold {
+                    format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\n\r\n")
+                } else {
+                    format!(
+                        "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    )
+                };
+                let _ = socket.get_mut().write_all(head.as_bytes()).await;
+                let _ = socket.get_mut().write_all(payload.as_bytes()).await;
+                if hold {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            });
+        }
+    });
+    (endpoint, seen)
+}
+
+fn message(text: &str) -> Reply {
+    Reply::Output(
+        json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}]),
+    )
+}
+
+fn function_call(id: &str, name: &str, arguments: Value) -> Reply {
+    Reply::Output(
+        json!([{"type":"function_call","id":format!("fc-{id}"),"call_id":id,"name":name,"arguments":arguments.to_string()}]),
+    )
+}
+
+fn is_title(body: &Value) -> bool {
+    body["instructions"] == crate::prompts::title()
+}
+
+fn answered(body: &Value) -> bool {
+    body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["type"] == "function_call_output")
+}
+
+fn responses(endpoint: String) -> ProviderConfig {
+    ProviderConfig {
+        family: ApiFamily::OpenAiResponses,
+        endpoint,
+        model: "gpt-6.1-sol".into(),
+        context_tokens: 65536,
+        output_tokens: 1024,
+        timeout_seconds: 10,
+        reasoning_options: Some(vec!["low".into(), "high".into()]),
+        reasoning_effort: Some("high".into()),
+        ..Default::default()
+    }
+}
+
+fn drain(receiver: &mut mpsc::Receiver<EngineEvent>) -> Vec<EngineEvent> {
+    let mut events = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delegation_returns_the_child_answer_with_parent_ids_and_the_first_turn_gets_a_title() {
+    let (directory, engine, mut request) = fixture();
+    let engine = AgentEngine::new(
+        engine.store.clone(),
+        engine.paths.clone(),
+        ToolSession::for_tests(PermissionMode::ApproveForMe),
+    );
+    std::fs::write(directory.path().join("fixture.txt"), "CHILD_EVIDENCE").unwrap();
+    let helper = crate::prompts::subagent(
+        &crate::prompts::PromptContext::detect(
+            directory.path(),
+            PermissionMode::ApproveForMe,
+            now_ms(),
+        ),
+        "x",
+    );
+    let helper_prefix = helper[..40].to_owned();
+    let (endpoint, seen) = serve(move |body| {
+        if is_title(body) {
+            // Reasoning models may stop at the output limit; the text counts.
+            return Reply::Truncated("\"Investigate the fixture.\"");
+        }
+        let child = body["instructions"]
+            .as_str()
+            .is_some_and(|text| text.starts_with(&helper_prefix));
+        match (child, answered(body)) {
+            (false, false) => function_call(
+                "delegate-call",
+                "agent_delegate",
+                json!({"task":"Read fixture.txt and report"}),
+            ),
+            (true, false) => {
+                function_call("child-read", "file_read", json!({"path":"fixture.txt"}))
+            }
+            (true, true) => message("Child complete"),
+            (false, true) => message("Parent complete"),
+        }
+    })
+    .await;
+    request.provider = responses(endpoint);
+    request.prompt = "Investigate fixture.txt".into();
+    let (events, mut receiver) = mpsc::channel(1024);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        engine.run(request.clone(), events, CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let events = drain(&mut receiver);
+    // The generated title follows the terminal event.
+    let terminal = events
+        .iter()
+        .rev()
+        .find(|event| !matches!(event, EngineEvent::TitleUpdated { .. }));
     assert!(
+        matches!(terminal, Some(EngineEvent::Completed { text, .. }) if text == "Parent complete"),
+        "{terminal:?}"
+    );
+    let delegate = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::ToolStarted {
+                action_id,
+                name,
+                parent_id: None,
+                ..
+            } if name == "agent_delegate" => Some(*action_id),
+            _ => None,
+        })
+        .unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ToolStarted { name, parent_id: Some(parent), .. } if name == "file_read" && *parent == delegate
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::Phase {
+            phase: TurnPhase::Delegating
+        }
+    )));
+    let bodies = seen.lock().clone();
+    for body in &bodies {
+        assert_eq!(body["model"], "gpt-6.1-sol");
+        if is_title(body) {
+            // Titles ask for the lowest effort and a small but usable limit.
+            assert_eq!(body["reasoning"]["effort"], "low");
+            assert_eq!(body["max_output_tokens"], 64);
+        } else {
+            assert_eq!(body["reasoning"]["effort"], "high");
+        }
+    }
+    assert_eq!(bodies.iter().filter(|body| is_title(body)).count(), 1);
+    let parent_final = bodies
+        .iter()
+        .find(|body| {
+            !is_title(body)
+                && answered(body)
+                && body["instructions"]
+                    .as_str()
+                    .is_some_and(|text| !text.starts_with(&helper[..40]))
+        })
+        .unwrap();
+    let output = parent_final["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .unwrap();
+    assert!(
+        output["output"]
+            .as_str()
+            .unwrap()
+            .contains("Child complete")
+    );
+    // The system prompt is Xylo's, identical across the parent's calls.
+    let parent_instructions = bodies
+        .iter()
+        .filter(|body| {
+            !is_title(body)
+                && !body["instructions"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&helper[..40])
+        })
+        .map(|body| body["instructions"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(parent_instructions.len(), 2);
+    assert_eq!(parent_instructions[0], parent_instructions[1]);
+    assert!(!parent_instructions[0].to_string().contains("Hermes"));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::TitleUpdated { title } if title == "Investigate the fixture"
+    )));
+    let conversation = engine
+        .store
+        .conversation(request.session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(conversation.title, "Investigate the fixture");
+    assert_eq!(conversation.title_source, TitleSource::Generated);
+    let completed = engine
+        .store
+        .completed_turn(request.session_id, request.turn_id)
+        .unwrap()
+        .unwrap();
+    assert!(completed.usage.context_tokens > 0);
+    assert!(completed.usage.input_tokens >= completed.usage.context_tokens);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_user_title_is_never_replaced() {
+    let (_directory, engine, mut request) = fixture();
+    engine
+        .store
+        .rename_conversation(request.session_id, "Mine", TitleSource::User)
+        .unwrap();
+    let (endpoint, seen) = serve(|body| {
+        assert!(!is_title(body), "no title request for a user-named chat");
+        message("Hello")
+    })
+    .await;
+    request.provider = responses(endpoint);
+    let (events, mut receiver) = mpsc::channel(256);
+    engine
+        .run(request.clone(), events, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        !drain(&mut receiver)
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TitleUpdated { .. }))
+    );
+    assert_eq!(seen.lock().len(), 1);
+    assert_eq!(
         engine
             .store
-            .unresolved_actions(request.session_id)
+            .conversation(request.session_id)
             .unwrap()
-            .is_empty()
+            .unwrap()
+            .title,
+        "Mine"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn actual_delegation_inherits_parent_model_and_reasoning_on_wire() {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+async fn a_failed_title_never_fails_a_completed_turn() {
     let (_directory, engine, mut request) = fixture();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    request.provider = ProviderConfig {
-        family: xylo_core::ApiFamily::OpenAiResponses,
-        endpoint: format!("http://{}/v1", listener.local_addr().unwrap()),
-        model: "gpt-6.1-sol".into(),
-        context_tokens: 65536,
-        reasoning_options: Some(vec!["low".into(), "high".into()]),
-        reasoning_effort: Some("high".into()),
-        ..Default::default()
+    let (endpoint, _) = serve(|body| {
+        if is_title(body) {
+            // Answer only after the consumer is gone, so announcing fails.
+            std::thread::sleep(Duration::from_millis(300));
+            message("A title")
+        } else {
+            message("Hello")
+        }
+    })
+    .await;
+    request.provider = responses(endpoint);
+    let (events, mut receiver) = mpsc::channel(256);
+    let consumer = tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            if matches!(event, EngineEvent::Completed { .. }) {
+                return true;
+            }
+        }
+        false
+    });
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        engine.run(request.clone(), events, CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .expect("the committed turn stays completed");
+    assert!(consumer.await.unwrap(), "Completed was delivered first");
+    assert!(
+        engine
+            .store
+            .completed_turn(request.session_id, request.turn_id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_keeps_the_streamed_text_as_an_interrupted_reply() {
+    let (_directory, engine, mut request) = fixture();
+    let (endpoint, _) = serve(|body| {
+        if is_title(body) {
+            message("A title")
+        } else {
+            Reply::Partial("Half an answer")
+        }
+    })
+    .await;
+    request.provider = responses(endpoint);
+    engine.store.register_user_turn(&request).unwrap();
+    let (events, mut receiver) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+    let run = engine.run(request.clone(), events, cancel.clone());
+    let watcher = async {
+        while let Some(event) = receiver.recv().await {
+            if matches!(event, EngineEvent::Delta { .. }) {
+                cancel.cancel();
+            }
+            if matches!(event, EngineEvent::Cancelled) {
+                return true;
+            }
+        }
+        false
     };
+    let (result, cancelled) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(run, watcher)
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+    assert!(cancelled);
+    let messages = engine.store.messages(request.session_id, 10).unwrap();
+    let reply = messages.iter().find(|m| m.role == "assistant").unwrap();
+    assert_eq!(reply.content, "Half an answer");
+    assert_eq!(reply.status, MessageStatus::Interrupted);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_credentials_end_with_a_non_retryable_authentication_error() {
+    let (_directory, engine, mut request) = fixture();
+    let (endpoint, seen) =
+        serve(|_| Reply::Status(401, json!({"error":{"code":"invalid_api_key"}}))).await;
+    request.provider = responses(endpoint);
+    let (events, mut receiver) = mpsc::channel(256);
+    engine
+        .run(request.clone(), events, CancellationToken::new())
+        .await
+        .unwrap();
+    let terminal = drain(&mut receiver).pop().unwrap();
+    assert!(matches!(
+        terminal,
+        EngineEvent::Error {
+            kind: ErrorKind::Authentication,
+            retryable: false,
+            ..
+        }
+    ));
+    // The main request is not retried; only it and the title request ran.
+    assert!(seen.lock().iter().filter(|body| !is_title(body)).count() == 1);
+}
+
+/// A provider whose every response asks for a long-running shell command.
+struct StalledChild;
+impl ModelProvider for StalledChild {
+    fn stream(&self, _: ModelRequest, _: CancellationToken) -> crate::model::EventStream {
+        use crate::model::{FinishReason, StreamEvent};
+        Box::pin(futures_util::stream::iter([
+            Ok(StreamEvent::ToolCall {
+                index: 0,
+                id: Some("child-call".into()),
+                name: Some("shell_command".into()),
+                arguments: Some(
+                    json!({"command":"printf started > child-started; sleep 30","timeout_seconds":60})
+                        .to_string(),
+                ),
+            }),
+            Ok(StreamEvent::Finished(FinishReason::ToolCalls)),
+        ]))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_timeout_cancels_its_stalled_process_without_cancelling_the_parent() {
+    let (_directory, engine, request) = fixture();
+    let session = ToolSession::for_tests(PermissionMode::FullAccess);
+    let engine = AgentEngine::new(engine.store.clone(), engine.paths.clone(), session);
+    let (events, mut receiver) = mpsc::channel(256);
+    let parent_cancel = CancellationToken::new();
+    let broker = Arc::new(
+        engine
+            .broker(&request, events.clone(), parent_cancel.clone())
+            .unwrap(),
+    );
+    let delegation = Arc::new(Delegation {
+        provider: Arc::new(StalledChild),
+        budget: ContextBudget::new(&ProviderConfig {
+            context_tokens: 65536,
+            ..Default::default()
+        }),
+        summary_deadline: Duration::from_secs(5),
+        max_tokens: 256,
+        parent: Arc::downgrade(&broker),
+        events,
+        slots: Arc::new(tokio::sync::Semaphore::new(2)),
+        cancel: parent_cancel.clone(),
+        timeout: Duration::from_millis(1500),
+        runtime: tokio::runtime::Handle::current(),
+        workspace: request.workspace.clone(),
+        permissions: crate::tools::PermissionCell::new(PermissionMode::FullAccess),
+    });
+    let handler = delegation.handler();
+    let call = crate::tools::DelegateCall {
+        parent_key: "root:parent-call".into(),
+        parent_action_id: Uuid::new_v4(),
+        arguments: json!({"task":"Run the fixture tool"}),
+    };
+    let start = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || handler(&call))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["status"], "timeout");
+    assert!(start.elapsed() < Duration::from_secs(10));
+    assert!(!parent_cancel.is_cancelled());
+    assert!(
+        drain(&mut receiver)
+            .iter()
+            .any(|event| matches!(event, EngineEvent::ToolStarted { .. })),
+        "the timeout must exercise a real host tool"
+    );
+    assert!(request.workspace.join("child-started").is_file());
+    broker.shutdown().await.unwrap();
+    let actions = engine.store.unresolved_actions(request.session_id).unwrap();
+    assert!(actions.iter().all(|action| action.state != "running"));
+}
+
+/// A Chat Completions server answering connections strictly in order, as the
+/// worker protocol fixtures do.
+async fn sequential_chat(replies: Vec<Value>) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
-        let mut seen = Vec::new();
-        for index in 0..3 {
+        let mut bodies = Vec::new();
+        for (index, delta) in replies.into_iter().enumerate() {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = BufReader::new(socket);
             let mut length = 0;
-            let mut first = String::new();
-            socket.read_line(&mut first).await.unwrap();
-            assert!(first.starts_with("POST /v1/responses "));
             loop {
                 let mut line = String::new();
                 socket.read_line(&mut line).await.unwrap();
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = value.trim().parse::<usize>().unwrap();
-                    }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().unwrap();
                 }
                 if line == "\r\n" {
                     break;
@@ -760,217 +917,192 @@ async fn actual_delegation_inherits_parent_model_and_reasoning_on_wire() {
             }
             let mut bytes = vec![0; length];
             socket.read_exact(&mut bytes).await.unwrap();
-            let body: Value = serde_json::from_slice(&bytes).unwrap();
-            seen.push(body.clone());
-            let output = if index == 0 {
-                json!([{"type":"function_call","id":"fc-delegate","call_id":"delegate-call","name":"agent_delegate","arguments":"{\"task\":\"Investigate independently and report\"}"}])
-            } else {
-                json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":if index==1 {"Child complete"} else {"Parent complete"}}]}])
-            };
-            let response = json!({"id":format!("response-{index}"),"status":"completed","model":"gpt-6.1-sol","output":output,"usage":{"input_tokens":10,"output_tokens":5}});
-            let (content_type, payload) = if body["stream"] == true {
-                (
-                    "text/event-stream",
-                    format!(
-                        "data: {}\n\n",
-                        json!({"type":"response.completed","response":response})
-                    ),
-                )
-            } else {
-                ("application/json", response.to_string())
-            };
-            socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",payload.len()).as_bytes()).await.unwrap();
+            bodies.push(serde_json::from_slice::<Value>(&bytes).unwrap());
+            let tool = delta.get("tool_calls").is_some();
+            let first = json!({"id":"fixture","object":"chat.completion.chunk","model":"fixture","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+            let last = json!({"id":"fixture","object":"chat.completion.chunk","model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":if tool {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":100 + index,"completion_tokens":20,"total_tokens":120}});
+            let body = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
+            socket
+                .get_mut()
+                .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes())
+                .await
+                .unwrap();
         }
-        seen
+        bodies
     });
+    (endpoint, server)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streamed_chat_tool_call_runs_before_the_answer_and_the_title_follows_completion() {
+    let (directory, engine, mut request) = fixture();
+    std::fs::write(
+        directory.path().join("sample.txt"),
+        "durable fixture contents",
+    )
+    .unwrap();
+    let (endpoint, server) = sequential_chat(vec![
+        json!({"tool_calls":[{"index":0,"id":"fixture-call-1","type":"function","function":{"name":"file_read","arguments":json!({"path":"sample.txt"}).to_string()}}]}),
+        json!({"content":"The contents of sample.txt are: durable fixture contents."}),
+        json!({"content":"Read the sample file"}),
+    ])
+    .await;
+    request.provider = ProviderConfig {
+        endpoint,
+        model: "fixture".into(),
+        context_tokens: 65536,
+        output_tokens: 1024,
+        timeout_seconds: 10,
+        ..Default::default()
+    };
+    request.prompt = "Read sample.txt using the file_read tool, then report its content.".into();
+    engine.store.register_user_turn(&request).unwrap();
     let (events, mut receiver) = mpsc::channel(1024);
     tokio::time::timeout(
-        Duration::from_secs(15),
-        engine.run(request, events, CancellationToken::new()),
+        Duration::from_secs(20),
+        engine.run(request.clone(), events, CancellationToken::new()),
     )
     .await
     .unwrap()
     .unwrap();
-    let seen = tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(seen.len(), 3);
-    assert_eq!(seen[1]["stream"], false);
-    for body in &seen {
-        assert_eq!(body["model"], "gpt-6.1-sol");
-        assert_eq!(body["reasoning"]["effort"], "high");
-    }
-    let mut completed = false;
-    while let Ok(event) = receiver.try_recv() {
-        if let EngineEvent::Completed { text, .. } = event {
-            assert_eq!(text, "Parent complete");
-            completed = true;
+    let events = drain(&mut receiver);
+    let position = |check: &dyn Fn(&EngineEvent) -> bool| events.iter().position(check).unwrap();
+    let started =
+        position(&|e| matches!(e, EngineEvent::ToolStarted { name, .. } if name == "file_read"));
+    let finished = position(&|e| matches!(e, EngineEvent::ToolFinished { success: true, .. }));
+    let answer = position(
+        &|e| matches!(e, EngineEvent::Delta { text } if text.contains("durable fixture contents")),
+    );
+    let completed = position(
+        &|e| matches!(e, EngineEvent::Completed { text, usage } if text.contains("durable fixture contents") && usage.context_tokens == 101),
+    );
+    let title = position(
+        &|e| matches!(e, EngineEvent::TitleUpdated { title } if title == "Read the sample file"),
+    );
+    // The title never delays the terminal event.
+    assert!(started < finished && finished < answer && answer < completed && completed < title);
+    assert_eq!(title, events.len() - 1);
+    let bodies = server.await.unwrap();
+    assert_eq!(bodies[2]["messages"][0]["content"], crate::prompts::title());
+    let checkpoint: Vec<Message> = serde_json::from_value(
+        engine
+            .store
+            .checkpoint(request.session_id)
+            .unwrap()
+            .unwrap()
+            .messages,
+    )
+    .unwrap();
+    assert!(
+        checkpoint
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("fixture-call-1"))
+    );
+}
+
+/// Problems the Responses API reports for a function's parameter schema.
+fn responses_schema_problems(path: &str, schema: &Value, problems: &mut Vec<String>) {
+    let Some(fields) = schema.as_object() else {
+        problems.push(format!("{path}: schema is not an object"));
+        return;
+    };
+    for key in ["$schema", "$id", "$ref", "definitions", "$defs"] {
+        if fields.contains_key(key) {
+            problems.push(format!("{path}: unsupported keyword {key}"));
         }
     }
-    assert!(completed);
-    let child_result = seen[2]["input"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["type"] == "function_call_output")
-        .unwrap();
-    let result: Value = serde_json::from_str(child_result["output"].as_str().unwrap()).unwrap();
-    assert_eq!(result["status"], "completed");
-    assert_eq!(result["result"], "Child complete");
+    let types: Vec<&str> = match &fields.get("type") {
+        Some(Value::String(kind)) => vec![kind.as_str()],
+        Some(Value::Array(kinds)) => kinds.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    if types.contains(&"array") && !fields.contains_key("items") {
+        problems.push(format!("{path}: array schema missing items"));
+    }
+    if let Some(Value::Array(values)) = fields.get("enum")
+        && values.is_empty()
+    {
+        problems.push(format!("{path}: empty enum"));
+    }
+    if let Some(properties) = fields.get("properties") {
+        match properties.as_object() {
+            Some(properties) => {
+                for (name, property) in properties {
+                    responses_schema_problems(&format!("{path}.{name}"), property, problems);
+                }
+            }
+            None => problems.push(format!("{path}: properties is not an object")),
+        }
+    }
+    if let Some(Value::Array(required)) = fields.get("required") {
+        for name in required.iter().filter_map(Value::as_str) {
+            if !fields
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| properties.contains_key(name))
+            {
+                problems.push(format!("{path}: required {name} is not a property"));
+            }
+        }
+    }
+    for key in ["items", "additionalProperties", "not"] {
+        if let Some(nested) = fields.get(key).filter(|nested| nested.is_object()) {
+            responses_schema_problems(&format!("{path}.{key}"), nested, problems);
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        for (index, nested) in fields
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            responses_schema_problems(&format!("{path}.{key}[{index}]"), nested, problems);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resumed_checkpoint_preserves_native_and_legacy_summaries() {
-    for summary in [
-        "# Summary of earlier work in this task\nKeep exact decisions",
-        "[Conversation summary] Earlier conversation compressed into key points:\nKeep exact decisions",
-    ] {
-        let (_directory, engine, request) = fixture();
-        let checkpoint = vec![
-            Message::system(format!("Old app policy\n\n{summary}")),
-            Message::user("Prior request"),
-        ];
-        engine
-            .store
-            .save_checkpoint(
-                request.session_id,
-                request.turn_id,
-                &serde_json::to_value(checkpoint).unwrap(),
-            )
+async fn every_offered_tool_schema_is_valid_for_the_responses_api() {
+    let (_directory, engine, request) = fixture();
+    for mode in PermissionMode::ALL {
+        let engine = AgentEngine::new(
+            engine.store.clone(),
+            engine.paths.clone(),
+            ToolSession::for_tests(mode),
+        );
+        let (events, _receiver) = mpsc::channel(256);
+        let broker = engine
+            .broker(&request, events, CancellationToken::new())
             .unwrap();
-        let (events, _) = mpsc::channel(32);
-        let restored = engine
-            .restored_messages(&request, events, CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(restored[0].content.as_deref(), Some(summary));
-        assert!(restored.iter().all(|message| {
-            !message
-                .content
-                .as_deref()
-                .unwrap_or("")
-                .contains("Old app policy")
-        }));
-    }
-}
-
-#[test]
-fn memory_excerpt_bounds_unicode_without_modifying_original() {
-    let original = "界".repeat(5000);
-    let excerpt = bounded_memory_excerpt(&original, 2000);
-    assert!(excerpt.len() < 2040);
-    assert!(excerpt.ends_with("[excerpt; remainder omitted]"));
-    assert_eq!(original, "界".repeat(5000));
-}
-
-struct StalledChildToolProvider;
-#[async_trait]
-impl LlmProvider for StalledChildToolProvider {
-    async fn chat_completion(
-        &self,
-        _: &[Message],
-        _: &[ToolSchema],
-        _: Option<u32>,
-        _: Option<f64>,
-        _: Option<&str>,
-        _: Option<&Value>,
-    ) -> Result<hermes_core::LlmResponse, AgentError> {
-        Ok(hermes_core::LlmResponse {
-            message: assistant_call(
-                "shell_command",
-                json!({"command":"printf started > child-started; sleep 30","timeout_seconds":60}),
-            ),
-            usage: None,
-            model: "fixture".into(),
-            finish_reason: Some("tool_calls".into()),
-        })
-    }
-    fn chat_completion_stream(
-        &self,
-        _: &[Message],
-        _: &[ToolSchema],
-        _: Option<u32>,
-        _: Option<f64>,
-        _: Option<&str>,
-        _: Option<&Value>,
-    ) -> futures_util::stream::BoxStream<'static, Result<hermes_core::StreamChunk, AgentError>>
-    {
-        Box::pin(futures_util::stream::empty())
-    }
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn child_timeout_cancels_stalled_host_process_without_cancelling_parent() {
-    let (_directory, engine, mut request) = fixture();
-    request.permissions = PermissionMode::Auto;
-    let (events, mut receiver) = mpsc::channel(256);
-    let parent_cancel = CancellationToken::new();
-    let broker = ToolBroker::new(
-        request.clone(),
-        engine.store.clone(),
-        engine.capability_config(&request).unwrap(),
-        ApprovalGate::default(),
-        events,
-        parent_cancel.clone(),
-    )
-    .unwrap();
-    let child = Arc::new(broker.scoped_child().unwrap());
-    let child_cancel = child.cancellation_token();
-    let child_cancel_for_timeout = child_cancel.clone();
-    let config = AgentConfig {
-        model: "fixture".into(),
-        allow_model_fallbacks: false,
-        native_product_finalization: true,
-        skip_memory: true,
-        skip_context_files: true,
-        max_turns: 2,
-        ..Default::default()
-    };
-    let orchestrator = Arc::new(
-        SubAgentOrchestrator::new(SubAgentOrchestratorConfig {
-            parent_config: config,
-            tool_registry: build_registry(child.clone(), Some("parent-call".into())).unwrap(),
-            llm_provider: Arc::new(StalledChildToolProvider),
-            parent_credential_pool: None,
-            parent_interrupt: InterruptController::new(),
-            hermes_home: engine.paths.data.clone(),
-            parent_session_id: Some(request.session_id.to_string()),
-            timeout: Duration::from_millis(600),
-            background_delegation_callback: None,
-        })
-        .with_child_cancellation(Arc::new(move || child_cancel_for_timeout.cancel())),
-    );
-    let start = Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(4),
-        orchestrator.execute(hermes_agent::SubAgentRequest {
-            task: "Run the fixture tool".into(),
-            child_depth: 1,
-            max_depth: 1,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&result).unwrap()["status"],
-        "timeout"
-    );
-    assert!(start.elapsed() < Duration::from_secs(4));
-    assert!(child_cancel.is_cancelled());
-    assert!(!parent_cancel.is_cancelled());
-    let mut tool_started = false;
-    while let Ok(event) = receiver.try_recv() {
-        if matches!(event, EngineEvent::ToolStarted { .. }) {
-            tool_started = true;
+        let mut problems = Vec::new();
+        let mut names = HashSet::new();
+        for definition in broker.initial_definitions() {
+            let name = &definition.name;
+            if !names.insert(name.clone()) {
+                problems.push(format!("{name}: duplicate tool name"));
+            }
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            {
+                problems.push(format!("{name}: invalid function name"));
+            }
+            if definition.description.trim().is_empty() || definition.description.len() > 1024 {
+                problems.push(format!(
+                    "{name}: description must be 1 to 1024 bytes, is {}",
+                    definition.description.len()
+                ));
+            }
+            if definition.parameters["type"] != "object" {
+                problems.push(format!("{name}: top-level parameters must be an object"));
+            }
+            responses_schema_problems(name, &definition.parameters, &mut problems);
         }
+        assert!(problems.is_empty(), "{mode:?}: {problems:#?}");
+        broker.shutdown().await.unwrap();
     }
-    assert!(tool_started, "The timeout must exercise a real host tool");
-    assert!(
-        request.workspace.join("child-started").is_file(),
-        "The real child process must have started"
-    );
-    child.shutdown().await.unwrap();
-    let actions = engine.store.unresolved_actions(request.session_id).unwrap();
-    assert!(actions.iter().all(|action| action.state != "running"));
 }

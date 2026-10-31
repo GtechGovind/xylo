@@ -3,6 +3,10 @@
 //! Output is drained continuously to prevent child deadlock. Only a bounded
 //! prefix is retained in memory. The caller receives explicit truncation and
 //! must preserve outcome-unknown for interrupted side effects.
+//!
+//! A sandboxed command that never started (sandbox unavailable, program not
+//! spawned) becomes [`NotStarted`]; that is read only from the launcher's
+//! private status file, never from the program's own output.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -104,11 +108,56 @@ pub async fn run_sandboxed(
 ) -> Result<ProcessResult> {
     let prepared =
         xylo_services::sandbox::prepare_coding(program, args, cwd, read_roots, protected_paths)
-            .map_err(|e| anyhow::Error::new(NotStarted(e.to_string())))?;
-    let _temporary = prepared.temporary;
-    run_prepared(prepared.command, cwd, timeout, cancel).await
+            .map_err(|error| {
+                // Nothing ran. Keep the sandbox's own explanation unchanged.
+                let reason =
+                    match error.downcast_ref::<xylo_services::sandbox::SandboxUnavailable>() {
+                        Some(unavailable) => unavailable.to_string(),
+                        None => format!("{error:#}"),
+                    };
+                anyhow::Error::new(NotStarted(reason))
+            })?;
+    Ok(run_prepared_sandboxed(prepared, cwd, timeout, cancel)
+        .await?
+        .result)
 }
 
+/// The outcome of a sandboxed command that started.
+#[derive(Clone, Debug)]
+pub struct SandboxedResult {
+    pub result: ProcessResult,
+    /// Destinations the sandbox refused, in first-attempt order.
+    pub network_denials: Vec<String>,
+}
+
+/// Runs a prepared sandbox command. Whether it started is read only from the
+/// launcher's private status file, which the sandboxed program cannot write;
+/// its stdout, stderr and exit code are never trusted for that.
+pub async fn run_prepared_sandboxed(
+    prepared: xylo_services::sandbox::PreparedSandbox,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<SandboxedResult> {
+    let xylo_services::sandbox::PreparedSandbox {
+        command,
+        temporary,
+        status_file,
+    } = prepared;
+    let result = run_prepared(command, cwd, timeout, cancel).await;
+    if let Some(failure) = xylo_services::sandbox::read_start_status(&status_file) {
+        return Err(NotStarted(failure.to_string()).into());
+    }
+    let network_denials = xylo_services::sandbox::read_network_denials(&status_file);
+    drop(temporary);
+    Ok(SandboxedResult {
+        result: result?,
+        network_denials,
+    })
+}
+
+/// Runs a prepared command without a sandbox, draining output and owning its
+/// process group until it ends.
 pub async fn run_prepared(
     mut command: Command,
     cwd: &Path,
@@ -174,95 +223,4 @@ pub fn require_success(result: ProcessResult) -> Result<ProcessResult> {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn managed_sandbox_allows_project_write_but_denies_outside_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let result = run_sandboxed(
-            "/bin/sh",
-            &[
-                "-c".into(),
-                "printf allowed > inside; printf denied > \"$1/outside\"".into(),
-                "sh".into(),
-                outside.path().to_string_lossy().into_owned(),
-            ],
-            dir.path(),
-            &[],
-            &[],
-            Duration::from_secs(20),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("inside")).unwrap(),
-            "allowed",
-            "sandbox output: {}",
-            result.stderr
-        );
-        assert!(!outside.path().join("outside").exists());
-        assert_ne!(result.code, Some(0));
-    }
-    #[tokio::test]
-    async fn managed_sandbox_protected_subdirectory_is_unreadable() {
-        let dir = tempfile::tempdir().unwrap();
-        let secret = dir.path().join("credentials");
-        std::fs::create_dir(&secret).unwrap();
-        std::fs::write(secret.join("token"), "private-fixture").unwrap();
-        let result = run_sandboxed(
-            "/bin/cat",
-            &[secret.join("token").to_string_lossy().into_owned()],
-            dir.path(),
-            &[],
-            &[secret],
-            Duration::from_secs(20),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(!result.stdout.contains("private-fixture"));
-        assert_ne!(result.code, Some(0));
-    }
-    #[tokio::test]
-    async fn arguments_are_literal_and_output_is_bounded() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = run(
-            "printf",
-            &["%s".into(), "$(do-not-execute)".into()],
-            dir.path(),
-            Duration::from_secs(5),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(result.stdout, "$(do-not-execute)");
-        let result = run(
-            "sh",
-            &["-c".into(), "head -c 600000 /dev/zero".into()],
-            dir.path(),
-            Duration::from_secs(5),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(result.truncated);
-        assert_eq!(result.stdout.len(), OUTPUT_LIMIT);
-    }
-    #[tokio::test]
-    async fn cancellation_terminates_child() {
-        let dir = tempfile::tempdir().unwrap();
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let result = run(
-            "sleep",
-            &["30".into()],
-            dir.path(),
-            Duration::from_secs(60),
-            cancel,
-        )
-        .await;
-        assert!(result.is_err());
-    }
-}
+mod tests;

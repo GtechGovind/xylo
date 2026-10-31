@@ -123,6 +123,18 @@ fn readable(value: &str, redactions: &[String]) -> String {
     }
     bounded(&output.join(" "), 480)
 }
+/// The provider's own explanation of a rejected request, from
+/// `/error/message` or the ChatGPT backend's `/detail`, bounded and with
+/// secrets, URLs and quoted values redacted.
+pub(super) fn reason(value: &Value, redactions: &[String]) -> Option<String> {
+    let text = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("detail").and_then(Value::as_str))
+        .or_else(|| value.pointer("/detail/message").and_then(Value::as_str))?;
+    Some(readable(text, redactions)).filter(|reason| !reason.is_empty())
+}
+
 pub(super) fn stream_error(
     value: &Value,
     redactions: &[String],
@@ -196,26 +208,4 @@ pub(super) fn stream_error(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn safe_cause_retains_contractions_and_numeric_context_limits() {
-        let detail = readable(
-            "Request doesn't fit: maximum context length 272000 tokens, requested 300000. Invalid 'input[4].content'. token=private-value, provider.invalid/path?token=private-query",
-            &[],
-        );
-        assert!(detail.contains("doesn't fit"));
-        assert!(detail.contains("272000 tokens"));
-        assert!(detail.contains("300000"));
-        assert!(detail.contains("input[4].content"));
-        assert!(!detail.contains("private-value"));
-        assert!(!detail.contains("private-query"));
-    }
-    #[test]
-    fn incomplete_response_retains_its_specific_safe_reason() {
-        let value = serde_json::json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}});
-        assert!(
-            stream_error(&value, &[], "response.incomplete", None).contains("max_output_tokens")
-        );
-    }
-}
+mod tests;

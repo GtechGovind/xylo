@@ -295,26 +295,6 @@ impl Xylo {
         self.page = Page::Artifacts;
         cx.notify();
     }
-    pub(super) fn document_pick(&mut self, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspace.clone() else {
-            self.documents.notice = "Open a project first.".into();
-            cx.notify();
-            return;
-        };
-        cx.spawn(async move |view, cx| {
-            if let Some(file) = rfd::AsyncFileDialog::new()
-                .set_title("Open a document from this project")
-                .set_directory(workspace)
-                .add_filter("Documents", &["txt", "md", "csv", "json", "docx", "xlsx"])
-                .pick_file()
-                .await
-            {
-                let path = file.path().to_path_buf();
-                let _ = view.update_in(cx, |view, window, cx| view.document_open(path, window, cx));
-            }
-        })
-        .detach();
-    }
     fn document_read(&mut self, kind: ReadKind, args: Value, cx: &mut Context<Self>) {
         let id = Uuid::new_v4();
         let result = self

@@ -153,10 +153,35 @@ impl Embedder {
         Ok(vector)
     }
 }
+/// After a failure, model loading and inference are not retried for this long,
+/// so a broken runtime does not cost a load attempt on every memory call.
+const EMBEDDING_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// Whether semantic (embedding) memory is working. Lexical memory always works.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EmbeddingStatus {
+    /// No embedding model is configured.
+    Disabled,
+    /// Configured; the model loads on first use.
+    Ready,
+    /// The last load or inference failed; memory runs lexical-only until the
+    /// retry delay passes or the configuration changes.
+    Failed { message: String },
+}
+
+struct EmbeddingFailure {
+    message: String,
+    at: Instant,
+    reported: bool,
+}
+
 #[derive(Clone)]
 pub struct SqliteMemory {
     store: Store,
     embedder: Arc<Mutex<Option<Embedder>>>,
+    /// Kept apart from `embedder` so status reads never wait on an inference.
+    failure: Arc<Mutex<Option<EmbeddingFailure>>>,
 }
 impl SqliteMemory {
     pub(crate) fn store(&self) -> &Store {
@@ -166,7 +191,63 @@ impl SqliteMemory {
         Self {
             store,
             embedder: Arc::new(Mutex::new(None)),
+            failure: Arc::new(Mutex::new(None)),
         }
+    }
+    /// Current state of semantic memory, for status and settings surfaces.
+    pub fn embedding_status(&self) -> EmbeddingStatus {
+        if let Ok(failure) = self.failure.lock()
+            && let Some(failure) = failure.as_ref()
+        {
+            return EmbeddingStatus::Failed {
+                message: failure.message.clone(),
+            };
+        }
+        match self.embedder.try_lock() {
+            Ok(guard) if guard.is_none() => EmbeddingStatus::Disabled,
+            _ => EmbeddingStatus::Ready,
+        }
+    }
+    /// The newest embedding failure, returned only once so the host can tell
+    /// the user a single time instead of on every memory call.
+    pub fn take_embedding_failure(&self) -> Option<String> {
+        let mut failure = self.failure.lock().ok()?;
+        let failure = failure.as_mut()?;
+        if failure.reported {
+            return None;
+        }
+        failure.reported = true;
+        Some(failure.message.clone())
+    }
+    fn record_failure(&self, error: &anyhow::Error) {
+        let message = format!("Semantic memory is unavailable: {error:#}");
+        let Ok(mut failure) = self.failure.lock() else {
+            return;
+        };
+        let repeated = failure
+            .as_ref()
+            .is_some_and(|known| known.message == message);
+        if !repeated {
+            tracing::warn!("{message}; memory continues with lexical search");
+        }
+        *failure = Some(EmbeddingFailure {
+            message,
+            at: Instant::now(),
+            reported: repeated && failure.as_ref().is_some_and(|known| known.reported),
+        });
+    }
+    fn clear_failure(&self) {
+        if let Ok(mut failure) = self.failure.lock() {
+            *failure = None;
+        }
+    }
+    /// The recorded failure while its retry delay has not passed.
+    fn cooling_down(&self) -> Option<String> {
+        let failure = self.failure.lock().ok()?;
+        failure
+            .as_ref()
+            .filter(|failure| failure.at.elapsed() < EMBEDDING_RETRY_AFTER)
+            .map(|failure| failure.message.clone())
     }
     /// Missing config is ordinary lexical mode. Existing invalid configuration is
     /// an explicit stable error, not silent fallback or a download trigger.
@@ -210,6 +291,7 @@ impl SqliteMemory {
             .embedder
             .lock()
             .map_err(|_| anyhow::anyhow!("Embedding lock poisoned"))? = replacement;
+        self.clear_failure();
         Ok(())
     }
     /// Drop a resident model while retaining its validated metadata for lazy reload.
@@ -280,6 +362,7 @@ impl SqliteMemory {
             model: None,
             last_used: None,
         });
+        self.clear_failure();
         Ok(())
     }
     pub fn disable_embeddings(&self) -> Result<()> {
@@ -287,23 +370,37 @@ impl SqliteMemory {
             .embedder
             .lock()
             .map_err(|_| anyhow::anyhow!("Embedding lock poisoned"))? = None;
+        self.clear_failure();
         Ok(())
     }
+    /// Embeds `text` with the configured model. Failures are recorded once and
+    /// suppress further attempts until the retry delay passes.
     fn vector(&self, text: &str) -> Result<Option<(String, Vec<u8>)>> {
-        let mut guard = self
-            .embedder
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Embedding lock poisoned"))?;
-        guard
-            .as_mut()
-            .map(|e| {
-                let v = e.embed(text)?;
-                Ok((
-                    e.assets.index_id()?,
-                    v.iter().flat_map(|n| n.to_le_bytes()).collect(),
-                ))
-            })
-            .transpose()
+        if let Some(message) = self.cooling_down() {
+            anyhow::bail!(message);
+        }
+        let result = {
+            let mut guard = self
+                .embedder
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Embedding lock poisoned"))?;
+            guard
+                .as_mut()
+                .map(|e| {
+                    let v = e.embed(text)?;
+                    Ok((
+                        e.assets.index_id()?,
+                        v.iter().flat_map(|n| n.to_le_bytes()).collect(),
+                    ))
+                })
+                .transpose()
+        };
+        match &result {
+            Ok(Some(_)) => self.clear_failure(),
+            Ok(None) => {}
+            Err(error) => self.record_failure(error),
+        }
+        result
     }
     pub fn remember_sync(&self, record: MemoryRecord) -> Result<()> {
         ensure!(
@@ -323,7 +420,6 @@ impl SqliteMemory {
         // superseded version. A reused ID with changed content is rejected.
         let existing = record.clone();
         let (exists, generation) = self.store.call(move |conn| {
-            crate::memory_facts::initialize(conn)?;
             crate::memory_facts::reject_deleted(conn, existing.id)?;
             Ok((
                 same_record(conn, &existing)?,
@@ -333,23 +429,24 @@ impl SqliteMemory {
         if exists {
             return Ok(());
         }
-        let vector = self.vector(&record.content).unwrap_or_else(|_| {
-            tracing::warn!("Optional memory embedding unavailable; saving lexical memory");
-            None
-        });
+        // Failures are recorded (and logged once) by `vector`; the memory is
+        // still saved for lexical recall.
+        let vector = self.vector(&record.content).unwrap_or(None);
         self.store.call(move|conn|{let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             crate::memory_facts::reject_deleted(&tx,record.id)?;
             if same_record(&tx, &record)? { tx.commit()?; return Ok(()); }
             ensure!(crate::memory_facts::generation(&tx,&record.scope)?==generation,"Project facts changed during this save; refresh and retry");
             if let Some(previous)=record.supersedes {let previous_state:Option<(String,bool)>=tx.query_row("SELECT scope,active FROM memories WHERE id=?1",[previous.to_string()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;ensure!(previous_state.as_ref().is_some_and(|(scope,active)|scope==&record.scope&&*active),"Correct the current memory in the same project");tx.execute("UPDATE memories SET active=0 WHERE id=?1",[previous.to_string()])?; delete_vectors(&tx, &previous.to_string())?;}
-            let (mut model,mut embedding)=match vector{Some((m,v))=>(Some(m),Some(v)),None=>(None,None)};
-            if let (Some(vector_model), Some(vector_embedding)) = (&model, &embedding) {
+            // The vector lives only in its model's vec0 table; `embedding_model`
+            // records which index holds it so reindexing can find stale rows.
+            let mut model=None;
+            if let Some((vector_model, vector_embedding)) = &vector {
                 tx.execute_batch("SAVEPOINT optional_memory_vector")?;
                 let indexed = (|| -> Result<()> { let table = ensure_vector_table(&tx, vector_model, vector_embedding.len()/4)?; tx.execute(&format!("INSERT INTO {table}(id,scope,embedding) VALUES(?1,?2,?3)"),params![record.id.to_string(),record.scope,vector_embedding])?; Ok(()) })();
-                if indexed.is_err() { tx.execute_batch("ROLLBACK TO optional_memory_vector")?; model = None; embedding = None; tracing::warn!("Optional semantic index unavailable; saving lexical memory"); }
+                if indexed.is_ok() { model = Some(vector_model.clone()); } else { tx.execute_batch("ROLLBACK TO optional_memory_vector")?; tracing::warn!("Optional semantic index unavailable; saving lexical memory"); }
                 tx.execute_batch("RELEASE optional_memory_vector")?;
             }
-            tx.execute("INSERT INTO memories(id,scope,content,json,embedding,embedding_model) VALUES(?1,?2,?3,?4,?5,?6)",params![record.id.to_string(),record.scope,record.content,serde_json::to_string(&record)?,embedding,model])?;
+            tx.execute("INSERT INTO memories(id,scope,content,json,embedding_model) VALUES(?1,?2,?3,?4,?5)",params![record.id.to_string(),record.scope,record.content,serde_json::to_string(&record)?,model])?;
             tx.execute("INSERT INTO memories_fts(id,scope,content) VALUES(?1,?2,?3)",params![record.id.to_string(),record.scope,record.content])?;
             crate::memory_facts::inserted(&tx,&record)?;tx.commit()?;Ok(())})
     }
@@ -365,10 +462,7 @@ impl SqliteMemory {
             .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
             .collect();
         let fts = terms.join(" OR ");
-        let vector = self.vector(query).unwrap_or_else(|_| {
-            tracing::warn!("Optional memory embedding unavailable; using lexical recall");
-            None
-        });
+        let vector = self.vector(query).unwrap_or(None);
         self.store.call(move|conn|{
             let mut lexical=conn.prepare("SELECT m.json FROM memories_fts f JOIN memories m ON m.id=f.id WHERE memories_fts MATCH ?1 AND m.scope=?2 AND m.active=1 ORDER BY bm25(memories_fts) LIMIT ?3")?;
             let lexical=lexical.query_map(params![fts,scope,(limit*4) as i64],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -388,7 +482,6 @@ impl SqliteMemory {
     }
     pub fn forget_sync(&self, id: Uuid) -> Result<()> {
         self.store.call(move |conn| {
-            crate::memory_facts::initialize(conn)?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let scope: Option<String> = tx
                 .query_row(
@@ -409,7 +502,6 @@ impl SqliteMemory {
         crate::memory_facts::validate_scope(scope)?;
         let scope = scope.to_owned();
         self.store.call(move |conn| {
-            crate::memory_facts::initialize(conn)?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             crate::memory_facts::delete_selected(&tx, &scope, id)?;
             tx.commit()?;
@@ -450,8 +542,8 @@ impl SqliteMemory {
                     params![id, scope, vector],
                 )?;
                 tx.execute(
-                    "UPDATE memories SET embedding=?1,embedding_model=?2 WHERE id=?3",
-                    params![vector, model, id],
+                    "UPDATE memories SET embedding_model=?1 WHERE id=?2",
+                    params![model, id],
                 )?;
                 tx.commit()?;
                 Ok(())
@@ -488,9 +580,8 @@ fn ensure_vector_table(
         dimensions > 0 && dimensions <= 4096,
         "Invalid vector dimensions"
     );
-    let hash = format!("{:x}", Sha256::digest(format!("{model}:{dimensions}")));
+    let hash = hex::encode(Sha256::digest(format!("{model}:{dimensions}")));
     let table = format!("memory_vec_{}", &hash[..24]);
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS memory_vector_tables(name TEXT PRIMARY KEY,model TEXT NOT NULL,dimensions INTEGER NOT NULL)")?;
     conn.execute_batch(&format!("CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(id TEXT PRIMARY KEY,scope TEXT PARTITION KEY,embedding float[{dimensions}] distance_metric=cosine)"))?;
     conn.execute(
         "INSERT OR IGNORE INTO memory_vector_tables(name,model,dimensions) VALUES(?1,?2,?3)",
@@ -499,7 +590,6 @@ fn ensure_vector_table(
     Ok(table)
 }
 pub(crate) fn delete_vectors(conn: &rusqlite::Connection, id: &str) -> Result<()> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS memory_vector_tables(name TEXT PRIMARY KEY,model TEXT NOT NULL,dimensions INTEGER NOT NULL)")?;
     let tables = conn
         .prepare("SELECT name FROM memory_vector_tables")?
         .query_map([], |r| r.get::<_, String>(0))?
@@ -515,14 +605,6 @@ pub(crate) fn delete_vectors(conn: &rusqlite::Connection, id: &str) -> Result<()
 }
 
 pub(crate) fn delete_vector_targets(conn: &rusqlite::Connection) -> Result<()> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='memory_vector_tables')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !exists {
-        return Ok(());
-    }
     let tables = conn
         .prepare("SELECT name FROM memory_vector_tables")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -561,213 +643,4 @@ fn same_record(conn: &rusqlite::Connection, record: &MemoryRecord) -> Result<boo
 }
 
 #[cfg(test)]
-mod vector_tests {
-    use super::*;
-
-    fn metadata_assets(directory: &std::path::Path) -> EmbeddingAssets {
-        EmbeddingAssets {
-            directory: directory.to_owned(),
-            model_id: "BAAI/bge-small-en-v1.5".into(),
-            dimensions: 384,
-            cpu_threads: 1,
-            pooling: EmbeddingPooling::Auto,
-            runtime_library: None,
-        }
-    }
-
-    #[test]
-    fn automatic_threads_follow_available_cpus_and_explicit_values_remain_bounds() {
-        let mut assets = metadata_assets(std::path::Path::new("/unused"));
-        assets.cpu_threads = 0;
-        assert_eq!(assets.threads_for_available(1), 1);
-        assert_eq!(assets.threads_for_available(32), 31);
-        assets.cpu_threads = 24;
-        assert_eq!(assets.threads_for_available(8), 7);
-        assert_eq!(assets.threads_for_available(64), 24);
-        let mut json = serde_json::to_value(&assets).unwrap();
-        json.as_object_mut().unwrap().remove("cpu_threads");
-        assert_eq!(
-            serde_json::from_value::<EmbeddingAssets>(json)
-                .unwrap()
-                .cpu_threads,
-            0
-        );
-    }
-
-    fn write_metadata_fixture(directory: &std::path::Path) {
-        std::fs::create_dir_all(directory).unwrap();
-        for file in [
-            "model.onnx",
-            "tokenizer.json",
-            "config.json",
-            "special_tokens_map.json",
-            "tokenizer_config.json",
-            EmbeddingAssets::runtime_filename(),
-        ] {
-            // Deliberately invalid assets prove that configuration does not load them.
-            std::fs::write(directory.join(file), b"metadata fixture only").unwrap();
-        }
-    }
-
-    #[test]
-    fn configured_missing_file_keeps_lexical_memory_available() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path().join("missing-config.db")).unwrap();
-        let memory =
-            SqliteMemory::configured(store, &directory.path().join("embedding.json")).unwrap();
-        assert!(memory.embedder.lock().unwrap().is_none());
-        assert!(
-            memory
-                .recall_sync("scope", "anything", 5)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(!memory.unload_if_idle(Duration::ZERO).unwrap());
-    }
-
-    #[test]
-    fn broken_optional_runtime_keeps_lexical_save_and_recall_available() {
-        let directory = tempfile::tempdir().unwrap();
-        let assets_directory = directory.path().join("assets");
-        write_metadata_fixture(&assets_directory);
-        let config = directory.path().join("embedding.json");
-        std::fs::write(
-            &config,
-            serde_json::to_vec(&metadata_assets(&assets_directory)).unwrap(),
-        )
-        .unwrap();
-        let store = Store::open(directory.path().join("fallback.db")).unwrap();
-        let memory = SqliteMemory::configured(store, &config).unwrap();
-        let record = xylo_core::MemoryRecord {
-            id: Uuid::new_v4(),
-            scope: "project-a".into(),
-            content: "Prefer violet accent".into(),
-            source: "Explicit user choice".into(),
-            created_at: 7,
-            supersedes: None,
-        };
-        memory.remember_sync(record.clone()).unwrap();
-        assert_eq!(
-            memory.recall_sync("project-a", "violet", 3).unwrap()[0].id,
-            record.id
-        );
-    }
-
-    #[test]
-    fn configured_validates_metadata_and_resolves_paths_without_loading_assets() {
-        let directory = tempfile::tempdir().unwrap();
-        let assets_directory = directory.path().join("assets");
-        write_metadata_fixture(&assets_directory);
-        let mut assets = metadata_assets(std::path::Path::new("assets"));
-        let config = directory.path().join("embedding.json");
-        std::fs::write(&config, serde_json::to_vec(&assets).unwrap()).unwrap();
-        let store = Store::open(directory.path().join("configured.db")).unwrap();
-        let memory = SqliteMemory::configured(store, &config).unwrap();
-        {
-            let guard = memory.embedder.lock().unwrap();
-            let configured = guard.as_ref().unwrap();
-            assert_eq!(configured.assets.directory, assets_directory);
-            assert_eq!(
-                configured.assets.runtime_library,
-                Some(assets_directory.join(EmbeddingAssets::runtime_filename()))
-            );
-            assert!(matches!(
-                configured.assets.resolved_pooling().unwrap(),
-                Pooling::Cls
-            ));
-            assert!(configured.model.is_none());
-            assert!(configured.last_used.is_none());
-            assert!(!memory.unload_if_idle(Duration::ZERO).unwrap());
-        }
-        assert!(!memory.unload_if_idle(Duration::ZERO).unwrap());
-        assets.dimensions = 0;
-        std::fs::write(&config, serde_json::to_vec(&assets).unwrap()).unwrap();
-        let store = Store::open(directory.path().join("invalid-metadata.db")).unwrap();
-        let error = SqliteMemory::configured(store, &config).err().unwrap();
-        assert_eq!(error.to_string(), "Invalid embedding configuration");
-    }
-
-    #[test]
-    fn configured_rejects_malformed_oversized_or_unrecognized_metadata() {
-        let directory = tempfile::tempdir().unwrap();
-        let config = directory.path().join("embedding.json");
-        let store = Store::open(directory.path().join("malformed.db")).unwrap();
-        std::fs::write(&config, b"{").unwrap();
-        let error = SqliteMemory::configured(store.clone(), &config)
-            .err()
-            .unwrap();
-        assert_eq!(error.to_string(), "Invalid embedding configuration JSON");
-        std::fs::write(&config, vec![b' '; 65537]).unwrap();
-        let error = SqliteMemory::configured(store.clone(), &config)
-            .err()
-            .unwrap();
-        assert_eq!(error.to_string(), "Embedding configuration exceeds 64 KiB");
-        let mut json = serde_json::to_value(metadata_assets(directory.path())).unwrap();
-        json["download_models"] = serde_json::json!(true);
-        std::fs::write(&config, serde_json::to_vec(&json).unwrap()).unwrap();
-        let error = SqliteMemory::configured(store, &config).err().unwrap();
-        assert_eq!(error.to_string(), "Invalid embedding configuration JSON");
-    }
-
-    #[test]
-    fn reload_validates_before_replacing_the_shared_lazy_configuration() {
-        let directory = tempfile::tempdir().unwrap();
-        let assets_directory = directory.path().join("assets");
-        write_metadata_fixture(&assets_directory);
-        let config = directory.path().join("embedding.json");
-        std::fs::write(
-            &config,
-            serde_json::to_vec(&metadata_assets(&assets_directory)).unwrap(),
-        )
-        .unwrap();
-        let memory = SqliteMemory::new(Store::open(directory.path().join("reload.db")).unwrap());
-        let other = memory.clone();
-        memory.reload_configuration(&config).unwrap();
-        assert!(
-            other
-                .embedder
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .model
-                .is_none()
-        );
-        std::fs::write(&config, b"not json").unwrap();
-        assert!(memory.reload_configuration(&config).is_err());
-        assert!(other.embedder.lock().unwrap().is_some());
-        std::fs::remove_file(&config).unwrap();
-        memory.reload_configuration(&config).unwrap();
-        assert!(other.embedder.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn pooling_defaults_match_known_models_and_vector_spaces_do_not_mix() {
-        let mut assets = metadata_assets(std::path::Path::new("/unused"));
-        let cls_index = assets.index_id().unwrap();
-        assert!(matches!(assets.resolved_pooling().unwrap(), Pooling::Cls));
-        assets.pooling = EmbeddingPooling::Mean;
-        assert!(matches!(assets.resolved_pooling().unwrap(), Pooling::Mean));
-        assert_ne!(assets.index_id().unwrap(), cls_index);
-        assets.pooling = EmbeddingPooling::Auto;
-        assets.model_id = "sentence-transformers/all-MiniLM-L6-v2".into();
-        assert!(matches!(assets.resolved_pooling().unwrap(), Pooling::Mean));
-        assets.model_id = "my-custom-model".into();
-        assert!(assets.resolved_pooling().is_err());
-        assets.pooling = EmbeddingPooling::Cls;
-        assert!(assets.resolved_pooling().is_ok());
-    }
-
-    #[test]
-    fn vec0_knn_uses_scope_partition_and_forget_removes_index_row() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path().join("vectors.db")).unwrap();
-        store.call(|conn|{
-            let table=ensure_vector_table(conn,"fixture-model",3)?;
-            for (id,scope,vector) in [("a","project-a",[1.0_f32,0.0,0.0]),("b","project-b",[1.0,0.0,0.0]),("c","project-a",[0.0,1.0,0.0])]{let blob:Vec<_>=vector.iter().flat_map(|n|n.to_le_bytes()).collect();conn.execute(&format!("INSERT INTO {table}(id,scope,embedding) VALUES(?1,?2,?3)"),params![id,scope,blob])?;}
-            let query:Vec<_>=[1.0_f32,0.0,0.0].iter().flat_map(|n|n.to_le_bytes()).collect();
-            let id:String=conn.query_row(&format!("SELECT id FROM {table} WHERE embedding MATCH ?1 AND k=1 AND scope='project-a' ORDER BY distance"),[query],|r|r.get(0))?;assert_eq!(id,"a");
-            delete_vectors(conn,"a")?;let count:i64=conn.query_row(&format!("SELECT count(*) FROM {table} WHERE id='a'"),[],|r|r.get(0))?;assert_eq!(count,0);Ok(())
-        }).unwrap();
-    }
-}
+mod vector_tests;

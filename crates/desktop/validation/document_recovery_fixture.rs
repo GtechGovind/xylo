@@ -142,7 +142,7 @@ pub fn seeded(kind: DocumentKind) -> Profile {
     let state = DocumentDraftState {
         source: DocumentSource {
             path: original.clone(),
-            revision: format!("{:x}", Sha256::digest(&bytes)),
+            revision: hex::encode(Sha256::digest(&bytes)),
             bytes: bytes.len() as u64,
             kind,
         },

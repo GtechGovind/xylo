@@ -180,27 +180,6 @@ fn validate(key: &DocumentDraftKey, state: &Option<DocumentDraftState>) -> Resul
     Ok(json)
 }
 
-fn initialize(conn: &mut Connection) -> Result<()> {
-    let ready: bool = conn.query_row(
-        "SELECT count(*)=6 FROM sqlite_schema WHERE name IN('document_drafts','document_draft_usage','document_draft_recent','document_draft_insert','document_draft_update','document_draft_delete')",
-        [], |row| row.get(0),
-    )?;
-    if ready {
-        return Ok(());
-    }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS document_drafts(workspace TEXT NOT NULL,source TEXT NOT NULL,json TEXT NOT NULL CHECK(json_valid(json) AND length(CAST(json AS BLOB))<=6291456),revision INTEGER NOT NULL CHECK(revision>0),updated_at INTEGER NOT NULL,mutation_id TEXT NOT NULL,expected INTEGER NOT NULL,PRIMARY KEY(workspace,source));
-CREATE INDEX IF NOT EXISTS document_draft_recent ON document_drafts(workspace,updated_at DESC,source ASC);
-CREATE TABLE IF NOT EXISTS document_draft_usage(singleton INTEGER PRIMARY KEY CHECK(singleton=1),bytes INTEGER NOT NULL DEFAULT 0,rows INTEGER NOT NULL DEFAULT 0);
-INSERT OR IGNORE INTO document_draft_usage(singleton) VALUES(1);
-CREATE TRIGGER IF NOT EXISTS document_draft_insert AFTER INSERT ON document_drafts BEGIN UPDATE document_draft_usage SET bytes=bytes+length(CAST(new.json AS BLOB)),rows=rows+1 WHERE singleton=1; END;
-CREATE TRIGGER IF NOT EXISTS document_draft_update AFTER UPDATE ON document_drafts BEGIN UPDATE document_draft_usage SET bytes=bytes-length(CAST(old.json AS BLOB))+length(CAST(new.json AS BLOB)) WHERE singleton=1; END;
-CREATE TRIGGER IF NOT EXISTS document_draft_delete AFTER DELETE ON document_drafts BEGIN UPDATE document_draft_usage SET bytes=bytes-length(CAST(old.json AS BLOB)),rows=rows-1 WHERE singleton=1; END;
-UPDATE document_draft_usage SET bytes=(SELECT coalesce(sum(length(CAST(json AS BLOB))),0) FROM document_drafts),rows=(SELECT count(*) FROM document_drafts) WHERE singleton=1;")?;
-    tx.commit()?;
-    Ok(())
-}
-
 fn absent(key: DocumentDraftKey) -> DocumentDraftSnapshot {
     DocumentDraftSnapshot {
         key,
@@ -242,10 +221,7 @@ fn read(conn: &Connection, key: &DocumentDraftKey) -> Result<Option<Stored>> {
 impl Store {
     pub fn document_draft(&self, key: DocumentDraftKey) -> Result<DocumentDraftSnapshot> {
         validate(&key, &None)?;
-        self.call(move |conn| {
-            initialize(conn)?;
-            Ok(read(conn, &key)?.map_or_else(|| absent(key), |row| row.0))
-        })
+        self.call(move |conn| Ok(read(conn, &key)?.map_or_else(|| absent(key), |row| row.0)))
     }
 
     pub fn save_document_draft(&self, write: DocumentDraftWrite) -> Result<DocumentDraftSave> {
@@ -255,7 +231,6 @@ impl Store {
             "Invalid document draft revision or save identity"
         );
         self.call(move |conn| {
-            initialize(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let stored = read(&tx,&write.key)?;
             let current = stored.as_ref().map_or_else(|| absent(write.key.clone()),|row| row.0.clone());
@@ -295,15 +270,14 @@ impl Store {
         }
         let limit = limit.clamp(1, 100);
         self.call(move |conn| {
-            initialize(conn)?;
             let mut query=conn.prepare("SELECT source,revision,updated_at,json_extract(json,'$.export_name'),json_extract(json,'$.source.revision'),json_array_length(json,'$.edits'),json_type(json,'$.pending_copy')!='null' FROM document_drafts WHERE workspace=?1 AND json!='null' AND (?2 IS NULL OR updated_at<?2 OR (updated_at=?2 AND source>?3)) ORDER BY updated_at DESC,source ASC LIMIT ?4")?;
-            let rows=query.query_map(params![scope,before.as_ref().map(|cursor|cursor.updated_at),before.as_ref().map(|cursor|path_text(&cursor.source)).transpose()?.unwrap_or_default(),limit+1],|row| {
-                Ok(DocumentDraftSummary { key:DocumentDraftKey{workspace:workspace.clone(),source:PathBuf::from(row.get::<_,String>(0)?)},revision:row.get(1)?,updated_at:row.get(2)?,export_name:row.get(3)?,source_revision:row.get(4)?,edits:row.get(5)?,has_pending_copy:row.get(6)? })
+            let rows=query.query_map(params![scope,before.as_ref().map(|cursor|cursor.updated_at),before.as_ref().map(|cursor|path_text(&cursor.source)).transpose()?.unwrap_or_default(),crate::store::sql_count(limit+1)],|row| {
+                Ok(DocumentDraftSummary { key:DocumentDraftKey{workspace:workspace.clone(),source:PathBuf::from(row.get::<_,String>(0)?)},revision:row.get(1)?,updated_at:row.get(2)?,export_name:row.get(3)?,source_revision:row.get(4)?,edits:crate::store::row_usize(row,5)?,has_pending_copy:row.get(6)? })
             })?;
             let mut drafts=rows.collect::<rusqlite::Result<Vec<_>>>()?;
             let has_more=drafts.len()>limit;
             drafts.truncate(limit);
-            let cursor=drafts.last().map(|draft|DocumentDraftCursor{updated_at:draft.updated_at,source:draft.key.source.clone()});
+            let cursor=if has_more {drafts.last().map(|draft|DocumentDraftCursor{updated_at:draft.updated_at,source:draft.key.source.clone()})} else {None};
             Ok(DocumentDraftPage { workspace,drafts,before:cursor,has_more })
         })
     }

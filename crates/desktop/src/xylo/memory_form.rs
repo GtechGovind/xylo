@@ -1,5 +1,6 @@
 //! Scoped Memory form autosave. IDs/generations fence late loads and receipts;
 //! persistence never occurs on the rendering thread or in the composer tables.
+use super::settings_ui;
 use super::*;
 use xylo_runtime::{MemoryFormSave, MemoryFormSnapshot, MemoryFormState, MemoryFormWrite};
 
@@ -508,12 +509,33 @@ impl Xylo {
         self.persist_memory_form(&scope, cx);
         cx.notify();
     }
+    /// Draft state under the entry form: saving, saved, a conflict with a
+    /// different saved entry, or a failed save with Retry.
+    /// Whether the closed form has anything to report (a draft, a conflict,
+    /// an error or an oversize warning); a quiet form takes no page space.
+    pub(super) fn memory_form_has_status(&self) -> bool {
+        self.facts.forms.oversize
+            || self
+                .facts
+                .forms
+                .entries
+                .get(&self.scope())
+                .is_none_or(|entry| {
+                    entry.conflict.is_some()
+                        || entry.error.is_some()
+                        || entry.dirty
+                        || entry.save.is_some()
+                        || entry.revision.is_none()
+                        || !entry.state.text.trim().is_empty()
+                        || entry.state.editing.is_some()
+                })
+    }
     pub(super) fn memory_form_status(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.facts.forms.oversize {
-            return subtitle("Current text is not saved: Memory drafts are limited to 256 KiB (262,144 UTF-8 bytes). Copy your text before shortening it.").into_any_element();
+            return settings_ui::caption("Current text is not saved: Memory drafts are limited to 256 KiB (262,144 UTF-8 bytes). Copy your text before shortening it.").into_any_element();
         }
         let Some(entry) = self.facts.forms.entries.get(&self.scope()) else {
-            return subtitle("Loading draft…").into_any_element();
+            return settings_ui::caption("Loading draft…").into_any_element();
         };
         if entry.conflict.is_none()
             && entry.error.is_none()
@@ -525,42 +547,72 @@ impl Xylo {
         {
             return div().into_any_element();
         }
-        let mut panel = div().flex().flex_col().gap_2();
         if entry.conflict.is_some() {
-            panel=panel.child(subtitle("A different saved Memory entry exists. Your text is still in the form. Choose which entry to keep."))
-            .child(div().flex().gap_2().child(button("memory-form-use-saved","Use saved entry").on_click(cx.listener(|view,_,window,cx|view.resolve_memory_form(true,window,cx))))
-                .child(button("memory-form-keep","Keep this entry").on_click(cx.listener(|view,_,window,cx|view.resolve_memory_form(false,window,cx)))));
-        } else if let Some(error) = &entry.error {
-            panel = panel.child(subtitle(error.clone())).child(
-                button("memory-form-retry", "Retry saving entry").on_click(cx.listener(
-                    |view, _, window, cx| {
-                        let scope = view.scope();
-                        if let Some(entry) = view.facts.forms.entries.get_mut(&scope) {
-                            entry.error = None;
-                        }
-                        if view
-                            .facts
-                            .forms
-                            .entries
-                            .get(&scope)
-                            .is_some_and(|entry| entry.revision.is_none())
-                        {
-                            view.memory_form_activate(window, cx);
-                        } else {
-                            view.persist_memory_form(&scope, cx);
-                        }
-                    },
-                )),
-            );
-        } else {
-            panel = panel.child(subtitle(if entry.save.is_some() || entry.dirty {
-                "Saving draft…"
-            } else if entry.revision.is_none() {
-                "Loading draft…"
-            } else {
-                "Draft saved"
-            }));
+            return div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(notice(
+                    BadgeTone::Warning,
+                    "A different saved Memory entry exists. Your text is still in the form. Choose which entry to keep.",
+                ))
+                .child(settings_ui::form_actions([
+                    settings_ui::text_button("memory-form-use-saved", "Use saved entry")
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.resolve_memory_form(true, window, cx)
+                        }))
+                        .into_any_element(),
+                    settings_ui::secondary_button("memory-form-keep", "Keep this entry")
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.resolve_memory_form(false, window, cx)
+                        }))
+                        .into_any_element(),
+                ]))
+                .into_any_element();
         }
-        panel.into_any_element()
+        if let Some(error) = &entry.error {
+            return div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(settings_ui::inline_error(error)),
+                )
+                .child(
+                    settings_ui::text_button("memory-form-retry", "Retry").on_click(cx.listener(
+                        |view, _, window, cx| {
+                            let scope = view.scope();
+                            if let Some(entry) = view.facts.forms.entries.get_mut(&scope) {
+                                entry.error = None;
+                            }
+                            if view
+                                .facts
+                                .forms
+                                .entries
+                                .get(&scope)
+                                .is_some_and(|entry| entry.revision.is_none())
+                            {
+                                view.memory_form_activate(window, cx);
+                            } else {
+                                view.persist_memory_form(&scope, cx);
+                            }
+                        },
+                    )),
+                )
+                .into_any_element();
+        }
+        settings_ui::caption(if entry.save.is_some() || entry.dirty {
+            "Saving draft…"
+        } else if entry.revision.is_none() {
+            "Loading draft…"
+        } else {
+            "Draft saved"
+        })
+        .into_any_element()
     }
 }

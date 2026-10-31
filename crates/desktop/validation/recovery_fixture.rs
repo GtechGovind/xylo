@@ -58,6 +58,7 @@ pub fn seeded(count: usize) -> Profile {
             provider: AppSettings::default().provider,
             permissions: AppSettings::default().permissions,
             attachments: vec![],
+            approved_rules: vec![],
         })
         .unwrap();
     let mut profile = Profile {

@@ -140,16 +140,14 @@ fn execute_blocking(
                     let mut text = String::new();
                     loop {
                         match reader.read_event()? {
-                            quick_xml::events::Event::Text(t) => {
-                                text.push_str(&quick_xml::escape::unescape(&t.decode()?)?)
-                            }
+                            quick_xml::events::Event::Text(t) => text.push_str(&t.xml10_content()),
                             quick_xml::events::Event::GeneralRef(reference) => {
                                 text.push_str(&quick_xml::escape::unescape(&format!(
                                     "&{};",
-                                    reference.decode()?
+                                    reference.xml10_content()
                                 ))?);
                             }
-                            quick_xml::events::Event::End(e) if e.name().as_ref() == b"w:p" => {
+                            quick_xml::events::Event::End(e) if e.name().as_ref() == "w:p" => {
                                 text.push('\n')
                             }
                             quick_xml::events::Event::Eof => break,
@@ -410,7 +408,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
         definition(
             "document_export_xlsx",
             "Create an XLSX artifact using native rust_xlsxwriter. Text remains text, including strings beginning with '='.",
-            json!({"name":{"type":"string"},"sheet":{"type":"string"},"rows":{"type":"array","items":{"type":"array"}}}),
+            json!({"name":{"type":"string"},"sheet":{"type":"string"},"rows":{"type":"array","items":{"type":"array","items":{"type":["string","number","boolean","null"]}}}}),
             &["name", "rows"],
             true,
         ),
@@ -425,58 +423,4 @@ pub fn definitions() -> Vec<ToolDefinition> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn config(root: &Path) -> CapabilityConfig {
-        CapabilityConfig {
-            workspace: root.canonicalize().unwrap(),
-            artifacts: root.canonicalize().unwrap(),
-            ..Default::default()
-        }
-    }
-    #[tokio::test]
-    async fn office_exports_round_trip_text_and_numbers_offline() {
-        let temp = tempfile::tempdir().unwrap();
-        let cfg = config(temp.path());
-        execute(
-            &cfg,
-            "document_export_xlsx",
-            &json!({"name":"sample","rows":[["=1+1",42], ["Station", "A"]]}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        let result = execute(
-            &cfg,
-            "document_read",
-            &json!({"path":"sample.xlsx"}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(result.summary.contains("=1+1") && result.summary.contains("42"));
-        execute(&cfg, "document_export_docx", &json!({"name":"report","paragraphs":["A & B <C>"],"sources":[{"title":"Source","url":"https://example.com"}]}), CancellationToken::new()).await.unwrap();
-        let result = execute(
-            &cfg,
-            "document_read",
-            &json!({"path":"report.docx"}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(result.summary.contains("A & B <C>"));
-        assert!(
-            execute(
-                &cfg,
-                "document_export_docx",
-                &json!({"name":"report","paragraphs":["overwrite"]}),
-                CancellationToken::new()
-            )
-            .await
-            .is_err()
-        );
-    }
-}
-
-#[cfg(test)]
-mod editing_tests;
+mod tests;

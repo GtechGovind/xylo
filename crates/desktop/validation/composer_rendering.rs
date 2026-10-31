@@ -3,6 +3,13 @@
 //! project. No prompt is sent, no account is read and no device is activated.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/assets.rs"]
+mod assets;
+mod capture_dir;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -113,9 +120,11 @@ mod xylo {
                 ..Default::default()
             };
             self.provider_form(&account, window, cx);
-            self.account_result("account_chatgpt_status",&serde_json::json!({"connected":true,"plan_usage_authorized":true,"email":"fixture-account@example.invalid"}),window,cx);
+            // A connected, authorized account with no saved ChatGPT connection
+            // loads its models as soon as its status arrives, so discovery is
+            // captured before the status is delivered.
             self.provider_discovery.test_dispatch = true;
-            self.use_chatgpt(window, cx);
+            self.account_result("account_chatgpt_status",&serde_json::json!({"connected":true,"plan_usage_authorized":true,"email":"fixture-account@example.invalid"}),window,cx);
             if ready {
                 let (generation, provider) = self
                     .provider_discovery
@@ -169,6 +178,7 @@ mod xylo {
             .into_iter()
             .map(|prompt| {
                 let turn = TurnRequest {
+                    approved_rules: Vec::new(),
                     session_id: self.session,
                     turn_id: Uuid::new_v4(),
                     workspace: self.workspace.clone().unwrap(),
@@ -240,7 +250,7 @@ fn render() {
     let store = Store::open(&paths.database).unwrap();
     let mut settings = AppSettings {
         last_workspace: Some(workspace.clone()),
-        permissions: PermissionMode::AskForWrites,
+        permissions: PermissionMode::AskForApproval,
         theme: "light".into(),
         ..Default::default()
     };
@@ -259,7 +269,7 @@ fn render() {
     let client = host.0.clone();
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        Arc::new(crate::assets::AppAssets),
         platform::current_headless_renderer,
     );
     cx.allow_parking();
@@ -312,13 +322,7 @@ fn render() {
     .unwrap();
     cx.run_until_parked();
 
-    let output = std::env::var_os("XYLO_RENDER_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../../../work/xylo-composer-rendering")
-        });
-    std::fs::create_dir_all(&output).unwrap();
+    let output = capture_dir::fresh("composer-rendering");
     let mut cases = Vec::new();
     for theme in ["light", "dark"] {
         settings.theme = theme.into();
@@ -338,17 +342,17 @@ fn render() {
                     view.read(cx).composer_capture_healthy();
                     window.render_frame(cx);
                     assert_eq!(window.viewport_size(), size(px(width as f32), px(880.)));
+                    // The context ring stays hidden until a chat uses 5% of the window.
                     let ids = [
                         "composer-context-actions",
                         "composer-permissions",
-                        "composer-context",
                         "composer-model",
                         "record-voice-composer",
                         "send-prompt",
                     ];
-                    assert_eq!(window.find("composer-context-actions").label().as_deref(), Some("Add context"));
-                    assert_eq!(window.find("composer-permissions").label().as_deref(), Some("Ask first"));
-                    assert_eq!(window.find("composer-context").label().as_deref(), Some("Context window"));
+                    assert_eq!(window.find("composer-context-actions").label(), Some("Add context"));
+                    assert_eq!(window.find("composer-permissions").label(), Some("Ask for approval"));
+                    assert!(window.try_find("composer-context").is_none(), "A fresh chat has no context ring");
                     let mut controls = Vec::new();
                     let mut previous_right = None;
                     let mut center_y = None::<Pixels>;
@@ -416,14 +420,12 @@ fn render() {
             screenshot.save(&destination).unwrap();
             cx.update_window(handle, |_, window, cx| {
                 window.click("composer-model", cx);
-                let model = window.find("composer-model-options").bounds();
-                let reset = window.find("composer-effort-default").bounds();
-                let effort = window.find(("composer-effort", 2usize)).bounds();
+                let panel = window.find("composer-model-panel").bounds();
+                let effort = window.find("composer-effort").bounds();
                 assert!(
-                    model.size.width <= px(260.) && effort.bottom() - reset.top() <= px(200.),
-                    "Model and effort controls must stay compact"
+                    panel.size.width <= px(340.) && effort.bottom() <= panel.bottom(),
+                    "Model and effort controls must stay compact inside the picker"
                 );
-                assert!(window.try_find(("composer-effort", 2usize)).is_some());
             })
             .unwrap();
             let popup_image = format!("composer-{theme}-{width}-model-popover.png");
@@ -451,7 +453,7 @@ fn render() {
             cases.push(serde_json::json!({
                 "geometry":geometry,"existing_chat_anchor":anchor,"image":filename,"model_popover_image":popup_image,
                 "pixels":[screenshot.width(),screenshot.height()],
-                "sha256":format!("{:x}",Sha256::digest(std::fs::read(destination).unwrap())),
+                "sha256":hex::encode(Sha256::digest(std::fs::read(destination).unwrap())),
             }));
         }
     }
@@ -548,7 +550,7 @@ fn render() {
             cx.update_window(handle, |_, window, cx| {
                 view.update(cx, |view, cx| view.account_capture(ready, window, cx));
                 window.render_frame(cx);
-                assert!(window.try_find("chatgpt-use-account").is_some());
+                assert!(window.try_find("chatgpt-refresh-models").is_some());
                 assert_eq!(
                     window.try_find("provider-cancel-discovery").is_some(),
                     !ready
@@ -596,7 +598,7 @@ fn render() {
         ("native-Cargo.lock", include_bytes!("Cargo.lock").as_slice()),
     ]
     .into_iter()
-    .map(|(path, bytes)| (path, format!("{:x}", Sha256::digest(bytes))))
+    .map(|(path, bytes)| (path, hex::encode(Sha256::digest(bytes))))
     .collect::<std::collections::BTreeMap<_, _>>();
     let metadata = serde_json::json!({
         "schema":1,

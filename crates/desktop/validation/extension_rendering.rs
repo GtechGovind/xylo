@@ -3,6 +3,13 @@
 //! No remote discovery, model inference, account credentials or physical desktop.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/assets.rs"]
+mod assets;
+mod capture_dir;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -82,7 +89,7 @@ fn render() {
     let client = host.0.clone();
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        Arc::new(crate::assets::AppAssets),
         platform::current_headless_renderer,
     );
     cx.allow_parking();
@@ -120,10 +127,7 @@ fn render() {
         }
     };
     wait(&mut cx, &|view| view.capture_ready());
-    let output = std::env::var_os("XYLO_RENDER_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "target/native-preview".into());
-    std::fs::create_dir_all(&output).unwrap();
+    let output = capture_dir::fresh("extension-rendering");
     let package = temporary.path().join("workspace-diagnostics");
     std::fs::create_dir_all(package.join("skills/check-project")).unwrap();
     std::fs::write(package.join("skills/check-project/SKILL.md"), "---\nname: check-project\ndescription: Inspect the selected project and report actionable diagnostics.\n---\nRead project configuration before running checks. Report evidence and preserve user changes.\n").unwrap();
@@ -136,6 +140,37 @@ fn render() {
     let catalog = xylo_services::extensions::ExtensionService::new(
         temporary.path().join("profile/extensions"),
     );
+    // The setup page is a scrolling form: bring a control into view the way a
+    // person would, by scrolling over a visible part of the page.
+    fn reveal(window: &mut Window, id: &'static str, cx: &mut App) {
+        const ANCHORS: [&str; 6] = [
+            "extension-setup-advanced",
+            "extension-setup-folder",
+            "extension-secret-save",
+            "extension-setup-back",
+            "extension-setup-save",
+            "extension-setup-verify",
+        ];
+        for _ in 0..10 {
+            window.render_frame(cx);
+            let target = window.find(id);
+            if target.visible() {
+                return;
+            }
+            let down = target.bounds().top() > window.viewport_size().height / 2.;
+            let Some(anchor) = ANCHORS
+                .into_iter()
+                .find(|anchor| window.try_find(*anchor).is_some_and(|node| node.visible()))
+            else {
+                return;
+            };
+            window.scroll(
+                anchor,
+                ScrollDelta::Pixels(point(px(0.), px(if down { -300. } else { 300. }))),
+                cx,
+            );
+        }
+    }
     let wait_controls = |cx: &mut HeadlessAppContext, id: &'static str| {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -161,12 +196,13 @@ fn render() {
     };
     cx.update_window(handle, |_, window, cx| {
         window.click("settings", cx);
-        window.click("nav-skills", cx);
+        // Sidebar order: Connections, then Plugins in "Tools & integrations".
+        window.click("nav-connections", cx);
         window.press("tab", cx);
         assert_eq!(
             window.find("nav-plugins").focused(),
             Some(true),
-            "Tab from Skills must reach Plugins"
+            "Tab from Connections must reach Plugins"
         );
     })
     .unwrap();
@@ -183,22 +219,22 @@ fn render() {
         );
         window.click("nav-skills", cx);
         window.render_frame(cx);
-        assert!(window.find("manage-portable-skills").visible());
+        assert!(window.find("skills-browse-plugins").visible());
     })
     .unwrap();
-    wait_controls(&mut cx, "refresh-learning");
+    wait(&mut cx, &|v| v.validation_learning_idle());
     cx.capture_screenshot(handle)
         .unwrap()
-        .save(output.join("saved-procedures-link.png"))
+        .save(output.join("skills-page.png"))
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
-        window.click("manage-portable-skills", cx);
+        window.click("skills-browse-plugins", cx);
         window.render_frame(cx);
         assert!(window.find("extensions-refresh").visible());
         window.click("nav-plugins", cx);
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait(&mut cx, &|v| v.validation_extensions_idle());
     cx.update_window(handle, |_, _, cx| {
         view.update(cx, |v, cx| {
             v.extension_review_request(
@@ -209,7 +245,7 @@ fn render() {
         })
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait_controls(&mut cx, "extension-review-enable");
     let installed = catalog.list().unwrap();
     assert_eq!(
         installed.len(),
@@ -235,10 +271,17 @@ fn render() {
     assert!(mcp.evidence.is_none());
     let package_id = installed[0].id.clone();
     cx.update_window(handle, |_, window, cx| {
-        window.click(("extension-enable", 0usize), cx);
+        // The review ends with its decision: scroll past the contents first.
+        window.scroll(
+            "extension-review-back",
+            ScrollDelta::Pixels(point(px(0.), px(-2000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        window.click("extension-review-enable", cx);
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait(&mut cx, &|v| v.validation_extensions_idle());
     assert!(
         catalog.list().unwrap()[0].enabled,
         "Actual Host must persist enable"
@@ -249,7 +292,9 @@ fn render() {
         .position(|c| c.name == "mcpServers")
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
-        for _ in 0..30 {
+        window.render_frame(cx);
+        // From the top of the window: past the settings sidebar and the page header.
+        for _ in 0..80 {
             if window.find(("extension-configure", mcp_index)).focused() == Some(true) {
                 break;
             }
@@ -279,6 +324,7 @@ fn render() {
         .save(output.join("mcp-setup-initial.png"))
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
+        reveal(window, "extension-setup-save", cx);
         window.click("extension-setup-save", cx)
     })
     .unwrap();
@@ -291,6 +337,7 @@ fn render() {
         "Saving setup must not claim execution"
     );
     cx.update_window(handle, |_, window, cx| {
+        reveal(window, "extension-setup-verify", cx);
         window.click("extension-setup-verify", cx)
     })
     .unwrap();
@@ -306,9 +353,20 @@ fn render() {
         .save(output.join("mcp-setup-verified.png"))
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
+        reveal(window, "extension-setup-advanced", cx);
         window.click("extension-setup-advanced", cx);
         let field = window.find_by_label("Non-secret environment variables");
-        window.click(field.path().last().unwrap().clone(), cx);
+        // Every input's own view is "input-state"; its keyed wrapper is unique.
+        window.click(
+            field
+                .path()
+                .iter()
+                .rev()
+                .find(|id| matches!(id, ElementId::NamedInteger(..)))
+                .unwrap()
+                .clone(),
+            cx,
+        );
         window.input("XYLO_DIAGNOSTIC_MODE=review", cx);
         window.render_frame(cx);
         assert_eq!(
@@ -324,13 +382,29 @@ fn render() {
         .save(output.join("mcp-setup-dirty.png"))
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
+        // Undo the edit so Back leaves without the discard prompt, which a
+        // headless window cannot answer.
+        window.press(
+            if cfg!(target_os = "macos") {
+                "cmd-a"
+            } else {
+                "ctrl-a"
+            },
+            cx,
+        );
+        window.press("backspace", cx);
+        window.render_frame(cx);
+        reveal(window, "extension-setup-back", cx);
         window.click("extension-setup-back", cx)
     })
     .unwrap();
+    wait(&mut cx, &|v| !v.validation_extension_setup_open());
     for theme in ["dark", "light"] {
-        let mut settings = xylo_core::AppSettings::default();
-        settings.theme = theme.into();
-        settings.last_workspace = Some(project.clone());
+        let settings = xylo_core::AppSettings {
+            theme: theme.into(),
+            last_workspace: Some(project.clone()),
+            ..Default::default()
+        };
         client.save_settings(settings).unwrap();
         wait(&mut cx, &|v| v.extension_review_theme() == theme);
         for width in [1000_u32, 1380, 1920] {
@@ -342,11 +416,15 @@ fn render() {
             cx.run_until_parked();
             for (tab, label) in [(1usize, "installed"), (0, "discover"), (2, "sources")] {
                 cx.update_window(handle, |_, window, cx| {
-                    window.click(("extensions-tab", tab), cx);
+                    if window.try_find("extension-detail-back").is_some() {
+                        window.click("extension-detail-back", cx);
+                        window.render_frame(cx);
+                    }
+                    window.click(SharedString::from(format!("extensions-tab-{tab}")), cx);
                     window.render_frame(cx);
                     assert!(window.find("nav-plugins").visible());
                     for i in 0usize..3 {
-                        let tab = window.find(("extensions-tab", i));
+                        let tab = window.find(SharedString::from(format!("extensions-tab-{i}")));
                         assert!(tab.visible());
                         let b = tab.bounds();
                         assert!(b.right() <= px(width as f32) && b.left() >= px(0.));
@@ -354,8 +432,8 @@ fn render() {
                     assert!(window.find("extensions-local").visible());
                     if label == "installed" {
                         assert_eq!(
-                            window.find(("extension-enable", 0usize)).label().as_deref(),
-                            Some("Disable")
+                            window.find(("extension-enable", 0usize)).checked(),
+                            Some(true)
                         );
                     }
                 })
@@ -366,11 +444,14 @@ fn render() {
                     .unwrap();
                 if label == "installed" {
                     cx.update_window(handle, |_, window, cx| {
+                        window.click(("extension-details", 0usize), cx);
+                        window.render_frame(cx);
                         window.click(("extension-configure", mcp_index), cx)
                     })
                     .unwrap();
                     wait_controls(&mut cx, "extension-setup-verify");
                     cx.update_window(handle, |_, window, cx| {
+                        reveal(window, "extension-setup-advanced", cx);
                         window.click("extension-setup-advanced", cx)
                     })
                     .unwrap();
@@ -405,6 +486,7 @@ fn render() {
                             ScrollDelta::Pixels(point(px(0.), px(600.))),
                             cx,
                         );
+                        reveal(window, "extension-setup-back", cx);
                         window.click("extension-setup-back", cx);
                     })
                     .unwrap();
@@ -413,7 +495,11 @@ fn render() {
         }
     }
     cx.update_window(handle, |_, window, cx| {
-        window.click(("extensions-tab", 1usize), cx)
+        if window.try_find("extension-detail-back").is_some() {
+            window.click("extension-detail-back", cx);
+            window.render_frame(cx);
+        }
+        window.click("extensions-tab-1", cx)
     })
     .unwrap();
     for component in ["hooks", "lspServers"] {
@@ -423,18 +509,36 @@ fn render() {
             .position(|c| c.name == component)
             .unwrap();
         cx.update_window(handle, |_, window, cx| {
+            if window.try_find(("extension-details", 0usize)).is_some() {
+                window.click(("extension-details", 0usize), cx);
+                window.render_frame(cx);
+            }
             window.click(("extension-configure", component_index), cx)
         })
         .unwrap();
         wait_controls(&mut cx, "extension-setup-save");
         if component == "hooks" {
             assert!(!project.join("native-hook-verified.txt").exists());
+            // Automatic events can be turned on only once the setup they run
+            // with is complete and saved.
             cx.update_window(handle, |_, window, cx| {
+                assert_eq!(
+                    window.find(("extension-hook-event", 1usize)).disabled(),
+                    Some(true)
+                );
+                reveal(window, "extension-setup-save", cx);
+                window.click("extension-setup-save", cx)
+            })
+            .unwrap();
+            wait_controls(&mut cx, "extension-setup-verify");
+            cx.update_window(handle, |_, window, cx| {
+                reveal(window, "extension-setup-folder", cx);
                 window.click(("extension-hook-event", 1usize), cx)
             })
             .unwrap();
         }
         cx.update_window(handle, |_, window, cx| {
+            reveal(window, "extension-setup-save", cx);
             window.click("extension-setup-save", cx)
         })
         .unwrap();
@@ -455,6 +559,7 @@ fn render() {
             );
         }
         cx.update_window(handle, |_, window, cx| {
+            reveal(window, "extension-setup-verify", cx);
             window.click("extension-setup-verify", cx)
         })
         .unwrap();
@@ -476,6 +581,7 @@ fn render() {
             .save(output.join(format!("{component}-setup-verified.png")))
             .unwrap();
         cx.update_window(handle, |_, window, cx| {
+            reveal(window, "extension-setup-back", cx);
             window.click("extension-setup-back", cx)
         })
         .unwrap();
@@ -484,7 +590,11 @@ fn render() {
     std::fs::create_dir_all(&failing).unwrap();
     std::fs::write(failing.join(".mcp.json"),serde_json::json!({"mcpServers":{"unavailable":{"command":"node","args":["-e","process.exit(23)"]}}}).to_string()).unwrap();
     cx.update_window(handle, |_, window, cx| {
-        window.click(("extensions-tab", 1usize), cx);
+        if window.try_find("extension-detail-back").is_some() {
+            window.click("extension-detail-back", cx);
+            window.render_frame(cx);
+        }
+        window.click("extensions-tab-1", cx);
         view.update(cx, |v, cx| {
             v.extension_review_request(
                 "extension_install_local",
@@ -494,7 +604,7 @@ fn render() {
         });
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait_controls(&mut cx, "extension-review-enable");
     let failed_package = catalog
         .list()
         .unwrap()
@@ -508,22 +618,30 @@ fn render() {
         .position(|p| p.id == failed_package.id)
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
-        window.click(("extension-enable", failed_index), cx)
+        window.scroll(
+            "extension-review-back",
+            ScrollDelta::Pixels(point(px(0.), px(-2000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        window.click("extension-review-enable", cx)
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait(&mut cx, &|v| v.validation_extensions_idle());
     cx.update_window(handle, |_, window, cx| {
         window.click(("extension-configure", failed_index * 1000), cx)
     })
     .unwrap();
     wait_controls(&mut cx, "extension-setup-save");
     cx.update_window(handle, |_, window, cx| {
+        reveal(window, "extension-setup-save", cx);
         window.click("extension-setup-save", cx)
     })
     .unwrap();
     wait_controls(&mut cx, "extension-setup-verify");
     for attempt in 1..=2 {
         cx.update_window(handle, |_, window, cx| {
+            reveal(window, "extension-setup-verify", cx);
             window.click("extension-setup-verify", cx)
         })
         .unwrap();
@@ -542,11 +660,19 @@ fn render() {
             .unwrap();
     }
     cx.update_window(handle, |_, window, cx| {
+        reveal(window, "extension-setup-back", cx);
         window.click("extension-setup-back", cx);
-        window.click(("extension-remove", failed_index), cx);
+        // Removal confirms through a native prompt; drive the confirmed request.
+        view.update(cx, |v, cx| {
+            v.extension_review_request(
+                "extension_remove",
+                serde_json::json!({"id": failed_package.id}),
+                cx,
+            )
+        });
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait(&mut cx, &|v| v.validation_extensions_idle());
     let stalled = temporary.path().join("stalled-diagnostics");
     std::fs::create_dir_all(&stalled).unwrap();
     std::fs::write(stalled.join(".mcp.json"),serde_json::json!({"mcpServers":{"waiting":{"command":"node","args":["${CLAUDE_PLUGIN_ROOT}/stall.cjs"]}}}).to_string()).unwrap();
@@ -561,7 +687,7 @@ fn render() {
         })
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait_controls(&mut cx, "extension-review-enable");
     let stalled_package = catalog
         .list()
         .unwrap()
@@ -575,21 +701,29 @@ fn render() {
         .position(|p| p.id == stalled_package.id)
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
-        window.click(("extension-enable", stalled_index), cx)
+        window.scroll(
+            "extension-review-back",
+            ScrollDelta::Pixels(point(px(0.), px(-2000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        window.click("extension-review-enable", cx)
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait(&mut cx, &|v| v.validation_extensions_idle());
     cx.update_window(handle, |_, window, cx| {
         window.click(("extension-configure", stalled_index * 1000), cx)
     })
     .unwrap();
     wait_controls(&mut cx, "extension-setup-save");
     cx.update_window(handle, |_, window, cx| {
+        reveal(window, "extension-setup-save", cx);
         window.click("extension-setup-save", cx)
     })
     .unwrap();
     wait_controls(&mut cx, "extension-setup-verify");
     cx.update_window(handle, |_, window, cx| {
+        reveal(window, "extension-setup-verify", cx);
         window.click("extension-setup-verify", cx)
     })
     .unwrap();
@@ -600,6 +734,7 @@ fn render() {
         .save(output.join("mcp-verification-cancellable.png"))
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
+        reveal(window, "extension-cancel", cx);
         assert!(window.find("extension-cancel").visible());
         window.click("extension-cancel", cx);
         assert_eq!(
@@ -667,31 +802,44 @@ fn render() {
         .save(output.join("mcp-verification-cancelled.png"))
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
+        reveal(window, "extension-setup-back", cx);
         window.click("extension-setup-back", cx);
-        window.click(("extension-remove", stalled_index), cx);
+        view.update(cx, |v, cx| {
+            v.extension_review_request(
+                "extension_remove",
+                serde_json::json!({"id": stalled_package.id}),
+                cx,
+            )
+        });
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait(&mut cx, &|v| v.validation_extensions_idle());
     cx.update_window(handle, |_, window, cx| {
-        window.click(("extensions-tab", 1usize), cx);
+        if window.try_find("extension-detail-back").is_some() {
+            window.click("extension-detail-back", cx);
+            window.render_frame(cx);
+        }
+        window.click("extensions-tab-1", cx);
+        window.render_frame(cx);
         window.click(("extension-enable", 0usize), cx);
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait(&mut cx, &|v| v.validation_extensions_idle());
     assert!(!catalog.list().unwrap()[0].enabled);
-    cx.update_window(handle, |_, window, cx| {
-        window.click(("extension-remove", 0usize), cx)
+    let remaining = catalog.list().unwrap()[0].id.clone();
+    cx.update_window(handle, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.extension_review_request("extension_remove", serde_json::json!({"id": remaining}), cx)
+        })
     })
     .unwrap();
-    wait_controls(&mut cx, "extensions-refresh");
+    wait(&mut cx, &|v| v.validation_extensions_idle());
     assert!(
         catalog.list().unwrap().is_empty(),
         "Actual Host must persist removal"
     );
-    cx.update_window(handle, |_, window, cx| {
-        window.click(("extensions-tab", 2usize), cx)
-    })
-    .unwrap();
+    cx.update_window(handle, |_, window, cx| window.click("extensions-tab-2", cx))
+        .unwrap();
     let initial_sources = catalog.sources().unwrap().len();
     for (source_input, revision, directory) in [
         ("openai/skills.git", "HEAD", ""),
@@ -702,8 +850,22 @@ fn render() {
         ),
     ] {
         cx.update_window(handle, |_, window, cx| {
+            if window.try_find("extension-source-new").is_some() {
+                window.click("extension-source-new", cx);
+                window.render_frame(cx);
+            }
             let field = window.find_by_label("GitHub repository or directory URL");
-            window.click(field.path().last().unwrap().clone(), cx);
+            // Every input's own view is "input-state"; its keyed wrapper is unique.
+            window.click(
+                field
+                    .path()
+                    .iter()
+                    .rev()
+                    .find(|id| matches!(id, ElementId::NamedInteger(..)))
+                    .unwrap()
+                    .clone(),
+                cx,
+            );
             window.press(
                 if cfg!(target_os = "macos") {
                     "cmd-a"
@@ -716,7 +878,7 @@ fn render() {
             window.click("extension-source-add", cx);
         })
         .unwrap();
-        wait_controls(&mut cx, "extension-source-add");
+        wait(&mut cx, &|v| v.validation_extensions_idle());
         assert!(
             catalog
                 .sources()
@@ -734,8 +896,22 @@ fn render() {
         ("invalid", "https://not-github.invalid/owner/repo"),
     ] {
         cx.update_window(handle, |_, window, cx| {
+            if window.try_find("extension-source-new").is_some() {
+                window.click("extension-source-new", cx);
+                window.render_frame(cx);
+            }
             let field = window.find_by_label("GitHub repository or directory URL");
-            window.click(field.path().last().unwrap().clone(), cx);
+            // Every input's own view is "input-state"; its keyed wrapper is unique.
+            window.click(
+                field
+                    .path()
+                    .iter()
+                    .rev()
+                    .find(|id| matches!(id, ElementId::NamedInteger(..)))
+                    .unwrap()
+                    .clone(),
+                cx,
+            );
             window.press(
                 if cfg!(target_os = "macos") {
                     "cmd-a"
@@ -748,7 +924,7 @@ fn render() {
             window.click("extension-source-add", cx);
         })
         .unwrap();
-        wait_controls(&mut cx, "extension-source-add");
+        wait(&mut cx, &|v| v.validation_extensions_idle());
         assert_eq!(
             catalog.sources().unwrap().len(),
             initial_sources + 2,
@@ -764,14 +940,14 @@ fn render() {
             window.click(("extension-source-remove", index), cx)
         })
         .unwrap();
-        wait_controls(&mut cx, "extension-source-add");
+        wait(&mut cx, &|v| v.validation_extensions_idle());
     }
     assert_eq!(
         catalog.sources().unwrap().len(),
         initial_sources,
         "Native remove must persist source cleanup"
     );
-    std::fs::write(output.join("lifecycle.json"),serde_json::to_vec_pretty(&serde_json::json!({"platform":"macOS native offscreen GPU","local_install":true,"package_id":package_id,"enable":true,"disable":true,"remove":true,"discovery_network_requested":false,"physical_desktop_verified":false})).unwrap()).unwrap();
+    std::fs::write(output.join("lifecycle.json"),serde_json::to_vec_pretty(&serde_json::json!({"platform":"macOS native offscreen GPU","local_install":true,"package_id":package_id,"enable":true,"disable":true,"remove":true,"discovery_network_requested":true,"physical_desktop_verified":false})).unwrap()).unwrap();
     client.shutdown().unwrap();
     println!(
         "Portable extension lifecycle and captures passed: {}",

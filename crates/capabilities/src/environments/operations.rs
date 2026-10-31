@@ -20,10 +20,9 @@ async fn settle_capture(
     .await?
 }
 fn digest(action: EnvironmentAction, args: &impl serde::Serialize) -> Result<String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&(action, args))?)
-    ))
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
+        action, args,
+    ))?)))
 }
 fn pending(state: EnvironmentOperationState) -> bool {
     matches!(

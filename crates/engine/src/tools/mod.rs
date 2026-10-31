@@ -1,15 +1,28 @@
-//! Application-owned durable tool and permission boundary. External tool metadata
-//! cannot supply its own permission flag; native classifications come from code.
+//! Application-owned durable tool and permission boundary.
+//!
+//! Every tool call is a journaled action with an idempotency key. Before an
+//! intent exists the broker classifies the call (external metadata cannot
+//! supply its own permission flag), reads the live permission mode and asks
+//! [`permissions::decide`] whether it runs, needs the user's decision or is
+//! refused. Writes to one file are serialized process-wide from preview to
+//! write, so concurrent edits of one file in a batch both land and each
+//! approval shows the change against current content. Child brokers created
+//! for delegated work share the journal, the mode and the turn's approved
+//! rules, and stamp their events with the parent `agent_delegate` action.
 mod builtin;
 mod code;
 mod image_generation;
+mod permissions;
 mod portable;
+mod risk;
+use crate::prompts;
 use anyhow::{Context, Result, bail, ensure};
 pub(crate) use code::shell_name;
 use parking_lot::Mutex;
+pub use permissions::{ApprovalGate, PermissionCell, ToolSession};
+use permissions::{Call, Origin, Reach, RuleSet, Verdict};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{Arc, mpsc},
     time::Duration,
@@ -18,94 +31,55 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xylo_capabilities::{CapabilityConfig, CapabilityService};
 use xylo_core::{
-    ConnectorConfig, EngineEvent, MemoryRecord, PermissionMode, ToolDefinition, TurnRequest,
+    ConnectorConfig, EngineEvent, MemoryRecord, PermissionMode, ToolDefinition, TurnPhase,
+    TurnRequest,
 };
 use xylo_services::{
-    ActionDecision, ActionIntent, ConnectorBroker, ConnectorLaunchScope, CredentialVault,
-    JournalAction, LearningService, NativeConnectors, SqliteMemory, Store,
+    ActionDecision, ActionIntent, ConnectorBroker, ConnectorLaunchScope, JournalAction,
+    LearningService, NativeConnectors, SqliteMemory, Store,
 };
 
-type Delegate = Arc<dyn Fn(&str, Value) -> Result<Value> + Send + Sync>;
-#[derive(Default)]
-struct GateState {
-    pending: HashMap<Uuid, (mpsc::SyncSender<bool>, Option<String>)>,
-    /// Rules the user chose to always allow; they live as long as this
-    /// worker's chat session and never cover reads-only policy or other chats.
-    remembered: std::collections::HashSet<String>,
-}
-/// Approval channels are installed before emitting a request and authorize one action.
-#[derive(Clone, Default)]
-pub struct ApprovalGate(Arc<Mutex<GateState>>);
-impl ApprovalGate {
-    pub fn decide(&self, id: Uuid, allow: bool) -> Result<()> {
-        self.decide_with(id, allow, false)
-    }
-    /// `remember` also allows later actions with the same rule in this chat.
-    pub fn decide_with(&self, id: Uuid, allow: bool, remember: bool) -> Result<()> {
-        let sender = {
-            let mut state = self.0.lock();
-            let (sender, rule) = state
-                .pending
-                .remove(&id)
-                .context("Approval is no longer pending")?;
-            if allow
-                && remember
-                && let Some(rule) = rule
-            {
-                state.remembered.insert(rule);
-            }
-            sender
-        };
-        sender
-            .send(allow)
-            .context("Task stopped before receiving the decision")
-    }
-    fn remembered(&self, rule: &str) -> bool {
-        self.0.lock().remembered.contains(rule)
-    }
-    fn install(&self, id: Uuid, sender: mpsc::SyncSender<bool>, rule: Option<String>) {
-        self.0.lock().pending.insert(id, (sender, rule));
-    }
-    fn withdraw(&self, id: Uuid) {
-        self.0.lock().pending.remove(&id);
-    }
+/// A request to run a delegated task in a child agent.
+pub struct DelegateCall {
+    /// Durable journal key of the parent `agent_delegate` call; namespaces the child's actions.
+    pub parent_key: String,
+    /// The parent `agent_delegate` action; child tool events carry it as `parent_id`.
+    pub parent_action_id: Uuid,
+    /// The model's `agent_delegate` arguments.
+    pub arguments: Value,
 }
 
-/// The rule key and its human description for "always allow in this chat".
-fn approval_rule(name: &str, arguments: &Value) -> Option<(String, String)> {
-    let text = |key: &str| arguments.get(key).and_then(Value::as_str);
-    match name {
-        "file_write" | "file_edit" => Some(("edit".into(), "file edits in this project".into())),
-        "run_command" => {
-            let program = text("program")?;
-            let first = arguments
-                .get("args")
-                .and_then(Value::as_array)
-                .and_then(|args| args.first())
-                .and_then(Value::as_str)
-                .filter(|arg| !arg.starts_with('-'));
-            let command = match first {
-                Some(first) => format!("{program} {first}"),
-                None => program.to_owned(),
-            };
-            Some((format!("run:{command}"), format!("`{command}` commands")))
-        }
-        "shell_command" => {
-            let command = text("command")?;
-            Some((format!("shell:{command}"), "this exact command".into()))
-        }
-        "memory_remember" => Some(("memory".into(), "saving project facts".into())),
-        "connector_call" => {
-            let connector = text("connector_id")?;
-            let tool = text("tool")?;
-            Some((
-                format!("connector:{connector}:{tool}"),
-                format!("`{tool}` on this connector"),
-            ))
-        }
-        _ => None,
-    }
-}
+/// Runs a delegated task and returns the child's result.
+pub type Delegate = Arc<dyn Fn(&DelegateCall) -> Result<Value> + Send + Sync>;
+
+/// Tools offered to the model directly in every mode that allows them; the
+/// rest stay discoverable through `search_tools` and `call_tool`.
+const CORE_TOOLS: [&str; 19] = [
+    "extension_skill",
+    "extension_resource",
+    "file_read",
+    "file_edit",
+    "file_write",
+    "files_list",
+    "find_files",
+    "search_project",
+    "git_status",
+    "git_diff",
+    "run_command",
+    "shell_command",
+    "todo_write",
+    "agent_delegate",
+    "memory_search",
+    "memory_remember",
+    "skill_read",
+    "search_tools",
+    "call_tool",
+];
+
+/// Largest approval or start presentation; long arguments are excerpted so an
+/// event can never approach the worker's protocol line limit.
+const PRESENTATION_EVENT_BYTES: usize = 256 * 1024;
+
 pub struct ToolBroker {
     request: TurnRequest,
     store: Store,
@@ -113,15 +87,20 @@ pub struct ToolBroker {
     capabilities: CapabilityService,
     capability_config: CapabilityConfig,
     definitions: Vec<ToolDefinition>,
-    /// Immutable turn-admission discovery snapshot; dispatch still authorizes live.
+    /// Tools usable in this turn (configured image provider, existing
+    /// connectors); the live mode filters them again at every read.
     advertised: Vec<ToolDefinition>,
     allowed_tools: Option<std::collections::HashSet<String>>,
-    approvals: ApprovalGate,
+    session: ToolSession,
+    /// "Always allow" rule keys in force for this turn, shared with children.
+    rules: RuleSet,
+    /// The `agent_delegate` action this child broker works for.
+    parent_id: Option<Uuid>,
     events: tokio::sync::mpsc::Sender<EngineEvent>,
     cancel: CancellationToken,
     artifacts: PathBuf,
     runtime: tokio::runtime::Handle,
-    resources: xylo_runtime::resources::ResourceManager,
+    resources: xylo_resources::ResourceManager,
     delegate: Mutex<Option<Delegate>>,
     connectors: ConnectorBroker,
     native: NativeConnectors,
@@ -132,7 +111,7 @@ impl ToolBroker {
         request: TurnRequest,
         store: Store,
         config: CapabilityConfig,
-        approvals: ApprovalGate,
+        session: ToolSession,
         events: tokio::sync::mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
     ) -> Result<Self> {
@@ -147,8 +126,7 @@ impl ToolBroker {
         let advertised = definitions
             .iter()
             .filter(|definition| {
-                (request.permissions != PermissionMode::ReadOnly || !definition.writes)
-                    && (definition.name != "image_generate" || image_generation.is_configured())
+                (definition.name != "image_generate" || image_generation.is_configured())
                     && (!matches!(
                         definition.name.as_str(),
                         "connector_call" | "connector_tools"
@@ -156,7 +134,7 @@ impl ToolBroker {
             })
             .cloned()
             .collect();
-        let vault = CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?;
+        let vault = session.vault().clone();
         let connector_scope = ConnectorLaunchScope {
             workspace: request.workspace.clone(),
             protected_paths: artifacts
@@ -179,9 +157,9 @@ impl ToolBroker {
                 );
                 SqliteMemory::new(store.clone())
             }),
+            rules: Arc::new(Mutex::new(request.approved_rules.iter().cloned().collect())),
             request,
-            connectors: ConnectorBroker::new(store.clone(), vault.clone())
-                .with_local_scope(connector_scope),
+            connectors: session.connectors(&store).with_local_scope(connector_scope),
             native: NativeConnectors::new(vault)?,
             image_generation,
             store,
@@ -190,29 +168,34 @@ impl ToolBroker {
             definitions,
             advertised,
             allowed_tools: None,
-            approvals,
+            session,
+            parent_id: None,
             events,
             cancel,
             artifacts,
             runtime: tokio::runtime::Handle::current(),
-            resources: xylo_runtime::resources::ResourceManager::new(),
+            resources: xylo_resources::ResourceManager::new(),
             delegate: Mutex::new(None),
         })
     }
-    /// A child shares durable identity and admission but owns cancellation and
-    /// connector processes. Cancelling it never cancels its parent or siblings.
-    pub(crate) fn scoped_child(&self) -> Result<Self> {
+    /// A child shares durable identity, admission, the live mode and the
+    /// turn's approved rules, but owns cancellation and connector processes.
+    /// Cancelling it never cancels its parent or siblings. Its tool events
+    /// carry `parent_action_id` as `parent_id`.
+    pub(crate) fn scoped_child(&self, parent_action_id: Uuid) -> Result<Self> {
         let mut child = Self::new(
             self.request.clone(),
             self.store.clone(),
             self.capability_config.clone(),
-            self.approvals.clone(),
+            self.session.clone(),
             self.events.clone(),
             self.cancel.child_token(),
         )?;
         child.memory = self.memory.clone();
         child.resources = self.resources.clone();
         child.advertised = self.advertised.clone();
+        child.rules = self.rules.clone();
+        child.parent_id = Some(parent_action_id);
         Ok(child)
     }
     pub(crate) fn restrict_tools(&mut self, requested: &[String]) -> Result<()> {
@@ -252,6 +235,14 @@ impl ToolBroker {
     pub fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
     }
+    /// The permission mode in force right now.
+    pub fn mode(&self) -> PermissionMode {
+        self.session.permissions().get()
+    }
+    /// Whether the current mode lets the model use `definition` at all.
+    fn usable(&self, definition: &ToolDefinition) -> bool {
+        self.mode().allows_writes() || !definition.writes
+    }
     /// Initial context and memory tools share one lazy resident embedding model.
     pub(crate) fn project_facts(&self) -> Result<Vec<MemoryRecord>> {
         self.memory.recall_sync(
@@ -260,105 +251,73 @@ impl ToolBroker {
             8,
         )
     }
-    /// Retrieval is advisory context. Promotion/evaluation stays on host maintenance;
-    /// this method never executes a learned step or relaxes action permissions.
+    /// The compact skills index for the system prompt: one `name: description`
+    /// line per built-in skill, installed portable skill, local plugin
+    /// component and relevant learned procedure. Bodies, resources and
+    /// procedure steps load on demand through `extension_skill`,
+    /// `extension_resource` and `skill_read`. Retrieval is advisory: it never
+    /// executes a learned step or relaxes action permissions.
     pub(crate) fn project_skill_context(&self) -> Result<String> {
+        let mut entries: Vec<(String, String)> = prompts::bundled_skills()
+            .iter()
+            .map(|skill| (skill.name.to_owned(), skill.description.to_owned()))
+            .collect();
+        entries.extend(portable::index(self)?);
         let learning = LearningService::new(self.store.clone());
-        let skills = learning.relevant_skills(
+        let learned = learning.relevant_skills(
             &self.request.workspace.to_string_lossy(),
             &self.request.prompt,
             2,
         )?;
-        let mut context = String::new();
-        let mut included = Vec::new();
-        for skill in skills {
-            let mut section = format!(
-                "Skill {} version {}: {}\n",
-                skill.skill.name, skill.skill.version, skill.title
-            );
-            if let Some(guidance) = &skill.correction_guidance
-                && guidance.len() <= 512
-            {
-                section.push_str(&format!("User correction: {guidance}\n"));
-            }
-            for (index, step) in skill.steps.iter().enumerate() {
-                let line = format!(
-                    "{}. {} {}{}\n",
-                    index + 1,
-                    step.tool,
-                    step.arguments,
-                    if step.requires_approval {
-                        " (current approval required)"
-                    } else {
-                        ""
-                    }
-                );
-                if section.len() + line.len() > 1600 {
-                    section.push_str("Read skill_read for remaining steps.\n");
-                    break;
-                }
-                section.push_str(&line);
-            }
-            if context.len() + section.len() > 2400 {
-                break;
-            }
-            context.push_str(&section);
-            included.push(skill);
+        entries.extend(learned.iter().map(|skill| {
+            (
+                skill.skill.name.clone(),
+                format!(
+                    "Learned procedure: {}. Read its steps with skill_read before reusing them",
+                    skill.title
+                ),
+            )
+        }));
+        if !learned.is_empty() {
+            learning.record_retrieval(self.request.session_id, self.request.turn_id, &learned)?;
         }
-        if !included.is_empty() {
-            learning.record_retrieval(self.request.session_id, self.request.turn_id, &included)?;
-        }
-        context.push_str(&portable::context(self)?);
-        Ok(context)
+        Ok(prompts::skills_index(entries.iter().map(
+            |(name, description)| (name.as_str(), description.as_str()),
+        )))
     }
     pub fn set_delegate(&self, handler: Delegate) {
         *self.delegate.lock() = Some(handler);
     }
-    /// Core coding tools are always offered directly; specialized capabilities
-    /// stay discoverable through search_tools/call_tool to keep the prompt small.
+    /// The tools to offer the model directly under the current permission
+    /// mode: a stable core set plus capabilities the user configured
+    /// (browser, local inference, speech, a saved image provider and existing
+    /// connectors). Call it again before each model request so a mode change
+    /// is reflected; everything else stays discoverable through `search_tools`.
     pub fn initial_definitions(&self) -> Vec<ToolDefinition> {
-        const CORE: [&str; 18] = [
-            "extension_skill",
-            "extension_resource",
-            "file_read",
-            "file_edit",
-            "file_write",
-            "files_list",
-            "find_files",
-            "search_project",
-            "git_status",
-            "git_diff",
-            "run_command",
-            "shell_command",
-            "todo_write",
-            "agent_delegate",
-            "memory_search",
-            "memory_remember",
-            "search_tools",
-            "call_tool",
-        ];
-        let prompt = self.request.prompt.to_lowercase();
-        let mut chosen: Vec<ToolDefinition> = self
+        let config = &self.capability_config;
+        let has_connectors = self
             .advertised
             .iter()
-            .filter(|d| CORE.contains(&d.name.as_str()))
+            .any(|definition| definition.name == "connector_call");
+        let configured = |name: &str| {
+            (name.starts_with("browser_") && config.chromium.is_some())
+                || (name.starts_with("local_inference_") && config.llama.is_some())
+                || (name.starts_with("speech_")
+                    && (config.whisper.is_some() || config.sherpa.is_some()))
+                || name == "image_generate"
+                || (name.starts_with("connector_") && has_connectors)
+        };
+        self.advertised
+            .iter()
+            .filter(|definition| {
+                self.usable(definition)
+                    && (CORE_TOOLS.contains(&definition.name.as_str())
+                        || configured(&definition.name))
+            })
             .cloned()
-            .collect();
-        chosen.extend(
-            self.advertised
-                .iter()
-                .filter(|d| {
-                    !CORE.contains(&d.name.as_str())
-                        && d.name
-                            .split('_')
-                            .next()
-                            .is_some_and(|prefix| prefix.len() > 2 && prompt.contains(prefix))
-                })
-                .take(8)
-                .cloned(),
-        );
-        chosen
+            .collect()
     }
+
     pub(crate) fn journal_key(namespace: Option<&str>, call_id: &str) -> String {
         match namespace {
             None => format!("root:{call_id}"),
@@ -412,13 +371,14 @@ impl ToolBroker {
             name: action.intent.name,
             result: serde_json::to_string(&presented)?,
             success,
+            parent_id: self.parent_id,
         })?;
         self.store
             .action(action.intent.id)?
             .context("Recovered action disappeared")
     }
     pub fn execute(&self, call_id: &str, name: &str, arguments: Value) -> Result<String> {
-        self.execute_scoped(None, call_id, name, arguments)
+        self.execute_scoped(None, call_id, name, arguments, Origin::Model)
     }
     /// A child has a unique stable parent-call namespace and no delegation entry,
     /// including through call_tool. It still shares policy and the durable journal.
@@ -429,7 +389,7 @@ impl ToolBroker {
         name: &str,
         arguments: Value,
     ) -> Result<String> {
-        self.execute_scoped(Some(namespace), call_id, name, arguments)
+        self.execute_scoped(Some(namespace), call_id, name, arguments, Origin::Model)
     }
     fn execute_scoped(
         &self,
@@ -437,6 +397,7 @@ impl ToolBroker {
         call_id: &str,
         name: &str,
         arguments: Value,
+        origin: Origin,
     ) -> Result<String> {
         ensure!(
             namespace.is_none() || name != "agent_delegate",
@@ -459,6 +420,7 @@ impl ToolBroker {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({})),
+                origin,
             );
         }
         ensure!(
@@ -472,42 +434,7 @@ impl ToolBroker {
             self.store
                 .action_for_key(self.request.session_id, self.request.turn_id, &key)?
         {
-            ensure!(
-                action.intent.name == name && action.intent.arguments == arguments,
-                "Tool call identity was reused with different arguments"
-            );
-            let action = self.recover_native_action(action)?;
-            match action.state.as_str() {
-                "succeeded" => {
-                    return Ok(serde_json::to_string(
-                        &self.model_result(
-                            action.intent.id,
-                            action
-                                .result
-                                .context("Successful action has no stored result")?,
-                        ),
-                    )?);
-                }
-                "outcome_unknown" => {
-                    bail!("Previous outcome is unknown. Reconcile the action before continuing")
-                }
-                "pending" | "running" => {
-                    bail!("Action is already pending or executing; it will not be dispatched twice")
-                }
-                "denied" => bail!("Action was denied"),
-                "failed" => {
-                    if let Some(result) = action.result {
-                        return Err(
-                            ObservedFailure(self.model_result(action.intent.id, result)).into()
-                        );
-                    }
-                    bail!(
-                        "Previous action failed: {}",
-                        action.error.as_deref().unwrap_or("No details")
-                    )
-                }
-                _ => bail!("Invalid action state"),
-            }
+            return self.replay(action, name, &arguments);
         }
         ensure!(
             !self.cancel.is_cancelled(),
@@ -516,7 +443,9 @@ impl ToolBroker {
         // Use one immutable skill snapshot for classification, approval and
         // execution. A package update must not add executable commands after
         // a read-only classification or replace code under an old approval.
-        let skill_snapshot = if name == "extension_skill" {
+        // Built-in skills are compiled in and never run commands.
+        let skill_snapshot = if name == "extension_skill" && portable::bundled(&arguments).is_none()
+        {
             Some(portable::load(self, &arguments)?)
         } else {
             None
@@ -526,9 +455,37 @@ impl ToolBroker {
             definition.writes = !skill.dynamic_commands.is_empty();
         }
         ensure!(
-            self.request.permissions != PermissionMode::ReadOnly || !definition.writes,
-            "{name} requires write permission; this task is read-only"
+            !(name.starts_with("plugin_") && arguments.get("capabilities").is_some()),
+            "Plugins run only with the grants reviewed in Settings; remove `capabilities`"
         );
+        let reach = self.reach(name, &arguments);
+        let network = if matches!(name, "run_command" | "shell_command") {
+            builtin::network_request(&arguments)?
+        } else {
+            None
+        };
+        let mode = self.mode();
+        let call = Call {
+            name,
+            arguments: &arguments,
+            writes: definition.writes,
+            origin,
+            reach: &reach,
+            workspace: &self.request.workspace,
+            network,
+        };
+        let verdict = permissions::decide(mode, &call);
+        let rule = permissions::approval_rule(name, &arguments, &reach, &self.request.workspace);
+        let ask = match verdict {
+            Verdict::Refuse(message) => bail!(message),
+            Verdict::Allow => None,
+            Verdict::Ask(reason) => {
+                let remembered = rule
+                    .as_ref()
+                    .is_some_and(|(key, _)| self.rules.lock().contains(key));
+                (!remembered).then_some(reason)
+            }
+        };
         if name == "image_generate" {
             self.image_generation.validate(&arguments)?;
         }
@@ -538,6 +495,11 @@ impl ToolBroker {
             let _: xylo_core::EnvironmentExecuteRequest = serde_json::from_value(arguments.clone())
                 .context("Invalid environment command request")?;
         }
+        let access = builtin::Access {
+            outside: matches!(reach, Reach::Outside(_)),
+            sandboxed: mode.sandboxed(),
+            network: network.is_some(),
+        };
         let component_snapshot = if name == "extension_component" && definition.writes {
             Some(
                 portable::service(self).component_status(
@@ -550,23 +512,21 @@ impl ToolBroker {
         } else {
             None
         };
-        let presentation = match name {
-            "image_generate" => self.image_generation.approval(&arguments)?,
-            "extension_skill" => {
-                let snapshot = skill_snapshot.as_ref().context("Skill snapshot missing")?;
-                json!({"request":arguments,"package_root":snapshot.package_root,"dynamic_commands":snapshot.dynamic_commands,"fork":snapshot.fork,"agent":snapshot.agent,"requested_model":snapshot.model,"allowed_tools":snapshot.allowed_tools})
-            }
-            "extension_component" if component_snapshot.is_some() => {
-                let snapshot = component_snapshot.as_ref().unwrap();
-                json!({"request":arguments,"digest":snapshot.digest,"workspace":snapshot.setup.workspace,"allowed_domains":snapshot.setup.allowed_domains,"environment_names":snapshot.setup.environment.keys().chain(snapshot.setup.credential_refs.keys()).collect::<Vec<_>>(),"timeout_seconds":snapshot.setup.timeout_seconds})
-            }
-            // Show the actual change, and reject an inapplicable edit before
-            // any intent or approval exists.
-            "file_write" | "file_edit" => {
-                builtin::change_preview(&self.request.workspace, name, &arguments)?
-            }
-            _ => arguments.clone(),
+        // Held from preview to write: a concurrent edit of the same file waits
+        // and then plans against the content this one leaves behind.
+        let _edit_lock = if matches!(name, "file_write" | "file_edit") {
+            let target = builtin::write_target(self, builtin::text(&arguments, "path")?, access)?;
+            Some(builtin::EditLock::acquire(&target, &self.cancel)?)
+        } else {
+            None
         };
+        let presentation = self.presentation(
+            name,
+            &arguments,
+            access,
+            skill_snapshot.as_ref(),
+            component_snapshot.as_ref(),
+        )?;
         let id = Uuid::new_v4();
         // Native clients can close inherited descriptors and outlive a crashed
         // worker. Only proven in-process writes qualify for generic review.
@@ -579,7 +539,7 @@ impl ToolBroker {
             .transpose()?;
         let _action_scope = execution_lease
             .as_ref()
-            .map(|lease| xylo_runtime::resources::ActionLeaseScope::enter(lease.file()));
+            .map(|lease| xylo_resources::ActionLeaseScope::enter(lease.file()));
         let intent = ActionIntent {
             id,
             session_id: self.request.session_id,
@@ -619,55 +579,31 @@ impl ToolBroker {
             action_id: id,
             name: name.into(),
             arguments: presentation.clone(),
+            parent_id: self.parent_id,
         }) {
             let _ = self.store.deny_action(id);
             return Err(error);
         }
-        let rule = approval_rule(name, &arguments);
-        let preapproved = match self.request.permissions {
-            PermissionMode::AcceptEdits => matches!(name, "file_write" | "file_edit"),
-            PermissionMode::Auto => matches!(
-                name,
-                "file_write" | "file_edit" | "run_command" | "shell_command"
-            ),
-            PermissionMode::AskForWrites | PermissionMode::ReadOnly => false,
-        } || rule
-            .as_ref()
-            .is_some_and(|(key, _)| self.approvals.remembered(key));
-        if definition.writes && !preapproved {
-            let (tx, rx) = mpsc::sync_channel(1);
-            let (key, label) = rule.unzip();
-            self.approvals.install(id, tx, key);
-            if let Err(error) = self.emit(EngineEvent::ApprovalRequired {
-                action_id: id,
-                name: name.into(),
-                arguments: presentation.clone(),
-                rule: label,
-            }) {
-                self.approvals.withdraw(id);
-                let _ = self.store.deny_action(id);
-                return Err(error);
-            }
-            let allowed = loop {
-                if self.cancel.is_cancelled() {
-                    break false;
-                }
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(allow) => break allow,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(_) => break false,
-                }
+        if let Some(reason) = ask {
+            let refusal = if self.await_approval(id, name, presentation, reason, rule)? {
+                // The mode may have changed while the user decided; an
+                // approval never outranks a mode that now refuses the action.
+                let current = self.mode();
+                matches!(permissions::decide(current, &call), Verdict::Refuse(_))
+                    .then(|| format!("Permission mode changed to {}; not run", current.label()))
+            } else {
+                Some("Action denied or task cancelled".to_owned())
             };
-            self.approvals.withdraw(id);
-            if !allowed || self.cancel.is_cancelled() {
+            if let Some(message) = refusal {
                 self.store.deny_action(id)?;
                 let _ = self.emit(EngineEvent::ToolFinished {
                     action_id: id,
                     name: name.into(),
-                    result: "Action denied or task cancelled".into(),
+                    result: message.clone(),
                     success: false,
+                    parent_id: self.parent_id,
                 });
-                bail!("Action denied or task cancelled")
+                bail!(message)
             }
         }
         if self.cancel.is_cancelled() {
@@ -675,10 +611,12 @@ impl ToolBroker {
             bail!("Task cancelled before execution")
         }
         self.store.mark_action_running(id)?;
+        // Hooks wrap the model's calls, never their own executions.
+        let hooked = origin == Origin::Model && name != "extension_component";
         // All fallible execution branches stay inside this closure, so no `?`
         // can strand a running action without recording failure/uncertainty.
         let execution = (|| -> Result<Value> {
-            if name != "extension_component" {
+            if hooked {
                 self.run_event_hooks(namespace, call_id, "PreToolUse", name, &arguments, None)
                     .map_err(|error| {
                         code::unapplied(format!(
@@ -687,30 +625,17 @@ impl ToolBroker {
                     })?;
             }
             let result = if name == "search_tools" {
-                let query = arguments
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_lowercase();
-                let words: Vec<_> = query.split_whitespace().collect();
-                let matches: Vec<_> = self
-                    .advertised
-                    .iter()
-                    .filter(|d| {
-                        (namespace.is_none() || d.name != "agent_delegate")
-                            && words.iter().any(|word| {
-                                d.name.contains(word) || d.description.to_lowercase().contains(word)
-                            })
-                    })
-                    .take(12)
-                    .collect();
-                json!({"status":"success","summary":matches,"next_actions":["Use call_tool with the selected tool name and documented arguments"],"artifacts":[]})
+                self.search_tools(namespace, &arguments)
             } else if name == "agent_delegate" {
                 // End the registration guard before the blocking callback;
                 // admission and resource leases govern parallel child work.
                 let handler =
                     { self.delegate.lock().clone() }.context("Subagent executor is unavailable")?;
-                handler(&key, arguments.clone())?
+                handler(&DelegateCall {
+                    parent_key: key.clone(),
+                    parent_action_id: id,
+                    arguments: arguments.clone(),
+                })?
             } else if name.starts_with("connector_") {
                 self.execute_connector(name, &arguments)?
             } else if name == "image_generate" {
@@ -724,23 +649,24 @@ impl ToolBroker {
                     name,
                     &arguments,
                     &key,
+                    id,
                     component_snapshot.as_ref(),
                     skill_snapshot.as_ref(),
                 )?
             } else if builtin::handles(name) {
-                builtin::execute(self, name, &arguments)?
+                builtin::execute(self, name, &arguments, access)?
             } else {
                 let operation = async {
-                    let _reservation =
-                        if let Some(demand) = xylo_runtime::resources::capability_demand(name) {
-                            Some(
-                                self.resources
-                                    .acquire(demand, self.cancel.child_token())
-                                    .await?,
-                            )
-                        } else {
-                            None
-                        };
+                    let _reservation = if let Some(demand) = xylo_resources::capability_demand(name)
+                    {
+                        Some(
+                            self.resources
+                                .acquire(demand, self.cancel.child_token())
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
                     // Capability execution owns the cross-process reservation;
                     // compiler and artifact closures retain it through cleanup.
                     self.capabilities
@@ -748,10 +674,9 @@ impl ToolBroker {
                         .await
                 };
                 let result = match &execution_lease {
-                    Some(lease) => self.runtime.block_on(xylo_runtime::resources::scope_action(
-                        lease.file(),
-                        operation,
-                    )),
+                    Some(lease) => self
+                        .runtime
+                        .block_on(xylo_resources::scope_action(lease.file(), operation)),
                     None => self.runtime.block_on(operation),
                 }?;
                 serde_json::to_value(result)?
@@ -774,30 +699,31 @@ impl ToolBroker {
                         .context("Tool completed but durable result could not be confirmed");
                 }
                 let mut result = result;
-                if name != "extension_component" {
-                    if let Err(error) = self.run_event_hooks(
+                if hooked
+                    && let Err(error) = self.run_event_hooks(
                         namespace,
                         call_id,
                         "PostToolUse",
                         name,
                         &arguments,
                         Some(&result),
-                    ) {
-                        let message = format!("Tool completed; post-tool hook failed: {error:#}");
-                        if let Some(fields) = result.as_object_mut() {
-                            fields.insert("post_tool_hook_error".into(), json!(message));
-                        } else {
-                            result = json!({"status":"success","summary":result,"post_tool_hook_error":message});
-                        }
+                    )
+                {
+                    let message = format!("Tool completed; post-tool hook failed: {error:#}");
+                    if let Some(fields) = result.as_object_mut() {
+                        fields.insert("post_tool_hook_error".into(), json!(message));
+                    } else {
+                        result = json!({"status":"success","summary":result,"post_tool_hook_error":message});
                     }
                 }
                 let model = self.model_result(id, result.clone());
-                let presented = self.bound_result(id, result);
+                let presented = self.presented_result(id, name, result);
                 self.emit(EngineEvent::ToolFinished {
                     action_id: id,
                     name: name.into(),
                     result: serde_json::to_string(&presented)?,
                     success: true,
+                    parent_id: self.parent_id,
                 })?;
                 Ok(serde_json::to_string(&model)?)
             }
@@ -818,12 +744,13 @@ impl ToolBroker {
                         self.store.fail_action_with_result(id, result, message)?;
                     }
                     let model = self.model_result(id, result.clone());
-                    let presented = self.bound_result(id, result.clone());
+                    let presented = self.presented_result(id, name, result.clone());
                     let _ = self.emit(EngineEvent::ToolFinished {
                         action_id: id,
                         name: name.into(),
                         result: serde_json::to_string(&presented)?,
                         success: false,
+                        parent_id: self.parent_id,
                     });
                     return Err(ObservedFailure(model).into());
                 }
@@ -853,10 +780,184 @@ impl ToolBroker {
                     name: name.into(),
                     result: message,
                     success: false,
+                    parent_id: self.parent_id,
                 });
                 Err(error)
             }
         }
+    }
+    /// The model's answer for a call identity that already has a journal entry.
+    fn replay(&self, action: JournalAction, name: &str, arguments: &Value) -> Result<String> {
+        ensure!(
+            action.intent.name == name && &action.intent.arguments == arguments,
+            "Tool call identity was reused with different arguments"
+        );
+        let action = self.recover_native_action(action)?;
+        match action.state.as_str() {
+            "succeeded" => Ok(serde_json::to_string(
+                &self.model_result(
+                    action.intent.id,
+                    action
+                        .result
+                        .context("Successful action has no stored result")?,
+                ),
+            )?),
+            "outcome_unknown" => {
+                bail!("Previous outcome is unknown. Reconcile the action before continuing")
+            }
+            "pending" | "running" => {
+                bail!("Action is already pending or executing; it will not be dispatched twice")
+            }
+            "denied" => bail!("Action was denied"),
+            "failed" => {
+                if let Some(result) = action.result {
+                    return Err(ObservedFailure(self.model_result(action.intent.id, result)).into());
+                }
+                bail!(
+                    "Previous action failed: {}",
+                    action.error.as_deref().unwrap_or("No details")
+                )
+            }
+            _ => bail!("Invalid action state"),
+        }
+    }
+    /// Where a file or search call's path points, resolved like execution
+    /// will resolve it. Unresolvable paths count as project paths: execution
+    /// then reports the real error, and still refuses to leave the project.
+    fn reach(&self, name: &str, arguments: &Value) -> Reach {
+        let (requested, writing) = match name {
+            "file_read" => (arguments.get("path").and_then(Value::as_str), false),
+            "file_write" | "file_edit" => (arguments.get("path").and_then(Value::as_str), true),
+            "files_list" | "find_files" | "search_project" => (
+                Some(arguments.get("path").and_then(Value::as_str).unwrap_or(".")),
+                false,
+            ),
+            _ => return Reach::Project,
+        };
+        match requested.map(|requested| builtin::resolve(self, requested, writing)) {
+            Some(Ok(builtin::Resolved::Outside(path))) => Reach::Outside(path),
+            _ => Reach::Project,
+        }
+    }
+    /// What the start and approval events show: the real change for edits,
+    /// the frozen snapshot for extensions, bounded arguments otherwise.
+    fn presentation(
+        &self,
+        name: &str,
+        arguments: &Value,
+        access: builtin::Access,
+        skill: Option<&xylo_services::extensions::LoadedSkill>,
+        component: Option<&xylo_services::extensions::ComponentRuntimeStatus>,
+    ) -> Result<Value> {
+        let value = match name {
+            "image_generate" => self.image_generation.approval(arguments)?,
+            "extension_skill" => match skill {
+                Some(snapshot) => {
+                    json!({"request":arguments,"package_root":snapshot.package_root,"dynamic_commands":snapshot.dynamic_commands,"fork":snapshot.fork,"agent":snapshot.agent,"requested_model":snapshot.model,"allowed_tools":snapshot.allowed_tools})
+                }
+                None => arguments.clone(),
+            },
+            "extension_component" => match component {
+                Some(snapshot) => {
+                    json!({"request":arguments,"digest":snapshot.digest,"workspace":snapshot.setup.workspace,"allowed_domains":snapshot.setup.allowed_domains,"environment_names":snapshot.setup.environment.keys().chain(snapshot.setup.credential_refs.keys()).collect::<Vec<_>>(),"timeout_seconds":snapshot.setup.timeout_seconds})
+                }
+                None => arguments.clone(),
+            },
+            // Show the actual change, and reject an inapplicable edit before
+            // any intent or approval exists.
+            "file_write" | "file_edit" => {
+                return builtin::change_preview(self, name, arguments, access);
+            }
+            // Installed plugins show their reviewed grants and budgets.
+            _ => self
+                .runtime
+                .block_on(self.capabilities.approval_presentation(
+                    name,
+                    arguments,
+                    self.cancel.child_token(),
+                ))?
+                .unwrap_or_else(|| arguments.clone()),
+        };
+        Ok(bound_presentation(value))
+    }
+    /// Emits the approval request and waits for the decision or cancellation.
+    fn await_approval(
+        &self,
+        id: Uuid,
+        name: &str,
+        presentation: Value,
+        reason: String,
+        rule: Option<(String, String)>,
+    ) -> Result<bool> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (rule_key, label) = rule.unzip();
+        let approvals = self.session.approvals();
+        approvals.install(
+            id,
+            tx,
+            rule_key.clone().map(|key| (key, self.rules.clone())),
+        );
+        let request = self
+            .emit(EngineEvent::Phase {
+                phase: TurnPhase::WaitingForApproval,
+            })
+            .and_then(|()| {
+                self.emit(EngineEvent::ApprovalRequired {
+                    action_id: id,
+                    name: name.into(),
+                    arguments: presentation,
+                    rule: label,
+                    rule_key,
+                    reason: Some(reason),
+                    parent_id: self.parent_id,
+                })
+            });
+        if let Err(error) = request {
+            approvals.withdraw(id);
+            let _ = self.store.deny_action(id);
+            return Err(error);
+        }
+        let allowed = loop {
+            if self.cancel.is_cancelled() {
+                break false;
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(allow) => break allow,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => break false,
+            }
+        };
+        approvals.withdraw(id);
+        if !approvals.waiting() {
+            let phase = if self.parent_id.is_some() {
+                TurnPhase::Delegating
+            } else {
+                TurnPhase::RunningTools
+            };
+            let _ = self.emit(EngineEvent::Phase { phase });
+        }
+        Ok(allowed && !self.cancel.is_cancelled())
+    }
+    fn search_tools(&self, namespace: Option<&str>, arguments: &Value) -> Value {
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        let words: Vec<_> = query.split_whitespace().collect();
+        let matches: Vec<_> = self
+            .advertised
+            .iter()
+            .filter(|d| {
+                self.usable(d)
+                    && (namespace.is_none() || d.name != "agent_delegate")
+                    && words.iter().any(|word| {
+                        d.name.contains(word) || d.description.to_lowercase().contains(word)
+                    })
+            })
+            .take(12)
+            .collect();
+        json!({"status":"success","summary":matches,"next_actions":["Use call_tool with the selected tool name and documented arguments"],"artifacts":[]})
     }
     fn run_event_hooks(
         &self,
@@ -891,7 +992,13 @@ impl ToolBroker {
         for (index, hook) in hooks.into_iter().enumerate() {
             let hook_id = format!("{call_id}:hook:{event}:{index}");
             let args = json!({"id":hook.package,"component":hook.component,"operation":"event","input":input});
-            self.execute_scoped(namespace, &hook_id, "extension_component", args)?;
+            self.execute_scoped(
+                namespace,
+                &hook_id,
+                "extension_component",
+                args,
+                Origin::Hook,
+            )?;
             let actual = self
                 .store
                 .action_for_key(
@@ -979,7 +1086,9 @@ impl ToolBroker {
                     &args.get("arguments").cloned().unwrap_or_else(|| json!({})),
                 )?;
             }
-            definition.writes = is_mcp(&config) || target.writes;
+            // MCP servers mark read-only tools with annotations; the
+            // connector layer already treats anything else as a write.
+            definition.writes = target.writes;
         } else if name == "connector_tools" {
             definition.writes = self.connector(args)?.transport == "stdio";
         } else if name == "extension_component" {
@@ -1085,6 +1194,16 @@ impl ToolBroker {
         }
         presented
     }
+    /// The `ToolFinished` presentation. A delegate's result is the child's
+    /// final answer, so the UI receives it at the model's bound rather than
+    /// the small placeholder used for other large results.
+    fn presented_result(&self, id: Uuid, name: &str, result: Value) -> Value {
+        if name == "agent_delegate" {
+            self.model_result(id, result)
+        } else {
+            self.bound_result(id, result)
+        }
+    }
     /// Saves the complete observation once; a replay must find identical bytes.
     fn persist_full(&self, id: Uuid, encoded: &[u8]) -> Result<PathBuf> {
         self.persist_once(&format!("tool-{id}.json"), encoded)
@@ -1161,10 +1280,29 @@ impl ToolBroker {
         }
         shortened
     }
+    /// Stops this turn's capability helpers. MCP connections belong to the
+    /// worker's [`ToolSession`] and stay open for later turns.
     pub async fn shutdown(&self) -> Result<()> {
-        self.capabilities.shutdown().await?;
-        self.connectors.reap_idle(Duration::ZERO).await;
-        Ok(())
+        self.capabilities.shutdown().await
+    }
+}
+/// Keeps start and approval events far below the protocol line limit; the
+/// journal and the tool itself always receive the complete arguments.
+fn bound_presentation(value: Value) -> Value {
+    match serde_json::to_vec(&value) {
+        Ok(encoded) if encoded.len() > PRESENTATION_EVENT_BYTES => {
+            let mut shortened = value;
+            for limit in [16_384, 4096, 1024, 256] {
+                shorten_strings(&mut shortened, limit);
+                if serde_json::to_vec(&shortened)
+                    .is_ok_and(|bytes| bytes.len() <= PRESENTATION_EVENT_BYTES)
+                {
+                    return json!({"request":shortened,"request_shortened":true});
+                }
+            }
+            json!({"request_shortened":true,"summary":excerpt(&String::from_utf8_lossy(&encoded), PRESENTATION_EVENT_BYTES / 2)})
+        }
+        _ => value,
     }
 }
 fn is_mcp(config: &ConnectorConfig) -> bool {
@@ -1278,7 +1416,13 @@ fn observation_failed(value: &Value) -> bool {
             .is_some_and(|status| {
                 matches!(
                     status,
-                    "error" | "failed" | "failure" | "incomplete" | "cancelled" | "timeout" | "outcome_unknown"
+                    "error"
+                        | "failed"
+                        | "failure"
+                        | "incomplete"
+                        | "cancelled"
+                        | "timeout"
+                        | "outcome_unknown"
                 )
             })
 }
@@ -1289,11 +1433,5 @@ fn ensure_observation_success(value: &Value) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, unix))]
-mod action_review_tests;
-#[cfg(test)]
-mod environment_recovery_tests;
-#[cfg(test)]
-mod native_connector_dispatch_tests;
 #[cfg(test)]
 mod tests;

@@ -1,14 +1,134 @@
 //! Managed OS sandbox launcher. Missing dependencies fail closed; the caller
 //! owns the returned process group and cancellation for its whole lifetime.
+//!
+//! The Node runtime that bootstraps the sandbox runs unsandboxed, so it must
+//! be trusted: the bundled runtime next to the helper, then an explicitly
+//! configured `XYLO_SANDBOX_NODE`, then a `node` discovered on `PATH` (or in
+//! Homebrew on macOS). A discovered binary, including one under the home
+//! directory (nvm, volta, fnm, asdf), is accepted only when it and every
+//! directory above it, up to but not including `HOME` (or up to `/` outside
+//! home), is owned by the current user or root and is not world-writable or
+//! writable by a group other than a root-equivalent one (`wheel`, and `admin`
+//! on macOS, which Homebrew uses). Every candidate must be at least Node
+//! 22.12. When none is usable, the error is a [`SandboxUnavailable`] naming
+//! each rejected binary, why, and how to fix it.
+//!
+//! Start failures and blocked connections are never reported on the
+//! program's stdout or stderr, which the program controls. Each prepared
+//! command has a private status file ([`PreparedSandbox::status_file`]) in its
+//! temporary directory that the sandboxed program can neither read nor write;
+//! only the launcher writes it. After the command exits, read it with
+//! [`read_start_status`] (a [`StartFailure`] means nothing ran) and
+//! [`read_network_denials`]. The file holds one JSON object per line:
+//! `{"kind":"unavailable","reason":..}` (exit [`UNAVAILABLE_EXIT`]),
+//! `{"kind":"spawn_failed","reason":..}` (exit [`SPAWN_FAILED_EXIT`]) or
+//! `{"kind":"network_denied","host":"host:port"}`.
 use anyhow::{Context, Result, ensure};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+/// The sandbox cannot start; nothing ran. Displays as an
+/// [`UNAVAILABLE_MARKER`] line with the reason and how to fix it, so callers
+/// can surface it directly or downcast it to classify the command as not
+/// started.
+#[derive(Debug)]
+pub struct SandboxUnavailable(pub String);
+impl std::fmt::Display for SandboxUnavailable {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(output, "{UNAVAILABLE_MARKER} {}", self.0)
+    }
+}
+impl std::error::Error for SandboxUnavailable {}
+
+/// Message prefix of [`SandboxUnavailable`] and [`StartFailure::Unavailable`].
+/// It is text for people; nothing parses it.
+pub const UNAVAILABLE_MARKER: &str = "XYLO_SANDBOX_UNAVAILABLE:";
+/// Launcher exit status when the sandbox could not be set up.
+pub const UNAVAILABLE_EXIT: i32 = 125;
+/// Message prefix of [`StartFailure::SpawnFailed`]. Text for people only.
+pub const SPAWN_FAILED_MARKER: &str = "XYLO_SANDBOX_SPAWN_FAILED:";
+/// Launcher exit status when the program could not be started in the sandbox.
+pub const SPAWN_FAILED_EXIT: i32 = 127;
+/// Environment variable naming an explicitly trusted Node runtime. It takes
+/// precedence over any discovered Node and is not subject to the ownership
+/// checks applied to discovered binaries.
+pub const NODE_OVERRIDE: &str = "XYLO_SANDBOX_NODE";
+const MINIMUM_NODE: (u64, u64) = (22, 12);
+
+/// A launcher command ready to spawn. Keep `temporary` alive until the
+/// command and its descendants have exited and the status file was read.
 pub struct PreparedSandbox {
     pub command: tokio::process::Command,
-    // Keep the private temporary directory alive until descendants terminate.
+    /// Private root holding the child's `TMPDIR` and the status directory.
     pub temporary: tempfile::TempDir,
+    /// The launcher's status file (see the module docs). It exists only once
+    /// something was recorded.
+    pub status_file: PathBuf,
 }
+
+/// Why a sandboxed command never started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartFailure {
+    /// The sandbox could not be set up.
+    Unavailable(String),
+    /// The sandbox was set up but the program could not be started in it.
+    SpawnFailed(String),
+}
+impl std::fmt::Display for StartFailure {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(reason) => write!(output, "{UNAVAILABLE_MARKER} {reason}"),
+            Self::SpawnFailed(reason) => write!(output, "{SPAWN_FAILED_MARKER} {reason}"),
+        }
+    }
+}
+
+const MAX_STATUS_BYTES: u64 = 256 * 1024;
+
+fn status_records(path: &Path) -> Vec<serde_json::Value> {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut text = String::new();
+    if file
+        .take(MAX_STATUS_BYTES)
+        .read_to_string(&mut text)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The recorded start failure, if the launcher recorded one. `None` means
+/// the program may have run: its exit status and output are its own.
+pub fn read_start_status(path: &Path) -> Option<StartFailure> {
+    status_records(path).into_iter().find_map(|record| {
+        let reason = record["reason"]
+            .as_str()
+            .unwrap_or("unknown reason")
+            .to_owned();
+        match record["kind"].as_str()? {
+            "unavailable" => Some(StartFailure::Unavailable(reason)),
+            "spawn_failed" => Some(StartFailure::SpawnFailed(reason)),
+            _ => None,
+        }
+    })
+}
+
+/// Destinations (`host:port`) the sandbox refused under [`Network::None`],
+/// in the order they were first attempted.
+pub fn read_network_denials(path: &Path) -> Vec<String> {
+    status_records(path)
+        .into_iter()
+        .filter(|record| record["kind"] == "network_denied")
+        .filter_map(|record| record["host"].as_str().map(str::to_owned))
+        .collect()
+}
+/// Prepare a sandboxed command with no network access.
 pub fn prepare(
     program: &str,
     args: &[String],
@@ -18,6 +138,8 @@ pub fn prepare(
 ) -> Result<PreparedSandbox> {
     prepare_with_policy(program, args, workspace, read_roots, protected_paths, &[])
 }
+/// Prepare a sandboxed command whose network access is limited to
+/// `allowed_domains`.
 pub fn prepare_with_policy(
     program: &str,
     args: &[String],
@@ -33,17 +155,53 @@ pub fn prepare_with_policy(
         read_roots,
         protected_paths,
         allowed_domains,
-        false,
+        None,
     )
 }
+/// Outbound network policy for a sandboxed coding command. Filesystem rules
+/// are the same under both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Network {
+    /// No outbound connections. Blocked destinations are recorded in the
+    /// status file; see [`read_network_denials`].
+    #[default]
+    None,
+    /// Any outbound host, through the sandbox runtime's proxy. The runtime
+    /// still refuses loopback, link-local and cloud-metadata addresses.
+    Unrestricted,
+}
+
 /// Coding commands may use installed host Rust binaries, but never the user's
 /// Cargo config/credentials. Cache/home writes stay in an owned temporary root.
+/// Equivalent to [`prepare_coding_with_network`] with [`Network::None`].
 pub fn prepare_coding(
     program: &str,
     args: &[String],
     workspace: &Path,
     read_roots: &[PathBuf],
     protected_paths: &[PathBuf],
+) -> Result<PreparedSandbox> {
+    prepare_coding_with_network(
+        program,
+        args,
+        workspace,
+        read_roots,
+        protected_paths,
+        Network::None,
+    )
+}
+
+/// A coding command with an explicit [`Network`] policy. Offline commands
+/// get Cargo's offline mode and a read-only view of the public crate cache;
+/// with network access Cargo downloads into the command's own temporary
+/// Cargo home instead, because the host cache stays read-only.
+pub fn prepare_coding_with_network(
+    program: &str,
+    args: &[String],
+    workspace: &Path,
+    read_roots: &[PathBuf],
+    protected_paths: &[PathBuf],
+    network: Network,
 ) -> Result<PreparedSandbox> {
     prepare_internal(
         program,
@@ -52,7 +210,7 @@ pub fn prepare_coding(
         read_roots,
         protected_paths,
         &[],
-        true,
+        Some(network),
     )
 }
 fn prepare_internal(
@@ -62,7 +220,7 @@ fn prepare_internal(
     read_roots: &[PathBuf],
     protected_paths: &[PathBuf],
     allowed_domains: &[String],
-    coding: bool,
+    coding: Option<Network>,
 ) -> Result<PreparedSandbox> {
     ensure!(
         cfg!(any(target_os = "macos", target_os = "linux")),
@@ -80,13 +238,36 @@ fn prepare_internal(
                 .any(|root| root.canonicalize().is_ok_and(|root| node.starts_with(root))),
         "Sandbox launcher must be installed outside the mutable project and plugin packages"
     );
+    // `tmp` is the child's writable TMPDIR; `control` holds the status file
+    // and is denied to the child for both reading and writing.
     let temporary = tempfile::tempdir()?;
-    let (toolchain_read_roots, coding_environment) = if coding {
-        rust_toolchain_scope(temporary.path(), &workspace, protected_paths, program, args)?
-    } else {
-        (Vec::new(), std::collections::BTreeMap::new())
+    let child_temporary = temporary.path().canonicalize()?.join("tmp");
+    let control = temporary.path().canonicalize()?.join("control");
+    std::fs::create_dir(&child_temporary)?;
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&control)?;
+    let status_file = control.join("status");
+    let (toolchain_read_roots, coding_environment) = match coding {
+        Some(network) => rust_toolchain_scope(
+            &child_temporary,
+            &workspace,
+            protected_paths,
+            program,
+            args,
+            network,
+        )?,
+        None => (Vec::new(), std::collections::BTreeMap::new()),
     };
-    let spec = json!({"program":program,"args":args,"workspace":workspace,"read_roots":read_roots,"protected_paths":protected_paths,"trusted_paths":trusted_paths_with_node(&node)?,"toolchain_read_roots":toolchain_read_roots,"coding_environment":coding_environment,"temporary":temporary.path(),"allowed_domains":allowed_domains});
+    let network = match coding.unwrap_or_default() {
+        Network::None => "none",
+        Network::Unrestricted => "unrestricted",
+    };
+    let spec = json!({"program":program,"args":args,"workspace":workspace,"read_roots":read_roots,"protected_paths":protected_paths,"trusted_paths":trusted_paths_with_node(&node)?,"toolchain_read_roots":toolchain_read_roots,"coding_environment":coding_environment,"temporary":child_temporary,"status_file":status_file,"allowed_domains":allowed_domains,"network":network});
     let mut command = tokio::process::Command::new(&node);
     command
         .arg(helper)
@@ -117,22 +298,31 @@ fn prepare_internal(
             command.env(name, value);
         }
     }
-    Ok(PreparedSandbox { command, temporary })
+    Ok(PreparedSandbox {
+        command,
+        temporary,
+        status_file,
+    })
 }
+/// The sandbox helper entrypoint. Release builds only use the copy packaged
+/// with the application; the source tree is a fallback for debug builds.
 pub fn helper_path() -> Result<PathBuf> {
     let executable = std::env::current_exe()?;
     let packaged = executable
         .parent()
         .context("Missing executable directory")?
         .join("../Resources/sandbox-helper/run.mjs");
-    let development = Path::new(env!("CARGO_MANIFEST_DIR")).join("sandbox-helper/run.mjs");
-    let helper = if packaged.is_file() {
-        packaged
-    } else {
-        development
-    };
-    ensure!(helper.is_file(), "Managed sandbox helper is missing");
-    Ok(helper.canonicalize()?)
+    if packaged.is_file() {
+        return Ok(packaged.canonicalize()?);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let development = Path::new(env!("CARGO_MANIFEST_DIR")).join("sandbox-helper/run.mjs");
+        if development.is_file() {
+            return Ok(development.canonicalize()?);
+        }
+    }
+    anyhow::bail!("Managed sandbox helper is missing from the application bundle")
 }
 fn rust_toolchain_scope(
     temporary: &Path,
@@ -140,6 +330,7 @@ fn rust_toolchain_scope(
     protected_paths: &[PathBuf],
     program: &str,
     args: &[String],
+    network: Network,
 ) -> Result<(Vec<PathBuf>, std::collections::BTreeMap<String, String>)> {
     use std::collections::BTreeMap;
     let mut roots = Vec::new();
@@ -150,7 +341,10 @@ fn rust_toolchain_scope(
         "CARGO_HOME".into(),
         cargo_home.to_string_lossy().into_owned(),
     );
-    environment.insert("CARGO_NET_OFFLINE".into(), "true".into());
+    let offline = network == Network::None;
+    if offline {
+        environment.insert("CARGO_NET_OFFLINE".into(), "true".into());
+    }
     if let Some(home) = std::env::var_os("HOME")
         .map(PathBuf::from)
         .and_then(|path| path.canonicalize().ok())
@@ -195,9 +389,10 @@ fn rust_toolchain_scope(
                 rustup.canonicalize()?.to_string_lossy().into_owned(),
             );
         }
-        if workspace.join("Cargo.toml").is_file()
-            || program.contains("cargo")
-            || args.iter().any(|arg| arg.contains("cargo"))
+        if offline
+            && (workspace.join("Cargo.toml").is_file()
+                || program.contains("cargo")
+                || args.iter().any(|arg| arg.contains("cargo")))
         {
             public_cargo_cache_view(&cargo, &cargo_home, &mut roots)?;
         }
@@ -402,26 +597,186 @@ fn launcher_path(
     );
     Ok(std::env::join_paths(directories)?)
 }
+/// The trusted Node runtime that bootstraps the sandbox. See the module docs
+/// for the search order and the ownership rule for discovered binaries.
 pub fn runtime_node() -> Result<PathBuf> {
+    let unavailable = |reason: String| -> anyhow::Error {
+        SandboxUnavailable(format!(
+            "{reason}. Install Node.js 22.12 or later, or set {NODE_OVERRIDE} to a trusted Node.js executable."
+        ))
+        .into()
+    };
     let packaged = helper_path()?
         .parent()
         .context("Missing sandbox helper directory")?
         .join("runtime/bin/node");
     if executable_file(&packaged) {
-        return Ok(packaged.canonicalize()?);
+        let packaged = packaged.canonicalize()?;
+        verified_node(&packaged).map_err(|reason| {
+            unavailable(format!(
+                "Bundled Node.js {} was rejected: {reason}",
+                packaged.display()
+            ))
+        })?;
+        return Ok(packaged);
     }
-    if let Some(node) = find_program("node") {
-        return Ok(node);
+    if let Some(configured) = std::env::var_os(NODE_OVERRIDE) {
+        let configured = PathBuf::from(configured);
+        if !configured.is_absolute() || !executable_file(&configured) {
+            return Err(unavailable(format!(
+                "{NODE_OVERRIDE}={} was rejected: it is not the absolute path of an executable file",
+                configured.display()
+            )));
+        }
+        let configured = configured.canonicalize()?;
+        verified_node(&configured).map_err(|reason| {
+            unavailable(format!(
+                "{NODE_OVERRIDE}={} was rejected: {reason}",
+                configured.display()
+            ))
+        })?;
+        return Ok(configured);
     }
-    // Finder-launched macOS applications do not inherit the user's shell PATH.
-    #[cfg(target_os = "macos")]
-    for installed in ["/opt/homebrew/bin/node", "/usr/local/bin/node"] {
-        let path = Path::new(installed);
-        if executable_file(path) {
-            return Ok(path.canonicalize()?);
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| home.canonicalize().ok());
+    let mut rejected = Vec::new();
+    for candidate in system_node_candidates() {
+        match trusted_system_location(&candidate, home.as_deref())
+            .and_then(|()| verified_node(&candidate))
+        {
+            Ok(()) => return Ok(candidate),
+            Err(reason) => rejected.push(format!(
+                "Node.js {} was rejected: {reason}",
+                candidate.display()
+            )),
         }
     }
-    anyhow::bail!("Node.js 22.12 or later is required for sandboxed tools")
+    Err(unavailable(if rejected.is_empty() {
+        "No Node.js was found on PATH".into()
+    } else {
+        rejected.join("; ")
+    }))
+}
+
+fn system_node_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = find_program("node").into_iter().collect();
+    // Finder-launched macOS applications do not inherit the user's shell PATH.
+    #[cfg(target_os = "macos")]
+    candidates.extend(
+        ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
+            .into_iter()
+            .map(Path::new)
+            .filter(|path| executable_file(path))
+            .filter_map(|path| path.canonicalize().ok()),
+    );
+    candidates.dedup();
+    candidates
+}
+
+/// Groups whose members can already act as root. Homebrew makes its Cellar
+/// writable by `admin` on macOS (gid 80, the sudoers group), which grants no
+/// one more than they already have.
+#[cfg(unix)]
+const ROOT_EQUIVALENT_GROUPS: &[u32] = &[
+    0,
+    #[cfg(target_os = "macos")]
+    80,
+];
+
+/// A discovered runtime must not be replaceable by anyone other than the user
+/// or root: the resolved binary and each directory above it, stopping before
+/// `home` when the binary is inside it and at `/` otherwise, must be owned by
+/// the current user or root and must not be world-writable or writable by a
+/// group other than a root-equivalent one.
+fn trusted_system_location(node: &Path, home: Option<&Path>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no arguments or memory preconditions.
+        let user = unsafe { libc::geteuid() };
+        let stop = home.filter(|home| node.starts_with(home));
+        for path in node.ancestors() {
+            if stop.is_some_and(|home| path == home) {
+                break;
+            }
+            let metadata = path
+                .metadata()
+                .with_context(|| format!("cannot inspect {}", path.display()))?;
+            ensure!(
+                metadata.uid() == user || metadata.uid() == 0,
+                "{} is owned by another user (uid {})",
+                path.display(),
+                metadata.uid()
+            );
+            let mode = metadata.permissions().mode();
+            ensure!(mode & 0o002 == 0, "{} is world-writable", path.display());
+            ensure!(
+                mode & 0o020 == 0 || ROOT_EQUIVALENT_GROUPS.contains(&metadata.gid()),
+                "{} is group-writable (gid {})",
+                path.display(),
+                metadata.gid()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (node, home);
+    Ok(())
+}
+
+fn verified_node(node: &Path) -> Result<()> {
+    let version = node_version(node)?;
+    ensure!(
+        version >= MINIMUM_NODE,
+        "it is version {}.{}, older than 22.12",
+        version.0,
+        version.1
+    );
+    Ok(())
+}
+
+/// `node --version`, cached per path and modification time so preparing a
+/// command does not spawn an extra process every time.
+fn node_version(node: &Path) -> Result<(u64, u64)> {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+        time::SystemTime,
+    };
+    type Cache = Mutex<HashMap<PathBuf, (SystemTime, (u64, u64))>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let modified = node.metadata()?.modified()?;
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((stamp, version)) = cache.lock().ok().and_then(|cache| cache.get(node).copied())
+        && stamp == modified
+    {
+        return Ok(version);
+    }
+    let output = std::process::Command::new(node)
+        .arg("--version")
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("Could not run {}", node.display()))?;
+    ensure!(
+        output.status.success(),
+        "{} --version failed",
+        node.display()
+    );
+    let version = parse_node_version(&String::from_utf8_lossy(&output.stdout))
+        .with_context(|| format!("{} reported an unrecognized version", node.display()))?;
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(node.to_owned(), (modified, version));
+    }
+    Ok(version)
+}
+
+fn parse_node_version(text: &str) -> Option<(u64, u64)> {
+    let mut parts = text.trim().strip_prefix('v')?.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 /// Host binaries and sandbox implementation cannot be rewritten by a tool,
@@ -446,6 +801,8 @@ fn trusted_paths_with_node(node: &Path) -> Result<Vec<PathBuf>> {
     paths.push(node.to_owned());
     Ok(paths)
 }
+/// Refuse writes into the helper, the host executable directory or the
+/// trusted Node runtime.
 pub fn ensure_writable_target(path: &Path) -> Result<()> {
     for protected in trusted_paths()? {
         ensure!(
@@ -454,74 +811,6 @@ pub fn ensure_writable_target(path: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn launcher_path_excludes_relative_project_and_package_directories() {
-        let project = tempfile::tempdir().unwrap();
-        let package = tempfile::tempdir().unwrap();
-        let system = tempfile::tempdir().unwrap();
-        let project = project.path().canonicalize().unwrap();
-        let package = package.path().canonicalize().unwrap();
-        let system = system.path().canonicalize().unwrap();
-        let value = std::env::join_paths([
-            Path::new("."),
-            project.as_path(),
-            package.as_path(),
-            system.as_path(),
-        ])
-        .unwrap();
-        let actual = launcher_path(Some(&value), &project, &[package]).unwrap();
-        assert_eq!(
-            std::env::split_paths(&actual).collect::<Vec<_>>(),
-            vec![system]
-        );
-    }
-    #[test]
-    fn launcher_cannot_live_in_the_mutable_project() {
-        let node = runtime_node().unwrap();
-        let result = prepare(
-            "/bin/echo",
-            &["not executed".into()],
-            node.parent().unwrap(),
-            &[],
-            &[],
-        );
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("outside the mutable project")
-        );
-    }
-    #[test]
-    fn sandbox_does_not_inherit_provider_environment() {
-        let dir = tempfile::tempdir().unwrap();
-        let prepared = prepare("/bin/echo", &["hello".into()], dir.path(), &[], &[]).unwrap();
-        let vars: Vec<_> = prepared
-            .command
-            .as_std()
-            .get_envs()
-            .filter_map(|(key, value)| value.map(|_| key.to_string_lossy().into_owned()))
-            .collect();
-        assert!(vars.iter().all(|k| {
-            [
-                "PATH",
-                "HOME",
-                "USER",
-                "LOGNAME",
-                "LANG",
-                "LC_ALL",
-                "TMPDIR",
-                "SYSTEMROOT",
-            ]
-            .contains(&k.as_str())
-        }));
-    }
 }
 
 /// Plugin-controlled environment reaches only the sandboxed child. It must never
@@ -558,76 +847,7 @@ pub fn set_child_environment(
 }
 
 #[cfg(test)]
-mod coding_scope_tests {
-    use super::*;
-    #[test]
-    fn public_cache_view_excludes_private_registry_config_and_credentials() {
-        let directory = tempfile::tempdir().unwrap();
-        let cargo = directory.path().join("host-cargo");
-        let isolated = directory.path().join("isolated");
-        std::fs::create_dir_all(&isolated).unwrap();
-        let name = "index.crates.io-fixture";
-        for kind in ["index", "cache", "src"] {
-            std::fs::create_dir_all(cargo.join("registry").join(kind).join(name)).unwrap();
-        }
-        std::fs::create_dir(cargo.join("registry/index").join(name).join(".cache")).unwrap();
-        std::fs::write(cargo.join("credentials.toml"), "private-token").unwrap();
-        std::fs::write(cargo.join("config.toml"), "private-config").unwrap();
-        let config = cargo.join("registry/index").join(name).join("config.json");
-        std::fs::write(
-            &config,
-            r#"{"dl":"https://private.example","auth-required":true}"#,
-        )
-        .unwrap();
-        let mut roots = Vec::new();
-        public_cargo_cache_view(&cargo, &isolated, &mut roots).unwrap();
-        assert!(roots.is_empty());
-        std::fs::write(
-            &config,
-            r#"{"dl":"https://static.crates.io/crates","api":"https://crates.io","unused-token":"not-for-child"}"#,
-        )
-        .unwrap();
-        public_cargo_cache_view(&cargo, &isolated, &mut roots).unwrap();
-        assert_eq!(roots.len(), 3);
-        assert!(!isolated.join("credentials.toml").exists());
-        assert!(!isolated.join("config.toml").exists());
-        assert!(
-            !std::fs::read_to_string(
-                isolated
-                    .join("registry/index")
-                    .join(name)
-                    .join("config.json")
-            )
-            .unwrap()
-            .contains("not-for-child")
-        );
-        assert!(
-            roots
-                .iter()
-                .all(|path| path.starts_with(cargo.join("registry").canonicalize().unwrap()))
-        );
-        #[cfg(unix)]
-        assert!(
-            std::fs::symlink_metadata(isolated.join("registry/index").join(name).join(".cache"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-    }
-    #[test]
-    fn plugin_scope_has_no_implicit_cargo_home_or_toolchain_grants() {
-        let directory = tempfile::tempdir().unwrap();
-        let prepared = prepare("/bin/echo", &["scope".into()], directory.path(), &[], &[]).unwrap();
-        let spec = prepared
-            .command
-            .as_std()
-            .get_args()
-            .nth(1)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        let spec: serde_json::Value = serde_json::from_str(spec).unwrap();
-        assert!(spec["toolchain_read_roots"].as_array().unwrap().is_empty());
-        assert!(spec["coding_environment"].as_object().unwrap().is_empty());
-    }
-}
+mod tests;
+
+#[cfg(test)]
+mod coding_scope_tests;

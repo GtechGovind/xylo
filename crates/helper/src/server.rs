@@ -196,8 +196,19 @@ fn load_configuration(data: &Path, workspace: &Path) -> Result<CapabilityConfig>
             bytes.len() as u64 <= CONFIG_BYTES,
             "Capability configuration exceeds 1MiB budget"
         );
-        serde_json::from_slice::<CapabilityConfig>(&bytes)
-            .context("Read native capability configuration")?
+        // A configuration from an older format or a corrupt one is deleted
+        // and replaced by defaults rather than migrated.
+        match serde_json::from_slice::<CapabilityConfig>(&bytes) {
+            Ok(config) => config,
+            Err(_) => {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                CapabilityConfig::default()
+            }
+        }
     } else {
         CapabilityConfig::default()
     };
@@ -526,52 +537,4 @@ pub async fn serve(data: PathBuf, workspace: PathBuf) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn configuration_cannot_replace_authorized_roots_and_save_is_atomic() {
-        let data = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let config = CapabilityConfig {
-            workspace: PathBuf::from("/untrusted"),
-            artifacts: PathBuf::from("/untrusted"),
-            management_root: Some(PathBuf::from("/untrusted/management")),
-            ..Default::default()
-        };
-        save_configuration(data.path(), &config).unwrap();
-        let loaded = load_configuration(data.path(), workspace.path()).unwrap();
-        assert_eq!(loaded.workspace, workspace.path());
-        assert_eq!(loaded.artifacts, data.path().join("artifacts"));
-        assert_eq!(
-            loaded.management_root,
-            Some(data.path().join("native-management"))
-        );
-        assert!(std::fs::read_dir(data.path()).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tmp")
-        }));
-    }
-
-    #[test]
-    fn configuration_patch_cannot_redirect_management_storage() {
-        let data = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let redirected = workspace.path().join("redirected");
-        replace_configuration(
-            data.path(),
-            workspace.path(),
-            Some((json!({"management_root": redirected}), true)),
-        )
-        .unwrap();
-        let loaded = load_configuration(data.path(), workspace.path()).unwrap();
-        assert_eq!(
-            loaded.management_root,
-            Some(data.path().join("native-management"))
-        );
-        assert!(!redirected.exists());
-        assert!(data.path().join("native-management").is_dir());
-    }
-}
+mod tests;

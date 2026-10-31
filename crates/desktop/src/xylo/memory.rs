@@ -1,6 +1,8 @@
 //! Request-correlated fact management. Mutations keep their input until the
 //! durable host receipt; late reads never populate a different project/query.
+use super::settings_ui;
 use super::*;
+use crate::motion;
 use xylo_runtime::{MemoryCursor, MemoryExport, MemoryMutation, MemoryPage};
 
 struct Query {
@@ -28,6 +30,8 @@ pub(super) struct MemoryUi {
     pub(super) export: Option<(Uuid, String)>,
     pub(super) notice: String,
     scroll: UniformListScrollHandle,
+    /// When the pending memory read was sent, for the slow-wait caption.
+    loading_since: Option<std::time::Instant>,
     pub(super) forms: super::memory_form::MemoryForms,
     pub(super) versions: super::memory_versions::VersionUi,
 }
@@ -80,6 +84,7 @@ impl Xylo {
             .and_then(|host| host.memory_search(id, scope.clone(), text.clone(), before));
         if result.is_ok() {
             self.facts.query = Some(Query { id, scope, text });
+            self.facts.loading_since = Some(self.arm_slow_hint(cx));
             self.facts.notice = "Loading memories…".into();
         }
         self.result(result, cx);
@@ -94,6 +99,7 @@ impl Xylo {
             return;
         }
         let query = self.facts.query.take().unwrap();
+        self.facts.loading_since = None;
         if query.scope != self.scope() || query.text != self.memory_query.read(cx).value().trim() {
             return;
         }
@@ -251,9 +257,6 @@ impl Xylo {
         self.advance_memory_flush(window, cx);
         cx.notify();
     }
-    fn export_memory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.export_fact_selection(xylo_runtime::ExportSelection::Project, window, cx);
-    }
     pub(super) fn memory_exported(
         &mut self,
         id: Uuid,
@@ -285,185 +288,298 @@ impl Xylo {
         };
         cx.notify();
     }
+    /// Memory, its detail sub-page or the version archive, depending on
+    /// what the person opened.
     pub(super) fn memory_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.facts.busy() || (self.workspace.is_some() && !self.workspace_ready);
-        let show_form = self.facts.composing
+        if let Some(id) = self.facts.selected {
+            return self.memory_detail_page(id, cx);
+        }
+        if self.facts.versions.archive_open() {
+            return self.memory_archive_page(cx);
+        }
+        self.memory_list_page(cx)
+    }
+    /// Whether the entry form has something to show: a new entry being
+    /// composed, a correction, or a save waiting for retry.
+    fn memory_form_visible(&self, cx: &Context<Self>) -> bool {
+        self.facts.composing
             || self.facts.editing.is_some()
             || self.facts.retry.is_some()
-            || !self.memory_content.read(cx).value().trim().is_empty();
-        let mut toolbar = div()
-            .w_full()
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .gap_2()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(180.))
-                    .child(Input::new(&self.memory_query).aria_label("Search memory")),
-            )
-            .child(
-                button("memory-search", "Search")
-                    .on_click(cx.listener(|view, _, _, cx| view.search_memory(cx))),
-            )
-            .child(
-                button("memory-export", "Export")
-                    .disabled(self.facts.export.is_some())
-                    .on_click(cx.listener(|view, _, window, cx| view.export_memory(window, cx))),
-            );
-        if !show_form {
-            toolbar = toolbar.child(
-                primary("memory-new", "Add memory")
-                    .disabled(busy || !self.memory_form_ready())
+            || !self.memory_content.read(cx).value().trim().is_empty()
+    }
+    /// Starts correcting `record`: its text fills the form, then its detail
+    /// page opens with the correction form.
+    pub(super) fn begin_memory_correction(
+        &mut self,
+        record: MemoryRecord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.memory_content.read(cx).value().trim().is_empty() {
+            if self.facts.editing != Some(record.id) {
+                self.facts.notice =
+                    "Save or clear your unsaved Memory entry before correcting a different fact."
+                        .into();
+                cx.notify();
+            }
+            return;
+        }
+        self.facts.editing = Some(record.id);
+        self.facts.retry = None;
+        self.memory_content.update(cx, |input, cx| {
+            input.set_value(record.content.clone(), window, cx)
+        });
+        self.memory_form_changed(cx);
+        cx.notify();
+    }
+    /// The entry form: the text area, draft status, then Cancel and Save.
+    /// A correction cancels back to no edit; a new entry closes the form.
+    pub(super) fn memory_form_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let busy = self.facts.busy() || (self.workspace.is_some() && !self.workspace_ready);
+        let correcting = self.facts.editing.is_some();
+        let mut actions: Vec<AnyElement> = Vec::new();
+        if correcting {
+            actions.push(
+                settings_ui::text_button("memory-cancel-edit", "Cancel correction")
+                    .disabled(busy)
                     .on_click(cx.listener(|view, _, window, cx| {
-                        view.facts.composing = true;
                         view.memory_content
-                            .update(cx, |input, cx| input.focus(window, cx));
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        view.facts.composing = false;
+                        view.facts.editing = None;
+                        view.facts.retry = None;
+                        view.memory_form_changed(cx);
                         cx.notify();
-                    })),
+                    }))
+                    .into_any_element(),
+            );
+        } else if self.memory_content.read(cx).value().trim().is_empty() {
+            actions.push(
+                settings_ui::text_button("memory-cancel-new", "Cancel")
+                    .disabled(busy)
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.facts.composing = false;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
             );
         }
-        let mut page = div()
-            .id("memory-scroll")
-            .w_full()
-            .max_w(px(760.))
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(toolbar);
-        if show_form {
-            let mut form = div()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(border()))
-                .p_4()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(
+        actions.push(
+            settings_ui::primary_button(
+                "memory-add",
+                if correcting {
+                    "Save correction"
+                } else {
+                    "Save memory"
+                },
+            )
+            .disabled(busy || !self.memory_form_ready())
+            .on_click(cx.listener(|view, _, _, cx| view.save_memory(cx)))
+            .map(|button| settings_ui::busy(button, self.facts.mutation.is_some()))
+            .into_any_element(),
+        );
+        settings_ui::section(
+            if correcting {
+                "Correction"
+            } else {
+                "New memory"
+            },
+            Some(if correcting {
+                "The correction becomes the current version; the earlier one stays in the history."
+                    .into()
+            } else {
+                "Your text is kept as a draft until it is saved.".into()
+            }),
+            settings_ui::form_column([
+                settings_ui::field(
+                    "Memory",
                     Textarea::new(&self.memory_content)
                         .accessibility_id("memory-entry")
                         .aria_label("Unsaved Memory entry")
                         .disabled(self.workspace.is_some() && !self.workspace_ready),
+                    None,
                 )
-                .child(
-                    div().flex().justify_end().child(
-                        primary(
-                            "memory-add",
-                            if self.facts.editing.is_some() {
-                                "Save correction"
-                            } else {
-                                "Save memory"
-                            },
-                        )
-                        .disabled(busy || !self.memory_form_ready())
-                        .on_click(cx.listener(|view, _, _, cx| view.save_memory(cx))),
-                    ),
-                );
-            if self.facts.editing.is_none()
-                && self.memory_content.read(cx).value().trim().is_empty()
-            {
-                form = form.child(
-                    button("memory-cancel-new", "Cancel")
-                        .disabled(busy)
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.facts.composing = false;
-                            cx.notify();
-                        })),
-                );
-            }
-            if self.facts.editing.is_some() {
-                form = form.child(
-                    button("memory-cancel-edit", "Cancel correction")
-                        .disabled(busy)
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.memory_content
-                                .update(cx, |input, cx| input.set_value("", window, cx));
-                            view.facts.composing = false;
-                            view.facts.editing = None;
-                            view.facts.retry = None;
-                            view.memory_form_changed(cx);
-                            cx.notify();
-                        })),
-                );
-            }
-            page = page.child(form);
+                .into_any_element(),
+                self.memory_form_status(cx),
+                settings_ui::form_actions(actions).into_any_element(),
+            ]),
+        )
+        .into_any_element()
+    }
+    /// The page's one primary action: open the new-entry form.
+    fn memory_new_button(&self, busy: bool, cx: &mut Context<Self>) -> gpui_kit::base::Button {
+        settings_ui::primary_button("memory-new", "Add memory")
+            .disabled(busy || !self.memory_form_ready())
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.facts.composing = true;
+                view.memory_content
+                    .update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+            }))
+    }
+    fn memory_list_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let busy = self.facts.busy() || (self.workspace.is_some() && !self.workspace_ready);
+        let show_form = self.memory_form_visible(cx);
+        let mut page = settings_ui::settings_page("memory-settings", "Memory").description(
+            "Facts Xylo remembers about this project and uses when they are relevant.",
+        );
+        let empty = self.memories.is_empty();
+        let loading = self.facts.query.is_some();
+        let searching = !self.memory_query.read(cx).value().trim().is_empty();
+        // Nothing saved yet: the page is only the empty state (or the new
+        // entry form), without search, archive or danger zone. A search with
+        // no results keeps the search field.
+        let nothing_saved = empty && !loading && !searching;
+        if !show_form && !nothing_saved {
+            page = page.action(self.memory_new_button(busy, cx));
         }
-        page = page.child(self.memory_form_status(cx));
-        if !self.facts.status_message().is_empty() {
-            page = page.child(subtitle(self.facts.status_message().to_owned()));
+        if show_form {
+            page = page.child(self.memory_form_section(cx));
+        } else if self.memory_form_has_status() {
+            page = page.child(self.memory_form_status(cx));
         }
-        if self.memories.is_empty() {
-            if self.facts.status_message().is_empty() {
-                page = page.child(subtitle("No saved memories"));
+        if nothing_saved {
+            if !show_form {
+                page = page.child(settings_ui::empty_state(
+                    AppIcon::Memory,
+                    "No memories yet",
+                    "Add facts you want Xylo to keep in mind in this project.",
+                    Some(self.memory_new_button(busy, cx).into_any_element()),
+                ));
             }
+            return page.into_any_element();
+        }
+        let search = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(div().flex_1().min_w_0().child(settings_ui::search_field(
+                &self.memory_query,
+                "Search memory",
+            )))
+            // Search runs as the person types; the spinner marks a search in
+            // flight.
+            .when(loading, |row| row.child(motion::spinner_inline()));
+        let mut saved = div().w_full().flex().flex_col().gap(px(12.)).child(search);
+        let status = self.facts.status_message();
+        if empty && !loading {
+            saved = saved.child(settings_ui::empty_state(
+                AppIcon::Memory,
+                "No matching memories",
+                "Try different words, or add the fact you were looking for.",
+                None,
+            ));
         } else {
-            let weak = cx.entity().downgrade();
-            let rows = uniform_list(
-                "saved-memory-list",
-                self.memories.len(),
-                move |range, _, cx| {
-                    weak.update(cx, |view, cx| {
-                        range
-                            .filter_map(|index| {
-                                let record = view.memories.get(index)?;
-                                let id = record.id;
-                                let preview: String = record.content.chars().take(160).collect();
-                                Some(
-                                    button(("memory-select", index), "")
-                                        .accessibility_label(preview.clone())
-                                        .w_full()
-                                        .h(px(56.))
-                                        .justify_start()
-                                        .px_4()
-                                        .border_b_1()
-                                        .border_color(rgb(border()))
-                                        .child(div().w_full().truncate().child(preview))
-                                        .on_click(cx.listener(move |view, _, _, cx| {
-                                            view.open_fact_versions(id, cx)
-                                        }))
-                                        .into_any_element(),
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-                },
-            )
-            .track_scroll(&self.facts.scroll)
-            .h(px((self.memories.len() as f32 * 56.).min(336.)))
-            .w_full();
-            page = page.child(
-                div()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(border()))
-                    .overflow_hidden()
-                    .child(rows),
+            if !status.is_empty() && !loading {
+                saved = saved.child(settings_ui::caption(status.to_owned()));
+            }
+            if empty {
+                saved = saved.child(settings_ui::loading_list(3, self.facts.loading_since));
+            } else {
+                saved = saved.child(self.memory_list(cx));
+            }
+        }
+        let mut paging: Vec<AnyElement> = Vec::new();
+        if self.facts.before.is_some() {
+            paging.push(
+                settings_ui::text_button("memory-first", "First memories")
+                    .disabled(self.facts.query.is_some())
+                    .on_click(cx.listener(|view, _, _, cx| view.request_memories(false, cx)))
+                    .into_any_element(),
             );
         }
         if self.facts.has_more {
-            page = page.child(
-                button("memory-more", "Next memories (replaces current page)")
+            paging.push(
+                settings_ui::text_button("memory-more", "Next memories")
                     .disabled(self.facts.query.is_some())
-                    .on_click(cx.listener(|view, _, _, cx| view.request_memories(true, cx))),
+                    .on_click(cx.listener(|view, _, _, cx| view.request_memories(true, cx)))
+                    .into_any_element(),
             );
         }
-        if self.facts.before.is_some() {
-            page = page.child(
-                button("memory-first", "First memories")
-                    .disabled(self.facts.query.is_some())
-                    .on_click(cx.listener(|view, _, _, cx| view.request_memories(false, cx))),
+        if !paging.is_empty() {
+            saved = saved.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .children(paging),
             );
         }
-        super::settings::settings_content("memory-settings")
-            .child(
-                page.child(self.memory_archive_controls(cx))
-                    .child(self.memory_versions_panel(cx)),
-            )
+        page.child(settings_ui::section("Saved memories", None, saved))
+            .child(self.memory_archive_controls(cx))
             .into_any_element()
     }
+    /// Current memories, virtualized: each opens its detail page, which holds
+    /// Correct, the version history and Forget.
+    fn memory_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        let weak = cx.entity().downgrade();
+        let count = self.memories.len();
+        let rows = uniform_list("saved-memory-list", count, move |range, _, cx| {
+            weak.update(cx, |view, cx| {
+                range
+                    .filter_map(|index| {
+                        let record = view.memories.get(index)?.clone();
+                        let id = record.id;
+                        Some(
+                            settings_ui::list_item(
+                                ("memory-select", index),
+                                None,
+                                memory_title(&record.content),
+                                Some(
+                                    format!(
+                                        "{} · {}",
+                                        memory_age(record.created_at),
+                                        record.source
+                                    )
+                                    .into(),
+                                ),
+                            )
+                            .tags([scope_label(&record.scope)])
+                            .divider(index > 0)
+                            .on_click(
+                                cx.listener(move |view, _, _, cx| view.open_fact_versions(id, cx)),
+                            )
+                            .into_any_element(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+        })
+        .track_scroll(&self.facts.scroll)
+        .h(px(
+            (count as f32 * settings_ui::LIST_ITEM_HEIGHT).min(8. * settings_ui::LIST_ITEM_HEIGHT)
+        ))
+        .w_full();
+        settings_ui::list_frame().child(rows).into_any_element()
+    }
+}
+
+/// The first line of a memory, short enough for a list title.
+pub(super) fn memory_title(content: &str) -> String {
+    let line = content.trim().lines().next().unwrap_or_default().trim();
+    let mut title: String = line.chars().take(80).collect();
+    if line.chars().count() > 80 {
+        title.push('…');
+    }
+    if title.is_empty() {
+        "Untitled memory".into()
+    } else {
+        title
+    }
+}
+/// The scope tag on a memory: "All projects" or the project folder name.
+pub(super) fn scope_label(scope: &str) -> SharedString {
+    if scope == "global" {
+        return "All projects".into();
+    }
+    Path::new(scope)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| scope.to_owned())
+        .into()
 }
 
 pub(super) fn memory_age(saved_at: i64) -> String {
@@ -475,3 +591,7 @@ pub(super) fn memory_age(saved_at: i64) -> String {
         _ => format!("Saved {} days ago", seconds / 86400),
     }
 }
+
+#[cfg(test)]
+#[path = "memory/tests.rs"]
+mod tests;

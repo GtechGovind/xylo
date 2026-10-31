@@ -162,6 +162,7 @@ fn user_turn_reopen_preserves_refs_and_idempotency_rejects_changed_images() {
         provider: ProviderConfig::default(),
         permissions: PermissionMode::ReadOnly,
         attachments: vec![reference.clone()],
+        approved_rules: Vec::new(),
     };
     let database = temp.path().join("history.sqlite");
     let store = crate::Store::open(&database).unwrap();

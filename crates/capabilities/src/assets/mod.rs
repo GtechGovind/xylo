@@ -100,6 +100,7 @@ impl AssetManager {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         }
+        reclaim_staging(&root);
         Ok(Self {
             downloader: Downloader::new(root.join("downloads"))?,
             root,
@@ -119,10 +120,9 @@ impl AssetManager {
     }
     fn fingerprint(variant: &Variant) -> Result<String> {
         use sha2::Digest;
-        Ok(format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(variant)?)
-        ))
+        Ok(hex::encode(sha2::Sha256::digest(serde_json::to_vec(
+            variant,
+        )?)))
     }
     fn location(&self, asset: &Asset) -> Result<PathBuf> {
         Ok(self
@@ -735,12 +735,8 @@ impl AssetManager {
                         tokio::fs::remove_dir_all(&stage).await?;
                         return Ok(());
                     }
-                    let quarantine = self.root.join("staging").join(format!(
-                        "recovery-{}-{}",
-                        asset.id,
-                        Uuid::new_v4()
-                    ));
-                    tokio::fs::rename(&destination, &quarantine)
+                    // A damaged or outdated installation is replaced, not kept.
+                    tokio::fs::remove_dir_all(&destination)
                         .await
                         .context("Stop active native tasks before repairing this installation")?;
                 }
@@ -755,6 +751,45 @@ impl AssetManager {
         }
         Ok(())
     }
+}
+
+/// Staging holds only the stages of running installs. Everything else is
+/// removed at startup: abandoned `<asset>-<job>` stages whose asset lock is
+/// free (a live install holds it) and any entry that is not a stage at all.
+/// Failures are ignored; an entry still in use is retried at the next start.
+fn reclaim_staging(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root.join("staging")) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let abandoned = match stage_asset(&name) {
+            None => true,
+            Some(asset) => std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(root.join("locks").join(format!("{asset}.lock")))
+                .is_ok_and(|lock| fs2::FileExt::try_lock_exclusive(&lock).is_ok()),
+        };
+        if abandoned {
+            let path = entry.path();
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+        }
+    }
+}
+
+/// The asset id of a `<asset>-<job uuid>` stage directory name.
+fn stage_asset(name: &str) -> Option<&str> {
+    let split = name.len().checked_sub(37)?;
+    let (asset, job) = name.split_at(split);
+    let job = job.strip_prefix('-')?;
+    (Uuid::parse_str(job).is_ok() && !asset.is_empty()).then_some(asset)
 }
 
 /// macOS reserves Contents/MacOS for signed code. Manifests and prebuilt asset
@@ -872,7 +907,7 @@ async fn build_whisper(stage: &Path, cancel: &CancellationToken) -> Result<()> {
     let cmake=std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).map(|path|path.join(if cfg!(windows){"cmake.exe"}else{"cmake"})).find(|path|path.is_file()).context("This development build needs CMake and native compiler tools to build whisper.cpp. Distribution packages must include the prebuilt native component.")?;
     let cmake = std::fs::canonicalize(cmake)?;
     let build = source.join("build-native");
-    let mut system = sysinfo::System::new();
+    let mut system = sysinfo::System::new().context("Read available memory")?;
     system.refresh_memory();
     let memory_jobs = (system.available_memory().saturating_sub(512 * 1024 * 1024)
         / (512 * 1024 * 1024))
@@ -959,142 +994,4 @@ async fn build_whisper(stage: &Path, cancel: &CancellationToken) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn native_asset_locations_match_packaged_and_development_layouts() {
-        use std::path::Path;
-        let (root, asset) =
-            super::packaged_asset_location(Path::new("/build/xylo-helper"), "whisper-runtime")
-                .unwrap();
-        assert_eq!(root, Path::new("/build"));
-        assert_eq!(asset, Path::new("/build/native-assets/whisper-runtime"));
-        #[cfg(target_os = "macos")]
-        {
-            let (root, asset) = super::packaged_asset_location(
-                Path::new("/Applications/Xylo.app/Contents/MacOS/xylo-helper"),
-                "whisper-runtime",
-            )
-            .unwrap();
-            assert_eq!(root, Path::new("/Applications/Xylo.app/Contents"));
-            assert_eq!(
-                asset,
-                Path::new(
-                    "/Applications/Xylo.app/Contents/Resources/native-assets/whisper-runtime"
-                )
-            );
-        }
-    }
-    use super::*;
-    #[test]
-    fn reviewed_catalog_is_pinned_and_models_require_an_explicit_selection() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = AssetManager::new(root.path()).unwrap();
-        let catalog = manager.catalog().unwrap();
-        assert_eq!(manager.active_jobs(), 0);
-        assert!(manager.status(None).unwrap().is_empty());
-        assert!(
-            catalog["assets"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|asset| asset["installed"] == false && asset["active"] == false)
-        );
-        assert!(
-            manager
-                .plan("qwen3-0.6b-q8")
-                .unwrap()
-                .contains(&"llama-runtime".into())
-        );
-        assert!(manager.install("https://arbitrary.example/binary").is_err());
-    }
-
-    #[tokio::test]
-    async fn installation_is_durable_verified_and_rejects_changed_bytes_on_activation() {
-        let root = tempfile::tempdir().unwrap();
-        let mut manager = AssetManager::new(root.path()).unwrap();
-        let body = b"deterministic native fixture".to_vec();
-        let (url, _, server) = download::tests::fixture(body.clone(), "normal").await;
-        let mut spec = download::tests::specification(url, &body);
-        spec.destination = "native-fixture".into();
-        manager.catalog = Arc::new(vec![Asset {
-            id: "fixture".into(),
-            name: "Fixture".into(),
-            kind: "model".into(),
-            description: "fixture".into(),
-            revision: "1".into(),
-            project_url: "https://example.com".into(),
-            license: catalog::License {
-                identifier: "MIT".into(),
-                url: "https://example.com/license".into(),
-                notice: "fixture".into(),
-            },
-            requires: vec![],
-            hidden: false,
-            variants: vec![Variant {
-                platform: "any".into(),
-                files: vec![spec],
-                exports: BTreeMap::from([(
-                    "model".into(),
-                    catalog::Export {
-                        basename: "native-fixture".into(),
-                        executable: false,
-                    },
-                )]),
-                source_build: false,
-            }],
-        }]);
-        manager.downloader = download::tests::local_downloader(manager.root.join("downloads"));
-        let job = manager.install("fixture").unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if manager.snapshot(job.job_id).unwrap().active() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                } else {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        let status = manager.status(Some(job.job_id)).unwrap();
-        assert_eq!(status[0].phase, "installed", "{}", status[0].message);
-        assert_eq!(status[0].progress, 1.);
-        let (directory, _) = manager
-            .verified_exports("fixture", &CancellationToken::new())
-            .await
-            .unwrap();
-        assert!(directory.starts_with(root.path().canonicalize().unwrap()));
-        assert!(directory.join("receipt.json").is_file());
-        std::fs::write(directory.join("native-fixture"), vec![0; body.len()]).unwrap();
-        assert!(
-            manager
-                .verified_exports("fixture", &CancellationToken::new())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("SHA256")
-        );
-        assert!(
-            manager
-                .activation("fixture", &CancellationToken::new())
-                .await
-                .is_err()
-        );
-        assert_eq!(manager.catalog().unwrap()["assets"][0]["installed"], false);
-        let repair = manager.install("fixture").unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while manager.snapshot(repair.job_id).unwrap().active() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(manager.snapshot(repair.job_id).unwrap().phase, "installed");
-        manager
-            .verified_exports("fixture", &CancellationToken::new())
-            .await
-            .unwrap();
-        manager.shutdown().await;
-        server.abort();
-    }
-}
+mod tests;

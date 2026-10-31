@@ -3,6 +3,13 @@
 //! No model turn, user project, account credentials, or physical desktop is used.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/assets.rs"]
+mod assets;
+mod capture_dir;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -36,7 +43,11 @@ mod xylo {
         }
         pub(crate) fn capture_diff_ready(&self) -> bool {
             self.git_panel.diff_request.is_none()
-                && self.diff.contains("+    println!(\"Focused workspace\");")
+                && self
+                    .git_panel
+                    .diff_lines
+                    .iter()
+                    .any(|line| line == "+    println!(\"Focused workspace\");")
         }
         pub(crate) fn capture_healthy(&self) {
             assert!(self.error.is_none(), "Actual Host error: {:?}", self.error);
@@ -122,7 +133,7 @@ fn render() {
     let client = host.0.clone();
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        Arc::new(crate::assets::AppAssets),
         platform::current_headless_renderer,
     );
     cx.allow_parking();
@@ -160,10 +171,7 @@ fn render() {
         }
     };
     wait(&mut cx, &|view| view.capture_ready());
-    let output = std::env::var_os("XYLO_RENDER_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "target/native-preview".into());
-    std::fs::create_dir_all(&output).unwrap();
+    let output = capture_dir::fresh("rendering");
     let save = |cx: &mut HeadlessAppContext, name: &str| {
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
@@ -237,13 +245,13 @@ fn render() {
     .unwrap();
     save(&mut cx, "settings.png");
     for (navigation, control, filename) in [
-        ("nav-agent", "agent-timeout-120", "settings-agent.png"),
+        ("nav-general", "agent-timeout-120", "settings-general.png"),
         (
-            "nav-context",
-            "manage-context-connections",
-            "settings-context.png",
+            "nav-connections",
+            "connector-add",
+            "settings-connections.png",
         ),
-        ("nav-skills", "refresh-learning", "settings-skills.png"),
+        ("nav-skills", "skills-browse-plugins", "settings-skills.png"),
         ("nav-memory", "memory-new", "settings-memory.png"),
     ] {
         cx.update_window(handle, |_, window, cx| {
@@ -259,18 +267,7 @@ fn render() {
             wait(&mut cx, &|view| view.capture_memory_ready());
         }
         if navigation == "nav-skills" {
-            let deadline = Instant::now() + Duration::from_secs(15);
-            loop {
-                cx.advance_clock(Duration::from_millis(2));
-                cx.run_until_parked();
-                let ready = cx.update_window(handle, |_, window, cx| {
-                    window.render_frame(cx);
-                    window.find("refresh-learning").disabled() != Some(true)
-                }).unwrap();
-                if ready { break; }
-                assert!(Instant::now() < deadline, "Skills capture did not settle");
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            wait(&mut cx, &|view| view.validation_learning_idle());
         }
         save(&mut cx, filename);
     }
@@ -289,7 +286,7 @@ fn render() {
     save(&mut cx, "settings-light.png");
     std::fs::write(output.join("capture-scope.json"),serde_json::to_vec_pretty(&serde_json::json!({
         "scope":"Production native renderer with a real temporary Git repository and Host; no model turn, user project, connected-account simulation or physical desktop capture.",
-        "size":[1380,880],"files":["home.png","files.png","changes.png","settings.png","settings-agent.png","settings-context.png","settings-permissions.png","settings-skills.png","settings-memory.png","settings-light.png"]
+        "size":[1380,880],"files":["home.png","files.png","changes.png","settings.png","settings-general.png","settings-connections.png","settings-permissions.png","settings-skills.png","settings-memory.png","settings-light.png"]
     })).unwrap()).unwrap();
     client.shutdown().unwrap();
     println!(

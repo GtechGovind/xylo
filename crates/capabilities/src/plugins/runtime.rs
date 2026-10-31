@@ -2,9 +2,9 @@
 
 use super::{
     catalog,
-    security::{bounded_read, checked, hash, open_workspace_read, validate_capability},
+    security::{checked, hash, open_workspace_read},
 };
-use crate::{CapabilityConfig, input_path, observation, output_path};
+use crate::{CapabilityConfig, observation, output_path};
 use anyhow::{Context, Result, ensure};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -585,77 +585,6 @@ fn bounded_error(error: &anyhow::Error, output_budget: usize) -> String {
         message.truncate(end);
     }
     message
-}
-
-pub(super) async fn legacy(
-    config: &CapabilityConfig,
-    args: &Value,
-    cancel: CancellationToken,
-) -> Result<ToolObservation> {
-    let grants: Vec<String> =
-        serde_json::from_value(args.get("capabilities").cloned().unwrap_or(json!([])))?;
-    ensure!(grants.len() <= 32, "Too many plugin capabilities");
-    for grant in &grants {
-        validate_capability(grant)?;
-    }
-    let number = |name: &str, default: u64| -> Result<u64> {
-        args.get(name).map_or(Ok(default), |value| {
-            value
-                .as_u64()
-                .context("Plugin resource budget must be an unsigned integer")
-        })
-    };
-    let budgets = PluginBudgets {
-        memory_mib: u32::try_from(number("memory_mib", 32)?)?,
-        fuel: number("fuel", 10_000_000)?,
-        timeout_seconds: number("timeout_seconds", 15)?,
-        max_input_bytes: config.max_output_bytes.min(1024 * 1024) as u64,
-        max_output_bytes: config.max_output_bytes.min(1024 * 1024) as u64,
-    };
-    let validation = xylo_core::NativePluginManifest {
-        format: 1,
-        id: "legacy".into(),
-        name: "Local component".into(),
-        version: "1".into(),
-        entrypoint: "component.wasm".into(),
-        sha256: "0".repeat(64),
-        capabilities: grants.clone(),
-        budgets: budgets.clone(),
-    };
-    super::security::validate_manifest(&validation)?;
-    let cfg = config.clone();
-    let raw = crate::required_str(args, "path")?.to_owned();
-    let read_cancel = cancel.clone();
-    let module = xylo_resources::spawn_blocking(move || {
-        checked(&read_cancel)?;
-        bounded_read(&input_path(&cfg, &raw)?, catalog::MAX_MODULE)
-    })
-    .await??;
-    // Legacy invocations are workspace scoped and have no catalog identity. The
-    // compile lock lives in private management storage when it is configured.
-    let root = if config.management_root.is_some() {
-        catalog::root(config)?
-    } else {
-        config.artifacts.clone()
-    };
-    run(
-        Invocation {
-            config: config.clone(),
-            module,
-            input: args
-                .get("input")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
-            grants: grants.into_iter().collect(),
-            budgets,
-            root,
-            lease: None,
-            identity: json!({"legacy":true}),
-        },
-        cancel,
-    )
-    .await
 }
 
 #[cfg(test)]

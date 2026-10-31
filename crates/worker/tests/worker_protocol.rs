@@ -1,4 +1,4 @@
-//! End-to-end checks use the real worker process, Hermes streaming provider,
+//! End-to-end checks use the real worker process, streaming provider,
 //! native broker and SQLite journal against a local deterministic HTTP fixture.
 
 use serde_json::{Value, json};
@@ -28,6 +28,13 @@ impl Worker {
         Self::with_profile(tempfile::tempdir().unwrap()).await
     }
     async fn with_profile(profile: tempfile::TempDir) -> Self {
+        // The host creates the database; workers only open it.
+        xylo_services::Store::open(
+            xylo_runtime::AppPaths::at(profile.path().to_owned())
+                .unwrap()
+                .database,
+        )
+        .unwrap();
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_xylo-worker"))
             .arg("--data-dir")
             .arg(profile.path())
@@ -49,6 +56,14 @@ impl Worker {
             worker.event().await.payload,
             EngineEvent::Ready { .. }
         ));
+        worker
+            .send(
+                Uuid::nil(),
+                WorkerCommand::Unlock {
+                    key: WorkerCredential(Some("00".repeat(32))),
+                },
+            )
+            .await;
         worker
     }
     async fn send(&mut self, session: Uuid, payload: WorkerCommand) {
@@ -160,8 +175,9 @@ fn turn(session: Uuid, workspace: &std::path::Path, endpoint: String) -> TurnReq
             model: "fixture".into(),
             ..Default::default()
         },
-        permissions: PermissionMode::AskForWrites,
+        permissions: PermissionMode::AskForApproval,
         attachments: Vec::new(),
+        approved_rules: Vec::new(),
     }
 }
 
@@ -305,11 +321,13 @@ async fn authorized_worker_does_not_read_the_platform_vault() {
 }
 
 #[tokio::test]
-async fn denied_write_never_changes_the_workspace() {
+async fn denied_write_outside_the_project_never_changes_it() {
     let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("sample.txt");
     let (endpoint, _requests) = provider_fixture(
         "file_write",
-        json!({"path":"sample.txt","content":"must not be written"}),
+        json!({"path":target,"content":"must not be written"}),
     );
     let mut worker = Worker::start().await;
     let session = Uuid::new_v4();
@@ -340,7 +358,7 @@ async fn denied_write_never_changes_the_workspace() {
         }
     }
     assert!(denied);
-    assert!(!workspace.path().join("sample.txt").exists());
+    assert!(!target.exists());
     worker.stop().await;
 }
 
@@ -367,10 +385,10 @@ async fn sse_validation_failure_is_correlated_once_and_retains_checkpointed_tool
             loop {
                 let mut line = String::new();
                 socket.read_line(&mut line).await.unwrap();
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = value.trim().parse::<usize>().unwrap();
-                    }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().unwrap();
                 }
                 if line == "\r\n" {
                     break;
@@ -475,7 +493,7 @@ async fn sse_validation_failure_is_correlated_once_and_retains_checkpointed_tool
     assert!(input.iter().any(|item| item["type"] == "reasoning"
         && item["id"] == "rs_fixture"
         && item["encrypted_content"] == "opaque-encrypted-fixture"));
-    let store = xylo_services::Store::open(&worker._profile.path().join("xylo.db")).unwrap();
+    let store = xylo_services::Store::open(worker._profile.path().join("xylo.db")).unwrap();
     let checkpoint = store.checkpoint(session).unwrap().unwrap();
     assert_eq!(checkpoint.turn_id, request.turn_id);
     assert!(
@@ -490,5 +508,75 @@ async fn sse_validation_failure_is_correlated_once_and_retains_checkpointed_tool
             .unwrap()
             .is_none()
     );
+    worker.stop().await;
+}
+
+#[tokio::test]
+async fn locked_worker_refuses_runs_and_failed_approvals_name_the_action() {
+    let profile = tempfile::tempdir().unwrap();
+    xylo_services::Store::open(
+        xylo_runtime::AppPaths::at(profile.path().to_owned())
+            .unwrap()
+            .database,
+    )
+    .unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_xylo-worker"))
+        .arg("--data-dir")
+        .arg(profile.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut worker = Worker {
+        input: child.stdin.take().unwrap(),
+        output: BufReader::new(child.stdout.take().unwrap()),
+        child,
+        _profile: profile,
+    };
+    match worker.event().await.payload {
+        EngineEvent::Ready { version } => assert_eq!(version, env!("CARGO_PKG_VERSION")),
+        other => panic!("expected Ready, got {other:?}"),
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let session = Uuid::new_v4();
+    worker
+        .send(
+            session,
+            WorkerCommand::Run {
+                turn: turn(session, workspace.path(), "http://127.0.0.1:1/v1".into()),
+            },
+        )
+        .await;
+    match worker.event().await.payload {
+        EngineEvent::Error { message, .. } => assert!(message.contains("Unlock"), "{message}"),
+        other => panic!("expected a locked-worker error, got {other:?}"),
+    }
+    worker
+        .send(
+            session,
+            WorkerCommand::Unlock {
+                key: WorkerCredential(Some("00".repeat(32))),
+            },
+        )
+        .await;
+    let action_id = Uuid::new_v4();
+    worker
+        .send(
+            session,
+            WorkerCommand::Approve {
+                action_id,
+                allow: true,
+                remember: false,
+            },
+        )
+        .await;
+    match worker.event().await.payload {
+        EngineEvent::Error { message, .. } => {
+            assert!(message.contains(&action_id.to_string()), "{message}")
+        }
+        other => panic!("expected an approval error, got {other:?}"),
+    }
     worker.stop().await;
 }

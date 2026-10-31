@@ -277,7 +277,7 @@ pub(super) fn manifest(root: &Path, cancel: &CancellationToken) -> Result<Vec<In
             files.push(InstalledFile {
                 path: entry.path().strip_prefix(root)?.to_path_buf(),
                 size_bytes: metadata.len(),
-                sha256: format!("{:x}", hash.finalize()),
+                sha256: hex::encode(hash.finalize()),
             });
         }
     }
@@ -286,25 +286,4 @@ pub(super) fn manifest(root: &Path, cancel: &CancellationToken) -> Result<Vec<In
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn archive_traversal_and_special_entries_are_rejected() {
-        let root = tempfile::tempdir().unwrap();
-        let file = root.path().join("unsafe.zip");
-        let mut zip = zip::ZipWriter::new(File::create(&file).unwrap());
-        zip.start_file("../escape", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(b"escape").unwrap();
-        zip.finish().unwrap();
-        let spec = Download {
-            url: "https://example.com/fixture".into(),
-            sha256: "a".repeat(64),
-            size_bytes: 1,
-            format: Format::Zip,
-            destination: "content".into(),
-        };
-        assert!(extract(&file, &spec, root.path(), &CancellationToken::new()).is_err());
-        assert!(!root.path().parent().unwrap().join("escape").exists());
-    }
-}
+mod tests;

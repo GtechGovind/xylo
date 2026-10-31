@@ -2,19 +2,58 @@
 use super::*;
 impl Xylo {
     pub(in crate::xylo) fn recovery_banner(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.recovery.items.is_empty()
-            && !self
-                .recovery
-                .entry()
-                .is_some_and(|entry| entry.form.pending.is_some())
-        {
+        let pending = self
+            .recovery
+            .entry()
+            .is_some_and(|entry| entry.form.pending.is_some());
+        let blocking = self.recovery.blocking_items().next().is_some() || pending;
+        let dismissed = self.recovery.dismissed_count();
+        if !blocking && dismissed == 0 {
             return div().into_any_element();
         }
-        div().w_full().px_6().py_2().flex().flex_wrap().items_center().gap_3().bg(rgb(lavender()))
-            .child(subtitle("An interrupted action needs review before this chat continues. Some changes may remain."))
-            .child(button("review-interrupted-actions", "Review interrupted action").on_click(cx.listener(|view, _, _, cx| {
-                view.recovery.open = true; cx.notify();
-            })))
+        let message = if blocking {
+            "An interrupted action needs review before this chat continues. Some changes may remain.".to_owned()
+        } else if dismissed == 1 {
+            "Continuing without a recorded outcome for an interrupted action. Its changes may remain.".to_owned()
+        } else {
+            format!(
+                "Continuing without a recorded outcome for {dismissed} interrupted actions. Their changes may remain."
+            )
+        };
+        let dismissible = self.recovery.dismissible_items().next().is_some();
+        div()
+            .w_full()
+            .px_6()
+            .py_2()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .child(div().flex_1().min_w_0().child(notice(
+                if blocking {
+                    BadgeTone::Neutral
+                } else {
+                    BadgeTone::Warning
+                },
+                message,
+            )))
+            .child(
+                button("review-interrupted-actions", "Review interrupted action").on_click(
+                    cx.listener(|view, _, _, cx| {
+                        view.recovery.open = true;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .when(blocking && dismissible, |row| {
+                row.child(self.recovery_dismiss_button("recovery-banner-dismiss", cx))
+            })
+            .into_any_element()
+    }
+    fn recovery_dismiss_button(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        button(id, "Dismiss and continue")
+            .disabled(self.recovery.mutation_busy())
+            .on_click(cx.listener(|view, _, window, cx| view.dismiss_stuck_actions(window, cx)))
             .into_any_element()
     }
     pub(in crate::xylo) fn recovery_panel(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -27,23 +66,28 @@ impl Xylo {
             .flex_col()
             .gap_4()
             .p_6()
-            .child(heading(
-                "Review interrupted action",
-                "Inspect the actual target, then record the outcome you observed.",
-            ))
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(button("review-back-chat", "Back to conversation").on_click(
-                        cx.listener(|view, _, _, cx| {
+                    .items_start()
+                    .gap(px(8.))
+                    .child(
+                        icons::icon_button(
+                            "review-back-chat",
+                            AppIcon::Back,
+                            "Back to conversation",
+                        )
+                        .on_click(cx.listener(|view, _, _, cx| {
                             view.recovery.open = false;
                             cx.notify();
-                        }),
-                    ))
+                        })),
+                    )
+                    .child(div().flex_1().min_w_0().child(heading(
+                        "Review interrupted action",
+                        "Inspect the actual target, then record the outcome you observed.",
+                    )))
                     .child(
-                        button("review-refresh", "Refresh actions")
+                        icons::icon_button("review-refresh", AppIcon::Refresh, "Refresh actions")
                             .disabled(busy || self.recovery.read_busy())
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.recovery_load_form(window, cx);
@@ -52,7 +96,10 @@ impl Xylo {
                     ),
             );
         if !self.recovery.notice.is_empty() {
-            page = page.child(subtitle(self.recovery.notice.clone()));
+            page = page.child(notice(BadgeTone::Neutral, self.recovery.notice.clone()));
+        }
+        if self.recovery.dismissible_items().next().is_some() {
+            page = page.child(self.recovery_dismiss_button("review-dismiss-stuck", cx));
         }
         if self.recovery.read_busy() || self.recovery.recording.is_some() {
             page = page.child(
@@ -69,7 +116,7 @@ impl Xylo {
             .w(px(280.))
             .flex_shrink_0()
             .gap_2()
-            .child(div().text_lg().child("Actions needing review"));
+            .child(sidebar_label("Needs review").px(px(0.)));
         if !self.recovery.loaded {
             actions = actions.child(subtitle("Loading this chat's interrupted actions…"));
         } else if rows.is_empty() {
@@ -136,9 +183,9 @@ impl Xylo {
                     "An interruption or cancellation does not show whether its effects completed.",
                 ));
             if saved.action.busy {
-                detail = detail.child(subtitle("This action is still running. Wait until it has stopped before recording an outcome."));
+                detail = detail.child(subtitle("This action is still running. Wait until it has stopped before recording an outcome. If it stays running, you can dismiss it and continue."));
             } else if saved.action.blocked_reason.is_some() {
-                detail = detail.child(subtitle("Verify this action in the service where it ran. Xylo cannot confirm that it has stopped, so recording an outcome here is unavailable."));
+                detail = detail.child(subtitle("Verify this action in the service where it ran. Xylo cannot confirm that it has stopped, so recording an outcome here is unavailable. You can dismiss it and continue."));
             }
             if let Some(target) = review_target(saved) {
                 detail = detail.child(div().text_sm().child(target));
@@ -194,7 +241,7 @@ impl Xylo {
         }
         if let Some(entry) = self.recovery.entry() {
             if let Some(error) = &entry.error {
-                detail = detail.child(subtitle(error.clone()));
+                detail = detail.child(notice(BadgeTone::Danger, error.clone()));
             }
             if entry.conflict.is_some() {
                 detail = detail

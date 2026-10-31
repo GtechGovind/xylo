@@ -1,13 +1,16 @@
 //! Native terminal rendering. No webview: PTY parsing is in runtime::terminal,
 //! glyph shaping, selection and IME are handled by GPUI.
-use crate::ui::{accent_text as accent, border, button, muted, panel, sidebar, text};
+use crate::icons::{self, AppIcon};
+use crate::ui::{border, button, muted, panel, text};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::{prelude::*, *};
 use std::ops::Range;
 use xylo_runtime::terminal::{TerminalSession, TerminalSnapshot};
 
 /// Terminal canvas: the same warm charcoal as the dark workspace.
-const SURFACE: u32 = 0x0f1117;
+pub(crate) const SURFACE: u32 = 0x0f1117;
+/// The text size a new terminal starts at and Reset text size returns to.
+pub const DEFAULT_FONT_SIZE: f32 = 13.;
 const MAX_ASSIST_CONTEXT: usize = 12 * 1024;
 
 /// A reviewed terminal question. The application opens a separate saved chat;
@@ -30,7 +33,6 @@ pub struct TerminalView {
     last_size: (u16, u16),
     font: Font,
     font_size: f32,
-    embedded: bool,
     search_open: bool,
     assist_open: bool,
     assist: Entity<TextareaState>,
@@ -81,30 +83,34 @@ impl TerminalView {
             _subscriptions: vec![subscription],
             last_size: (80, 24),
             font: terminal_font(window),
-            font_size: 13.,
-            embedded: false,
+            font_size: DEFAULT_FONT_SIZE,
             search_open: false,
             assist_open: false,
             assist,
         }
     }
-    pub fn set_embedded(&mut self, embedded: bool, cx: &mut Context<Self>) {
-        self.embedded = embedded;
-        cx.notify();
+    /// The shell this view shows. For validation.
+    #[cfg(feature = "validation")]
+    pub fn session(&self) -> TerminalSession {
+        self.session.clone()
     }
     pub fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
     }
-    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_open = !self.search_open;
-        if self.search_open {
-            self.search.update(cx, |input, cx| input.focus(window, cx));
-        } else {
-            self.focus_terminal(window, cx);
-        }
+    /// Shows the scrollback search bar and focuses it.
+    pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = true;
+        self.search.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
-    fn open_assist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = false;
+        self.focus_terminal(window, cx);
+        cx.notify();
+    }
+    /// Opens or closes the "Ask Xylo" panel, seeding it with the reviewed
+    /// output the first time it opens.
+    pub fn toggle_assist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.assist_open && self.assist.read(cx).value().is_empty() {
             let output = assistant_context(&self.snapshot);
             let prompt = if output.is_empty() {
@@ -129,8 +135,14 @@ impl TerminalView {
             cx.emit(TerminalEvent::AssistRequested { prompt });
         }
     }
-    fn zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
+    /// Changes the text size by `delta` points, within 10 to 24.
+    pub fn zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.font_size = (self.font_size + delta).clamp(10., 24.);
+        cx.notify();
+    }
+    /// Returns the text size to [`DEFAULT_FONT_SIZE`].
+    pub fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.font_size = DEFAULT_FONT_SIZE;
         cx.notify();
     }
     fn search_next(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -193,17 +205,14 @@ impl TerminalView {
             return;
         }
         if clipboard_modifier && k.key == "f" {
-            self.search_open = true;
-            self.search.update(cx, |s, cx| s.focus(window, cx));
-            cx.notify();
+            self.open_search(window, cx);
             cx.stop_propagation();
             window.prevent_default();
             return;
         }
         if clipboard_modifier && matches!(k.key.as_str(), "+" | "=" | "-" | "0") {
             if k.key == "0" {
-                self.font_size = 13.;
-                cx.notify();
+                self.reset_zoom(cx);
             } else {
                 self.zoom(if k.key == "-" { -1. } else { 1. }, cx);
             }
@@ -306,65 +315,6 @@ impl Render for TerminalView {
             .size_full()
             .min_h_0()
             .bg(rgb(SURFACE))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .h(px(32.))
-                    .flex_shrink_0()
-                    .bg(rgb(sidebar()))
-                    .border_b_1()
-                    .border_color(rgb(border()))
-                    .when(!self.embedded, |bar| {
-                        bar.child(div().text_xs().text_color(rgb(muted())).child(
-                            if self.snapshot.exited {
-                                "Shell closed"
-                            } else {
-                                "Terminal"
-                            },
-                        ))
-                    })
-                    .child(
-                        button("term-assist", "✦ Ask Xylo")
-                            .text_xs()
-                            .text_color(rgb(accent()))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_assist(window, cx)),
-                            ),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        button("term-font-smaller", "−")
-                            .text_xs()
-                            .on_click(cx.listener(|this, _, _, cx| this.zoom(-1., cx))),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(muted()))
-                            .child(format!("{}", self.font_size as u8)),
-                    )
-                    .child(
-                        button("term-font-larger", "+")
-                            .text_xs()
-                            .on_click(cx.listener(|this, _, _, cx| this.zoom(1., cx))),
-                    )
-                    .child(button("term-find", "Find").text_xs().on_click(
-                        cx.listener(|this, _, window, cx| this.toggle_search(window, cx)),
-                    ))
-                    .child(
-                        button("term-copy", "Copy")
-                            .text_xs()
-                            .on_click(cx.listener(|this, _, _, cx| this.copy(cx))),
-                    )
-                    .child(
-                        button("term-paste", "Paste")
-                            .text_xs()
-                            .on_click(cx.listener(|this, _, _, cx| this.paste(cx))),
-                    ),
-            )
             .when(self.search_open, |surface| {
                 surface.child(
                     div()
@@ -377,24 +327,35 @@ impl Render for TerminalView {
                         .bg(rgb(panel()))
                         .border_b_1()
                         .border_color(rgb(border()))
-                        .child(div().flex_1().child(Input::new(&self.search)))
                         .child(
-                            button("term-prev", "↑").on_click(
-                                cx.listener(|this, _, _, cx| this.search_next(false, cx)),
-                            ),
+                            div()
+                                .flex_1()
+                                .child(Input::new(&self.search).aria_label("Find in scrollback")),
                         )
                         .child(
-                            button("term-next", "↓")
+                            icons::icon_button("term-prev", AppIcon::ChevronUp, "Previous match")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.search_next(false, cx)),
+                                ),
+                        )
+                        .child(
+                            icons::icon_button("term-next", AppIcon::ChevronDown, "Next match")
                                 .on_click(cx.listener(|this, _, _, cx| this.search_next(true, cx))),
                         )
-                        .child(button("term-find-close", "Done").on_click(
-                            cx.listener(|this, _, window, cx| this.toggle_search(window, cx)),
-                        )),
+                        .child(
+                            icons::icon_button("term-find-close", AppIcon::Close, "Close find")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.close_search(window, cx)
+                                    }),
+                                ),
+                        ),
                 )
             })
             .child(
                 div()
                     .id("terminal-surface")
+                    .test_support()
                     .role(Role::Terminal)
                     .aria_label("Project terminal")
                     .flex_1()
@@ -429,7 +390,7 @@ impl Render for TerminalView {
                         MouseButton::Left,
                         cx.listener(|this, _, _, _| this.selecting = false),
                     )
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         let delta = event.delta.pixel_delta(this.cell_height).y;
                         let lines = (delta / this.cell_height).round() as i32;
                         if lines != 0 {
@@ -456,11 +417,23 @@ impl Render for TerminalView {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(div().text_sm().child("Ask Xylo"))
-                                .child(div().flex_1())
-                                .child(button("term-assist-close", "Close").text_xs().on_click(
-                                    cx.listener(|this, _, window, cx| this.open_assist(window, cx)),
-                                )),
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Ask Xylo about this output"),
+                                )
+                                .child(
+                                    icons::icon_button(
+                                        "term-assist-close",
+                                        AppIcon::Close,
+                                        "Close",
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| this.toggle_assist(window, cx),
+                                    )),
+                                ),
                         )
                         .child(div().h(px(76.)).child(Textarea::new(&self.assist)))
                         .child(
@@ -891,143 +864,7 @@ impl Element for TerminalElement {
         });
     }
 }
+
 #[cfg(test)]
-pub(crate) mod tests {
-    use super::{
-        MAX_ASSIST_CONTEXT, SURFACE, TerminalElement, TerminalView, assistant_context, encode_key,
-        terminal_run,
-    };
-    use gpui_kit::{App, Bounds, Element, Entity, Font, Window, point, px, size};
-    use xylo_runtime::terminal::TerminalCell;
-    use xylo_runtime::terminal::TerminalSnapshot;
-
-    #[test]
-    fn assistance_context_is_bounded_and_prefers_the_explicit_selection() {
-        let mut snapshot = TerminalSnapshot {
-            selection: Some(format!("{}尾\u{1b}", "界".repeat(MAX_ASSIST_CONTEXT))),
-            ..Default::default()
-        };
-        let context = assistant_context(&snapshot);
-        assert!(context.len() <= MAX_ASSIST_CONTEXT + "[Earlier output omitted]\n".len());
-        assert!(context.ends_with('尾'));
-        assert!(!context.contains('\u{1b}'));
-        snapshot.selection = Some("user-selected output".into());
-        assert_eq!(assistant_context(&snapshot), "user-selected output");
-    }
-
-    #[allow(dead_code)] // Invoked by the separate native renderer harness.
-    pub(crate) fn install_render_fixture(view: &mut TerminalView) {
-        let columns = 110;
-        let blank = TerminalCell {
-            text: " ".into(),
-            foreground: 0xe4e7ee,
-            background: SURFACE,
-            bold: false,
-            italic: false,
-            underline: false,
-            wide_spacer: false,
-            selected: false,
-        };
-        let mut cells = vec![blank; columns * 8];
-        let prompt = "govind@Govinds-MacBook-Pro Documents % ";
-        for (column, c) in prompt.chars().enumerate() {
-            cells[column].text = c.to_string();
-        }
-        cells[columns].text = "界".into();
-        cells[columns + 1].wide_spacer = true;
-        cells[columns + 2].text = "e\u{301}".into();
-        cells[columns + 3].text = "X".into();
-        for cell in &mut cells[columns * 2..columns * 2 + 3] {
-            cell.underline = true;
-        }
-        view.snapshot = TerminalSnapshot {
-            columns,
-            rows: 8,
-            cells: std::sync::Arc::new(cells),
-            cursor: Some((0, prompt.len())),
-            title: "zsh".into(),
-            ..Default::default()
-        };
-    }
-
-    /// Uses the production prepaint path and the platform's actual shaper.
-    /// Mock text systems cannot detect a proportional fallback on macOS.
-    #[allow(dead_code)] // Invoked by the separate native renderer harness.
-    pub(crate) fn assert_render_geometry(
-        view: Entity<TerminalView>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> serde_json::Value {
-        let mut element = TerminalElement { view: view.clone() };
-        let bounds = Bounds::new(point(px(10.), px(42.)), size(px(940.), px(200.)));
-        let lines = element.prepaint(None, None, bounds, &mut (), window, cx);
-        let state = view.read(cx);
-        let prompt = "govind@Govinds-MacBook-Pro Documents % ";
-        let line = lines.iter().find(|line| line.row == 0).unwrap();
-        let cursor_x = state.cell_width * prompt.len() as f32;
-        let shaped_x = line.line.x_for_index(prompt.len());
-        assert!(
-            (cursor_x - shaped_x).abs() < px(1.),
-            "cursor {cursor_x:?} separated from shaped prompt {shaped_x:?}"
-        );
-        let x = lines
-            .iter()
-            .find(|line| line.row == 1 && line.column == 3)
-            .unwrap();
-        assert!(
-            x.line.text.starts_with('X'),
-            "wide and combining cells shifted subsequent text"
-        );
-        assert!(
-            lines.iter().any(|line| line.row == 2),
-            "ANSI underlines on spaces must remain paintable"
-        );
-        let old_font = Font {
-            family: "monospace".into(),
-            ..Default::default()
-        };
-        let old_width = window
-            .text_system()
-            .shape_line(
-                "M".into(),
-                px(14.),
-                &[terminal_run(&old_font, 1, 0xffffff, false, false, false)],
-                None,
-            )
-            .width;
-        let old_prompt = window.text_system().shape_line(
-            prompt.into(),
-            px(14.),
-            &[terminal_run(
-                &old_font,
-                prompt.len(),
-                0xffffff,
-                false,
-                false,
-                false,
-            )],
-            None,
-        );
-        serde_json::json!({"font": state.font.family.to_string(), "font_size": state.font_size,
-            "cursor_gap_pixels": f32::from(cursor_x - shaped_x),
-            "old_generic_font_gap_pixels": f32::from(old_width * prompt.len() as f32 - old_prompt.width),
-            "unicode_column_anchor": x.column})
-    }
-    #[test]
-    fn printable_keys_wait_for_native_ime() {
-        assert_eq!(encode_key("a", false, false, false, false), None);
-        assert_eq!(encode_key("界", false, false, false, false), None);
-    }
-    #[test]
-    fn terminal_control_keys_are_encoded() {
-        assert_eq!(encode_key("c", true, false, false, false), Some(vec![3]));
-        assert_eq!(
-            encode_key("up", false, false, false, true),
-            Some(b"\x1bOA".to_vec())
-        );
-        assert_eq!(
-            encode_key("tab", false, false, true, false),
-            Some(b"\x1b[Z".to_vec())
-        );
-    }
-}
+#[path = "terminal_view/tests.rs"]
+pub(crate) mod tests;

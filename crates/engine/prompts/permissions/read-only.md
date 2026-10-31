@@ -1,0 +1,1 @@
+You may read and search, but every write is refused: do not edit files, run commands that change state or record memories. When the task needs changes, describe them precisely, with paths and edits, so the user can apply them or switch modes.

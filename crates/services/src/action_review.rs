@@ -1,8 +1,6 @@
 //! Operator-only review of uncertain effects. Observation never authorizes replay.
 mod forms;
 mod leases;
-#[cfg(test)]
-mod tests;
 pub use forms::*;
 pub use leases::ActionExecutionLease;
 
@@ -98,18 +96,6 @@ pub struct ActionResolutionReceipt {
     pub source: String,
 }
 
-pub(super) fn initialize(conn: &Connection) -> Result<()> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS action_review_clock(id INTEGER PRIMARY KEY CHECK(id=1),seq INTEGER NOT NULL);INSERT OR IGNORE INTO action_review_clock VALUES(1,0);
-CREATE TABLE IF NOT EXISTS action_review_revisions(action_id TEXT PRIMARY KEY,seq INTEGER NOT NULL);
-CREATE TRIGGER IF NOT EXISTS action_review_insert AFTER INSERT ON actions BEGIN UPDATE action_review_clock SET seq=seq+1 WHERE id=1;INSERT OR REPLACE INTO action_review_revisions VALUES(new.id,(SELECT seq FROM action_review_clock WHERE id=1));END;
-CREATE TRIGGER IF NOT EXISTS action_review_update AFTER UPDATE ON actions BEGIN UPDATE action_review_clock SET seq=seq+1 WHERE id=1;INSERT OR REPLACE INTO action_review_revisions VALUES(new.id,(SELECT seq FROM action_review_clock WHERE id=1));END;
-CREATE INDEX IF NOT EXISTS action_review_page ON actions(session_id,state,updated_at DESC,id DESC);
-CREATE TABLE IF NOT EXISTS action_execution_protocol(action_id TEXT PRIMARY KEY,version INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS action_resolutions(operation_id TEXT PRIMARY KEY,action_id TEXT NOT NULL UNIQUE,request TEXT NOT NULL,receipt TEXT NOT NULL,original TEXT NOT NULL,original_sha256 TEXT NOT NULL);
-CREATE TRIGGER IF NOT EXISTS action_resolution_immutable_update BEFORE UPDATE ON action_resolutions BEGIN SELECT RAISE(ABORT,'Action resolution audit is immutable');END;
-CREATE TRIGGER IF NOT EXISTS action_resolution_immutable_delete BEFORE DELETE ON action_resolutions BEGIN SELECT RAISE(ABORT,'Action resolution audit is immutable');END;")?;
-    Ok(())
-}
 pub(super) fn scope(mut scope: ActionReviewScope) -> Result<ActionReviewScope> {
     ensure!(
         !scope.session_id.is_nil() && scope.workspace.is_absolute(),
@@ -142,13 +128,10 @@ pub(super) fn check_scope(conn: &Connection, scope: &ActionReviewScope) -> Resul
     Ok(())
 }
 fn revision(id: Uuid, session: Uuid, state: &str, updated: i64, seq: i64) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&(id, session, state, updated, seq))
-                .expect("Scalar revision serialization")
-        )
-    )
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&(id, session, state, updated, seq))
+            .expect("Scalar revision serialization"),
+    ))
 }
 type StoredActionRow = (String, String, Option<String>, Option<String>, i64, i64);
 fn read(conn: &Connection, id: Uuid, scope: &ActionReviewScope) -> Result<(JournalAction, i64)> {
@@ -379,7 +362,7 @@ impl Store {
             }
             let(action,seq)=read(&tx,request.action_id,&request.scope)?;let original_revision=revision(action.intent.id,action.intent.session_id,&action.state,action.updated_at,seq);
             ensure!(original_revision==request.expected_revision&&action.state=="outcome_unknown","This action changed; refresh it before recording an outcome");
-            let original=serde_json::to_string(&action)?;let original_sha256=format!("{:x}",Sha256::digest(original.as_bytes()));
+            let original=serde_json::to_string(&action)?;let original_sha256=hex::encode(Sha256::digest(original.as_bytes()));
             let completed=request.outcome==ActionResolutionOutcome::Completed;let timestamp=now_ms();
             let observed=json!({"status":if completed{"user_confirmed"}else{"failed"},"summary":if completed{"User-confirmed completion after inspecting the outcome. Native execution output remains unverified."}else{"The user observed that the action did not complete. Partial effects may remain. The original action must not be replayed."},"operator_observation":{"source":"operator_review","operation_id":request.operation_id,"outcome":request.outcome,"evidence":request.evidence,"observed_at":timestamp,"native_execution_verified":false},"original_observation":action.result,"artifacts":action.result.as_ref().and_then(|v|v.get("artifacts")).cloned().unwrap_or(json!([]))});
             tx.execute("UPDATE actions SET state=?1,result=?2,error=?3,updated_at=?4 WHERE id=?5 AND state='outcome_unknown'",params![if completed{"succeeded"}else{"failed"},serde_json::to_string(&observed)?,format!("Outcome recorded by the user: {}",request.evidence),timestamp,request.action_id.to_string()])?;
@@ -390,3 +373,6 @@ impl Store {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

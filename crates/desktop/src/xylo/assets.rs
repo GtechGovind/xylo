@@ -1,6 +1,9 @@
-//! Product installation UI. The helper owns verified release metadata, file I/O,
+//! Downloads page. The helper owns verified release metadata, file I/O,
 //! extraction and activation. Merely opening this page never downloads an asset.
+//! Progress polling backs off after a failed status read instead of stopping.
+use super::settings_ui;
 use super::*;
+use crate::motion;
 use serde::Deserialize;
 use serde_json::{Value, json};
 #[derive(Clone, Default, Deserialize)]
@@ -63,7 +66,17 @@ pub(super) struct AssetsUi {
     pub filter: usize,
     state: CatalogState,
     poll: Option<Task<()>>,
+    /// Consecutive failed status reads while a download is active.
+    poll_failures: u32,
     notice: String,
+    /// When the pending catalog read was sent, for the slow-wait caption.
+    loading_since: Option<std::time::Instant>,
+    /// The asset whose Install or Use request awaits the helper's answer.
+    pending_action: Option<String>,
+}
+/// Delay before the next status read: 800 ms, doubling per failure, at most 30 s.
+fn poll_delay(failures: u32) -> std::time::Duration {
+    std::time::Duration::from_millis((800u64 << failures.min(6)).min(30_000))
 }
 impl Xylo {
     pub(super) fn open_assets(&mut self, filter: usize, cx: &mut Context<Self>) {
@@ -72,6 +85,7 @@ impl Xylo {
     }
     pub(super) fn refresh_assets(&mut self, cx: &mut Context<Self>) {
         self.assets.state = CatalogState::Loading;
+        self.assets.loading_since = Some(self.arm_slow_hint(cx));
         self.assets.notice.clear();
         self.capability(
             "helper_asset_catalog",
@@ -91,14 +105,31 @@ impl Xylo {
     pub(super) fn asset_error(&mut self, name: &str, error: &str, cx: &mut Context<Self>) -> bool {
         match name {
             "helper_asset_catalog" => {
+                self.assets.loading_since = None;
                 self.assets.state = CatalogState::Failed(product_error(error))
+            }
+            // The shared error presentation reports these; only the busy
+            // state is settled here.
+            "helper_asset_install" | "helper_asset_activate" => {
+                self.assets.pending_action = None;
+                cx.notify();
+                return false;
             }
             "helper_asset_status" => {
                 self.assets.poll = None;
-                self.assets.notice = format!(
-                    "Could not check download progress. {} Refresh to try again.",
-                    product_error(error)
-                );
+                if self.assets.jobs.iter().any(InstallJob::active) {
+                    self.assets.poll_failures = self.assets.poll_failures.saturating_add(1);
+                    self.assets.notice = format!(
+                        "Could not check download progress. {} Retrying…",
+                        product_error(error)
+                    );
+                    self.schedule_asset_status(cx);
+                } else {
+                    self.assets.notice = format!(
+                        "Could not check download progress. {} Refresh to try again.",
+                        product_error(error)
+                    );
+                }
             }
             _ => return false,
         }
@@ -113,24 +144,30 @@ impl Xylo {
     ) -> bool {
         match name {
             "helper_asset_catalog" => {
+                self.assets.loading_since = None;
                 match serde_json::from_value(value.get("assets").cloned().unwrap_or(json!([]))) {
                     Ok(assets) => {
                         self.assets.catalog = assets;
                         self.assets.state = CatalogState::Ready;
                     }
-                    Err(error) => {
-                        self.assets.state = CatalogState::Failed(format!(
-                            "Could not read available features: {error}"
-                        ));
+                    Err(_) => {
+                        self.assets.state = CatalogState::Failed(
+                            "Could not read the list of downloads. Please try again.".into(),
+                        );
                     }
                 }
             }
             "helper_asset_status" => {
                 let was_active = self.assets.jobs.iter().any(InstallJob::active);
+                if self.assets.poll_failures > 0 {
+                    self.assets.poll_failures = 0;
+                    self.assets.notice.clear();
+                }
                 match serde_json::from_value(value.get("jobs").cloned().unwrap_or(json!([]))) {
                     Ok(jobs) => self.assets.jobs = jobs,
-                    Err(error) => {
-                        self.error = Some(format!("Could not read download progress: {error}"))
+                    Err(_) => {
+                        self.assets.notice =
+                            "Could not read download progress. Refresh to try again.".into()
                     }
                 }
                 if self.assets.jobs.iter().any(InstallJob::active) {
@@ -149,6 +186,7 @@ impl Xylo {
                 }
             }
             "helper_asset_install" => {
+                self.assets.pending_action = None;
                 if let Ok(job) = serde_json::from_value::<InstallJob>(value.clone()) {
                     self.assets
                         .jobs
@@ -175,6 +213,7 @@ impl Xylo {
                 );
             }
             "helper_asset_activate" => {
+                self.assets.pending_action = None;
                 self.assets.notice = if value
                     .get("restart_required")
                     .and_then(Value::as_bool)
@@ -205,10 +244,9 @@ impl Xylo {
         if self.quitting {
             return;
         }
+        let delay = poll_delay(self.assets.poll_failures);
         self.assets.poll = Some(cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(800))
-                .await;
+            cx.background_executor().timer(delay).await;
             let _ = view.update(cx, |view, cx| {
                 view.capability(
                     "helper_asset_status",
@@ -221,66 +259,89 @@ impl Xylo {
         }));
     }
     pub(super) fn assets_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut filters = div().flex().gap_2();
-        for (i, label) in ["All", "Models", "Documents", "Voice", "Memory"]
-            .into_iter()
-            .enumerate()
-        {
-            filters = filters.child(
-                button(("asset-filter", i), label)
-                    .bg(rgb(if self.assets.filter == i {
-                        selected()
-                    } else {
-                        panel()
-                    }))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.assets.filter = i;
-                        cx.notify();
-                    })),
-            );
-        }
-        let mut page = div()
-            .id("downloads-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .p_6()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(heading(
-                "Downloads",
-                "Choose the features and local models you want to use.",
-            ))
-            .child(filters)
-            .child(
-                button("refresh-assets", "Refresh")
-                    .self_start()
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.refresh_assets(cx);
-                    })),
+        let filters = settings_ui::segmented(
+            "asset-filter",
+            ["All", "Models", "Documents", "Voice", "Memory"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    let view = cx.entity().downgrade();
+                    settings_ui::SelectOption::new(
+                        label,
+                        self.assets.filter == index,
+                        move |_, cx| {
+                            let _ = view.update(cx, |view, cx| {
+                                view.assets.filter = index;
+                                cx.notify();
+                            });
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let mut page = settings_ui::settings_page("downloads-scroll", "Downloads")
+            .description("Features and local models Xylo can run on this computer. Nothing downloads until you choose Install.")
+            .action(
+                settings_ui::busy(
+                    settings_ui::secondary_button("refresh-assets", "Refresh")
+                        .on_click(cx.listener(|view, _, _, cx| view.refresh_assets(cx))),
+                    matches!(self.assets.state, CatalogState::Loading),
+                ),
             );
         if !self.assets.notice.is_empty() {
-            page = page.child(subtitle(self.assets.notice.clone()));
+            page = page.child(notice(BadgeTone::Neutral, self.assets.notice.clone()));
         }
-        match &self.assets.state {
-            CatalogState::Idle => {
-                page = page.child(subtitle("Refresh to load available features."))
+        let body: AnyElement = match &self.assets.state {
+            CatalogState::Idle => settings_ui::empty_state(
+                AppIcon::Storage,
+                "Downloads not loaded",
+                "Load the list of features you can add to this computer.",
+                Some(
+                    settings_ui::primary_button("load-assets", "Load downloads")
+                        .on_click(cx.listener(|view, _, _, cx| view.refresh_assets(cx)))
+                        .into_any_element(),
+                ),
+            )
+            .into_any_element(),
+            CatalogState::Loading => {
+                settings_ui::loading_list(3, self.assets.loading_since).into_any_element()
             }
-            CatalogState::Loading => page = page.child(subtitle("Loading available features…")),
-            CatalogState::Failed(error) => {
-                page = page.child(
-                    card()
-                        .child(div().text_color(rgb(danger())).child(error.clone()))
-                        .child(
-                            button("retry-assets", "Try again")
-                                .self_start()
-                                .on_click(cx.listener(|view, _, _, cx| view.refresh_assets(cx))),
-                        ),
+            CatalogState::Failed(error) => div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(settings_ui::inline_error(error)),
                 )
-            }
-            CatalogState::Ready => {}
-        }
-        let mut visible_count = 0;
+                .child(settings_ui::busy(
+                    settings_ui::secondary_button("retry-assets", "Try again")
+                        .on_click(cx.listener(|view, _, _, cx| view.refresh_assets(cx))),
+                    matches!(self.assets.state, CatalogState::Loading),
+                ))
+                .into_any_element(),
+            CatalogState::Ready => self.asset_list(cx),
+        };
+        page.child(settings_ui::section(
+            "Available features",
+            None,
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(filters)
+                .child(body),
+        ))
+        .into_any_element()
+    }
+    /// The catalog under the current filter as list items: status, progress
+    /// or the Install / Use action, and the license in the overflow menu.
+    fn asset_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut items: Vec<AnyElement> = Vec::new();
         for (i, asset) in self
             .assets
             .catalog
@@ -297,7 +358,6 @@ impl Xylo {
                 _ => true,
             })
         {
-            visible_count += 1;
             let job = self
                 .assets
                 .jobs
@@ -312,121 +372,126 @@ impl Xylo {
                     )
                 });
             let active_job = job.filter(|job| job.active());
-            let mut row = card()
-                .max_w(px(880.))
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .items_center()
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child(
-                            if asset.kind == "language-server" {
-                                "Rust code assistance".to_string()
-                            } else {
-                                asset.name.clone()
-                            },
-                        ))
-                        .child(subtitle(if asset.active {
-                            "In use"
-                        } else if installed {
-                            "Installed"
-                        } else {
-                            "Available"
-                        })),
+            let failed = job.filter(|job| job.phase == "failed");
+            let name = if asset.kind == "language-server" {
+                "Rust code assistance".to_string()
+            } else {
+                asset.name.clone()
+            };
+            let subtitle = if let Some(job) = active_job {
+                format!(
+                    "{} · {} of {}",
+                    phase_label(&job.phase),
+                    human_bytes(job.downloaded_bytes),
+                    human_bytes(job.total_bytes)
                 )
-                .child(div().text_sm().child(asset_description(&asset.kind)))
-                .child(subtitle(format!(
-                    "{} · {}",
-                    human_bytes(asset.size_bytes),
-                    asset.license.identifier
-                )));
-            if !asset.requires.is_empty() {
-                row = row.child(subtitle(
-                    "Required components are included in this download.",
-                ));
+            } else if let Some(job) = failed {
+                format!("Download could not finish. {}", product_error(&job.message))
+            } else {
+                asset_description(&asset.kind).to_owned()
+            };
+            let mut tags: Vec<SharedString> = vec![human_bytes(asset.size_bytes).into()];
+            if !asset.license.identifier.is_empty() {
+                tags.push(asset.license.identifier.clone().into());
             }
+            if !asset.requires.is_empty() {
+                tags.push("Components included".into());
+            }
+            let mut item = settings_ui::list_item(
+                ("asset", i),
+                Some(settings_ui::monogram(&name, &asset.id).into_any_element()),
+                name,
+                Some(subtitle.into()),
+            )
+            .tags(tags);
             if !asset.supported {
-                row = row.child(subtitle("Not available for this computer."));
+                item = item.trailing(settings_ui::pill(
+                    "Not supported",
+                    settings_ui::Tone::Neutral,
+                ));
             } else if let Some(job) = active_job {
                 let job_id = job.job_id.clone();
-                row = row
-                    .child(subtitle(format!(
-                        "{} · {} / {}",
-                        phase_label(&job.phase),
-                        human_bytes(job.downloaded_bytes),
-                        human_bytes(job.total_bytes)
-                    )))
-                    .child(
+                item = item
+                    .trailing(
                         div()
-                            .w_full()
-                            .h(px(5.))
-                            .rounded_full()
-                            .bg(rgb(border()))
-                            .child(
-                                div()
-                                    .w(relative(job.progress.clamp(0., 1.)))
-                                    .h_full()
-                                    .bg(rgb(accent()))
-                                    .rounded_full(),
-                            ),
+                            .w(px(72.))
+                            .child(motion::progress_bar(("asset-progress", i), job.progress)),
                     )
-                    .child(button(("cancel-download", i), "Cancel download").on_click(
-                        cx.listener(move |view, _, _, cx| {
+                    .trailing(
+                        settings_ui::text_button(("cancel-download", i), "Cancel").on_click(
+                            cx.listener(move |view, _, _, cx| {
+                                view.capability(
+                                    "helper_asset_cancel",
+                                    json!({"job_id":job_id}),
+                                    "Cancelling download",
+                                    None,
+                                    cx,
+                                );
+                            }),
+                        ),
+                    );
+            } else {
+                if asset.active {
+                    item = item.trailing(settings_ui::pill("In use", settings_ui::Tone::Success));
+                } else if failed.is_some() {
+                    item = item.trailing(settings_ui::status_pill(settings_ui::Status::Error));
+                } else if installed {
+                    item =
+                        item.trailing(settings_ui::pill("Installed", settings_ui::Tone::Neutral));
+                }
+                if !asset.active {
+                    let id = asset.id.clone();
+                    let pending = self.assets.pending_action.as_deref() == Some(id.as_str());
+                    item = item.trailing(
+                        settings_ui::secondary_button(
+                            ("install-asset", i),
+                            if installed { "Use" } else { "Install" },
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.assets.pending_action = Some(id.clone());
                             view.capability(
-                                "helper_asset_cancel",
-                                json!({"job_id":job_id}),
-                                "Cancelling download",
+                                if installed {
+                                    "helper_asset_activate"
+                                } else {
+                                    "helper_asset_install"
+                                },
+                                json!({"id":id}),
+                                if installed {
+                                    "Applying feature"
+                                } else {
+                                    "Starting download"
+                                },
                                 None,
                                 cx,
                             );
-                        }),
-                    ));
-            } else if !asset.active {
-                let id = asset.id.clone();
-                row = row.child(
-                    primary(
-                        ("install-asset", i),
-                        if installed { "Use" } else { "Install" },
-                    )
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.capability(
-                            if installed {
-                                "helper_asset_activate"
-                            } else {
-                                "helper_asset_install"
-                            },
-                            json!({"id":id}),
-                            if installed {
-                                "Applying feature"
-                            } else {
-                                "Starting download"
-                            },
-                            None,
-                            cx,
-                        );
-                    })),
-                );
-            }
-            if let Some(job) = job.filter(|job| job.phase == "failed") {
-                row = row.child(subtitle(format!(
-                    "Download could not finish. {}",
-                    product_error(&job.message)
-                )));
+                        }))
+                        .map(|button| settings_ui::busy(button, pending)),
+                    );
+                }
             }
             if !asset.license.url.is_empty() {
                 let url = asset.license.url.clone();
-                row = row.child(
-                    button(("asset-license", i), "License")
-                        .text_xs()
-                        .on_click(move |_, _, cx| cx.open_url(&url)),
-                );
+                item = item.trailing(settings_ui::overflow_menu(
+                    ("asset-actions", i),
+                    "More actions",
+                    vec![settings_ui::MenuAction::new(
+                        "View license",
+                        move |_, cx| cx.open_url(&url),
+                    )],
+                ));
             }
-            page = page.child(row);
+            items.push(item.into_any_element());
         }
-        if matches!(self.assets.state, CatalogState::Ready) && visible_count == 0 {
-            page = page.child(subtitle("No features available in this category."));
+        if items.is_empty() {
+            return settings_ui::empty_state(
+                AppIcon::Storage,
+                "Nothing in this category",
+                "Choose another category to see more downloads.",
+                None,
+            )
+            .into_any_element();
         }
-        page.into_any_element()
+        settings_ui::list_container(items).into_any_element()
     }
 }
 fn human_bytes(bytes: u64) -> String {
@@ -461,3 +526,7 @@ fn asset_description(kind: &str) -> &'static str {
         _ => "Add this feature to your workspace.",
     }
 }
+
+#[cfg(test)]
+#[path = "assets/tests.rs"]
+mod tests;

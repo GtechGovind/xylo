@@ -1,15 +1,22 @@
 //! Account identity is distinct from authorization and usable model access.
 //! Tokens stay in the host; each visible action is UUID correlated.
 use super::*;
+use crate::motion;
 use serde_json::{Value, json};
+use std::time::Instant;
 pub(super) const CHATGPT_REF: &str = "account:chatgpt";
 #[derive(Default)]
 pub(super) struct AccountUi {
     connected: bool,
     signed_out: bool,
     plan_authorized: bool,
+    /// Whether the account status was read this session (or the account was
+    /// signed out here); until then `connected` is only a default.
+    status_known: bool,
     email: Option<String>,
     pending: Option<(Uuid, String)>,
+    /// When the pending command was sent, for the slow-wait caption.
+    pending_since: Option<Instant>,
     notice: Option<String>,
 }
 impl Xylo {
@@ -32,6 +39,7 @@ impl Xylo {
         match result {
             Ok(()) => {
                 self.account.pending = Some((id, name.into()));
+                self.account.pending_since = Some(self.arm_slow_hint(cx));
                 self.account.notice = None;
             }
             Err(error) => self.account.notice = Some(error.to_string()),
@@ -39,12 +47,12 @@ impl Xylo {
         cx.notify();
     }
     pub(super) fn cancel_account_command(&mut self, cx: &mut Context<Self>) {
-        if let Some((id, _)) = self.account.pending.take() {
-            if let Some(host) = &self.host {
-                if let Err(error) = host.cancel_capability(id) {
-                    self.account.notice = Some(error.to_string());
-                }
-            }
+        self.account.pending_since = None;
+        if let Some((id, _)) = self.account.pending.take()
+            && let Some(host) = &self.host
+            && let Err(error) = host.cancel_capability(id)
+        {
+            self.account.notice = Some(error.to_string());
         }
         cx.notify();
     }
@@ -69,6 +77,7 @@ impl Xylo {
             return true;
         }
         self.account.pending = None;
+        self.account.pending_since = None;
         match result {
             Ok(value) => {
                 let summary = value
@@ -106,12 +115,18 @@ impl Xylo {
                     .get("email")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                self.account.status_known = true;
                 self.account.notice = None;
                 if !self.account.connected || !self.account.plan_authorized {
                     if self.provider_editor_kind == "ChatGPT" {
                         self.reset_provider_discovery(cx);
                     }
-                } else if name == "account_chatgpt_sign_in"
+                } else if (name == "account_chatgpt_sign_in"
+                    || !self
+                        .settings
+                        .providers
+                        .iter()
+                        .any(|provider| provider.credential_ref.as_deref() == Some(CHATGPT_REF)))
                     && self.provider_editor_kind == "ChatGPT"
                     && self.provider_form_open
                     && self.page == Page::Providers
@@ -122,6 +137,7 @@ impl Xylo {
             "account_chatgpt_sign_out" => {
                 self.account = AccountUi::default();
                 self.account.signed_out = true;
+                self.account.status_known = true;
                 self.account.notice = Some(
                     if value
                         .get("warning")
@@ -203,113 +219,122 @@ impl Xylo {
     pub(super) fn account_model_selected(&mut self) {
         self.account.signed_out = false;
     }
+    /// The signed-in ChatGPT account's email, when the account reported one.
+    pub(super) fn account_email(&self) -> Option<&str> {
+        self.account
+            .email
+            .as_deref()
+            .filter(|_| self.account.connected)
+    }
     pub(super) fn account_can_load_models(&self) -> bool {
         self.account.connected && self.account.plan_authorized
     }
-    pub(super) fn account_can_select_model(&self, model: &str) -> bool {
-        self.account.connected
-            && self.account.plan_authorized
-            && self.provider_discovery.ready()
-            && self.models.iter().any(|candidate| candidate == model)
+    /// Whether the ChatGPT account may load models, or `None` before its
+    /// status was read this session.
+    pub(super) fn account_authorized(&self) -> Option<bool> {
+        self.account
+            .status_known
+            .then(|| self.account_can_load_models())
     }
+    /// The ChatGPT account as a settings section: who is signed in, the
+    /// account actions, and any request in flight.
     pub(super) fn account_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut section = div().flex().flex_col().gap_3();
-        let identity = if self.account.connected {
+        let mut description: SharedString = if self.account.connected {
             self.account
                 .email
                 .clone()
                 .unwrap_or_else(|| "Signed in".into())
+                .into()
         } else {
             "Not signed in".into()
         };
-        let mut row = div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .p_4()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(border()))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Account"),
-                    )
-                    .child(subtitle(identity)),
-            );
+        let mut actions = div().flex().items_center().gap(px(8.));
         if let Some((_, command)) = &self.account.pending {
-            let label = match command.as_str() {
+            description = match command.as_str() {
                 "account_chatgpt_sign_in" => "Finish signing in through your browser…",
                 "account_chatgpt_sign_out" => "Signing out…",
                 _ => "Checking sign-in…",
-            };
-            row = row.child(subtitle(label)).child(
-                button("chatgpt-cancel-sign-in", "Cancel").on_click(cx.listener(
-                    |view, _, _, cx| {
+            }
+            .into();
+            actions = actions.child(motion::spinner_inline()).child(
+                settings_ui::secondary_button("chatgpt-cancel-sign-in", "Cancel").on_click(
+                    cx.listener(|view, _, _, cx| {
                         view.cancel_account_command(cx);
                         view.account.notice = Some("Account request cancelled.".into());
                         cx.notify();
-                    },
-                )),
+                    }),
+                ),
             );
         } else if !self.account.connected {
-            row = row.child(primary("chatgpt-sign-in", "Sign in").on_click(
-                cx.listener(|view, _, _, cx| view.account_command("account_chatgpt_sign_in", cx)),
-            ));
+            actions = actions.child(
+                settings_ui::primary_button("chatgpt-sign-in", "Sign in").on_click(cx.listener(
+                    |view, _, _, cx| view.account_command("account_chatgpt_sign_in", cx),
+                )),
+            );
         } else {
-            if self.account.plan_authorized && !self.provider_discovery.retry_state() {
-                row = row.child(
-                    primary(
-                        "chatgpt-use-account",
-                        if self.models.is_empty() {
-                            "Use account"
-                        } else {
-                            "Refresh models"
-                        },
-                    )
-                    .disabled(self.provider_discovery.loading())
-                    .on_click(cx.listener(|view, _, window, cx| view.use_chatgpt(window, cx))),
-                );
-            } else if !self.account.plan_authorized {
-                row = row.child(
-                    primary("chatgpt-authorize-plan", "Authorize plan access").on_click(
-                        cx.listener(|view, _, _, cx| {
+            if self.provider_discovery.failed() {
+                actions = actions.child(
+                    settings_ui::secondary_button("chatgpt-reconnect", "Reconnect account")
+                        .on_click(cx.listener(|view, _, _, cx| {
                             view.account_command("account_chatgpt_sign_in", cx)
-                        }),
-                    ),
+                        })),
                 );
             }
-            row = row.child(button("chatgpt-sign-out", "Sign out").on_click(
-                cx.listener(|view, _, _, cx| view.account_command("account_chatgpt_sign_out", cx)),
-            ));
+            if self.account.plan_authorized {
+                actions = actions.child(settings_ui::busy(
+                    settings_ui::secondary_button("chatgpt-refresh-models", "Refresh models")
+                        .on_click(cx.listener(|view, _, window, cx| view.use_chatgpt(window, cx))),
+                    self.provider_discovery.loading(),
+                ));
+            } else {
+                description = format!(
+                    "{description} · Your identity is linked. Plan access has not been authorized."
+                )
+                .into();
+                actions = actions.child(
+                    settings_ui::primary_button("chatgpt-authorize-plan", "Authorize plan access")
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.account_command("account_chatgpt_sign_in", cx)
+                        })),
+                );
+            }
+            actions = actions.child(
+                settings_ui::text_button("chatgpt-sign-out", "Sign out").on_click(cx.listener(
+                    |view, _, _, cx| view.account_command("account_chatgpt_sign_out", cx),
+                )),
+            );
         }
-        section = section.child(row);
-        if self.account.connected && !self.account.plan_authorized {
-            section = section.child(subtitle(
-                "Your identity is linked. Plan access has not been authorized.",
-            ));
-        }
-        if self.provider_discovery.failed() && self.account.connected {
-            section = section.child(button("chatgpt-reconnect", "Reconnect account").on_click(
-                cx.listener(|view, _, _, cx| view.account_command("account_chatgpt_sign_in", cx)),
-            ));
-        }
+        let mut rows = vec![
+            settings_ui::setting_row(
+                "ChatGPT account",
+                Some(description),
+                Some(actions.into_any_element()),
+            )
+            .feedback(
+                self.account
+                    .pending_since
+                    .filter(|since| {
+                        self.account.pending.is_some() && motion::is_slow(*since, Instant::now())
+                    })
+                    .map(|_| settings_ui::Feedback::Pending(motion::SLOW_HINT.into())),
+            )
+            .into_any_element(),
+        ];
         if let Some(notice) = &self.account.notice {
-            section = section.child(div().id("account-notice").text_sm().child(notice.clone()));
+            rows.push(
+                div()
+                    .id("account-notice")
+                    .py(px(10.))
+                    .child(settings_ui::caption(notice.clone()))
+                    .into_any_element(),
+            );
         }
-        section.into_any_element()
+        settings_ui::section("Account", None, settings_ui::rows(rows)).into_any_element()
     }
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // Exercised by the separate native validation test target.
 impl AccountUi {
     pub(super) fn validation_pending(&mut self, id: Uuid, name: &str) {
         self.pending = Some((id, name.into()));

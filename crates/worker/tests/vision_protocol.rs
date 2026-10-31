@@ -18,6 +18,8 @@ struct Worker {
 }
 impl Worker {
     async fn start(paths: &AppPaths) -> Self {
+        // The host creates the database; workers only open it.
+        xylo_services::Store::open(&paths.database).unwrap();
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_xylo-worker"))
             .arg("--data-dir")
             .arg(&paths.data)
@@ -38,6 +40,14 @@ impl Worker {
             worker.event().await.payload,
             EngineEvent::Ready { .. }
         ));
+        worker
+            .send(
+                Uuid::nil(),
+                WorkerCommand::Unlock {
+                    key: WorkerCredential(Some("00".repeat(32))),
+                },
+            )
+            .await;
         worker
     }
     async fn send(&mut self, session: Uuid, command: WorkerCommand) {
@@ -95,7 +105,10 @@ async fn fixture() -> (String, tokio::task::JoinHandle<Vec<Value>>) {
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let handle = tokio::spawn(async move {
         let mut requests = Vec::new();
-        for _ in 0..2 {
+        // Two turns; the engine's title request after the first turn is
+        // answered too but not recorded. The title follows Completed, so the
+        // restart between the turns may abandon it mid-response.
+        while requests.len() < 2 {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = BufReader::new(socket);
             let mut line = String::new();
@@ -116,7 +129,11 @@ async fn fixture() -> (String, tokio::task::JoinHandle<Vec<Value>>) {
             assert!(length > 0 && length < 1024 * 1024);
             let mut bytes = vec![0; length];
             socket.read_exact(&mut bytes).await.unwrap();
-            requests.push(serde_json::from_slice(&bytes).unwrap());
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            // Both turns carry the image; the title request does not.
+            if request.to_string().contains("image_url") {
+                requests.push(request);
+            }
             let body = format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
                 json!({"choices":[{"delta":{"content":"Image received."},"finish_reason":null}]}),
@@ -127,7 +144,9 @@ async fn fixture() -> (String, tokio::task::JoinHandle<Vec<Value>>) {
                 body.len()
             );
             for bytes in response.as_bytes().chunks(7) {
-                socket.get_mut().write_all(bytes).await.unwrap();
+                if socket.get_mut().write_all(bytes).await.is_err() {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         }
@@ -168,6 +187,7 @@ async fn actual_worker_sends_managed_image_and_rehydrates_it_after_process_resta
         },
         permissions: PermissionMode::ReadOnly,
         attachments: vec![image.clone()],
+        approved_rules: Vec::new(),
     };
     let mut worker = Worker::start(&paths).await;
     worker

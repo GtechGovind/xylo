@@ -4,9 +4,6 @@ mod model;
 pub use model::*;
 mod persistence;
 mod sanitize;
-pub(crate) use persistence::schema;
-#[cfg(test)]
-mod tests;
 use crate::{ActionIntent, JournalAction, SkillVersion, Store};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,7 +17,7 @@ use xylo_core::{ChatMessage, Conversation, now_ms};
 const MAX_STEPS: usize = 16;
 const MAX_CASES: usize = 16;
 fn digest(value: &impl serde::Serialize) -> Result<String> {
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
 }
 #[derive(Clone)]
 pub struct LearningService {
@@ -162,3 +159,6 @@ impl LearningService {
         self.review_impl(scope, name, version, evidence)
     }
 }
+
+#[cfg(test)]
+mod tests;

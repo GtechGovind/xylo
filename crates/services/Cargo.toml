@@ -17,8 +17,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 tracing.workspace = true
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
-sqlite-vec = "=0.1.7"
+rusqlite = { version = "0.41", features = ["bundled", "hooks"] }
+sqlite-vec = "=0.1.9"
 fastembed = { version = "7.5", default-features = false, features = ["onnx", "ort-load-dynamic"] }
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
 keyring-core = "1.0.1"
@@ -27,15 +27,18 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 futures-util = "0.3"
 base64 = "0.22"
 getrandom = "0.4"
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hex = "0.4"
+zeroize = "1"
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+hmac = "0.13"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 url = "2"
-jsonwebtoken = "9.3.1"
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 fs2 = "0.4"
 serde-saphyr = { version = "=2.0.0", default-features = false, features = ["deserialize"] }
 shell-words = "1"
-zip = { version = "6", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tempfile = "3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
 

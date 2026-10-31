@@ -366,10 +366,9 @@ pub(super) fn catalog_reasoning(row: &Value) -> (Option<Vec<String>>, Option<Str
                     .get("effort")
                     .and_then(Value::as_str)
                     .filter(|v| xylo_core::valid_reasoning_option(v))
+                    && !options.iter().any(|v| v == effort)
                 {
-                    if !options.iter().any(|v| v == effort) {
-                        options.push(effort.to_owned());
-                    }
+                    options.push(effort.to_owned());
                 }
             }
             options

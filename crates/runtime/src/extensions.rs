@@ -3,13 +3,17 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 pub use xylo_services::extensions::{
-    ComponentKind, ComponentRuntimeStatus, ComponentSetup, DiscoveredExtension, ExtensionPackage,
-    ExtensionService, ExtensionSource, default_sources,
+    ComponentKind, ComponentRuntimeStatus, ComponentSetup, DirectoryEntry, DirectoryPage,
+    DirectoryQuery, DirectorySourceStatus, DiscoveredExtension, ExtensionPackage, ExtensionService,
+    ExtensionSource, default_sources,
 };
 
+/// Runs one extension settings action. `vault` is the host's secret vault;
+/// actions that need no secret never touch it.
 pub async fn execute(
     root: std::path::PathBuf,
     store: xylo_services::Store,
+    vault: Result<xylo_services::CredentialVault>,
     attempt_id: uuid::Uuid,
     name: &str,
     args: &Value,
@@ -65,12 +69,11 @@ pub async fn execute(
         );
         ensure!(reference.len() <= 256, "Credential reference is too long");
         let saved = reference.clone();
+        let vault = vault?;
         tokio::task::spawn_blocking(move || {
-            xylo_services::CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?
+            vault
                 .set(&saved, &secret)
-                .map_err(|_| {
-                    anyhow::anyhow!("Could not store component credential in the OS vault")
-                })
+                .map_err(|_| anyhow::anyhow!("Could not store the component credential"))
         })
         .await??;
         return Ok(json!({"credential":{"variable":variable,"reference":reference}}));
@@ -106,7 +109,7 @@ pub async fn execute(
                 operation,
                 args.get("input").cloned().unwrap_or_else(|| json!({})),
                 store.clone(),
-                xylo_services::CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?,
+                vault?,
                 cancel,
                 &state,
             )
@@ -117,9 +120,15 @@ pub async fn execute(
         return Ok(output);
     }
 
-    if name == "extension_discover" {
-        let source: ExtensionSource = serde_json::from_value(args["source"].clone())?;
-        return tokio::select! { _=cancel.cancelled()=>bail!("Discovery cancelled"), result=xylo_services::extensions::discover(&source)=>Ok(json!({"discovered":result?})) };
+    if name == "extension_directory_refresh" {
+        let force = args["force"].as_bool().unwrap_or(false);
+        let query = directory_query(&args["query"])?;
+        let sources = tokio::select! {
+            _ = cancel.cancelled() => bail!("Directory refresh cancelled"),
+            sources = service.refresh_directory(force) => sources?,
+        };
+        let directory = tokio::task::spawn_blocking(move || service.directory(&query)).await??;
+        return Ok(json!({"sources":sources,"directory":directory}));
     }
     if name == "extension_install_remote" {
         let item: DiscoveredExtension = serde_json::from_value(args["item"].clone())?;
@@ -134,6 +143,11 @@ pub async fn execute(
         ensure!(!cancel.is_cancelled(), "Extension request cancelled");
         match name.as_str() {
             "extension_snapshot" => {}
+            // Reads only the cached directory: cheap enough for every keystroke.
+            "extension_directory" => {
+                let query = directory_query(&args)?;
+                return Ok(json!({"directory":service.directory(&query)?}));
+            }
             "extension_component_receipts" => {
                 return Ok(json!({"receipts":store.extension_execution_receipts(100)?}));
             }
@@ -193,135 +207,13 @@ impl Drop for NativeReceiptGuard {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn fixture(
-        command: &str,
-    ) -> (
-        tempfile::TempDir,
-        std::path::PathBuf,
-        xylo_services::Store,
-        ExtensionPackage,
-        std::path::PathBuf,
-    ) {
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source");
-        let workspace = directory.path().join("workspace");
-        std::fs::create_dir_all(source.join("hooks")).unwrap();
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(
-            source.join("hooks/hooks.json"),
-            json!({"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":command}]}]}})
-                .to_string(),
-        )
-        .unwrap();
-        let root = directory.path().join("profile/extensions");
-        let service = ExtensionService::new(&root);
-        let package = service.install_local(&source).unwrap();
-        service.set_enabled(&package.id, true).unwrap();
-        service
-            .component_setup(
-                &package.id,
-                "hooks",
-                ComponentSetup {
-                    workspace: workspace.clone(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let store = xylo_services::Store::open(directory.path().join("profile/store.db")).unwrap();
-        (directory, root, store, package, workspace)
+/// A directory query from action arguments; absent fields take defaults.
+fn directory_query(args: &Value) -> Result<DirectoryQuery> {
+    if args.is_null() {
+        return Ok(DirectoryQuery::default());
     }
-    #[tokio::test]
-    async fn native_component_receipt_reuses_result_without_reexecuting_hook() {
-        let (_directory, root, store, package, workspace) =
-            fixture("printf once >> receipt-marker; printf '{}'");
-        let attempt = uuid::Uuid::new_v4();
-        let args = json!({"id":package.id,"component":"hooks"});
-        let first = execute(
-            root.clone(),
-            store.clone(),
-            attempt,
-            "extension_component_verify",
-            &args,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        let second = execute(
-            root,
-            store.clone(),
-            attempt,
-            "extension_component_verify",
-            &args,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(first, second);
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("receipt-marker")).unwrap(),
-            "once"
-        );
-        assert_eq!(first["component_status"]["readiness"], "execution_verified");
-        assert_eq!(
-            store.extension_execution_receipts(5).unwrap()[0]["state"],
-            "succeeded"
-        );
-        assert!(store.conversations(10).unwrap().is_empty());
-    }
-    #[tokio::test]
-    async fn cancelled_native_component_has_unknown_receipt_and_same_attempt_never_replays() {
-        let (_directory, root, store, package, workspace) =
-            fixture("printf once >> receipt-marker; sleep 30; printf '{}'");
-        let attempt = uuid::Uuid::new_v4();
-        let args = json!({"id":package.id,"component":"hooks"});
-        let cancel = CancellationToken::new();
-        let worker_cancel = cancel.clone();
-        let worker_root = root.clone();
-        let worker_store = store.clone();
-        let worker_args = args.clone();
-        let running = tokio::spawn(async move {
-            execute(
-                worker_root,
-                worker_store,
-                attempt,
-                "extension_component_verify",
-                &worker_args,
-                worker_cancel,
-            )
-            .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            // Opening shell redirection creates the file before printf writes.
-            // Cancel only after the observable effect this test asserts exists.
-            while std::fs::read_to_string(workspace.join("receipt-marker")).ok().as_deref() != Some("once") {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        cancel.cancel();
-        assert!(running.await.unwrap().is_err());
-        assert_eq!(
-            store.extension_execution_receipts(5).unwrap()[0]["state"],
-            "outcome_unknown"
-        );
-        let retry = execute(
-            root,
-            store,
-            attempt,
-            "extension_component_verify",
-            &args,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-        assert!(retry.to_string().contains("outcome is unknown"));
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("receipt-marker")).unwrap(),
-            "once"
-        );
-    }
+    serde_json::from_value(args.clone()).context("Invalid directory search")
 }
+
+#[cfg(test)]
+mod tests;

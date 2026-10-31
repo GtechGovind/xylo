@@ -12,6 +12,9 @@ fn fixture() -> (tempfile::TempDir, Store, SteeringRequest, DraftSubmission) {
             title: "Active task".into(),
             workspace: directory.path().into(),
             updated_at: 7,
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
         })
         .unwrap();
     store
@@ -186,10 +189,27 @@ fn wrong_target_checkpoint_cannot_apply_or_clear_guidance() {
     store
         .save_checkpoint(guidance.session_id, Uuid::new_v4(), &json!([]))
         .unwrap();
+    let waiting = store
+        .apply_steering(guidance.session_id, guidance.turn_id, &json!([]))
+        .unwrap();
+    assert!(waiting.applied.is_empty() && waiting.has_more);
+    store
+        .call({
+            let (session, turn) = (guidance.session_id, guidance.turn_id);
+            move |conn| {
+                conn.execute(
+                    "INSERT INTO completed_turns(session_id,turn_id,json,completed_at) VALUES(?1,?2,'{}',0)",
+                    params![session.to_string(), turn.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .unwrap();
     assert!(
         store
             .apply_steering(guidance.session_id, guidance.turn_id, &json!([]))
-            .is_err()
+            .is_err(),
+        "a finished turn can no longer take guidance"
     );
     assert_eq!(
         store.steering(guidance.id).unwrap().unwrap().receipt.state,
@@ -250,4 +270,70 @@ fn startup_recovery_cancels_only_unapplied_guidance_and_keeps_its_draft() {
     let checkpoint = store.checkpoint(applied.session_id).unwrap().unwrap();
     assert!(checkpoint.messages.to_string().contains(&applied.text));
     assert!(!checkpoint.messages.to_string().contains(&pending.text));
+}
+#[test]
+fn resubmitting_after_cancellation_queues_new_guidance() {
+    let (_directory, store, guidance, submission) = fixture();
+    store.queue_steering(&guidance, &submission).unwrap();
+    store
+        .finish_pending_steering(guidance.session_id, Some(guidance.turn_id), "Stopped")
+        .unwrap();
+    let same_id = store.queue_steering(&guidance, &submission).unwrap();
+    assert_eq!(same_id.receipt.state, SteeringState::Queued);
+    store
+        .finish_pending_steering(guidance.session_id, Some(guidance.turn_id), "Stopped")
+        .unwrap();
+    let mut fresh = guidance.clone();
+    fresh.id = Uuid::new_v4();
+    let resubmitted = store.queue_steering(&fresh, &submission).unwrap();
+    assert_eq!(resubmitted.request.id, fresh.id);
+    assert_eq!(resubmitted.receipt.state, SteeringState::Queued);
+    let applied = store
+        .apply_steering(guidance.session_id, guidance.turn_id, &json!([]))
+        .unwrap();
+    assert_eq!(applied.applied.len(), 1);
+    assert_eq!(applied.applied[0].request.id, fresh.id);
+}
+#[test]
+fn guidance_before_the_first_checkpoint_waits_for_it() {
+    let (_directory, store, guidance, submission) = fixture();
+    let mut early = guidance.clone();
+    early.turn_id = Uuid::new_v4();
+    store.queue_steering(&early, &submission).unwrap();
+    let waiting = store
+        .apply_steering(early.session_id, early.turn_id, &json!([]))
+        .unwrap();
+    assert!(waiting.applied.is_empty());
+    assert!(
+        waiting.has_more,
+        "the engine must try again after checkpointing"
+    );
+    assert_eq!(
+        store.steering(early.id).unwrap().unwrap().receipt.state,
+        SteeringState::Queued
+    );
+    store
+        .save_checkpoint(early.session_id, early.turn_id, &json!([]))
+        .unwrap();
+    let applied = store
+        .apply_steering(early.session_id, early.turn_id, &json!([]))
+        .unwrap();
+    assert_eq!(applied.applied.len(), 1);
+}
+#[test]
+fn finished_guidance_expires_and_only_queued_guidance_counts_toward_the_cap() {
+    let (_directory, store, guidance, submission) = fixture();
+    store.queue_steering(&guidance, &submission).unwrap();
+    store
+        .apply_steering(guidance.session_id, guidance.turn_id, &json!([]))
+        .unwrap();
+    let expired = now_ms() - FINISHED_RETENTION_MS - 1;
+    store
+        .call(move |conn| {
+            conn.execute("UPDATE user_guidance SET updated_at=?1", [expired])?;
+            Ok(())
+        })
+        .unwrap();
+    store.recover_steering().unwrap();
+    assert!(store.steering(guidance.id).unwrap().is_none());
 }

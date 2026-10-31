@@ -1,3 +1,10 @@
+//! OAuth 2.0 authorization-code (PKCE) sign-in and token refresh for connectors.
+//!
+//! Refreshes are single-flight per credential reference within the process:
+//! providers that rotate refresh tokens revoke the old one on first use, so two
+//! concurrent refreshes with the same token would leave the loser holding a
+//! revoked credential. A waiter re-reads the stored record after acquiring the
+//! gate and skips its own exchange when another caller already rotated it.
 use super::mcp::validate_endpoint;
 use crate::CredentialVault;
 use anyhow::{Context, Result, bail, ensure};
@@ -5,9 +12,14 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Weak},
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 
+/// Endpoints and client registration for one OAuth provider.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OAuthConfig {
     pub authorization_endpoint: String,
@@ -24,6 +36,7 @@ pub struct OAuthTokens {
     pub scope: Option<String>,
 }
 impl OAuthTokens {
+    /// True when the access token expires within the next 30 seconds.
     pub fn is_expired(&self) -> bool {
         self.expires_at_ms
             .is_some_and(|expiry| expiry <= xylo_core::now_ms() + 30_000)
@@ -92,7 +105,10 @@ impl PendingOAuth {
             self.created_at.elapsed() < Duration::from_secs(600),
             "OAuth flow expired"
         );
-        ensure!(returned_state == self.state, "OAuth state mismatch");
+        ensure!(
+            constant_time_eq(returned_state.as_bytes(), self.state.as_bytes()),
+            "OAuth state mismatch"
+        );
         ensure!(!code.is_empty(), "OAuth authorization code is required");
         exchange(
             &self.config,
@@ -110,26 +126,36 @@ impl PendingOAuth {
 }
 /// Refresh is explicit. Never retry a business mutation automatically after auth
 /// failure: refreshing a credential and replaying a write are separate decisions.
+///
+/// Concurrent refreshes of one `reference` in this process perform a single
+/// token exchange; callers that waited return once the rotated record is stored.
 pub async fn refresh_oauth(
     config: &OAuthConfig,
     vault: &CredentialVault,
     reference: &str,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let v = vault.clone();
-    let r = reference.to_owned();
-    let old = tokio::task::spawn_blocking(move || v.get(&r))
-        .await??
-        .context("OAuth credential is absent")?;
-    let old: OAuthTokens = serde_json::from_str(&old)?;
-    let refresh = old
+    let observed = load_tokens(vault, reference).await?;
+    let gate = refresh_gate(reference)?;
+    let _flight = tokio::select! {
+        _ = cancel.cancelled() => bail!("OAuth refresh cancelled"),
+        guard = gate.lock() => guard,
+    };
+    let current = load_tokens(vault, reference).await?;
+    if current.access_token != observed.access_token
+        || current.refresh_token != observed.refresh_token
+    {
+        // Another caller rotated the credential while this one waited.
+        return Ok(());
+    }
+    let refresh = current
         .refresh_token
         .as_deref()
         .context("Provider did not issue a refresh token; reconnect the account")?;
     let tokens = exchange(
         config,
         &[("grant_type", "refresh_token"), ("refresh_token", refresh)],
-        old.refresh_token.clone(),
+        current.refresh_token.clone(),
         cancel,
     )
     .await?;
@@ -139,6 +165,53 @@ pub async fn refresh_oauth(
     tokio::task::spawn_blocking(move || v.set(&r, &json)).await??;
     Ok(())
 }
+
+async fn load_tokens(vault: &CredentialVault, reference: &str) -> Result<OAuthTokens> {
+    let v = vault.clone();
+    let r = reference.to_owned();
+    let json = tokio::task::spawn_blocking(move || v.get(&r))
+        .await??
+        .context("OAuth credential is absent")?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+type RefreshGates = std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
+
+/// Per-reference refresh gates. Entries are weak so finished references do not
+/// accumulate; a gate lives exactly as long as some caller holds or awaits it.
+static REFRESH_GATES: LazyLock<RefreshGates> = LazyLock::new(Default::default);
+
+fn refresh_gate(reference: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+    ensure!(
+        !reference.trim().is_empty() && reference.len() <= 256,
+        "Invalid credential reference"
+    );
+    let mut gates = REFRESH_GATES
+        .lock()
+        .map_err(|_| anyhow::anyhow!("OAuth refresh coordination is unavailable"))?;
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(reference).and_then(Weak::upgrade) {
+        return Ok(gate);
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(reference.to_owned(), Arc::downgrade(&gate));
+    Ok(gate)
+}
+
+/// Compares secrets without an early exit on the first differing byte, so the
+/// response time does not reveal how much of a guessed `state` was correct.
+/// Lengths are not secret (the state is a fixed-size encoding).
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let difference = left
+        .iter()
+        .zip(right)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    std::hint::black_box(difference) == 0
+}
+
 async fn exchange(
     config: &OAuthConfig,
     form: &[(&str, &str)],
@@ -207,3 +280,6 @@ async fn exchange(
             .map(str::to_owned),
     })
 }
+
+#[cfg(test)]
+mod tests;

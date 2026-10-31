@@ -25,6 +25,47 @@ use uuid::Uuid;
 
 type Reply = std::result::Result<Value, String>;
 
+/// Parent variables the helper keeps. It starts from an empty environment, so
+/// provider API keys and other application secrets never reach it or the
+/// native tools it launches; `LC_*` locale categories are kept as well.
+/// `SSH_AUTH_SOCK` and the container daemon addresses exist only so the
+/// helper can hand them to ssh and docker/podman, which need them.
+const HELPER_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "TMPDIR",
+    "SSH_AUTH_SOCK",
+    "DOCKER_HOST",
+    "CONTAINER_HOST",
+    "RUST_LOG",
+    #[cfg(windows)]
+    "SYSTEMROOT",
+    #[cfg(windows)]
+    "WINDIR",
+    #[cfg(windows)]
+    "TEMP",
+    #[cfg(windows)]
+    "TMP",
+    #[cfg(windows)]
+    "USERPROFILE",
+    #[cfg(windows)]
+    "LOCALAPPDATA",
+    #[cfg(windows)]
+    "APPDATA",
+    #[cfg(windows)]
+    "PATHEXT",
+    #[cfg(windows)]
+    "COMSPEC",
+];
+
+fn helper_environment() -> impl Iterator<Item = (String, String)> {
+    std::env::vars()
+        .filter(|(name, _)| HELPER_ENVIRONMENT.contains(&name.as_str()) || name.starts_with("LC_"))
+}
+
 #[derive(Default)]
 struct Shared {
     closed: AtomicBool,
@@ -130,6 +171,8 @@ impl HelperClient {
             .arg("--workspace")
             .arg(&workspace)
             .current_dir(&workspace)
+            .env_clear()
+            .envs(helper_environment())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -403,58 +446,4 @@ impl HelperClient {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn audio_stop_bypasses_full_normal_execution_slots() {
-        let shared = Arc::new(Shared::default());
-        let (requests, _incoming) = mpsc::channel(QUEUE_CAPACITY);
-        let (control, mut controls) = mpsc::channel(QUEUE_CAPACITY);
-        let (_exited_tx, exited) = watch::channel(true);
-        let client = HelperClient {
-            inner: Arc::new(Inner {
-                shared: shared.clone(),
-                requests,
-                control,
-                slots: Semaphore::new(QUEUE_CAPACITY),
-                control_slots: Semaphore::new(8),
-                stop: CancellationToken::new(),
-                exited,
-                pid: 0,
-            }),
-        };
-        let _all_slots = client
-            .inner
-            .slots
-            .acquire_many(QUEUE_CAPACITY as u32)
-            .await
-            .unwrap();
-        let peer = tokio::spawn(async move {
-            let message = controls.recv().await.unwrap();
-            assert!(
-                matches!(message.command,Command::Execute{name,..} if name=="helper_audio_record_cancel")
-            );
-            shared
-                .pending
-                .lock()
-                .unwrap()
-                .remove(&message.id)
-                .unwrap()
-                .send(Ok(json!({"state":"cancelled"})))
-                .unwrap();
-        });
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            client.execute(
-                "helper_audio_record_cancel",
-                &json!({}),
-                CancellationToken::new(),
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(result["state"], "cancelled");
-        peer.await.unwrap();
-    }
-}
+mod tests;

@@ -125,25 +125,6 @@ fn validate(key: &DraftKey, text: &str, attachments: &[ImageAttachment]) -> Resu
     ensure!(json.len() <= 8192, "Draft image references are too large");
     Ok(json)
 }
-pub(crate) fn initialize(conn: &mut Connection) -> Result<()> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='composer_drafts')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !exists {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS composer_draft_usage(id INTEGER PRIMARY KEY CHECK(id=1),total_bytes INTEGER NOT NULL DEFAULT 0,row_count INTEGER NOT NULL DEFAULT 0);
-INSERT OR IGNORE INTO composer_draft_usage(id) VALUES(1);
-CREATE TABLE IF NOT EXISTS composer_drafts(session_id TEXT NOT NULL,workspace TEXT NOT NULL,text TEXT NOT NULL CHECK(length(CAST(text AS BLOB))<=262144),attachments TEXT NOT NULL,revision INTEGER NOT NULL CHECK(revision>0),updated_at INTEGER NOT NULL,last_mutation TEXT NOT NULL,last_expected INTEGER NOT NULL,PRIMARY KEY(session_id,workspace));
-CREATE INDEX IF NOT EXISTS composer_drafts_recent ON composer_drafts(workspace,updated_at DESC,session_id DESC);
-CREATE TRIGGER IF NOT EXISTS composer_drafts_insert AFTER INSERT ON composer_drafts BEGIN UPDATE composer_draft_usage SET total_bytes=total_bytes+length(CAST(new.text AS BLOB))+length(CAST(new.attachments AS BLOB)),row_count=row_count+1 WHERE id=1; END;
-CREATE TRIGGER IF NOT EXISTS composer_drafts_update AFTER UPDATE ON composer_drafts BEGIN UPDATE composer_draft_usage SET total_bytes=total_bytes-length(CAST(old.text AS BLOB))-length(CAST(old.attachments AS BLOB))+length(CAST(new.text AS BLOB))+length(CAST(new.attachments AS BLOB)) WHERE id=1; END;
-CREATE TRIGGER IF NOT EXISTS composer_drafts_delete AFTER DELETE ON composer_drafts BEGIN UPDATE composer_draft_usage SET total_bytes=total_bytes-length(CAST(old.text AS BLOB))-length(CAST(old.attachments AS BLOB)),row_count=row_count-1 WHERE id=1; END;")?;
-        tx.commit()?;
-    }
-    Ok(())
-}
 type Stored = (DraftSnapshot, String, i64);
 fn read(conn: &Connection, key: &DraftKey, workspace: &str) -> Result<Option<Stored>> {
     let row: Option<(String,String,i64,i64,String,i64)> = conn.query_row("SELECT text,attachments,revision,updated_at,last_mutation,last_expected FROM composer_drafts WHERE session_id=?1 AND workspace=?2", params![key.session_id.to_string(),workspace], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
@@ -245,7 +226,6 @@ impl Store {
         let key = key.clone();
         let workspace = scope(&key.workspace)?;
         self.call(move |conn| {
-            initialize(conn)?;
             Ok(read(conn, &key, &workspace)?
                 .map(|row| row.0)
                 .unwrap_or_else(|| absent(key)))
@@ -256,7 +236,6 @@ impl Store {
         let workspace = scope(&request.key.workspace)?;
         let attachments = validate(&request.key, &request.text, &request.attachments)?;
         self.call(move |conn| {
-            initialize(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let result = write(&tx, &request, &workspace, &attachments)?;
             tx.commit()?;
@@ -278,9 +257,9 @@ impl Store {
                 "Draft cursor belongs to another project"
             );
         }
-        self.call(move|conn|{initialize(conn)?;
+        self.call(move|conn|{
             let mut statement=conn.prepare("SELECT session_id,revision,updated_at,substr(text,1,120),length(CAST(text AS BLOB)),json_array_length(attachments) FROM composer_drafts WHERE workspace=?1 AND(text!='' OR json_array_length(attachments)>0) AND(?2 IS NULL OR updated_at<?2 OR(updated_at=?2 AND session_id<?3)) ORDER BY updated_at DESC,session_id DESC LIMIT ?4")?;
-            let rows=statement.query_map(params![scope,before.as_ref().map(|cursor|cursor.updated_at),before.as_ref().map(|cursor|cursor.session_id.to_string()),(limit+1)as i64],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,usize>(4)?,row.get::<_,usize>(5)?)))?;
+            let rows=statement.query_map(params![scope,before.as_ref().map(|cursor|cursor.updated_at),before.as_ref().map(|cursor|cursor.session_id.to_string()),(limit+1)as i64],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,crate::store::row_usize(row,4)?,crate::store::row_usize(row,5)?)))?;
             let mut drafts=rows.map(|row|{let(id,revision,updated_at,preview,bytes,attachment_count)=row?;Ok(DraftSummary{key:DraftKey{session_id:Uuid::parse_str(&id)?,workspace:workspace.clone()},revision,updated_at,preview,bytes,attachment_count})}).collect::<Result<Vec<_>>>()?;
             let has_more=drafts.len()>limit;drafts.truncate(limit);let before=if has_more{drafts.last().map(|draft|DraftCursor{updated_at:draft.updated_at,session_id:draft.key.session_id,workspace:workspace.clone()})}else{None};Ok(DraftPage{workspace,drafts,before,has_more})
         })
@@ -308,7 +287,6 @@ impl Store {
         let submission = submission.clone();
         let workspace = scope(&submission.key.workspace)?;
         self.call(move |conn| {
-            initialize(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let message_id = Uuid::new_v5(&turn.turn_id, b"user-message");
             let existing: bool = tx.query_row(
@@ -362,9 +340,6 @@ impl Store {
         })
     }
 }
-#[cfg(test)]
-#[path = "drafts/tests.rs"]
-mod tests;
 
 /// Shared only by application-owned atomic admission services.
 pub(crate) fn snapshot_in_transaction(conn: &Connection, key: &DraftKey) -> Result<DraftSnapshot> {
@@ -397,3 +372,6 @@ pub(crate) fn clear_submission_in_transaction(
     }
     Ok(current)
 }
+
+#[cfg(test)]
+mod tests;

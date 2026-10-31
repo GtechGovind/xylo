@@ -7,9 +7,8 @@ pub use catalog::*;
 pub use manifest::*;
 pub use sources::*;
 
-#[cfg(test)]
-mod tests;
 mod runtime;
 pub use runtime::*;
+
 #[cfg(test)]
-mod runtime_tests;
+mod tests;

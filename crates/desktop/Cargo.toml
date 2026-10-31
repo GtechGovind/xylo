@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-gpui-kit = { version = "=0.8.0", features = ["tree-sitter", "tree-sitter-rust", "tree-sitter-c", "tree-sitter-cpp", "tree-sitter-python", "tree-sitter-typescript", "tree-sitter-javascript", "tree-sitter-markdown"] }
+gpui-kit = { version = "=0.8.1", features = ["tree-sitter", "tree-sitter-rust", "tree-sitter-c", "tree-sitter-cpp", "tree-sitter-python", "tree-sitter-typescript", "tree-sitter-javascript", "tree-sitter-markdown"] }
 xylo-core.workspace = true
 xylo-runtime.workspace = true
 anyhow.workspace = true
@@ -16,7 +16,7 @@ tokio.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-rfd = "0.15"
+rfd = "0.17"
 shell-words = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
@@ -30,6 +30,12 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 
 
 [dev-dependencies]
-gpui-kit = { version = "=0.8.0", features = ["test-support"] }
+gpui-kit = { version = "=0.8.1", features = ["test-support"] }
 tempfile = "3"
-sha2 = "0.10"
+sha2 = "0.11"
+hex = "0.4"
+
+[features]
+# Test-only accessors used by the native validation crate in `validation/`,
+# which compiles these sources with this feature on. Never enabled in the app.
+validation = []

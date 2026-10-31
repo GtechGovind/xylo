@@ -406,7 +406,7 @@ fn safe_name(name: &str) -> String {
     }
 }
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 fn create_directory(path: &Path) -> Result<()> {
     match fs::create_dir(path) {

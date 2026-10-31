@@ -2,6 +2,10 @@
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
 mod document_recovery_fixture;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]

@@ -130,10 +130,23 @@ pub(super) fn replace(
     File::open(parent)?.sync_all()?;
     Ok(())
 }
+/// Run a system verification tool. It gets a fixed system `PATH` and none of
+/// the application's environment (which can hold provider keys); only
+/// `HOME` and `TMPDIR` pass through for the tools' own caches.
 fn run(program: &str, args: &[&str], cancel: &CancellationToken) -> Result<String> {
     let output = NamedTempFile::new()?;
     let stream = output.reopen()?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("LANG", "C");
+    for name in ["HOME", "TMPDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(stream.try_clone()?)

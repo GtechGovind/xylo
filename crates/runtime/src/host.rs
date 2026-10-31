@@ -1,10 +1,16 @@
 //! Event-driven application host. UI methods enqueue bounded commands and return
 //! immediately; database, credentials, process I/O and networking stay off the UI.
+//!
+//! - Settings are the source of truth for the permission mode: every admission
+//!   uses the current mode and a change is forwarded to live workers. Scheduled
+//!   turns run unattended and so never get Full access (see `effective_mode`).
+//! - Standing approvals ("always allow") are saved per project and loaded into
+//!   every admitted turn.
+//! - The host alone opens the secret vault; workers receive its key over their
+//!   private pipe (see `worker_control`).
+//! - Stop is captured at intake (`capture_stop`) and is the only cancel path.
 
-use crate::{
-    AppPaths,
-    resources::{ResourceLease, ResourceManager, TaskDemand},
-};
+use crate::AppPaths;
 use anyhow::{Context, Result, ensure};
 use async_channel::{Receiver, Sender};
 use fs2::FileExt;
@@ -27,31 +33,21 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xylo_core::*;
 use xylo_helper_client::HelperClient;
+use xylo_resources::{ResourceLease, ResourceManager, TaskDemand};
 use xylo_services::{ConnectorBroker, CredentialVault, SqliteMemory, Store};
-#[path = "host/action_control.rs"]
 mod action_control;
-#[path = "host/credential_control.rs"]
 mod credential_control;
-#[path = "host/document_control.rs"]
 mod document_control;
-#[path = "host/event_control.rs"]
-mod event_control;
-#[path = "host/fact_control.rs"]
 mod fact_control;
-#[path = "host/image_control.rs"]
 mod image_control;
-#[path = "host/notice_control.rs"]
 mod notice_control;
-#[path = "host/provider_control.rs"]
 mod provider_control;
-#[path = "host/settings_control.rs"]
 mod settings_control;
-#[path = "host/steering_control.rs"]
 mod steering_control;
-#[path = "host/turn_queue_control.rs"]
 mod turn_queue_control;
-#[path = "host/update_control.rs"]
 mod update_control;
+mod worker_control;
+use worker_control::{SessionSequences, WorkerHandle, effective_mode, retire_idle_workers};
 
 #[derive(Clone)]
 pub struct ConnectorMutationReceipt {
@@ -177,7 +173,6 @@ pub enum HostEvent {
         result: std::result::Result<crate::history::HistorySearchPage, String>,
     },
     HistoryWindow(crate::history::HistoryWindow),
-    HistoryIndexReady,
     WorkspaceOpened {
         requested: PathBuf,
         root: PathBuf,
@@ -197,12 +192,7 @@ pub enum HostEvent {
     },
     Engine(Envelope<EngineEvent>),
     Settings(AppSettings),
-    Conversations(Vec<Conversation>),
     ConversationPage(ConversationPage),
-    History {
-        session_id: Uuid,
-        messages: Vec<ChatMessage>,
-    },
     HistoryPage(HistoryPage),
     LspResponse {
         request_id: Uuid,
@@ -230,10 +220,6 @@ pub enum HostEvent {
     AuthorizationUrl(String),
     Error(String),
     Status(String),
-    File {
-        path: PathBuf,
-        content: String,
-    },
     OpenedFile {
         request_id: Uuid,
         path: PathBuf,
@@ -244,7 +230,6 @@ pub enum HostEvent {
         path: PathBuf,
         message: String,
     },
-    Diff(String),
     GitStatus {
         request_id: Uuid,
         root: PathBuf,
@@ -302,12 +287,18 @@ pub enum HostEvent {
         request_id: Uuid,
         result: Result<(), String>,
     },
-    TeamTasks(Vec<TeamTask>),
     Capability {
         request_id: Uuid,
         name: String,
         result: std::result::Result<Value, String>,
     },
+    /// Standing approvals of a project, after a load or a revocation.
+    ApprovalRules {
+        workspace: PathBuf,
+        result: std::result::Result<Vec<xylo_core::ApprovalRule>, String>,
+    },
+    /// A conversation's title changed (user rename or generated title).
+    ConversationRenamed(Conversation),
     Stopped,
 }
 
@@ -339,20 +330,16 @@ enum HostCommand {
     ProjectSearch(Uuid, PathBuf, crate::workspace::SearchOptions),
     CancelProjectSearch(Uuid),
     Worker(Option<Uuid>, WorkerCommand),
-    Load(Uuid),
     HistoryPage(Uuid, Option<i64>, usize),
     Lsp(crate::lsp::Command),
     Conversations,
     ConversationPage(Option<ConversationCursor>, usize),
     SaveSettings(AppSettings),
-    Credential(String, String),
     Models(u64, ProviderConfig),
-    SaveProvider(u64, AppSettings, ProviderConfig, Option<String>),
+    SaveProvider(u64, Box<AppSettings>, ProviderConfig, Option<String>),
     Workspace(PathBuf),
-    Read(PathBuf),
     OpenFile(Uuid, PathBuf),
     Save(PathBuf, String),
-    Diff(PathBuf),
     GitStatus(Uuid, PathBuf),
     GitFileDiff(
         Uuid,
@@ -363,8 +350,6 @@ enum HostCommand {
     ),
     MemorySearch(Uuid, String, String, Option<crate::MemoryCursor>),
     Remember(Uuid, MemoryRecord),
-    Forget(Uuid, String, Uuid),
-    ExportMemory(Uuid, String, PathBuf),
     QueueDraft(Uuid, TurnRequest, crate::drafts::DraftSubmission),
     ListTurnQueue(Uuid, Uuid),
     RemoveQueuedTurn(Uuid, Uuid, Uuid),
@@ -374,15 +359,18 @@ enum HostCommand {
     MutateConnector(Uuid, Option<ConnectorConfig>, Option<Uuid>, Option<String>),
     ConnectorTools(Uuid, Uuid, Option<PathBuf>),
     Schedules,
-    SaveSchedule(crate::scheduler::ScheduledTask),
     CreateSchedule(String, String, PathBuf),
     CreateScheduleTracked(Uuid, String, String, PathBuf),
     SaveScheduleTracked(Uuid, crate::scheduler::ScheduledTask),
     RemoveScheduleTracked(Uuid, Uuid),
-    RemoveSchedule(Uuid),
-    TeamTasks,
     Capability(Uuid, String, Value),
     CancelCapability(Uuid),
+    ApprovalRules(PathBuf),
+    RemoveApprovalRule(PathBuf, String),
+    RenameConversation(Uuid, String),
+    SetConversationPinned(Uuid, bool),
+    SetConversationArchived(Uuid, bool),
+    RemoveProvider(ProviderConfig),
     Shutdown,
 }
 
@@ -415,34 +403,80 @@ impl HostClient {
             let result = (|| -> Result<()> {
                 let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
                 let store = Store::open(&paths.database)?;
+                let database_reset = store.reset_notice();
                 let recovered = store.recover_interrupted()?;
                 store.recover_steering()?;
                 store.recover_turn_queue()?;
-                let settings = store.settings()?;
-                let vault = CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?;
-                let accounts=xylo_services::providers::ChatGptSignInService::new(&paths.data)?;
-                let notifications=crate::notifications::Service::new(paths.data.clone(),crate::notifications::AppIdentity{id:APPLICATION_ID.into(),name:APPLICATION_NAME.into()})?;
-                let (notices,notice_incoming)=async_channel::bounded(128);
-                let updates=crate::updates::Service::new(paths.data.clone(),std::env::current_exe()?)?;
-                let (memory,memory_setup_needed) = match SqliteMemory::configured(store.clone(), &paths.data.join("embedding.json")) {
-                    Ok(memory)=>(memory,false),
-                    Err(error)=>{
-                        tracing::warn!(%error,"Semantic memory assets need repair");
-                        (SqliteMemory::new(store.clone()),true)
-                    }
-                };
-                let (editor_events,editor_incoming)=async_channel::bounded(128);
-                let (workspace_events,workspace_incoming)=async_channel::bounded(16);
-                let workspace=crate::workspace::WorkspaceService::with_cache(workspace_events,paths.data.join("workspace-index"));
-                let context=runtime.enter();
-                let lsp=crate::lsp::Service::new(paths.data.clone(),editor_events);
+                let (mut settings, settings_reset) = startup_settings(&store)?;
+                let secrets = open_secrets(&paths.data, settings.secret_storage, &store);
+                follow_vault_storage(&store, &mut settings, &paths.data, secrets.as_ref().ok())?;
+                let secrets = secrets.map_err(|error| format!("{error:#}"));
+                let accounts = xylo_services::providers::ChatGptSignInService::new(&paths.data)?;
+                let notifications = crate::notifications::Service::new(
+                    paths.data.clone(),
+                    crate::notifications::AppIdentity {
+                        id: APPLICATION_ID.into(),
+                        name: APPLICATION_NAME.into(),
+                    },
+                )?;
+                let (notices, notice_incoming) = async_channel::bounded(128);
+                let updates =
+                    crate::updates::Service::new(paths.data.clone(), std::env::current_exe()?)?;
+                let (memory, memory_setup_needed) =
+                    match SqliteMemory::configured(store.clone(), &paths.data.join("embedding.json")) {
+                        Ok(memory) => (memory, false),
+                        Err(error) => {
+                            tracing::warn!(%error, "Semantic memory assets need repair");
+                            (SqliteMemory::new(store.clone()), true)
+                        }
+                    };
+                let (editor_events, editor_incoming) = async_channel::bounded(128);
+                let (workspace_events, workspace_incoming) = async_channel::bounded(16);
+                let workspace = crate::workspace::WorkspaceService::with_cache(
+                    workspace_events,
+                    paths.data.join("workspace-index"),
+                );
+                let context = runtime.enter();
+                let lsp = crate::lsp::Service::new(paths.data.clone(), editor_events);
                 drop(context);
-                let state = Arc::new(HostState { discovery:host_discovery, provider_save_gate:Mutex::new(()), paths, memory,accounts,updates,notifications,notices,foreground:Arc::new(AtomicBool::new(false)),operations:tokio::sync::RwLock::new(()),installing:Arc::new(AtomicBool::new(false)),install_request:Arc::new(parking_lot::Mutex::new(None)),workspace,search_requests:Mutex::new(HashMap::new()),image_import_gate:Mutex::new(()),
-                    connectors:ConnectorBroker::new(store.clone(),vault.clone()),vault,store,
-                    settings:Mutex::new(settings.clone()),workers:Mutex::new(HashMap::new()),events:events.clone(),
-                    resources:ResourceManager::new(),queued:Arc::new(parking_lot::Mutex::new(HashMap::new())),turn_queue:turn_queue_control::TurnQueueControl::default(),
-                    scheduled:Arc::new(Mutex::new(HashMap::new())),stopping:Arc::new(AtomicBool::new(false)),
-                    helpers:Mutex::new(HashMap::new()),capability_requests:Mutex::new(HashMap::new()),lsp });
+                // Read once, right after open: an unreadable vault was replaced.
+                let secrets_notice = match &secrets {
+                    Ok(secrets) => secrets.vault.reset_notice(),
+                    Err(error) => Some(format!(
+                        "Saved keys are unavailable: {error}. Choose the same secret storage in Settings to try again, or a different one to start over without them."
+                    )),
+                };
+                let state = Arc::new(HostState {
+                    discovery: host_discovery,
+                    provider_save_gate: Mutex::new(()),
+                    paths,
+                    memory,
+                    accounts,
+                    updates,
+                    notifications,
+                    notices,
+                    foreground: Arc::new(AtomicBool::new(false)),
+                    operations: tokio::sync::RwLock::new(()),
+                    installing: Arc::new(AtomicBool::new(false)),
+                    install_request: Arc::new(parking_lot::Mutex::new(None)),
+                    workspace,
+                    search_requests: Mutex::new(HashMap::new()),
+                    image_import_gate: Mutex::new(()),
+                    secrets: parking_lot::RwLock::new(secrets),
+                    store,
+                    settings: Mutex::new(settings.clone()),
+                    workers: Mutex::new(HashMap::new()),
+                    sequences: SessionSequences::default(),
+                    events: events.clone(),
+                    resources: ResourceManager::new(),
+                    queued: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                    turn_queue: turn_queue_control::TurnQueueControl::default(),
+                    scheduled: Arc::new(Mutex::new(HashMap::new())),
+                    stopping: Arc::new(AtomicBool::new(false)),
+                    helpers: Mutex::new(HashMap::new()),
+                    capability_requests: Mutex::new(HashMap::new()),
+                    lsp,
+                });
                 runtime.block_on(async move {
                     let maintenance_stop=CancellationToken::new();
                     let _maintenance_guard=maintenance_stop.clone().drop_guard();
@@ -451,21 +485,6 @@ impl HostClient {
                     let learning_stop=maintenance_stop.clone();
                     let learning_task=tokio::spawn(async move {
                         if let Err(error)=learning.run(learning_stop).await {tracing::warn!(%error,"Background procedure evaluation stopped");}
-                    });
-                    let history_store=state.store.clone();
-                    let history_stop=maintenance_stop.clone();
-                    let history_events=state.events.clone();
-                    let history_indexer=tokio::spawn(async move{
-                        loop {
-                            if history_stop.is_cancelled(){break;}
-                            let store=history_store.clone();
-                            match tokio::task::spawn_blocking(move||store.index_history_chunk(500)).await {
-                                Ok(Ok(true))=>{let _=history_events.send(HostEvent::HistoryIndexReady).await;break;},
-                                Ok(Ok(false))=>{},
-                                result=>{tracing::warn!(?result,"Conversation indexing stopped");break;}
-                            }
-                            tokio::select!{_=history_stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(20))=>{}}
-                        }
                     });
                     let project_events=state.events.clone();
                     let project_forwarder=tokio::spawn(async move {
@@ -488,16 +507,28 @@ impl HostClient {
                         }
                     });
                     state.events.send(HostEvent::Settings(settings)).await?;
+                    if let Some(reset) = database_reset {
+                        state.events.send(HostEvent::Status(reset.to_string())).await?;
+                    }
+                    if settings_reset {
+                        state.events.send(HostEvent::Status(SETTINGS_RESET_NOTICE.into())).await?;
+                    }
+                    if let Some(notice) = secrets_notice {
+                        state.events.send(HostEvent::Status(notice)).await?;
+                    }
                     if memory_setup_needed {state.events.send(HostEvent::Status("Semantic search needs setup in Downloads. Your saved memories remain searchable.".into())).await?;}
                     if recovered > 0 {state.events.send(HostEvent::Status(format!("Recovered {recovered} interrupted actions; uncertain writes require review"))).await?;}
                     state.send_conversations().await?;
                     let scheduling_state=state.clone();
                     let scheduling=tokio::spawn(async move{scheduling_state.schedule_loop().await;});
                     let settings_commits = settings_control::CommitOrder::default();
+                    // Project opens are ordered among themselves, not behind
+                    // settings commits, so a slow provider save cannot block them.
+                    let workspace_opens = settings_control::CommitOrder::default();
                     while let Ok(command) = incoming.recv().await {
-                        if matches!(command,HostCommand::Shutdown) {maintenance_stop.cancel();state.shutdown().await;scheduling.abort();editor_forwarder.abort();project_forwarder.abort();let _=learning_task.await;let _=history_indexer.await;for task in notification_tasks {let _=task.await;}state.events.send(HostEvent::Stopped).await?;break;}
+                        if matches!(command,HostCommand::Shutdown) {maintenance_stop.cancel();state.shutdown().await;scheduling.abort();editor_forwarder.abort();project_forwarder.abort();let _=learning_task.await;for task in notification_tasks {let _=task.await;}state.events.send(HostEvent::Stopped).await?;break;}
                         // Reserve at receipt, before any task can race to acquire admission.
-                        let settings_commit = matches!(&command, HostCommand::SaveSettings(_) | HostCommand::SaveProvider(..) | HostCommand::Workspace(_)).then(|| settings_commits.reserve());
+                        let settings_commit = matches!(&command, HostCommand::SaveSettings(_) | HostCommand::SaveProvider(..) | HostCommand::RemoveProvider(_)).then(|| settings_commits.reserve());
                         // Preserve document ordering independently of concurrent
                         // host work. The language-server actor owns synchronization.
                         if state.installing.load(Ordering::Acquire) && matches!(&command,HostCommand::Workspace(_)|HostCommand::Lsp(_)) {
@@ -513,11 +544,19 @@ impl HostClient {
                                 continue;
                             },
                             HostCommand::Workspace(path)=>{
-                                let _commit = settings_commit.expect("Workspace commit receipt").enter().await;
-                                if let Err(error)=state.handle(HostCommand::Workspace(path)).await{state.events.send(HostEvent::Error(error.to_string())).await?;}
+                                let order = workspace_opens.reserve();
+                                let state = state.clone();
+                                tokio::spawn(async move {
+                                    let _order = order.enter().await;
+                                    if let Err(error) = state.handle(HostCommand::Workspace(path)).await {
+                                        let _ = state.events.send(HostEvent::Error(error.to_string())).await;
+                                    }
+                                });
                                 continue;
                             },
                             HostCommand::Lsp(mut command)=>{
+                                // Code intelligence follows every project open received before it.
+                                drop(workspace_opens.reserve().enter().await);
                                 let request_id=if let crate::lsp::Command::Request{request_id,..}=&command{Some(*request_id)}else{None};
                                 if let crate::lsp::Command::Request{workspace,..}|crate::lsp::Command::Change{workspace,..}=&mut command {
                                     if let Some(root)=state.settings.lock().await.last_workspace.clone(){*workspace=root;}
@@ -621,9 +660,6 @@ impl HostClient {
     pub fn send_to(&self, session: Uuid, command: WorkerCommand) -> Result<()> {
         self.enqueue(HostCommand::Worker(Some(session), command))
     }
-    pub fn load_session(&self, id: Uuid) -> Result<()> {
-        self.enqueue(HostCommand::Load(id))
-    }
     pub fn load_session_page(&self, id: Uuid, before: Option<i64>, limit: usize) -> Result<()> {
         self.enqueue(HostCommand::HistoryPage(id, before, limit))
     }
@@ -664,6 +700,33 @@ impl HostClient {
     pub fn list_conversations(&self) -> Result<()> {
         self.enqueue(HostCommand::Conversations)
     }
+    /// Loads a project's standing approvals; answered with `HostEvent::ApprovalRules`.
+    pub fn approval_rules(&self, workspace: PathBuf) -> Result<()> {
+        self.enqueue(HostCommand::ApprovalRules(workspace))
+    }
+    /// Revokes one standing approval; answered with `HostEvent::ApprovalRules`.
+    pub fn remove_approval_rule(&self, workspace: PathBuf, key: String) -> Result<()> {
+        self.enqueue(HostCommand::RemoveApprovalRule(workspace, key))
+    }
+    /// Renames a conversation; answered with `HostEvent::ConversationRenamed`.
+    pub fn rename_conversation(&self, id: Uuid, title: String) -> Result<()> {
+        self.enqueue(HostCommand::RenameConversation(id, title))
+    }
+    /// Pins or unpins a conversation; answered with a fresh
+    /// `HostEvent::ConversationPage`.
+    pub fn set_conversation_pinned(&self, id: Uuid, pinned: bool) -> Result<()> {
+        self.enqueue(HostCommand::SetConversationPinned(id, pinned))
+    }
+    /// Archives or restores a conversation; answered with a fresh
+    /// `HostEvent::ConversationPage`.
+    pub fn set_conversation_archived(&self, id: Uuid, archived: bool) -> Result<()> {
+        self.enqueue(HostCommand::SetConversationArchived(id, archived))
+    }
+    /// Removes a saved provider connection and, when unshared, its secret;
+    /// answered with `HostEvent::Settings`.
+    pub fn remove_provider(&self, provider: ProviderConfig) -> Result<()> {
+        self.enqueue(HostCommand::RemoveProvider(provider))
+    }
     pub fn search_history(
         &self,
         id: Uuid,
@@ -689,9 +752,6 @@ impl HostClient {
     pub fn save_settings(&self, settings: AppSettings) -> Result<()> {
         self.enqueue(HostCommand::SaveSettings(settings))
     }
-    pub fn set_credential(&self, reference: String, secret: String) -> Result<()> {
-        self.enqueue(HostCommand::Credential(reference, secret))
-    }
     /// Persist credentials before settings and discovery, within one host operation.
     pub fn save_provider(&self, settings: AppSettings, secret: Option<String>) -> Result<()> {
         let provider = settings.provider.clone();
@@ -706,7 +766,7 @@ impl HostClient {
     ) -> Result<()> {
         self.enqueue(HostCommand::SaveProvider(
             self.discovery.begin(),
-            settings,
+            Box::new(settings),
             provider,
             secret,
         ))
@@ -747,9 +807,6 @@ impl HostClient {
     pub fn cancel_project_search(&self, request_id: Uuid) -> Result<()> {
         self.enqueue(HostCommand::CancelProjectSearch(request_id))
     }
-    pub fn read_file(&self, path: PathBuf) -> Result<()> {
-        self.enqueue(HostCommand::Read(path))
-    }
     pub fn open_file(&self, request_id: Uuid, path: PathBuf) -> Result<()> {
         self.enqueue(HostCommand::OpenFile(request_id, path))
     }
@@ -771,9 +828,6 @@ impl HostClient {
             request_id, root, path, original, group,
         ))
     }
-    pub fn git_diff(&self, path: PathBuf) -> Result<()> {
-        self.enqueue(HostCommand::Diff(path))
-    }
     pub fn memory_search(
         &self,
         request_id: Uuid,
@@ -785,17 +839,6 @@ impl HostClient {
     }
     pub fn memory_remember(&self, request_id: Uuid, record: MemoryRecord) -> Result<()> {
         self.enqueue(HostCommand::Remember(request_id, record))
-    }
-    pub fn memory_forget(&self, request_id: Uuid, scope: String, id: Uuid) -> Result<()> {
-        self.enqueue(HostCommand::Forget(request_id, scope, id))
-    }
-    pub fn memory_export(
-        &self,
-        request_id: Uuid,
-        scope: String,
-        destination: PathBuf,
-    ) -> Result<()> {
-        self.enqueue(HostCommand::ExportMemory(request_id, scope, destination))
     }
     pub fn connectors(&self) -> Result<()> {
         self.enqueue(HostCommand::Connectors)
@@ -824,9 +867,6 @@ impl HostClient {
             None,
         ))
     }
-    pub fn connector_tools(&self, id: Uuid) -> Result<()> {
-        self.enqueue(HostCommand::ConnectorTools(Uuid::new_v4(), id, None))
-    }
     pub fn connector_tools_scoped(
         &self,
         request_id: Uuid,
@@ -838,14 +878,8 @@ impl HostClient {
     pub fn list_schedules(&self) -> Result<()> {
         self.enqueue(HostCommand::Schedules)
     }
-    pub fn save_schedule(&self, task: crate::scheduler::ScheduledTask) -> Result<()> {
-        self.enqueue(HostCommand::SaveSchedule(task))
-    }
     pub fn create_schedule(&self, prompt: String, cron: String, workspace: PathBuf) -> Result<()> {
         self.enqueue(HostCommand::CreateSchedule(prompt, cron, workspace))
-    }
-    pub fn remove_schedule(&self, id: Uuid) -> Result<()> {
-        self.enqueue(HostCommand::RemoveSchedule(id))
     }
     pub fn create_schedule_tracked(
         &self,
@@ -868,9 +902,6 @@ impl HostClient {
     pub fn remove_schedule_tracked(&self, request_id: Uuid, id: Uuid) -> Result<()> {
         self.enqueue(HostCommand::RemoveScheduleTracked(request_id, id))
     }
-    pub fn team_tasks(&self) -> Result<()> {
-        self.enqueue(HostCommand::TeamTasks)
-    }
     /// Perform an explicit product action without requiring a model turn.
     pub fn capability(&self, request_id: Uuid, name: String, args: Value) -> Result<()> {
         self.enqueue(HostCommand::Capability(request_id, name, args))
@@ -883,38 +914,6 @@ impl HostClient {
     }
 }
 
-struct WorkerHandle {
-    credentials: Arc<parking_lot::Mutex<Option<Arc<credential_control::RunCredentials>>>>,
-    commands: mpsc::Sender<Envelope<WorkerCommand>>,
-    active: Arc<AtomicBool>,
-    queue_epoch: Arc<std::sync::atomic::AtomicU64>,
-    queue_stopped: Arc<AtomicBool>,
-    lease: Arc<Mutex<Option<ResourceLease>>>,
-    stop: CancellationToken,
-    exited: tokio::sync::watch::Receiver<bool>,
-    run_request: Arc<parking_lot::Mutex<Option<Uuid>>>,
-    run_turn: Arc<parking_lot::Mutex<Option<Uuid>>>,
-    model_activity: Arc<Mutex<Option<ModelActivityLease>>>,
-}
-
-/// Keep a retiring process supervised until its reader has killed/waited it and
-/// reconciled the journal. The stop token also prevents a new turn being queued
-/// behind Shutdown on the old channel. Idle workers have no active turn to lose.
-fn retire_idle_workers(workers: &mut HashMap<Uuid, WorkerHandle>, current: Uuid) {
-    workers.retain(|session, worker| *session == current || !*worker.exited.borrow());
-    for (session, worker) in workers.iter() {
-        if *session != current && !worker.active.load(Ordering::Acquire) {
-            let _ = worker.commands.try_send(Envelope::new(
-                Uuid::new_v4(),
-                Some(*session),
-                0,
-                WorkerCommand::Shutdown,
-            ));
-            worker.stop.cancel();
-        }
-    }
-}
-
 struct ModelActivityLease(std::fs::File);
 impl Drop for ModelActivityLease {
     fn drop(&mut self) {
@@ -924,13 +923,34 @@ impl Drop for ModelActivityLease {
 
 type PendingRuns = Arc<parking_lot::Mutex<HashMap<Uuid, (Uuid, CancellationToken)>>>;
 
+/// A queued message being admitted: the item, its admitted flag, and whether
+/// the queue started it automatically.
+type QueuedAdmission = (crate::turn_queue::QueuedTurn, Arc<AtomicBool>, bool);
+
+/// How a Run admission ended.
+enum Admission {
+    Dispatched(Option<crate::drafts::DraftAdmission>),
+    /// The turn had already completed; its stored answer was published.
+    Replayed(Option<crate::drafts::DraftAdmission>),
+    Cancelled,
+}
+
+/// Saved models belong to one connection when everything but the model
+/// choice matches.
+fn same_connection(a: &ProviderConfig, b: &ProviderConfig) -> bool {
+    a.family == b.family
+        && a.endpoint == b.endpoint
+        && a.credential_ref == b.credential_ref
+        && a.discovery_url == b.discovery_url
+        && a.headers == b.headers
+}
+
 /// Retain a session's starting state until it is either running or fully failed.
 /// Cancelling a queued turn leaves the guard in place until admission unwinds.
 struct PendingRun {
     session: Uuid,
     pending: PendingRuns,
     id: Uuid,
-    cancel: CancellationToken,
 }
 
 impl Drop for PendingRun {
@@ -944,6 +964,99 @@ impl Drop for PendingRun {
         }
     }
 }
+/// The secret vault and the connector broker that reads from it. Both are
+/// replaced together when the configured secret storage changes.
+struct Secrets {
+    storage: SecretStorage,
+    vault: CredentialVault,
+    connectors: Arc<ConnectorBroker>,
+}
+
+/// Opens the vault. Its own record of where the key lives wins over
+/// `storage`, so [`Secrets::storage`] may differ from the request.
+fn open_secrets(data: &std::path::Path, storage: SecretStorage, store: &Store) -> Result<Secrets> {
+    secrets_for(CredentialVault::open(data, storage)?, store)
+}
+
+/// Opens a vault that was unavailable, after the user chose `storage`.
+/// Choosing the storage the vault records retries it; choosing another while
+/// the vault still cannot be opened starts over there without the saved keys
+/// (the startup notice says so). Returns whether it started over.
+fn reopen_secrets(
+    data: &std::path::Path,
+    storage: SecretStorage,
+    store: &Store,
+) -> Result<(Secrets, bool)> {
+    match open_secrets(data, storage, store) {
+        Ok(secrets) => Ok((secrets, false)),
+        Err(error) if CredentialVault::recorded_storage(data)? != Some(storage) => {
+            tracing::warn!("Starting the secret vault over: {error:#}");
+            Ok((
+                secrets_for(CredentialVault::start_over(data, storage)?, store)?,
+                true,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn secrets_for(vault: CredentialVault, store: &Store) -> Result<Secrets> {
+    Ok(Secrets {
+        storage: vault
+            .storage()
+            .context("A host vault knows where its key is stored")?,
+        connectors: Arc::new(ConnectorBroker::new(store.clone(), vault.clone())),
+        vault,
+    })
+}
+
+/// Makes the saved setting name the storage the vault actually uses (or
+/// records, when it could not be opened). The vault's record is the source of
+/// truth, so a reset settings database never points the vault at the wrong
+/// key.
+fn follow_vault_storage(
+    store: &Store,
+    settings: &mut AppSettings,
+    data: &std::path::Path,
+    secrets: Option<&Secrets>,
+) -> Result<()> {
+    let actual = match secrets {
+        Some(secrets) => Some(secrets.storage),
+        None => CredentialVault::recorded_storage(data).unwrap_or_else(|error| {
+            tracing::warn!("Read where the vault key is stored: {error:#}");
+            None
+        }),
+    };
+    if let Some(actual) = actual
+        && actual != settings.secret_storage
+    {
+        settings.secret_storage = actual;
+        store.save_settings(settings)?;
+    }
+    Ok(())
+}
+
+/// Shown when a storage switch (or a start-over) discarded the saved keys.
+const STORAGE_CHANGED_NOTICE: &str =
+    "Secret storage changed. Saved keys were removed; reconnect your providers.";
+
+const SETTINGS_RESET_NOTICE: &str =
+    "Your saved settings could not be read, so Xylo started with default settings.";
+
+/// Stored settings, or defaults (saved, with a notice flag) when they no
+/// longer decode. There is no compatibility parsing of older formats.
+fn startup_settings(store: &Store) -> Result<(AppSettings, bool)> {
+    match store.settings() {
+        Ok(settings) => Ok((settings, false)),
+        Err(error) => {
+            tracing::warn!(%error, "Stored settings could not be read; using defaults");
+            let defaults = AppSettings::default();
+            store.save_settings(&defaults)?;
+            Ok((defaults, true))
+        }
+    }
+}
+
 struct HostState {
     discovery: Arc<provider_control::DiscoveryControl>,
     provider_save_gate: Mutex<()>,
@@ -954,10 +1067,11 @@ struct HostState {
     store: Store,
     memory: SqliteMemory,
     accounts: xylo_services::providers::ChatGptSignInService,
-    vault: CredentialVault,
-    connectors: ConnectorBroker,
+    /// The vault and connector broker, or why the vault could not be opened.
+    secrets: parking_lot::RwLock<std::result::Result<Secrets, String>>,
     settings: Mutex<AppSettings>,
     workers: Mutex<HashMap<Uuid, WorkerHandle>>,
+    sequences: SessionSequences,
     events: Sender<HostEvent>,
     resources: ResourceManager,
     queued: PendingRuns,
@@ -980,17 +1094,6 @@ impl HostState {
     /// Register cancellation before dispatching asynchronous work. The command
     /// stream is ordered even when its execution tasks are scheduled differently.
     async fn prepare_command(&self, command: &HostCommand) -> Result<bool> {
-        if let HostCommand::PreparedCancel(stops) = command {
-            self.publish_prepared_startup_stops(stops).await?;
-        }
-        if let HostCommand::Worker(target, WorkerCommand::Cancel) = command {
-            self.turn_queue.stop(*target);
-            for (session, (_, cancel)) in self.queued.lock().iter() {
-                if target.is_none_or(|target| target == *session) {
-                    cancel.cancel();
-                }
-            }
-        }
         if self.installing.load(Ordering::Acquire) {
             match command {
                 HostCommand::QueueDraft(id, _, _) => {
@@ -1099,17 +1202,10 @@ impl HostState {
                     self.events.send(event).await?;
                     return Ok(false);
                 }
-                HostCommand::MemorySearch(id, _, _, _)
-                | HostCommand::Remember(id, _)
-                | HostCommand::Forget(id, _, _)
-                | HostCommand::ExportMemory(id, _, _) => {
+                HostCommand::MemorySearch(id, _, _, _) | HostCommand::Remember(id, _) => {
                     let message = "Wait for the update installation to finish".to_owned();
                     let event = match command {
                         HostCommand::MemorySearch(_, _, _, _) => HostEvent::MemoryPage {
-                            request_id: *id,
-                            result: Err(message),
-                        },
-                        HostCommand::ExportMemory(_, _, _) => HostEvent::MemoryExport {
                             request_id: *id,
                             result: Err(message),
                         },
@@ -1513,16 +1609,6 @@ impl HostState {
                     .await?;
             }
             HostCommand::Worker(session, command) => self.worker_command(session, command).await?,
-            HostCommand::Load(id) => {
-                let store = self.store.clone();
-                let rows = tokio::task::spawn_blocking(move || store.messages(id, 1000)).await??;
-                self.events
-                    .send(HostEvent::History {
-                        session_id: id,
-                        messages: rows,
-                    })
-                    .await?;
-            }
             HostCommand::HistoryPage(id, before, limit) => {
                 let store = self.store.clone();
                 let page =
@@ -1531,6 +1617,39 @@ impl HostState {
                 self.events.send(HostEvent::HistoryPage(page)).await?;
             }
             HostCommand::Conversations => self.send_conversations().await?,
+            HostCommand::ApprovalRules(workspace) => {
+                let result = self.approval_rules(&workspace).await;
+                self.events
+                    .send(HostEvent::ApprovalRules { workspace, result })
+                    .await?;
+            }
+            HostCommand::RemoveApprovalRule(workspace, key) => {
+                let result = match self.revoke_approval_rule(&workspace, key).await {
+                    Ok(()) => self.approval_rules(&workspace).await,
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                self.events
+                    .send(HostEvent::ApprovalRules { workspace, result })
+                    .await?;
+            }
+            HostCommand::RenameConversation(id, title) => {
+                self.rename_conversation(id, title).await?
+            }
+            HostCommand::SetConversationPinned(id, pinned) => {
+                let store = self.store.clone();
+                tokio::task::spawn_blocking(move || store.set_conversation_pinned(id, pinned))
+                    .await??
+                    .context("This chat no longer exists")?;
+                self.send_conversations().await?
+            }
+            HostCommand::SetConversationArchived(id, archived) => {
+                let store = self.store.clone();
+                tokio::task::spawn_blocking(move || store.set_conversation_archived(id, archived))
+                    .await??
+                    .context("This chat no longer exists")?;
+                self.send_conversations().await?
+            }
+            HostCommand::RemoveProvider(provider) => self.remove_provider(provider).await?,
             HostCommand::ConversationPage(before, limit) => {
                 let store = self.store.clone();
                 let page =
@@ -1539,20 +1658,8 @@ impl HostState {
                 self.events.send(HostEvent::ConversationPage(page)).await?;
             }
             HostCommand::SaveSettings(settings) => {
-                let value = settings.clone();
-                let store = self.store.clone();
-                tokio::task::spawn_blocking(move || store.save_settings(&value)).await??;
-                *self.settings.lock().await = settings.clone();
+                self.commit_settings(settings.clone()).await?;
                 self.events.send(HostEvent::Settings(settings)).await?;
-            }
-            HostCommand::Credential(reference, secret) => {
-                let vault = self.vault.clone();
-                tokio::task::spawn_blocking(move || vault.set(&reference, &secret)).await??;
-                self.events
-                    .send(HostEvent::Status(
-                        "Credential saved in the OS credential store".into(),
-                    ))
-                    .await?;
             }
             HostCommand::SaveProvider(generation, settings, config, secret) => {
                 let _save = self.provider_save_gate.lock().await;
@@ -1566,13 +1673,11 @@ impl HostState {
                         .credential_ref
                         .clone()
                         .context("Missing credential reference")?;
-                    let vault = self.vault.clone();
+                    let vault = self.vault()?;
                     tokio::task::spawn_blocking(move || vault.set(&reference, &secret)).await??;
                 }
-                let value = settings.clone();
-                let store = self.store.clone();
-                tokio::task::spawn_blocking(move || store.save_settings(&value)).await??;
-                *self.settings.lock().await = settings.clone();
+                let settings = *settings;
+                self.commit_settings(settings.clone()).await?;
                 if self.discovery.generation() != generation {
                     return Ok(());
                 }
@@ -1606,15 +1711,20 @@ impl HostState {
                 let requested = path;
                 let path = tokio::fs::canonicalize(&requested).await?;
                 ensure!(path.is_dir(), "Choose a directory");
-                let mut settings = self.settings.lock().await;
-                settings.last_workspace = Some(path.clone());
-                if !settings.ui.open_projects.contains(&path) {
-                    settings.ui.open_projects.push(path.clone());
+                {
+                    // Persist and publish under one lock so memory and the
+                    // database never disagree with a concurrent settings save.
+                    let mut settings = self.settings.lock().await;
+                    let mut value = settings.clone();
+                    value.last_workspace = Some(path.clone());
+                    if !value.ui.open_projects.contains(&path) {
+                        value.ui.open_projects.push(path.clone());
+                    }
+                    let store = self.store.clone();
+                    let saved = value.clone();
+                    tokio::task::spawn_blocking(move || store.save_settings(&saved)).await??;
+                    *settings = value;
                 }
-                let store = self.store.clone();
-                let value = settings.clone();
-                drop(settings);
-                tokio::task::spawn_blocking(move || store.save_settings(&value)).await??;
                 self.workspace.open(&path).await?;
                 self.events
                     .send(HostEvent::WorkspaceOpened {
@@ -1625,15 +1735,6 @@ impl HostState {
                 self.events
                     .send(HostEvent::Settings(self.settings.lock().await.clone()))
                     .await?;
-            }
-            HostCommand::Read(path) => {
-                let path = self.authorized_file(path, false).await?;
-                ensure!(
-                    tokio::fs::metadata(&path).await?.len() <= 8 * 1024 * 1024,
-                    "File exceeds editor preview limit"
-                );
-                let content = tokio::fs::read_to_string(&path).await?;
-                self.events.send(HostEvent::File { path, content }).await?;
             }
             HostCommand::OpenFile(request_id, path) => {
                 let result = async {
@@ -1695,22 +1796,6 @@ impl HostState {
                     })
                     .await?;
             }
-            HostCommand::Diff(path) => {
-                self.authorized_git_root(&path).await?;
-                let result = crate::workspace::git::run_read(
-                    &path,
-                    &[
-                        "diff".into(),
-                        "--no-ext-diff".into(),
-                        "--no-textconv".into(),
-                    ],
-                    Duration::from_secs(30),
-                    Default::default(),
-                )
-                .await?;
-                let result = crate::process::require_success(result)?;
-                self.events.send(HostEvent::Diff(result.stdout)).await?;
-            }
             HostCommand::MemorySearch(request_id, scope, query, before) => {
                 let memory = self.memory.clone();
                 let store = self.store.clone();
@@ -1733,6 +1818,7 @@ impl HostState {
                 self.events
                     .send(HostEvent::MemoryPage { request_id, result })
                     .await?;
+                self.report_embedding_failure().await;
             }
             HostCommand::Remember(request_id, record) => {
                 let memory = self.memory.clone();
@@ -1750,38 +1836,7 @@ impl HostState {
                 self.events
                     .send(HostEvent::MemoryMutation { request_id, result })
                     .await?;
-            }
-            HostCommand::Forget(request_id, scope, id) => {
-                let memory = self.memory.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    memory.forget_scoped(&scope, id)?;
-                    Ok::<_, anyhow::Error>(crate::MemoryMutation {
-                        scope,
-                        id,
-                        deleted: true,
-                    })
-                })
-                .await?
-                .map_err(|error| error.to_string());
-                self.events
-                    .send(HostEvent::MemoryMutation { request_id, result })
-                    .await?;
-            }
-            HostCommand::ExportMemory(request_id, scope, destination) => {
-                let database = self.paths.database.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    xylo_services::export_memories(
-                        &database,
-                        &scope,
-                        &destination,
-                        &CancellationToken::new(),
-                    )
-                })
-                .await?
-                .map_err(|error| error.to_string());
-                self.events
-                    .send(HostEvent::MemoryExport { request_id, result })
-                    .await?;
+                self.report_embedding_failure().await;
             }
             HostCommand::Connectors => {
                 let store = self.store.clone();
@@ -1799,7 +1854,8 @@ impl HostState {
                 let id = remove
                     .or_else(|| config.as_ref().map(|config| config.id))
                     .context("Connector mutation has no target")?;
-                let _configuration = match self.connectors.configuration_guard(id).await {
+                let connectors = self.connectors()?;
+                let _configuration = match connectors.configuration_guard(id).await {
                     Ok(guard) => guard,
                     Err(error) => {
                         self.events
@@ -1812,12 +1868,12 @@ impl HostState {
                     }
                 };
                 let store = self.store.clone();
-                let vault = self.vault.clone();
+                let vault = self.vault();
                 let result =
                     tokio::task::spawn_blocking(move || -> Result<ConnectorMutationReceipt> {
                         if let Some(config) = &config {
                             if let Some(secret) = secret {
-                                vault.set(
+                                vault?.set(
                                     config
                                         .credential_ref
                                         .as_deref()
@@ -1847,11 +1903,12 @@ impl HostState {
                     .send(HostEvent::ConnectorMutation { request_id, result })
                     .await?;
                 if let Some(id) = invalidated {
-                    self.connectors.disconnect(id).await.context("Connection change saved, but ending its previous inspection session failed")?;
+                    connectors.disconnect(id).await.context("Connection change saved, but ending its previous inspection session failed")?;
                 }
             }
             HostCommand::ConnectorTools(request_id, id, workspace) => {
-                let _configuration = match self.connectors.configuration_guard(id).await {
+                let connectors = self.connectors()?;
+                let _configuration = match connectors.configuration_guard(id).await {
                     Ok(guard) => guard,
                     Err(error) => {
                         self.events
@@ -1881,11 +1938,11 @@ impl HostState {
                             protected_paths: vec![self.paths.data.clone()],
                             ..Default::default()
                         };
-                        self.connectors
+                        connectors
                             .tools_scoped(&config, &scope, &Default::default())
                             .await
                     } else {
-                        self.connectors.tools(&config, &Default::default()).await
+                        connectors.tools(&config, &Default::default()).await
                     }
                 }
                 .await;
@@ -1906,16 +1963,8 @@ impl HostState {
                 self.events.send(event).await?;
             }
             HostCommand::Schedules => self.send_schedules().await?,
-            HostCommand::SaveSchedule(task) => {
-                self.scheduler(task.workspace.clone())?.save(task).await?;
-                self.send_schedules().await?;
-            }
             HostCommand::CreateSchedule(prompt, cron, workspace) => {
                 self.scheduler(workspace)?.create(prompt, cron).await?;
-                self.send_schedules().await?;
-            }
-            HostCommand::RemoveSchedule(id) => {
-                self.default_scheduler()?.remove(id).await?;
                 self.send_schedules().await?;
             }
             HostCommand::CreateScheduleTracked(request_id, prompt, cron, workspace) => {
@@ -1941,48 +1990,6 @@ impl HostState {
                 }
                 .await;
                 self.schedule_mutated(request_id, result).await?;
-            }
-            HostCommand::TeamTasks => {
-                let store = self.store.clone();
-                let actions = tokio::task::spawn_blocking(move || {
-                    store.actions_by_name("agent_delegate", 200)
-                })
-                .await??;
-                let tasks = actions
-                    .into_iter()
-                    .map(|action| TeamTask {
-                        id: action.intent.id,
-                        title: action
-                            .intent
-                            .arguments
-                            .get("task")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Delegated task")
-                            .chars()
-                            .take(120)
-                            .collect(),
-                        status: match action.state.as_str() {
-                            "succeeded" => "Completed",
-                            "running" => "Working",
-                            "pending" => "Waiting",
-                            "denied" => "Cancelled",
-                            _ => "Needs attention",
-                        }
-                        .into(),
-                        summary: action
-                            .result
-                            .as_ref()
-                            .and_then(|result| result.get("summary"))
-                            .map(|summary| {
-                                summary
-                                    .as_str()
-                                    .map(str::to_owned)
-                                    .unwrap_or_else(|| summary.to_string())
-                            })
-                            .unwrap_or_default(),
-                    })
-                    .collect();
-                self.events.send(HostEvent::TeamTasks(tasks)).await?;
             }
             HostCommand::Capability(request_id, name, args) => {
                 let cancel = self
@@ -2033,6 +2040,7 @@ impl HostState {
             return crate::extensions::execute(
                 self.paths.data.join("extensions"),
                 self.store.clone(),
+                self.vault(),
                 request_id,
                 name,
                 args,
@@ -2041,6 +2049,9 @@ impl HostState {
             .await;
         }
         match name {
+            "memory_embedding_status" => {
+                return Ok(serde_json::to_value(self.memory.embedding_status())?);
+            }
             "updates_status" => return Ok(self.updates.status()),
             "updates_check" => return self.updates.check(cancel).await,
             "updates_download" => return self.updates.stage(cancel).await,
@@ -2067,7 +2078,7 @@ impl HostState {
                         .accounts
                         .sign_in(
                             &host_id,
-                            self.vault.clone(),
+                            self.vault()?,
                             reference,
                             cancel,
                             move |url| async move {
@@ -2082,13 +2093,13 @@ impl HostState {
                 }
                 "account_chatgpt_status" => {
                     return Ok(serde_json::to_value(
-                        self.accounts.account(self.vault.clone(), reference).await?,
+                        self.accounts.account(self.vault()?, reference).await?,
                     )?);
                 }
                 "account_chatgpt_sign_out" => {
                     let warning = self
                         .accounts
-                        .sign_out(self.vault.clone(), reference, &cancel)
+                        .sign_out(self.vault()?, reference, &cancel)
                         .await?;
                     return Ok(serde_json::json!({"signed_out":true,"warning":warning}));
                 }
@@ -2108,7 +2119,7 @@ impl HostState {
         // Local reservations coordinate foreground host work. The helper also
         // acquires the shared process-wide pool and retains its OS lease inside
         // native blocking cleanup, even if this RPC is cancelled early.
-        let _native_lease = if let Some(demand) = crate::resources::capability_demand(name) {
+        let _native_lease = if let Some(demand) = xylo_resources::capability_demand(name) {
             Some(self.resources.acquire(demand, cancel.clone()).await?)
         } else {
             None
@@ -2304,19 +2315,9 @@ impl HostState {
         target: Option<Uuid>,
         command: WorkerCommand,
     ) -> Result<()> {
-        self.worker_command_with_draft(target, command, None)
+        self.worker_command_with_draft_and_receipt(target, command, None, None)
             .await
             .map(|_| ())
-    }
-
-    async fn worker_command_with_draft(
-        self: &Arc<Self>,
-        target: Option<Uuid>,
-        command: WorkerCommand,
-        submission: Option<crate::drafts::DraftSubmission>,
-    ) -> Result<Option<crate::drafts::DraftAdmission>> {
-        self.worker_command_with_draft_and_receipt(target, command, submission, None)
-            .await
     }
 
     async fn publish_draft_admission(
@@ -2351,425 +2352,764 @@ impl HostState {
         self.worker_command_with_queue_receipt(target, command, submission, draft_request_id, None)
             .await
     }
+
     async fn worker_command_with_queue_receipt(
         self: &Arc<Self>,
         target: Option<Uuid>,
-        mut command: WorkerCommand,
+        command: WorkerCommand,
         submission: Option<crate::drafts::DraftSubmission>,
         draft_request_id: Option<Uuid>,
-        queued_item: Option<(crate::turn_queue::QueuedTurn, Arc<AtomicBool>, bool)>,
+        queued_item: Option<QueuedAdmission>,
     ) -> Result<Option<crate::drafts::DraftAdmission>> {
+        match command {
+            WorkerCommand::Run { turn } => {
+                self.admit_run(turn, submission, draft_request_id, queued_item)
+                    .await
+            }
+            command => {
+                self.control_worker(target, command).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Delivers a UI control command (Approve, guidance, Shutdown) to a worker.
+    /// Stop never arrives here: [`HostState::capture_stop`] owns it.
+    async fn control_worker(&self, target: Option<Uuid>, command: WorkerCommand) -> Result<()> {
         ensure!(
             !matches!(
                 command,
                 WorkerCommand::RunAuthorized { .. }
                     | WorkerCommand::ProviderCredentialUpdated { .. }
+                    | WorkerCommand::Unlock { .. }
+                    | WorkerCommand::SetPermissions { .. }
+                    | WorkerCommand::Hello
+                    | WorkerCommand::Cancel
             ),
-            "Authenticated worker commands are host-internal"
+            "This command is managed by the application host"
         );
-        let session = match &command {
-            WorkerCommand::Run { turn } => turn.session_id,
-            _ => match target {
-                Some(id) => id,
-                None => {
-                    let workers = self.workers.lock().await;
-                    let active: Vec<_> = workers
-                        .iter()
-                        .filter(|(_, w)| w.active.load(Ordering::Acquire))
-                        .map(|(id, _)| *id)
-                        .collect();
-                    ensure!(
-                        active.len() == 1,
-                        "Select a single active task for this control action"
-                    );
-                    active[0]
-                }
-            },
+        let session = match target {
+            Some(session) => session,
+            None => {
+                let active = self.turn_queue.active_sessions();
+                ensure!(
+                    active.len() == 1,
+                    "Select a single active task for this control action"
+                );
+                active[0]
+            }
         };
-        if matches!(command, WorkerCommand::Cancel) {
-            // Stop must reach a worker even while SQLite admission is blocked.
-            // The synchronous stop fence already prevents automatic dispatch.
-            self.turn_queue.stop(Some(session));
-            let fence = self.turn_queue.fence(session);
-            let host = self.clone();
-            tokio::spawn(async move {
-                let Ok(_guard) = host.turn_queue.gate(session).await else {
-                    return;
-                };
-                if fence
-                    .as_ref()
-                    .is_some_and(|(epoch, expected)| epoch.load(Ordering::Acquire) != *expected)
-                {
-                    return;
-                }
-                let store = host.store.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    store.pause_turn_queue(
-                        session,
-                        "The task stopped. Send a queued message when ready.",
-                    )
-                })
-                .await;
-                let _ = host.emit_turn_queue(Uuid::nil(), session, None).await;
-            });
-            let queued = self
-                .queued
-                .lock()
-                .get(&session)
-                .map(|(_, cancel)| cancel.clone());
-            if let Some(cancel) = queued {
-                cancel.cancel();
-                self.events
-                    .send(HostEvent::Engine(Envelope::new(
-                        Uuid::new_v4(),
-                        Some(session),
-                        0,
-                        EngineEvent::Cancelled,
-                    )))
-                    .await?;
-                return Ok(None);
-            }
-        }
-        let mut resolved_credential = None;
-        let mut pending_run = None;
-        let mut admitted = None;
-        let mut model_activity = None;
-        if let WorkerCommand::Run { turn } = &mut command {
-            let cancellation = {
-                let mut queued = self.queued.lock();
-                match queued.get(&session) {
-                    Some((id, cancel)) => {
-                        ensure!(*id == turn.turn_id, "This task is already waiting to start");
-                        cancel.clone()
-                    }
-                    None => {
-                        let cancel = CancellationToken::new();
-                        queued.insert(session, (turn.turn_id, cancel.clone()));
-                        cancel
-                    }
-                }
+        let worker = self
+            .workers
+            .lock()
+            .await
+            .get(&session)
+            .filter(|worker| !worker.dead())
+            .cloned();
+        if let WorkerCommand::Approve {
+            action_id,
+            allow,
+            remember,
+        } = command
+        {
+            let Some(worker) = worker else {
+                return self.report_lost_decision(session, action_id, None).await;
             };
-            pending_run = Some(PendingRun {
-                session,
-                id: turn.turn_id,
-                cancel: cancellation.clone(),
-                pending: self.queued.clone(),
+            return self
+                .decide(session, &worker, action_id, allow, remember)
+                .await;
+        }
+        let worker = worker.context("This task is no longer running")?;
+        worker.send_control(session, Uuid::new_v4(), command).await
+    }
+
+    /// Forwards a decision and, for "always allow", saves the project rule.
+    /// Only the first decision for an action counts.
+    async fn decide(
+        &self,
+        session: Uuid,
+        worker: &WorkerHandle,
+        action_id: Uuid,
+        allow: bool,
+        remember: bool,
+    ) -> Result<()> {
+        let request = Uuid::new_v4();
+        let first = worker
+            .approvals
+            .lock()
+            .get_mut(&action_id)
+            .and_then(|pending| {
+                pending.decision.is_none().then(|| {
+                    pending.decision = Some(request);
+                    pending.clone()
+                })
             });
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            // A chat's durable action provenance is bound to its original
-            // canonical workspace. Reject redirection before admission or any
-            // model/helper/worker dispatch, including a completed-turn replay.
-            let workspace = tokio::fs::canonicalize(&turn.workspace)
-                .await
-                .context("The selected project is unavailable")?;
-            ensure!(workspace.is_dir(), "The selected project is unavailable");
+        let command = WorkerCommand::Approve {
+            action_id,
+            allow,
+            remember,
+        };
+        if worker
+            .send_control(session, request, command)
+            .await
+            .is_err()
+        {
+            let pending = worker.approvals.lock().remove(&action_id);
+            return self.report_lost_decision(session, action_id, pending).await;
+        }
+        let workspace = worker.workspace.lock().clone();
+        if allow
+            && remember
+            && let Some(pending) = first
+            && let Some(key) = pending.rule_key
+            && let Some(workspace) = workspace
+        {
+            let rule = ApprovalRule {
+                label: pending.rule.unwrap_or_else(|| key.clone()),
+                key,
+                workspace,
+                created_at: now_ms(),
+            };
             let store = self.store.clone();
-            if let Some(conversation) =
-                tokio::task::spawn_blocking(move || store.conversation(session)).await??
-            {
-                ensure!(
-                    tokio::fs::canonicalize(&conversation.workspace).await? == workspace,
-                    "This chat belongs to another project"
-                );
-            }
-            // Compare canonical identities without rewriting the submitted
-            // spelling: draft CAS and durable admission bind the exact scoped
-            // request, which may legitimately use an equivalent path alias.
-            ensure!(
-                !self.stopping.load(Ordering::Acquire),
-                "Application is closing"
-            );
-            let store = self.store.clone();
-            let turn_id = turn.turn_id;
-            if let Some(completed) =
-                tokio::task::spawn_blocking(move || store.completed_turn(session, turn_id))
-                    .await??
-            {
-                self.complete_schedule(session).await?;
-                let receipt = if let Some(submission) = submission {
-                    Some(
-                        crate::drafts::admit_turn(self.store.clone(), turn.clone(), submission)
-                            .await?,
-                    )
-                } else {
-                    None
-                };
-                if let Some((item, admitted, _)) = &queued_item {
-                    let store = self.store.clone();
-                    let item = item.clone();
-                    tokio::task::spawn_blocking(move || {
-                        store.admit_queued_turn(item.turn.session_id, item.id, &item.turn)
-                    })
-                    .await??;
-                    admitted.store(true, Ordering::Release);
-                }
-                self.publish_draft_admission(draft_request_id, &receipt)
-                    .await;
-                self.publish_queued_admission(&queued_item).await;
+            let saved = tokio::task::spawn_blocking(move || store.save_approval_rule(&rule)).await;
+            if !matches!(saved, Ok(Ok(()))) {
+                tracing::warn!(?saved, "Save standing approval");
                 self.events
-                    .send(HostEvent::Engine(Envelope::new(
-                        turn_id,
-                        Some(session),
-                        0,
-                        EngineEvent::Completed {
-                            text: completed.text,
-                            usage: completed.usage,
-                        },
-                    )))
+                    .send(HostEvent::Error(
+                        "The action was allowed, but \"always allow\" could not be saved for this project."
+                            .into(),
+                    ))
                     .await?;
-                return Ok(receipt);
-            }
-            turn.provider.validate()?;
-            resolved_credential = Some(xylo_core::WorkerCredential(
-                self.accounts
-                    .resolve_provider_credential(&turn.provider, self.vault.clone(), &cancellation)
-                    .await?,
-            ));
-            {
-                let mut workers = self.workers.lock().await;
-                ensure!(
-                    !workers
-                        .get(&session)
-                        .is_some_and(|w| w.active.load(Ordering::Acquire)),
-                    "This task is already working"
-                );
-                retire_idle_workers(&mut workers, session);
-            }
-            admitted = Some(
-                self.resources
-                    .acquire(
-                        TaskDemand::interactive(turn.provider.context_tokens),
-                        cancellation.clone(),
-                    )
-                    .await?,
-            );
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            if turn.provider.managed_local {
-                let helper = self
-                    .helper_for_workspace(turn.workspace.clone(), &cancellation)
-                    .await?;
-                model_activity = Some(
-                    acquire_model_activity(
-                        self.paths.data.join("local-inference-activity.lock"),
-                        cancellation.clone(),
-                    )
-                    .await?,
-                );
-                let value = helper
-                    .execute(
-                        "local_inference_start",
-                        &serde_json::json!({}),
-                        cancellation.clone(),
-                    )
-                    .await?;
-                let summary: Value = serde_json::from_str(
-                    value
-                        .get("summary")
-                        .and_then(Value::as_str)
-                        .context("Local model did not return connection information")?,
-                )?;
-                turn.provider.endpoint = summary
-                    .get("endpoint")
-                    .and_then(Value::as_str)
-                    .context("Local model did not become available")?
-                    .to_owned();
-            }
-            if cancellation.is_cancelled() {
-                return Ok(None);
             }
         }
-        let mut workers = self.workers.lock().await;
+        Ok(())
+    }
+
+    /// Admits one Run: reserve, prepare (credentials, resources, worker), make
+    /// the user message durable, then dispatch. A Run that does not dispatch
+    /// after a Stop reports exactly one `Cancelled` for its request.
+    async fn admit_run(
+        self: &Arc<Self>,
+        mut turn: TurnRequest,
+        submission: Option<crate::drafts::DraftSubmission>,
+        draft_request_id: Option<Uuid>,
+        queued_item: Option<QueuedAdmission>,
+    ) -> Result<Option<crate::drafts::DraftAdmission>> {
+        let session = turn.session_id;
+        let cancellation = {
+            let mut queued = self.queued.lock();
+            match queued.get(&session) {
+                Some((id, cancel)) => {
+                    ensure!(*id == turn.turn_id, "This task is already waiting to start");
+                    cancel.clone()
+                }
+                None => {
+                    let cancel = CancellationToken::new();
+                    queued.insert(session, (turn.turn_id, cancel.clone()));
+                    cancel
+                }
+            }
+        };
+        let _pending = PendingRun {
+            session,
+            id: turn.turn_id,
+            pending: self.queued.clone(),
+        };
+        let request_id = Uuid::new_v4();
+        let outcome = self
+            .admit_reserved(
+                request_id,
+                &mut turn,
+                &cancellation,
+                submission,
+                draft_request_id,
+                &queued_item,
+            )
+            .await;
+        let delivered = matches!(
+            outcome,
+            Ok(Admission::Dispatched(_) | Admission::Replayed(_))
+        );
+        if !delivered && cancellation.is_cancelled() {
+            let _ = self
+                .events
+                .send(
+                    self.sequences
+                        .engine(request_id, session, EngineEvent::Cancelled),
+                )
+                .await;
+        }
+        Ok(match outcome? {
+            Admission::Dispatched(receipt) | Admission::Replayed(receipt) => receipt,
+            Admission::Cancelled => None,
+        })
+    }
+
+    async fn admit_reserved(
+        self: &Arc<Self>,
+        request_id: Uuid,
+        turn: &mut TurnRequest,
+        cancellation: &CancellationToken,
+        submission: Option<crate::drafts::DraftSubmission>,
+        draft_request_id: Option<Uuid>,
+        queued_item: &Option<QueuedAdmission>,
+    ) -> Result<Admission> {
+        let session = turn.session_id;
+        if cancellation.is_cancelled() {
+            return Ok(Admission::Cancelled);
+        }
+        // Show activity before credentials, resources or a local model start.
+        // Best effort: a closed UI receiver must not block admission.
+        let _ = self
+            .events
+            .send(self.sequences.engine(
+                request_id,
+                session,
+                EngineEvent::Phase {
+                    phase: TurnPhase::Preparing,
+                },
+            ))
+            .await;
+        // A chat's durable action provenance is bound to its original
+        // canonical workspace. Reject redirection before admission or any
+        // model/helper/worker dispatch, including a completed-turn replay.
+        let workspace = tokio::fs::canonicalize(&turn.workspace)
+            .await
+            .context("The selected project is unavailable")?;
+        ensure!(workspace.is_dir(), "The selected project is unavailable");
+        let store = self.store.clone();
+        if let Some(conversation) =
+            tokio::task::spawn_blocking(move || store.conversation(session)).await??
+        {
+            ensure!(
+                tokio::fs::canonicalize(&conversation.workspace).await? == workspace,
+                "This chat belongs to another project"
+            );
+        }
+        // Compare canonical identities without rewriting the submitted
+        // spelling: draft CAS and durable admission bind the exact scoped
+        // request, which may legitimately use an equivalent path alias.
         ensure!(
             !self.stopping.load(Ordering::Acquire),
             "Application is closing"
         );
-        if pending_run
-            .as_ref()
-            .is_some_and(|pending| pending.cancel.is_cancelled())
+        if let Some(receipt) = self
+            .replay_completed(turn, submission.clone(), draft_request_id, queued_item)
+            .await?
         {
-            return Ok(None);
+            return Ok(Admission::Replayed(receipt));
         }
-        let dead = workers.get(&session).is_some_and(|worker| {
-            worker.stop.is_cancelled() || *worker.exited.borrow() || worker.commands.is_closed()
-        });
-        if dead && let Some(worker) = workers.get_mut(&session) {
-            worker.stop.cancel();
-            if !*worker.exited.borrow() {
-                tokio::time::timeout(Duration::from_secs(8), worker.exited.changed())
-                    .await
-                    .context("The previous task is still stopping")??;
-            }
-            workers.remove(&session);
-        }
-        if let std::collections::hash_map::Entry::Vacant(entry) = workers.entry(session) {
+        turn.provider.validate()?;
+        let credential = WorkerCredential(
+            self.accounts
+                .resolve_provider_credential(&turn.provider, self.vault()?, cancellation)
+                .await?,
+        );
+        let scheduled = self.scheduled.lock().await.contains_key(&session);
+        let store = self.store.clone();
+        let rules_workspace = workspace.clone();
+        turn.approved_rules =
+            tokio::task::spawn_blocking(move || store.approval_rules(&rules_workspace))
+                .await??
+                .into_iter()
+                .map(|rule| rule.key)
+                .collect();
+        {
+            let mut workers = self.workers.lock().await;
             ensure!(
-                matches!(command, WorkerCommand::Run { .. }),
-                "This task is no longer running"
-            );
-            entry.insert(self.spawn_worker(session).await?);
-        }
-        let worker = workers.get(&session).context("Task could not start")?;
-        if let Some(pending) = pending_run.as_ref() {
-            ensure!(
-                !worker.active.load(Ordering::Acquire),
+                !workers
+                    .get(&session)
+                    .is_some_and(|w| w.active.load(Ordering::Acquire)),
                 "This task is already working"
             );
-            let permit = worker
-                .commands
-                .clone()
-                .try_reserve_owned()
-                .context("This task cannot accept another message yet")?;
+            retire_idle_workers(&mut workers, Some(session), std::time::Instant::now());
+        }
+        let lease = self
+            .resources
+            .acquire(
+                TaskDemand::interactive(turn.provider.context_tokens),
+                cancellation.clone(),
+            )
+            .await?;
+        if cancellation.is_cancelled() {
+            return Ok(Admission::Cancelled);
+        }
+        let model_activity = if turn.provider.managed_local {
+            Some(self.start_local_model(turn, cancellation).await?)
+        } else {
+            None
+        };
+        if cancellation.is_cancelled() {
+            return Ok(Admission::Cancelled);
+        }
+        self.ready_worker(session).await?;
+        let workers = self.workers.lock().await;
+        ensure!(
+            !self.stopping.load(Ordering::Acquire),
+            "Application is closing"
+        );
+        if cancellation.is_cancelled() {
+            return Ok(Admission::Cancelled);
+        }
+        let worker = workers
+            .get(&session)
+            .filter(|worker| !worker.dead())
+            .context("Task could not start")?
+            .clone();
+        ensure!(
+            !worker.active.load(Ordering::Acquire),
+            "This task is already working"
+        );
+        let permit = worker
+            .commands
+            .clone()
+            .try_reserve_owned()
+            .context("This task cannot accept another message yet")?;
+        ensure!(
+            !cancellation.is_cancelled() && !self.stopping.load(Ordering::Acquire),
+            "Task cancelled before admission"
+        );
+        let automatic = queued_item
+            .as_ref()
+            .is_some_and(|(_, _, automatic)| *automatic);
+        // An explicit fresh Run may resume a paused chat. Never reset this
+        // latch after an await: Stop during durable commit must survive.
+        if !automatic {
+            worker.queue_stopped.store(false, Ordering::Release);
+        }
+        let attachments = turn.attachments.clone();
+        let artifacts = self.paths.artifacts.clone();
+        tokio::task::spawn_blocking(move || {
+            xylo_services::attachments::AttachmentStore::new(artifacts)?
+                .validate(session, &attachments)
+        })
+        .await??;
+        ensure!(
+            !cancellation.is_cancelled(),
+            "Task cancelled before admission"
+        );
+        // Settings are the source of truth: every admission, queued or not,
+        // runs with the current mode (unattended scheduled turns never with
+        // Full access). Later changes reach the worker as
+        // SetPermissions, ordered after this Run by the workers lock.
+        turn.permissions = effective_mode(self.settings.lock().await.permissions, scheduled);
+        *worker.mode.lock() = turn.permissions;
+        if automatic {
             ensure!(
-                !pending.cancel.is_cancelled() && !self.stopping.load(Ordering::Acquire),
-                "Task cancelled before admission"
+                !worker.queue_stopped.load(Ordering::Acquire),
+                "Task stopped before admission"
             );
-            // An explicit fresh Run may resume a paused chat. Never reset this
-            // latch after an await: Stop during durable commit must survive.
-            if !queued_item
-                .as_ref()
-                .is_some_and(|(_, _, automatic)| *automatic)
-            {
-                worker.queue_stopped.store(false, Ordering::Release);
+        }
+        let receipt = self.commit_admission(turn, submission, queued_item).await?;
+        // Publish the durable user message before this Run can emit a reply.
+        self.publish_draft_admission(draft_request_id, &receipt)
+            .await;
+        self.publish_queued_admission(queued_item).await;
+        // The durable user turn and conditional draft clear have committed.
+        // Always dispatch the reserved Run, even if cancellation arrived
+        // during SQLite commit; a following Stop ends that exact run.
+        *worker.run_request.lock() = Some(request_id);
+        *worker.run_turn.lock() = Some(turn.turn_id);
+        *worker.workspace.lock() = Some(workspace);
+        *worker.last_used.lock() = std::time::Instant::now();
+        worker.queue_epoch.fetch_add(1, Ordering::AcqRel);
+        worker.active.store(true, Ordering::Release);
+        *worker.lease.lock().await = Some(lease);
+        *worker.model_activity.lock().await = model_activity;
+        // Add authentication only after durable admission. Only the private
+        // worker pipe sees this envelope; the persisted TurnRequest has refs.
+        *worker.credentials.lock() = Some(Arc::new(credential_control::RunCredentials::new(
+            request_id,
+            turn.provider.clone(),
+            credential.clone(),
+            worker.stop.child_token(),
+        )));
+        let command = WorkerCommand::RunAuthorized {
+            turn: turn.clone(),
+            credential,
+        };
+        permit.send(Envelope::new(request_id, Some(session), 0, command));
+        let cancelled = {
+            let mut starting = self.queued.lock();
+            starting.remove(&session);
+            cancellation.is_cancelled() || self.stopping.load(Ordering::Acquire)
+        };
+        drop(workers);
+        if cancelled {
+            self.stop_active_run(session).await;
+        }
+        if let Err(error) = self.send_conversations().await {
+            tracing::debug!(%error, "Refresh admitted conversation list");
+        }
+        Ok(Admission::Dispatched(receipt))
+    }
+
+    /// A retried turn that already completed is answered from the journal.
+    async fn replay_completed(
+        &self,
+        turn: &TurnRequest,
+        submission: Option<crate::drafts::DraftSubmission>,
+        draft_request_id: Option<Uuid>,
+        queued_item: &Option<QueuedAdmission>,
+    ) -> Result<Option<Option<crate::drafts::DraftAdmission>>> {
+        let session = turn.session_id;
+        let turn_id = turn.turn_id;
+        let store = self.store.clone();
+        let Some(completed) =
+            tokio::task::spawn_blocking(move || store.completed_turn(session, turn_id)).await??
+        else {
+            return Ok(None);
+        };
+        self.complete_schedule(session).await?;
+        let receipt = match submission {
+            Some(submission) => {
+                Some(crate::drafts::admit_turn(self.store.clone(), turn.clone(), submission).await?)
             }
-            if queued_item.is_some()
-                && let WorkerCommand::Run { turn } = &mut command
-            {
-                turn.permissions = turn_queue_control::tighter(
-                    turn.permissions,
-                    self.settings.lock().await.permissions,
-                );
-            }
-            let WorkerCommand::Run { turn } = &command else {
-                unreachable!()
-            };
-            let credential = resolved_credential
-                .take()
-                .context("Provider credential was not resolved")?;
-            let attachments = turn.attachments.clone();
-            let artifacts = self.paths.artifacts.clone();
+            None => None,
+        };
+        if let Some((item, admitted, _)) = queued_item {
+            let store = self.store.clone();
+            let item = item.clone();
             tokio::task::spawn_blocking(move || {
-                xylo_services::attachments::AttachmentStore::new(artifacts)?
-                    .validate(session, &attachments)
+                store.admit_queued_turn(item.turn.session_id, item.id, &item.turn)
             })
             .await??;
-            ensure!(
-                !pending.cancel.is_cancelled(),
-                "Task cancelled before admission"
-            );
-            if queued_item.is_some()
-                && let WorkerCommand::Run { turn } = &mut command
-            {
-                turn.permissions = turn_queue_control::tighter(
-                    turn.permissions,
-                    self.settings.lock().await.permissions,
-                );
-            }
-            let WorkerCommand::Run { turn } = &command else {
-                unreachable!()
+            admitted.store(true, Ordering::Release);
+        }
+        self.publish_draft_admission(draft_request_id, &receipt)
+            .await;
+        self.publish_queued_admission(queued_item).await;
+        self.events
+            .send(self.sequences.engine(
+                turn_id,
+                session,
+                EngineEvent::Completed {
+                    text: completed.text,
+                    usage: completed.usage,
+                },
+            ))
+            .await?;
+        Ok(Some(receipt))
+    }
+
+    /// Makes the user message durable: a draft, a queued item or a plain turn.
+    async fn commit_admission(
+        &self,
+        turn: &TurnRequest,
+        submission: Option<crate::drafts::DraftSubmission>,
+        queued_item: &Option<QueuedAdmission>,
+    ) -> Result<Option<crate::drafts::DraftAdmission>> {
+        if let Some(submission) = submission {
+            return Ok(Some(
+                crate::drafts::admit_turn(self.store.clone(), turn.clone(), submission).await?,
+            ));
+        }
+        let store = self.store.clone();
+        let turn = turn.clone();
+        let queued = queued_item.clone();
+        tokio::task::spawn_blocking(move || match queued {
+            Some((item, admitted, _)) => store
+                .admit_queued_turn(turn.session_id, item.id, &turn)
+                .map(|_| admitted.store(true, Ordering::Release)),
+            None => store.register_user_turn(&turn),
+        })
+        .await??;
+        Ok(None)
+    }
+
+    /// Starts the application-managed local model and points the turn at it.
+    async fn start_local_model(
+        &self,
+        turn: &mut TurnRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelActivityLease> {
+        let helper = self
+            .helper_for_workspace(turn.workspace.clone(), cancellation)
+            .await?;
+        let activity = acquire_model_activity(
+            self.paths.data.join("local-inference-activity.lock"),
+            cancellation.clone(),
+        )
+        .await?;
+        let value = helper
+            .execute(
+                "local_inference_start",
+                &serde_json::json!({}),
+                cancellation.clone(),
+            )
+            .await?;
+        let summary: Value = serde_json::from_str(
+            value
+                .get("summary")
+                .and_then(Value::as_str)
+                .context("Local model did not return connection information")?,
+        )?;
+        turn.provider.endpoint = summary
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .context("Local model did not become available")?
+            .to_owned();
+        Ok(activity)
+    }
+
+    /// Ensures a live worker for `session` is in the map. A dead one is reaped
+    /// first; neither the reap wait nor the spawn holds the workers lock.
+    async fn ready_worker(self: &Arc<Self>, session: Uuid) -> Result<()> {
+        loop {
+            let dead = {
+                let workers = self.workers.lock().await;
+                match workers.get(&session) {
+                    Some(worker) if worker.dead() => Some(worker.clone()),
+                    Some(_) => return Ok(()),
+                    None => None,
+                }
             };
-            if queued_item
-                .as_ref()
-                .is_some_and(|(_, _, automatic)| *automatic)
-            {
-                ensure!(
-                    !worker.queue_stopped.load(Ordering::Acquire),
-                    "Task stopped before admission"
-                );
-            }
-            let receipt = if let Some(submission) = submission {
-                Some(crate::drafts::admit_turn(self.store.clone(), turn.clone(), submission).await?)
-            } else {
-                let store = self.store.clone();
-                let turn = turn.clone();
-                let queued = queued_item.clone();
-                tokio::task::spawn_blocking(move || {
-                    if let Some((item, admitted, _)) = queued {
-                        store.admit_queued_turn(session, item.id, &turn).map(|_| {
-                            admitted.store(true, Ordering::Release);
-                        })
-                    } else {
-                        store.register_user_turn(&turn)
+            match dead {
+                Some(worker) => {
+                    worker.stop.cancel();
+                    let mut exited = worker.exited.clone();
+                    tokio::time::timeout(Duration::from_secs(8), exited.wait_for(|exited| *exited))
+                        .await
+                        .context("The previous task is still stopping")?
+                        .ok();
+                    let mut workers = self.workers.lock().await;
+                    if workers
+                        .get(&session)
+                        .is_some_and(|current| current.exited.same_channel(&worker.exited))
+                    {
+                        workers.remove(&session);
                     }
-                })
-                .await??;
-                None
-            };
-            // Publish the durable user message before this Run can emit a reply.
-            self.publish_draft_admission(draft_request_id, &receipt)
-                .await;
-            self.publish_queued_admission(&queued_item).await;
-            // The durable user turn and conditional draft clear have committed.
-            // Always dispatch the reserved Run, even if cancellation arrived
-            // during SQLite commit; a following Cancel stops that exact run.
-            let request_id = Uuid::new_v4();
-            *worker.run_request.lock() = Some(request_id);
-            if let WorkerCommand::Run { turn } = &command {
-                *worker.run_turn.lock() = Some(turn.turn_id);
-            }
-            worker.queue_epoch.fetch_add(1, Ordering::AcqRel);
-            worker.active.store(true, Ordering::Release);
-            *worker.lease.lock().await = admitted;
-            *worker.model_activity.lock().await = model_activity;
-            // Add authentication only after durable admission. Only the private
-            // worker pipe sees this envelope; the persisted TurnRequest has refs.
-            let WorkerCommand::Run { turn } = command else {
-                unreachable!()
-            };
-            *worker.credentials.lock() = Some(Arc::new(credential_control::RunCredentials::new(
-                request_id,
-                turn.provider.clone(),
-                credential.clone(),
-                worker.stop.child_token(),
-            )));
-            let command = WorkerCommand::RunAuthorized { turn, credential };
-            permit.send(Envelope::new(request_id, Some(session), 0, command));
-            let cancelled = {
-                let mut starting = self.queued.lock();
-                starting.remove(&session);
-                pending.cancel.is_cancelled() || self.stopping.load(Ordering::Acquire)
-            };
-            let control = worker.commands.clone();
-            let stop = worker.stop.clone();
-            drop(workers);
-            if cancelled {
-                // Never drop an admitted cancellation because Run filled the
-                // channel. If a stalled writer cannot accept it promptly,
-                // supervise a process stop and preserve journal recovery.
-                if !matches!(
-                    tokio::time::timeout(
-                        Duration::from_millis(100),
-                        control.send(Envelope::new(
-                            Uuid::new_v4(),
-                            Some(session),
-                            0,
-                            WorkerCommand::Cancel
-                        ))
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
-                    stop.cancel();
+                }
+                None => {
+                    let spawned = self.spawn_worker(session).await?;
+                    let mut workers = self.workers.lock().await;
+                    match workers.entry(session) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(spawned);
+                            return Ok(());
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => spawned.retire(session),
+                    }
                 }
             }
-            if let Err(error) = self.send_conversations().await {
-                tracing::debug!(%error, "Refresh admitted conversation list");
-            }
-            return Ok(receipt);
         }
-        if matches!(command, WorkerCommand::Cancel | WorkerCommand::Shutdown) {
-            if let Some(credentials) = worker.credentials.lock().as_ref() {
-                credentials.cancel.cancel();
+    }
+
+    /// Persists a complete settings snapshot and applies its live effects. A
+    /// changed secret storage switches the vault; when that fails the
+    /// previous choice is restored, and when the vault turns out to keep its
+    /// key elsewhere the setting follows the vault. A changed mode reaches
+    /// running tasks.
+    async fn commit_settings(&self, settings: AppSettings) -> Result<()> {
+        let previous = self.settings.lock().await.clone();
+        self.save_settings_snapshot(&settings).await?;
+        let mut applied = settings.clone();
+        match self.apply_secret_storage(settings.secret_storage).await {
+            Ok(actual) if actual == settings.secret_storage => {}
+            Ok(actual) => {
+                applied.secret_storage = actual;
+                self.save_settings_snapshot(&applied).await?;
+                self.events
+                    .send(HostEvent::Settings(applied.clone()))
+                    .await?;
+            }
+            Err(error) if settings.secret_storage == previous.secret_storage => {
+                // The vault is still unavailable; the rest of the change stands.
+                self.events
+                    .send(HostEvent::Error(format!("{error:#}")))
+                    .await?;
+            }
+            Err(error) => {
+                // Never leave the saved choice and the live vault disagreeing.
+                applied.secret_storage = previous.secret_storage;
+                self.save_settings_snapshot(&applied).await?;
+                if applied.permissions != previous.permissions {
+                    self.forward_permissions(applied.permissions).await;
+                }
+                self.events.send(HostEvent::Settings(applied)).await?;
+                return Err(error);
             }
         }
-        worker
-            .commands
-            .send(Envelope::new(Uuid::new_v4(), Some(session), 0, command))
+        if applied.permissions != previous.permissions {
+            self.forward_permissions(applied.permissions).await;
+        }
+        Ok(())
+    }
+
+    /// Saves a settings snapshot and makes it current; memory and the
+    /// database never disagree.
+    async fn save_settings_snapshot(&self, settings: &AppSettings) -> Result<()> {
+        let mut current = self.settings.lock().await;
+        let store = self.store.clone();
+        let value = settings.clone();
+        tokio::task::spawn_blocking(move || store.save_settings(&value)).await??;
+        *current = settings.clone();
+        Ok(())
+    }
+
+    /// Switches the vault to `storage` (key file or keychain item) after the
+    /// setting is saved and returns the storage now in use;
+    /// [`Self::commit_settings`] restores the setting when this fails. The
+    /// switch starts an empty vault; nothing old is kept. A vault that could
+    /// not be opened at startup is opened again (see [`reopen_secrets`]).
+    async fn apply_secret_storage(&self, storage: SecretStorage) -> Result<SecretStorage> {
+        let current = match &*self.secrets.read() {
+            Ok(secrets) if secrets.storage == storage => return Ok(storage),
+            Ok(secrets) => Some(secrets.vault.clone()),
+            Err(_) => None,
+        };
+        let data = self.paths.data.clone();
+        let Some(vault) = current else {
+            let store = self.store.clone();
+            let (secrets, started_over) =
+                tokio::task::spawn_blocking(move || reopen_secrets(&data, storage, &store))
+                    .await??;
+            let actual = secrets.storage;
+            let notice = if started_over {
+                Some(STORAGE_CHANGED_NOTICE.into())
+            } else {
+                secrets.vault.reset_notice()
+            };
+            *self.secrets.write() = Ok(secrets);
+            if let Some(notice) = notice {
+                self.events.send(HostEvent::Status(notice)).await?;
+            }
+            return Ok(actual);
+        };
+        tokio::task::spawn_blocking(move || vault.change_storage(&data, storage))
+            .await?
+            .context("Secret storage could not be changed")?;
+        if let Ok(secrets) = &mut *self.secrets.write() {
+            secrets.storage = storage;
+        }
+        self.retire_workers_for_new_key().await;
+        self.events
+            .send(HostEvent::Status(STORAGE_CHANGED_NOTICE.into()))
             .await?;
-        Ok(None)
+        Ok(storage)
+    }
+
+    /// Tells the user once when semantic memory stopped working.
+    async fn report_embedding_failure(&self) {
+        if let Some(message) = self.memory.take_embedding_failure() {
+            let _ = self.events.send(HostEvent::Status(message)).await;
+        }
+    }
+
+    fn vault(&self) -> Result<CredentialVault> {
+        match &*self.secrets.read() {
+            Ok(secrets) => Ok(secrets.vault.clone()),
+            Err(error) => anyhow::bail!("Saved keys are unavailable: {error}"),
+        }
+    }
+
+    fn connectors(&self) -> Result<Arc<ConnectorBroker>> {
+        match &*self.secrets.read() {
+            Ok(secrets) => Ok(secrets.connectors.clone()),
+            Err(error) => anyhow::bail!("Saved keys are unavailable: {error}"),
+        }
+    }
+
+    /// Canonical identity of a project for standing approvals; a project that
+    /// is no longer on disk keeps the spelling it was saved under.
+    async fn approval_workspace(workspace: &std::path::Path) -> PathBuf {
+        tokio::fs::canonicalize(workspace)
+            .await
+            .unwrap_or_else(|_| workspace.to_owned())
+    }
+
+    async fn approval_rules(
+        &self,
+        workspace: &std::path::Path,
+    ) -> std::result::Result<Vec<ApprovalRule>, String> {
+        let workspace = Self::approval_workspace(workspace).await;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.approval_rules(&workspace))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| format!("{error:#}")))
+    }
+
+    /// Revokes a standing approval. Rules live in the host and seed each
+    /// turn through `TurnRequest.approved_rules`; a worker keeps them only
+    /// for that turn, so the rule stops applying at the project's next turn
+    /// while a running turn keeps the set it started with. Workers of the
+    /// project are also retired (idle ones now, running ones when their turn
+    /// ends) as defense in depth, so no process that held the rule is reused.
+    async fn revoke_approval_rule(&self, workspace: &std::path::Path, key: String) -> Result<()> {
+        let workspace = Self::approval_workspace(workspace).await;
+        let store = self.store.clone();
+        let removed = workspace.clone();
+        tokio::task::spawn_blocking(move || store.remove_approval_rule(&removed, &key)).await??;
+        let workers = self.workers.lock().await;
+        for (session, worker) in workers.iter() {
+            if worker.workspace.lock().as_deref() == Some(workspace.as_path()) {
+                worker.retire_when_idle(*session);
+            }
+        }
+        Ok(())
+    }
+
+    async fn rename_conversation(&self, id: Uuid, title: String) -> Result<()> {
+        let title = title.trim().to_owned();
+        ensure!(
+            (1..=120).contains(&title.chars().count()),
+            "Titles must be 1 to 120 characters"
+        );
+        let store = self.store.clone();
+        let conversation = tokio::task::spawn_blocking(move || {
+            store.rename_conversation(id, &title, TitleSource::User)
+        })
+        .await??
+        .context("This chat no longer exists")?;
+        self.events
+            .send(HostEvent::ConversationRenamed(conversation))
+            .await?;
+        self.send_conversations().await
+    }
+
+    /// Removes every saved model of one connection. The active model moves to
+    /// the next saved one (or the default), and the connection's secret is
+    /// deleted after settings are saved when nothing else uses it.
+    async fn remove_provider(&self, provider: ProviderConfig) -> Result<()> {
+        let mut settings = self.settings.lock().await.clone();
+        let saved = settings.providers.len();
+        settings
+            .providers
+            .retain(|candidate| !same_connection(candidate, &provider));
+        let active_removed = same_connection(&settings.provider, &provider);
+        ensure!(
+            saved != settings.providers.len() || active_removed,
+            "This connection is no longer saved"
+        );
+        if active_removed {
+            settings.provider = settings.providers.first().cloned().unwrap_or_default();
+        }
+        // Account sign-ins are revoked by signing out, not by removing a model.
+        let orphaned = provider.credential_ref.clone().filter(|reference| {
+            !reference.starts_with("account:")
+                && !settings
+                    .providers
+                    .iter()
+                    .chain([&settings.provider])
+                    .any(|other| other.credential_ref.as_deref() == Some(reference.as_str()))
+        });
+        self.commit_settings(settings.clone()).await?;
+        self.events.send(HostEvent::Settings(settings)).await?;
+        if let Some(reference) = orphaned {
+            let vault = self.vault()?;
+            let deleted = tokio::task::spawn_blocking(move || vault.delete(&reference)).await;
+            if !matches!(deleted, Ok(Ok(()))) {
+                tracing::warn!(?deleted, "Delete removed provider secret");
+                self.events
+                    .send(HostEvent::Error(
+                        "The connection was removed, but its saved key could not be deleted."
+                            .into(),
+                    ))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn discover_models(&self, generation: u64, config: ProviderConfig) -> Result<()> {
@@ -2777,10 +3117,11 @@ impl HostState {
             return Ok(());
         };
         let result = async {
+            let vault = self.vault()?;
             self.accounts
-                .prepare_provider_credential(&config, self.vault.clone(), &cancel)
+                .prepare_provider_credential(&config, vault.clone(), &cancel)
                 .await?;
-            xylo_services::providers::discover_provider_models(&config, &self.vault, &cancel).await
+            xylo_services::providers::discover_provider_models(&config, &vault, &cancel).await
         }
         .await;
         // Superseded requests must not emit either a catalog or an error that
@@ -2824,330 +3165,6 @@ impl HostState {
             result = self.events.send(HostEvent::Models { generation, provider: config, models, context_limits, reasoning_options, default_reasoning_efforts }) => { result?; },
         }
         Ok(())
-    }
-
-    async fn spawn_worker(self: &Arc<Self>, session: Uuid) -> Result<WorkerHandle> {
-        let executable = native_executable("xylo-worker")?;
-        let mut command = tokio::process::Command::new(executable);
-        #[cfg(windows)]
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: worker uses private pipes.
-        let mut child = command
-            .arg("--data-dir")
-            .arg(&self.paths.data)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-        let input = child.stdin.take().context("Missing worker stdin")?;
-        let output = child.stdout.take().context("Missing worker stdout")?;
-        let errors = child.stderr.take().context("Missing worker stderr")?;
-        let (tx, mut rx) = mpsc::channel::<Envelope<WorkerCommand>>(64);
-        let active = Arc::new(AtomicBool::new(false));
-        let active_reader = active.clone();
-        let queue_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let reader_queue_epoch = queue_epoch.clone();
-        let queue_stopped = Arc::new(AtomicBool::new(false));
-        let reader_queue_stopped = queue_stopped.clone();
-        self.turn_queue
-            .register(session, &queue_stopped, &queue_epoch);
-        let run_request = Arc::new(parking_lot::Mutex::new(None::<Uuid>));
-        let reader_request = run_request.clone();
-        let credentials = Arc::new(parking_lot::Mutex::new(
-            None::<Arc<credential_control::RunCredentials>>,
-        ));
-        let reader_credentials = credentials.clone();
-        let credential_commands = tx.clone();
-        let accounts = self.accounts.clone();
-        let vault = self.vault.clone();
-        let renewal_capacity = Arc::new(tokio::sync::Semaphore::new(4));
-        let run_turn = Arc::new(parking_lot::Mutex::new(None::<Uuid>));
-        let reader_turn = run_turn.clone();
-        let notice_sender = self.notices.clone();
-        let foreground = self.foreground.clone();
-        let model_activity = Arc::new(Mutex::new(None::<ModelActivityLease>));
-        let reader_activity = model_activity.clone();
-        let recovery_store = self.store.clone();
-        let steering_store = self.store.clone();
-        let events = self.events.clone();
-        let scheduling = self.default_scheduler()?;
-        let scheduling_state = self.scheduled.clone();
-        let lease = Arc::new(Mutex::new(None::<ResourceLease>));
-        let reader_lease = lease.clone();
-        let stop = CancellationToken::new();
-        let reader_stop = stop.clone();
-        let queue_host = Arc::downgrade(self);
-        let writer_stop = stop.clone();
-        let (exited_tx, exited) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move {
-            let mut input = BufWriter::new(input);
-            loop {
-                let command =
-                    tokio::select! {_ = writer_stop.cancelled()=>break,command=rx.recv()=>command};
-                let Some(command) = command else {
-                    break;
-                };
-                let shutdown = matches!(command.payload, WorkerCommand::Shutdown);
-                let Ok(mut bytes) = serde_json::to_vec(&command) else {
-                    break;
-                };
-                bytes.push(b'\n');
-                if input.write_all(&bytes).await.is_err() || input.flush().await.is_err() {
-                    break;
-                }
-                if shutdown {
-                    break;
-                }
-            }
-        });
-        tokio::spawn(async move {
-            let mut errors = BufReader::new(errors);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match (&mut errors)
-                    .take(16 * 1024)
-                    .read_until(b'\n', &mut line)
-                    .await
-                {
-                    Ok(0) | Err(_) => break,
-                    _ => {
-                        tracing::debug!(worker=%session,message=%String::from_utf8_lossy(&line),"native worker")
-                    }
-                }
-            }
-        });
-        tokio::spawn(async move {
-            let mut output = BufReader::new(output);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                let mut limited = (&mut output).take((MAX_PROTOCOL_BYTES + 1) as u64);
-                let read = tokio::select! {
-                    _ = reader_stop.cancelled() => break,
-                    read = limited.read_until(b'\n', &mut line) => read,
-                };
-                match read {
-                    Ok(0) | Err(_) => break,
-                    _ => {}
-                }
-                if line.len() > MAX_PROTOCOL_BYTES {
-                    let _ = events
-                        .send(HostEvent::Error(
-                            "Worker exceeded protocol payload limit".into(),
-                        ))
-                        .await;
-                    break;
-                }
-                match serde_json::from_slice::<Envelope<EngineEvent>>(&line) {
-                    Ok(mut envelope) if envelope.validate().is_ok() => {
-                        envelope.session_id = Some(session);
-                        if let EngineEvent::Steering { receipt } = &envelope.payload {
-                            if let Err(error) = steering_control::emit_receipt(
-                                steering_store.clone(),
-                                &events,
-                                session,
-                                receipt.clone(),
-                            )
-                            .await
-                            {
-                                tracing::warn!(%error, "Read durable guidance receipt");
-                            }
-                            continue;
-                        }
-                        let terminal = matches!(
-                            envelope.payload,
-                            EngineEvent::Completed { .. }
-                                | EngineEvent::Cancelled
-                                | EngineEvent::Error { .. }
-                        );
-                        let active_request = *reader_request.lock();
-                        let matched = active_request == Some(envelope.request_id);
-                        if !event_control::accepts(active_request, &envelope) {
-                            if active_request.is_none()
-                                && let EngineEvent::Error { message, .. } = envelope.payload
-                            {
-                                let _ = events.send(HostEvent::Error(message)).await;
-                            }
-                            continue;
-                        }
-                        if let EngineEvent::ProviderCredentialRequested {
-                            request_id,
-                            generation,
-                            force,
-                        } = &envelope.payload
-                        {
-                            let renewal = reader_credentials.lock().clone();
-                            if let Some(renewal) = renewal {
-                                let commands = credential_commands.clone();
-                                let accounts = accounts.clone();
-                                let vault = vault.clone();
-                                let run = envelope.request_id;
-                                let request_id = *request_id;
-                                let generation = *generation;
-                                let force = *force;
-                                let permit = renewal_capacity.clone().try_acquire_owned();
-                                tokio::spawn(async move {
-                                    let result = match permit {
-                                        Ok(_permit) => renewal.resolve(run, generation, force, accounts, vault).await
-                                            .map_err(|_| "ChatGPT access could not be renewed. Reconnect the account in Settings → Providers.".to_string()),
-                                        Err(_) => Err("Too many pending credential requests".into()),
-                                    };
-                                    tracing::debug!(%session, %run, %request_id, force, success=result.is_ok(), "Provider credential renewal finished");
-                                    let envelope = Envelope::new(
-                                        run,
-                                        Some(session),
-                                        0,
-                                        WorkerCommand::ProviderCredentialUpdated {
-                                            request_id,
-                                            result,
-                                        },
-                                    );
-                                    tokio::select! {
-                                        biased;
-                                        _ = renewal.cancel.cancelled() => {},
-                                        _ = tokio::time::timeout(Duration::from_secs(5), commands.send(envelope)) => {},
-                                    }
-                                });
-                            }
-                            continue;
-                        }
-                        let scheduled_task =
-                            terminal && scheduling_state.lock().await.contains_key(&session);
-                        if matches!(envelope.payload, EngineEvent::Completed { .. })
-                            && let Err(error) =
-                                acknowledge_schedule(&scheduling, &scheduling_state, session).await
-                        {
-                            tracing::error!(%error,"Acknowledge completed schedule");
-                        }
-                        let current_turn = *reader_turn.lock();
-                        if matched && let Some(turn_id) = current_turn {
-                            notice_control::emit(
-                                &notice_sender,
-                                &foreground,
-                                session,
-                                turn_id,
-                                &envelope.payload,
-                                scheduled_task,
-                            );
-                        }
-                        let terminal_epoch = reader_queue_epoch.load(Ordering::Acquire);
-                        if terminal {
-                            if let Some(credentials) = reader_credentials.lock().take() {
-                                credentials.cancel.cancel();
-                            }
-                            if let Err(error) = steering_control::finish_turn(
-                                steering_store.clone(),
-                                &events,
-                                session,
-                                current_turn,
-                            )
-                            .await
-                            {
-                                tracing::warn!(%error, "Settle ended task guidance");
-                            }
-                            reader_turn.lock().take();
-                            reader_request.lock().take();
-                            active_reader.store(false, Ordering::Release);
-                            reader_lease.lock().await.take();
-                            reader_activity.lock().await.take();
-                        }
-                        let successful = matches!(envelope.payload, EngineEvent::Completed { .. });
-                        if events.send(HostEvent::Engine(envelope)).await.is_err() {
-                            break;
-                        }
-                        if terminal && let Some(host) = queue_host.upgrade() {
-                            tokio::spawn(host.settle_turn_queue(
-                                session,
-                                successful,
-                                reader_queue_epoch.clone(),
-                                terminal_epoch,
-                                reader_queue_stopped.clone(),
-                            ));
-                        }
-                    }
-                    _ => {
-                        let _ = events
-                            .send(HostEvent::Error("Invalid native worker message".into()))
-                            .await;
-                        break;
-                    }
-                }
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let ended_turn = *reader_turn.lock();
-            if let Err(error) =
-                steering_control::finish_turn(steering_store, &events, session, ended_turn).await
-            {
-                tracing::warn!(%error, "Recover reaped task guidance");
-            }
-            let recovered = tokio::task::spawn_blocking(move || {
-                recovery_store.recover_session_interrupted(session)
-            })
-            .await;
-            if !matches!(recovered, Ok(Ok(_))) {
-                tracing::error!(?recovered,%session,"Recover reaped task journal");
-            }
-            if let Some(host) = queue_host.upgrade() {
-                tokio::spawn(host.settle_turn_queue(
-                    session,
-                    false,
-                    reader_queue_epoch.clone(),
-                    reader_queue_epoch.load(Ordering::Acquire),
-                    reader_queue_stopped.clone(),
-                ));
-            }
-            reader_stop.cancel();
-            if let Some(credentials) = reader_credentials.lock().take() {
-                credentials.cancel.cancel();
-            }
-            let crashed_turn = reader_turn.lock().take();
-            reader_request.lock().take();
-            if active_reader.swap(false, Ordering::AcqRel) {
-                if let Some(turn) = crashed_turn {
-                    notice_control::emit(
-                        &notice_sender,
-                        &foreground,
-                        session,
-                        turn,
-                        &EngineEvent::Error {
-                            message: String::new(),
-                            retryable: true,
-                        },
-                        scheduling_state.lock().await.contains_key(&session),
-                    );
-                }
-                let _ = events
-                    .send(HostEvent::Engine(Envelope::new(
-                        Uuid::new_v4(),
-                        Some(session),
-                        0,
-                        EngineEvent::Error {
-                            message: "This task stopped unexpectedly. Resume the chat to continue."
-                                .into(),
-                            retryable: true,
-                        },
-                    )))
-                    .await;
-            }
-            reader_lease.lock().await.take();
-            reader_activity.lock().await.take();
-            let _ = exited_tx.send(true);
-        });
-        Ok(WorkerHandle {
-            credentials,
-            commands: tx,
-            active,
-            queue_epoch,
-            queue_stopped,
-            lease,
-            stop,
-            exited,
-            run_request,
-            run_turn,
-            model_activity,
-        })
     }
 
     async fn shutdown(&self) {
@@ -3256,6 +3273,7 @@ impl HostState {
                 return;
             }
         };
+        let mut reported_interruptions = std::collections::HashSet::new();
         loop {
             let operation = self.operations.read().await;
             if self.installing.load(Ordering::Acquire) {
@@ -3267,6 +3285,12 @@ impl HostState {
             if self.stopping.load(Ordering::Acquire) {
                 break;
             }
+            retire_idle_workers(
+                &mut *self.workers.lock().await,
+                None,
+                std::time::Instant::now(),
+            );
+            self.report_embedding_failure().await;
             let scheduled = self.scheduled.lock().await.clone();
             for (session, id) in scheduled {
                 let queued = self.queued.lock().contains_key(&session);
@@ -3299,11 +3323,14 @@ impl HostState {
                     }
                 }
             }
+            self.report_interrupted_schedules(&scheduler, &mut reported_interruptions)
+                .await;
             match scheduler.claim_due().await {
                 Ok(tasks) => {
                     for task in tasks {
-                        let occurrence =
-                            Uuid::new_v5(&task.id, task.next_run.to_rfc3339().as_bytes());
+                        let Some(occurrence) = task.claim.map(|claim| claim.occurrence) else {
+                            continue;
+                        };
                         if self
                             .scheduled
                             .lock()
@@ -3317,15 +3344,20 @@ impl HostState {
                         self.queued
                             .lock()
                             .insert(occurrence, (occurrence, CancellationToken::new()));
-                        let provider = self.settings.lock().await.provider.clone();
+                        let (provider, permissions) = {
+                            let settings = self.settings.lock().await;
+                            (settings.provider.clone(), settings.permissions)
+                        };
+                        // Admission fills the current mode and standing approvals.
                         let turn = TurnRequest {
                             session_id: occurrence,
                             turn_id: occurrence,
                             prompt: task.prompt,
                             workspace: task.workspace,
                             provider,
-                            permissions: PermissionMode::AskForWrites,
+                            permissions,
                             attachments: Vec::new(),
+                            approved_rules: Vec::new(),
                         };
                         let state = self.clone();
                         let scheduler = scheduler.clone();
@@ -3344,6 +3376,7 @@ impl HostState {
                                     &EngineEvent::Error {
                                         message: String::new(),
                                         retryable: true,
+                                        kind: ErrorKind::Internal,
                                     },
                                     true,
                                 );
@@ -3364,6 +3397,33 @@ impl HostState {
             }
             drop(operation);
             tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    }
+}
+
+impl HostState {
+    /// Tells the user once per occurrence that a scheduled run was cut off
+    /// (its host stopped renewing the claim) and was not repeated.
+    async fn report_interrupted_schedules(
+        &self,
+        scheduler: &crate::scheduler::Scheduler,
+        reported: &mut std::collections::HashSet<Uuid>,
+    ) {
+        let Ok(tasks) = scheduler.list().await else {
+            return;
+        };
+        for task in tasks {
+            if let Some(occurrence) = task.interrupted
+                && reported.insert(occurrence)
+            {
+                let name: String = task.prompt.chars().take(60).collect();
+                let _ = self
+                    .events
+                    .send(HostEvent::Status(format!(
+                        "A scheduled run of \"{name}\" was interrupted and was not repeated"
+                    )))
+                    .await;
+            }
         }
     }
 }
@@ -3456,7 +3516,3 @@ fn native_executable(name: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "host/draft_tests.rs"]
-mod draft_tests;

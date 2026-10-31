@@ -1,54 +1,259 @@
 //! Portable extension management. Filesystem and networking stay on the host.
+//!
+//! "Plugins" are portable packages (skills, commands, agents, hooks, MCP and
+//! language servers); "Native modules" are Xylo's own WebAssembly plugins.
+//! A package is reviewed before it runs: an install opens a review of what it
+//! contains, and enabling requires confirming that review.
+//!
+//! Package operations are single-flight. Discover reads the host's cached
+//! plugin directory (`extension_directory`, cheap enough for every keystroke)
+//! and refreshes that cache from GitHub in the background
+//! (`extension_directory_refresh`); both run beside package operations, so
+//! browsing never blocks installing or configuring. The page itself is in
+//! `extensions_view.rs`.
 use super::*;
 use serde_json::{Value, json};
+use std::time::Instant;
 use xylo_runtime::extensions::{
-    ComponentKind, DiscoveredExtension, ExtensionPackage, ExtensionSource, default_sources,
+    ComponentKind, DirectoryEntry, DirectoryPage, DirectoryQuery, DirectorySourceStatus,
+    ExtensionPackage, ExtensionSource, default_sources,
 };
 #[path = "extension_setup.rs"]
 mod setup;
+#[path = "extensions_view.rs"]
+mod view;
+
+/// Tabs of the Plugins page, in segmented-control order; Sources is the
+/// third.
+pub(super) const DISCOVER: usize = 0;
+pub(super) const INSTALLED: usize = 1;
+
+/// The plugin a detail sub-page shows.
+#[derive(Clone)]
+enum Detail {
+    /// A directory entry, installed or not.
+    Available(Box<DirectoryEntry>),
+    /// An installed package, by id.
+    Installed(String),
+}
+
+/// Directory results come from the host's cache, so a search runs on every
+/// keystroke; refreshing the cache from GitHub runs in the background. Both
+/// sit beside the single-flight package operations so browsing never blocks
+/// installing or configuring.
+struct Directory {
+    /// The page for the current search, once one has arrived.
+    page: Option<DirectoryPage>,
+    /// The newest search; older answers are ignored.
+    search: Option<Uuid>,
+    /// Installed entries, for the update pills of the Installed tab.
+    installed: Vec<DirectoryEntry>,
+    installed_search: Option<Uuid>,
+    /// The background refresh in flight.
+    refresh: Option<Uuid>,
+    /// Source freshness from the latest refresh or search.
+    sources: Vec<DirectorySourceStatus>,
+    /// Why the last search or refresh request failed.
+    error: Option<String>,
+    /// Category filter; `None` shows every category.
+    category: Option<String>,
+    /// When the wait for the first page began, for the slow caption.
+    since: Option<Instant>,
+    /// When a forced refresh began, for the slow caption.
+    refresh_since: Option<Instant>,
+    /// Entries requested; "Show more" grows it by a page.
+    limit: usize,
+}
+impl Default for Directory {
+    fn default() -> Self {
+        Self {
+            page: None,
+            search: None,
+            installed: Vec::new(),
+            installed_search: None,
+            refresh: None,
+            sources: Vec::new(),
+            error: None,
+            category: None,
+            since: None,
+            refresh_since: None,
+            limit: DIRECTORY_PAGE,
+        }
+    }
+}
+/// Entries per directory page.
+const DIRECTORY_PAGE: usize = 50;
 
 pub(super) struct ExtensionUi {
     tab: usize,
     native: bool,
     packages: Vec<ExtensionPackage>,
     sources: Vec<ExtensionSource>,
-    discovered: Vec<DiscoveredExtension>,
     pending: Option<Uuid>,
     pending_name: String,
+    /// The entry, package or source the pending operation acts on, so only
+    /// its button shows as busy.
+    pending_target: Option<String>,
+    /// When the pending operation began, for the slow caption.
+    pending_since: Option<Instant>,
     cancelling: bool,
     loaded: bool,
     notice: String,
     source: Entity<InputState>,
     query: Entity<InputState>,
-    selected_source: usize,
+    /// Repository shown in Discover; `None` shows every source.
+    source_filter: Option<String>,
+    directory: Directory,
+    detail: Option<Detail>,
+    /// Whether the Sources tab shows its add-source form.
+    adding_source: bool,
     pub(super) setup: Option<setup::SetupUi>,
+    /// The package whose contents the user is reviewing before enabling it.
+    review: Option<ExtensionPackage>,
+    /// Holds focus while Plugins swaps sub-pages; see `focus_plugins_page`.
+    focus: FocusHandle,
+    _subscriptions: Vec<Subscription>,
 }
 impl ExtensionUi {
     pub fn new(window: &mut Window, cx: &mut Context<Xylo>) -> Self {
         let input = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Xylo>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
+        let query = input("Search plugins and skills", window, cx);
+        // Discover searches the cached directory as the person types.
+        let subscription = cx.subscribe(&query, |view, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                view.extensions.directory.limit = DIRECTORY_PAGE;
+                view.extension_directory_search(cx);
+            }
+        });
         Self {
-            tab: 1,
+            tab: DISCOVER,
             native: false,
             packages: vec![],
             sources: default_sources(),
-            discovered: vec![],
             pending: None,
             pending_name: String::new(),
+            pending_target: None,
+            pending_since: None,
             cancelling: false,
             loaded: false,
             notice: String::new(),
-            source: input("GitHub repository or directory URL", window, cx),
-            query: input("Search plugins and skills", window, cx),
-            selected_source: 0,
+            source: input("owner/repository or a GitHub folder URL", window, cx),
+            query,
+            source_filter: None,
+            directory: Directory::default(),
+            detail: None,
+            adding_source: false,
             setup: None,
+            review: None,
+            focus: cx.focus_handle(),
+            _subscriptions: vec![subscription],
         }
     }
     pub(super) fn active(&self) -> bool {
         self.pending.is_some()
     }
 }
+
+/// One portable skill from an installed package, for the Skills page.
+pub(super) struct InstalledSkill {
+    pub(super) package_id: String,
+    /// Readable name of the package that ships the skill.
+    pub(super) package: String,
+    pub(super) name: String,
+    pub(super) description: String,
+    /// Whether its package is enabled, so the agent can load it.
+    pub(super) enabled: bool,
+}
+
+/// Identity of a source: the same repository can be added at another
+/// revision or folder.
+fn source_key(source: &ExtensionSource) -> String {
+    format!(
+        "{}@{}/{}",
+        source.repository, source.revision, source.subdirectory
+    )
+}
+/// Whether a source ships with Xylo; only custom sources can be removed.
+fn built_in_source(source: &ExtensionSource) -> bool {
+    default_sources()
+        .iter()
+        .any(|built_in| source_key(built_in) == source_key(source))
+}
+
+/// A readable name for a package or skill id: words split on `-`, `_` and
+/// `.`, the first capitalised, common acronyms and brands spelled properly
+/// ("build-ios-apps" -> "Build iOS apps").
+pub(super) fn display_name(raw: &str) -> String {
+    const SPELLINGS: [(&str, &str); 18] = [
+        ("ios", "iOS"),
+        ("macos", "macOS"),
+        ("api", "API"),
+        ("apis", "APIs"),
+        ("mcp", "MCP"),
+        ("lsp", "LSP"),
+        ("ui", "UI"),
+        ("ux", "UX"),
+        ("cli", "CLI"),
+        ("sql", "SQL"),
+        ("pdf", "PDF"),
+        ("css", "CSS"),
+        ("html", "HTML"),
+        ("github", "GitHub"),
+        ("gitlab", "GitLab"),
+        ("aws", "AWS"),
+        ("ci", "CI"),
+        ("json", "JSON"),
+    ];
+    let words: Vec<String> = raw
+        .split(['-', '_', '.', ' '])
+        .filter(|word| !word.is_empty())
+        .enumerate()
+        .map(|(index, word)| {
+            let lower = word.to_lowercase();
+            if let Some((_, spelling)) = SPELLINGS.iter().find(|(key, _)| *key == lower) {
+                return (*spelling).to_owned();
+            }
+            if index > 0 || word.chars().any(char::is_uppercase) {
+                return if index == 0 { word.to_owned() } else { lower };
+            }
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    if words.is_empty() {
+        raw.to_owned()
+    } else {
+        words.join(" ")
+    }
+}
+
+/// "5 min ago" for a past time in Unix seconds.
+fn time_ago(then: i64) -> String {
+    let seconds = (now_ms() / 1000).saturating_sub(then).max(0);
+    match seconds {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", seconds / 60),
+        3600..=86399 => format!("{} h ago", seconds / 3600),
+        _ => format!("{} days ago", seconds / 86400),
+    }
+}
+/// The freshness caption for the shown sources: the oldest fetch among them,
+/// or why there is nothing yet.
+fn freshness_caption(statuses: &[&DirectorySourceStatus], refreshing: bool) -> String {
+    if refreshing {
+        return "Checking sources for updates…".into();
+    }
+    match statuses.iter().filter_map(|status| status.fetched_at).min() {
+        Some(oldest) => format!("Updated {}", time_ago(oldest)),
+        None => "Not loaded yet".into(),
+    }
+}
+
 impl Xylo {
     pub(super) fn extension_request(&mut self, name: &str, args: Value, cx: &mut Context<Self>) {
         if self.extensions.pending.is_some() {
@@ -62,14 +267,275 @@ impl Xylo {
             .and_then(|host| host.capability(id, name.into(), args));
         match result {
             Ok(()) => {
+                self.extensions.pending_since = Some(self.arm_slow_hint(cx));
+                self.extensions.pending_target = None;
                 self.extensions.pending = Some(id);
                 self.extensions.pending_name = name.into();
                 self.extensions.cancelling = false;
                 self.extensions.notice.clear();
             }
-            Err(e) => self.extensions.notice = e.to_string(),
+            Err(e) => self.extensions.notice = product_error(&e.to_string()),
         }
         cx.notify();
+    }
+    /// Starts an operation on one entry, package or source so that only its
+    /// button shows as busy.
+    fn extension_request_for(
+        &mut self,
+        name: &str,
+        target: impl Into<String>,
+        args: Value,
+        cx: &mut Context<Self>,
+    ) {
+        let idle = self.extensions.pending.is_none();
+        self.extension_request(name, args, cx);
+        if idle && self.extensions.pending.is_some() {
+            self.extensions.pending_target = Some(target.into());
+        }
+    }
+    /// Whether `name` is running, on `target` when one is given.
+    fn extension_busy(&self, name: &str, target: Option<&str>) -> bool {
+        self.extensions.pending.is_some()
+            && self.extensions.pending_name == name
+            && target.is_none_or(|target| self.extensions.pending_target.as_deref() == Some(target))
+    }
+    fn extension_directory_query(&self, installed_only: bool, cx: &App) -> DirectoryQuery {
+        let ui = &self.extensions;
+        DirectoryQuery {
+            text: if installed_only {
+                String::new()
+            } else {
+                ui.query.read(cx).value().trim().to_owned()
+            },
+            source: if installed_only {
+                None
+            } else {
+                ui.source_filter.clone()
+            },
+            category: if installed_only {
+                None
+            } else {
+                ui.directory.category.clone()
+            },
+            installed_only,
+            offset: 0,
+            limit: if installed_only {
+                200
+            } else {
+                ui.directory.limit
+            },
+        }
+    }
+    /// Sends a capability call beside the package operations; returns its id.
+    fn extension_directory_call(&mut self, name: &str, args: Value) -> Option<Uuid> {
+        let id = Uuid::new_v4();
+        let result = self
+            .host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
+            .and_then(|host| host.capability(id, name.into(), args));
+        match result {
+            Ok(()) => Some(id),
+            Err(error) => {
+                self.extensions.directory.error = Some(product_error(&error.to_string()));
+                None
+            }
+        }
+    }
+    /// Searches the cached directory with the current text, source and
+    /// category; the newest search wins.
+    pub(super) fn extension_directory_search(&mut self, cx: &mut Context<Self>) {
+        if self.extensions.directory.page.is_none() && self.extensions.directory.since.is_none() {
+            self.extensions.directory.since = Some(self.arm_slow_hint(cx));
+        }
+        let query = self.extension_directory_query(false, cx);
+        self.extensions.directory.search =
+            self.extension_directory_call("extension_directory", json!(query));
+        cx.notify();
+    }
+    /// Loads the installed entries that the Installed tab's pills need.
+    fn extension_directory_installed(&mut self, cx: &mut Context<Self>) {
+        let query = self.extension_directory_query(true, cx);
+        self.extensions.directory.installed_search =
+            self.extension_directory_call("extension_directory", json!(query));
+        cx.notify();
+    }
+    /// Refreshes source caches from GitHub in the background; `force` also
+    /// refreshes caches that are still fresh.
+    pub(super) fn extension_directory_refresh(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self.extensions.directory.refresh.is_some() {
+            return;
+        }
+        let query = self.extension_directory_query(false, cx);
+        self.extensions.directory.error = None;
+        self.extensions.directory.refresh_since = force.then(|| self.arm_slow_hint(cx));
+        self.extensions.directory.refresh = self.extension_directory_call(
+            "extension_directory_refresh",
+            json!({"force": force, "query": query}),
+        );
+        cx.notify();
+    }
+    /// Applies a directory answer; returns false when `id` is not a
+    /// directory request.
+    fn extension_directory_result(
+        &mut self,
+        id: Uuid,
+        result: &Result<Value, String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let directory = &mut self.extensions.directory;
+        let kind = if directory.search == Some(id) {
+            directory.search = None;
+            0
+        } else if directory.installed_search == Some(id) {
+            directory.installed_search = None;
+            1
+        } else if directory.refresh == Some(id) {
+            directory.refresh = None;
+            2
+        } else {
+            return false;
+        };
+        let parsed = result
+            .clone()
+            .map_err(anyhow::Error::msg)
+            .and_then(|value| {
+                let page: DirectoryPage = serde_json::from_value(value["directory"].clone())?;
+                let sources: Option<Vec<DirectorySourceStatus>> = value
+                    .get("sources")
+                    .map(|sources| serde_json::from_value(sources.clone()))
+                    .transpose()?;
+                Ok((page, sources))
+            });
+        match parsed {
+            Ok((page, sources)) => {
+                directory.error = None;
+                directory.sources = sources.unwrap_or_else(|| page.sources.clone());
+                if kind == 1 {
+                    directory.installed = page.entries;
+                } else {
+                    directory.since = None;
+                    directory.page = Some(page);
+                }
+            }
+            Err(error) => directory.error = Some(product_error(&error.to_string())),
+        }
+        if kind == 2 {
+            // The cache changed: the installed entries may have updates now.
+            self.extension_directory_installed(cx);
+        }
+        cx.notify();
+        true
+    }
+    /// Opening Plugins: search the cache now, then refresh it in the
+    /// background.
+    pub(super) fn extension_directory_open(&mut self, cx: &mut Context<Self>) {
+        self.extension_directory_search(cx);
+        self.extension_directory_installed(cx);
+        self.extension_directory_refresh(false, cx);
+    }
+    /// The directory entry of an installed package, when a source lists it.
+    fn extension_directory_entry(&self, package: &ExtensionPackage) -> Option<&DirectoryEntry> {
+        self.extensions.directory.installed.iter().find(|entry| {
+            entry.install.as_ref().is_some_and(|item| {
+                package.source.ends_with(&format!("/{}", item.path))
+                    && package.source.contains(&item.source.repository)
+            })
+        })
+    }
+    /// Installed portable skills across packages, in package order.
+    pub(super) fn installed_skills(&self) -> Vec<InstalledSkill> {
+        self.extensions
+            .packages
+            .iter()
+            .flat_map(|package| {
+                package
+                    .components
+                    .iter()
+                    .filter(|component| component.kind == ComponentKind::Skill)
+                    .map(move |component| InstalledSkill {
+                        package_id: package.id.clone(),
+                        package: display_name(&package.name),
+                        name: component.name.clone(),
+                        description: component.description.clone(),
+                        enabled: package.enabled,
+                    })
+            })
+            .collect()
+    }
+    /// When the pending package operation began, for the slow caption.
+    pub(super) fn extensions_pending_since(&self) -> Option<Instant> {
+        self.extensions.pending_since
+    }
+    /// Whether the installed packages have been loaded at least once.
+    pub(super) fn extensions_loaded(&self) -> bool {
+        self.extensions.loaded
+    }
+    /// Loads installed packages unless they are already known.
+    pub(super) fn ensure_extensions_loaded(&mut self, cx: &mut Context<Self>) {
+        if !self.extensions.loaded {
+            self.extension_request("extension_snapshot", json!({}), cx);
+        }
+    }
+    /// "Plugins / Native modules" above the native modules sub-page.
+    pub(super) fn native_modules_breadcrumb(&self, cx: &mut Context<Self>) -> Div {
+        settings_ui::breadcrumb(
+            [
+                settings_ui::crumb("native-modules-back", "Plugins").on_click(cx.listener(
+                    |view, _, window, cx| {
+                        view.focus_plugins_page(window, cx);
+                        view.extensions.native = false;
+                        cx.notify();
+                    },
+                )),
+            ],
+            "Native modules",
+        )
+    }
+    #[cfg(test)]
+    #[allow(dead_code)] // Exercised by the separate native validation test target.
+    pub(crate) fn validation_extensions_idle(&self) -> bool {
+        self.extensions.pending.is_none()
+    }
+    #[cfg(test)]
+    #[allow(dead_code)] // Exercised by the separate native validation test target.
+    pub(crate) fn validation_extension_setup_open(&self) -> bool {
+        self.extensions.setup.is_some()
+    }
+    /// Moves focus to the Plugins page itself. A sub-page change removes the
+    /// control that was pressed, and focus left on a control that is gone
+    /// stops Tab from moving; from the page, Tab continues with the new
+    /// sub-page's first control.
+    pub(super) fn focus_plugins_page(&self, window: &mut Window, cx: &mut App) {
+        self.extensions.focus.focus(window, cx);
+    }
+    /// Opens Plugins on its Discover tab, for "Browse plugins" elsewhere.
+    pub(super) fn open_plugins_discover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.extensions.native = false;
+        self.extensions.detail = None;
+        self.extension_leave_setup(Some(DISCOVER), window, cx);
+        self.navigate(Page::Plugins, cx);
+    }
+    fn confirm_remove_extension(
+        &mut self,
+        package: &ExtensionPackage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = package.id.clone();
+        self.confirm_destructive(
+            &format!("Remove {}?", package.name),
+            "Its skills, commands, hooks and servers are removed with their setup.",
+            "Remove plugin",
+            window,
+            cx,
+            move |view, _, cx| {
+                if view.extensions.review.as_ref().is_some_and(|p| p.id == id) {
+                    view.extensions.review = None;
+                }
+                view.extension_request("extension_remove", json!({"id": id}), cx)
+            },
+        );
     }
     pub(super) fn extension_result(
         &mut self,
@@ -78,44 +544,92 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.extension_directory_result(id, &result, cx) {
+            return;
+        }
         if self.extensions.pending != Some(id) {
             return;
         }
         self.extensions.pending = None;
         let operation = std::mem::take(&mut self.extensions.pending_name);
         let cancelling = std::mem::take(&mut self.extensions.cancelling);
+        let mut sources_changed = false;
         let result = result.map_err(anyhow::Error::msg).and_then(|v| {
             self.extension_setup_result(&v, window, cx)?;
             if let Some(p) = v.get("packages") {
-                self.extensions.packages = serde_json::from_value(p.clone())?;
+                let previous = std::mem::replace(
+                    &mut self.extensions.packages,
+                    serde_json::from_value(p.clone())?,
+                );
+                // A local install answers with the package list only; the
+                // package it installed or replaced is the one that is new or
+                // whose contents changed, and it opens for review like any
+                // install.
+                if operation == "extension_install_local"
+                    && let Some(package) = installed_package(&previous, &self.extensions.packages)
+                {
+                    self.extensions.review = Some(package.clone());
+                    self.extensions.notice = install_notice(package);
+                }
                 self.extensions.loaded = true;
+                // A removed plugin's page closes with it.
+                if let Some(Detail::Installed(id)) = &self.extensions.detail
+                    && !self
+                        .extensions
+                        .packages
+                        .iter()
+                        .any(|package| &package.id == id)
+                {
+                    self.extensions.detail = None;
+                }
             }
             if let Some(s) = v.get("sources") {
                 self.extensions.sources = serde_json::from_value(s.clone())?;
-                self.extensions.selected_source = self
+                if self
                     .extensions
-                    .selected_source
-                    .min(self.extensions.sources.len().saturating_sub(1));
+                    .source_filter
+                    .as_ref()
+                    .is_some_and(|filter| {
+                        !self
+                            .extensions
+                            .sources
+                            .iter()
+                            .any(|source| &source.repository == filter)
+                    })
+                {
+                    self.extensions.source_filter = None;
+                }
+                sources_changed = true;
             }
-            if let Some(d) = v.get("discovered") {
-                self.extensions.discovered = serde_json::from_value(d.clone())?;
-            }
-            if v.get("package").is_some() {
-                self.extensions.tab = 1;
-                self.extensions.notice =
-                    "Installed. Enable it when you are ready to use it.".into();
+            if let Some(package) = v.get("package") {
+                let package: ExtensionPackage = serde_json::from_value(package.clone())?;
+                self.extensions.notice = install_notice(&package);
+                self.extensions.review = Some(package);
             }
             Ok(())
         });
+        if sources_changed && operation == "extension_sources" {
+            self.extensions.adding_source = false;
+            self.extension_directory_refresh(false, cx);
+        }
+        if operation != "extension_snapshot" && operation != "extension_component_status" {
+            // Installs, removals and enables change what the directory marks
+            // as installed.
+            self.extension_directory_search(cx);
+            self.extension_directory_installed(cx);
+        }
         if let Err(e) = result {
+            let cause = product_error(&e.to_string());
             self.extensions.notice = if cancelling {
-                format!("Operation interrupted. Changes made before cancellation may remain.\n{e}")
+                format!(
+                    "Operation interrupted. Changes made before cancellation may remain. {cause}"
+                )
             } else if operation == "extension_component_verify" {
                 format!(
-                    "Verification failed. Check the component's command and setup, then retry.\n{e}"
+                    "Verification failed. Check the component's command and setup, then retry. {cause}"
                 )
             } else {
-                e.to_string()
+                cause
             };
         }
         cx.notify();
@@ -141,411 +655,106 @@ impl Xylo {
         })
         .detach();
     }
-    pub(super) fn plugins_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.extensions.native {
-            return div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(
-                    button("extensions-back", "Back to plugins").on_click(cx.listener(
-                        |v, _, _, cx| {
-                            v.extensions.native = false;
-                            cx.notify();
-                        },
-                    )),
-                )
-                .child(div().flex_1().min_h_0().child(self.native_plugins_page(cx)))
-                .into_any_element();
-        }
-        let busy = self.extensions.pending.is_some();
-        let mut tabs = div().flex().gap_2();
-        for (index, label) in ["Discover", "Installed", "Sources"].into_iter().enumerate() {
-            tabs = tabs.child(
-                button(("extensions-tab", index), label)
-                    .disabled(busy)
-                    .bg(rgb(if self.extensions.tab == index {
-                        selected()
-                    } else {
-                        panel()
-                    }))
-                    .on_click(cx.listener(move |v, _, window, cx| {
-                        v.extension_leave_setup(Some(index), window, cx);
-                    })),
-            );
-        }
-        let mut content = div()
-            .w_full()
-            .max_w(px(760.))
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(22.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Plugins"),
-                    )
-                    .child(
-                        button("extensions-local", "Install from folder")
-                            .disabled(busy)
-                            .on_click(cx.listener(|v, _, w, cx| v.extension_pick(w, cx))),
-                    ),
-            )
-            .child(tabs);
-        if busy {
-            content = content.child(div().flex().items_center().gap_3()
-                .child(subtitle(if self.extensions.pending_name == "extension_component_verify" { "Verifying…" } else { "Working…" }))
-                .child(button("extension-cancel", "Cancel").on_click(cx.listener(|view, _, _, cx| {
-                    if let Some(id) = view.extensions.pending && let Some(host) = &view.host {
-                        view.extensions.notice = match host.cancel_capability(id) {
-                            Ok(()) => { view.extensions.cancelling = true; "Cancellation requested. Waiting for the operation's result.".into() },
-                            Err(error) => error.to_string(),
-                        };
-                        cx.notify();
-                    }
-                }))));
-        }
-        if !self.extensions.notice.is_empty() {
-            content = content.child(
-                div()
-                    .id("extensions-notice")
-                    .text_sm()
-                    .child(self.extensions.notice.clone()),
-            );
-        }
-        content = content.child(if self.extensions.setup.is_some() {
-            self.extension_setup_view(cx)
-        } else {
-            match self.extensions.tab {
-                0 => self.extension_discover_view(cx),
-                1 => self.extension_installed_view(cx),
-                _ => self.extension_sources_view(cx),
-            }
-        });
-        div()
-            .id("extensions-page")
-            .size_full()
-            .overflow_y_scroll()
-            .px(px(40.))
-            .py(px(32.))
-            .flex()
-            .flex_col()
-            .items_center()
-            .child(content)
-            .into_any_element()
-    }
-    fn extension_discover_view(&self, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.extensions.pending.is_some();
-        let mut sources = div().flex().flex_wrap().gap_2();
-        for (index, source) in self.extensions.sources.iter().enumerate() {
-            sources = sources.child(
-                button(("extension-source", index), source.name.clone())
-                    .disabled(busy)
-                    .bg(rgb(if index == self.extensions.selected_source {
-                        selected()
-                    } else {
-                        panel()
-                    }))
-                    .on_click(cx.listener(move |v, _, _, cx| {
-                        v.extensions.selected_source = index;
-                        v.extensions.discovered.clear();
-                        if let Some(source) = v.extensions.sources.get(index).cloned() {
-                            v.extension_request("extension_discover", json!({"source":source}), cx);
-                        }
-                    })),
-            );
-        }
-        let mut body = div().flex().flex_col().gap_3().child(sources).child(
-            div()
-                .flex()
-                .gap_2()
-                .child(div().flex_1().child(Input::new(&self.extensions.query)))
-                .child(
-                    button("extension-search", "Search")
-                        .disabled(busy)
-                        .on_click(cx.listener(|v, _, _, cx| {
-                            if let Some(source) = v
-                                .extensions
-                                .sources
-                                .get(v.extensions.selected_source)
-                                .cloned()
-                            {
-                                v.extension_request(
-                                    "extension_discover",
-                                    json!({"source":source}),
-                                    cx,
-                                );
-                            }
-                        })),
-                ),
-        );
-        let query = self.extensions.query.read(cx).value().to_lowercase();
-        for (index, item) in self
-            .extensions
-            .discovered
+}
+
+/// The package an install added or replaced: new, or with changed contents.
+fn installed_package<'a>(
+    previous: &[ExtensionPackage],
+    current: &'a [ExtensionPackage],
+) -> Option<&'a ExtensionPackage> {
+    current.iter().find(|package| {
+        !previous
             .iter()
-            .filter(|p| {
-                p.name.to_lowercase().contains(&query) || p.path.to_lowercase().contains(&query)
-            })
-            .enumerate()
-        {
-            let item = item.clone();
-            let installed = self.extensions.packages.iter().any(|p| {
-                p.source.ends_with(&format!("/{}", item.path))
-                    && p.source.contains(&item.source.repository)
-            });
-            body = body.child(
-                div()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(rgb(border()))
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_sm().child(item.name.clone()))
-                            .child(subtitle(item.source.name.clone())),
-                    )
-                    .child(
-                        button(
-                            ("extension-install", index),
-                            if installed { "Update" } else { "Install" },
-                        )
-                        .disabled(busy)
-                        .on_click(cx.listener(move |v, _, _, cx| {
-                            v.extension_request(
-                                "extension_install_remote",
-                                json!({"item":item}),
-                                cx,
-                            )
-                        })),
-                    ),
-            );
-        }
-        if self.extensions.discovered.is_empty() && !busy {
-            body = body.child(subtitle("Choose a source to browse plugins and skills."));
-        }
-        body.into_any_element()
-    }
-    fn extension_installed_view(&self, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.extensions.pending.is_some();
-        let mut body = div().flex().flex_col().gap_3().child(
-            div()
-                .flex()
-                .gap_2()
-                .child(
-                    button("extensions-refresh", "Refresh")
-                        .disabled(busy)
-                        .on_click(cx.listener(|v, _, _, cx| {
-                            v.extension_request("extension_snapshot", json!({}), cx)
-                        })),
-                )
-                .child(
-                    button("extensions-native", "Native modules").on_click(cx.listener(
-                        |v, _, _, cx| {
-                            v.extensions.native = true;
-                            cx.notify();
-                        },
-                    )),
-                ),
-        );
-        if self.extensions.packages.is_empty() && !busy {
-            body = body.child(subtitle(if self.extensions.loaded {
-                "No plugins installed. Browse Discover or install a folder."
-            } else {
-                "Could not load plugins. Refresh to try again."
-            }));
-        }
-        for (index, p) in self.extensions.packages.iter().enumerate() {
-            let id = p.id.clone();
-            let remove = id.clone();
-            let enabled = p.enabled;
-            let mut row = div()
-                .py_4()
-                .border_b_1()
-                .border_color(rgb(border()))
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(p.name.clone()),
-                        )
-                        .child(
-                            button(
-                                ("extension-enable", index),
-                                if enabled { "Disable" } else { "Enable" },
-                            )
-                            .disabled(busy)
-                            .on_click(cx.listener(
-                                move |v, _, _, cx| {
-                                    v.extension_request(
-                                        "extension_enable",
-                                        json!({"id":id,"enabled":!enabled}),
-                                        cx,
-                                    )
-                                },
-                            )),
-                        )
-                        .child(
-                            button(("extension-remove", index), "Remove")
-                                .disabled(busy)
-                                .on_click(cx.listener(move |v, _, _, cx| {
-                                    v.extension_request(
-                                        "extension_remove",
-                                        json!({"id":remove}),
-                                        cx,
-                                    )
-                                })),
-                        ),
-                );
-            for (component_index, c) in p.components.iter().enumerate() {
-                let mut component = div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(div().flex_1().text_size(px(12.)).child(match c.kind {
-                        ComponentKind::Mcp => "MCP servers".to_owned(),
-                        ComponentKind::LanguageServer => "Language servers".to_owned(),
-                        ComponentKind::Hooks => "Hooks".to_owned(),
-                        ComponentKind::HostedIntegration => "Hosted integrations".to_owned(),
-                        _ => c.name.clone(),
-                    }))
-                    .child(subtitle(c.readiness.label()));
-                if matches!(
-                    c.kind,
-                    ComponentKind::Hooks | ComponentKind::Mcp | ComponentKind::LanguageServer
-                ) {
-                    let package = p.clone();
-                    let selected = c.clone();
-                    component = component.child(
-                        button(
-                            ("extension-configure", index * 1000 + component_index),
-                            "Configure",
-                        )
-                        .disabled(busy || !enabled)
-                        .on_click(cx.listener(move |v, _, w, cx| {
-                            v.extension_open_setup(
-                                &package,
-                                &selected.name,
-                                selected.kind.clone(),
-                                w,
-                                cx,
-                            )
-                        })),
-                    );
-                }
-                row = row.child(component);
-                for requirement in &c.requirements {
-                    if requirement == &format!("Configure and verify {}", c.name) {
-                        continue;
-                    }
-                    row = row.child(subtitle(requirement.clone()));
-                }
-            }
-            body = body.child(row);
-        }
-        body.into_any_element()
-    }
-    fn extension_sources_view(&self, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.extensions.pending.is_some();
-        let mut body = div().flex().flex_col().gap_3();
-        for (index, source) in self.extensions.sources.iter().enumerate() {
-            body = body.child(
-                div()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(rgb(border()))
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_sm().child(source.name.clone()))
-                            .child(subtitle(format!(
-                                "{} · {}",
-                                source.repository, source.revision
-                            ))),
-                    )
-                    .child(
-                        button(("extension-source-remove", index), "Remove")
-                            .disabled(busy)
-                            .on_click(cx.listener(move |v, _, _, cx| {
-                                let mut sources = v.extensions.sources.clone();
-                                sources.remove(index);
-                                v.extension_request(
-                                    "extension_sources",
-                                    json!({"sources":sources}),
-                                    cx,
-                                );
-                            })),
-                    ),
-            );
-        }
-        body.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().flex_1().child(Input::new(&self.extensions.source)))
-                .child(
-                    button("extension-source-add", "Add source")
-                        .disabled(busy)
-                        .on_click(cx.listener(|v, _, _, cx| {
-                            match ExtensionSource::from_input(&v.extensions.source.read(cx).value())
-                            {
-                                Ok(source) => {
-                                    let mut sources = v.extensions.sources.clone();
-                                    if sources.iter().any(|s| {
-                                        s.repository == source.repository
-                                            && s.revision == source.revision
-                                            && s.subdirectory == source.subdirectory
-                                    }) {
-                                        v.extensions.notice =
-                                            "This source is already added.".into();
-                                        cx.notify();
-                                        return;
-                                    }
-                                    sources.push(source);
-                                    v.extension_request(
-                                        "extension_sources",
-                                        json!({"sources":sources}),
-                                        cx,
-                                    );
-                                }
-                                Err(error) => {
-                                    v.extensions.notice = error.to_string();
-                                    cx.notify();
-                                }
-                            }
-                        })),
-                ),
-        )
-        .into_any_element()
+            .any(|old| old.id == package.id && old.digest == package.digest)
+    })
+}
+/// What to do after an install: review before enabling, or review what an
+/// update changed in an enabled plugin.
+fn install_notice(package: &ExtensionPackage) -> String {
+    if package.enabled {
+        "Updated. This plugin stays enabled; review what changed below.".into()
+    } else {
+        "Installed and disabled. Review what it contains before enabling it.".into()
     }
 }
+/// Product name of a component group.
+fn component_group(kind: &ComponentKind) -> &'static str {
+    match kind {
+        ComponentKind::Skill => "Skills",
+        ComponentKind::Command => "Commands",
+        ComponentKind::Agent => "Agents",
+        ComponentKind::Hooks => "Hooks",
+        ComponentKind::Mcp => "MCP servers",
+        ComponentKind::LanguageServer => "Language servers",
+        ComponentKind::HostedIntegration => "Hosted integrations",
+    }
+}
+/// Short tag for a component kind in list rows.
+fn component_tag(kind: &ComponentKind) -> &'static str {
+    match kind {
+        ComponentKind::Skill => "Skills",
+        ComponentKind::Command => "Commands",
+        ComponentKind::Agent => "Agents",
+        ComponentKind::Hooks => "Hooks",
+        ComponentKind::Mcp => "MCP",
+        ComponentKind::LanguageServer => "LSP",
+        ComponentKind::HostedIntegration => "Hosted",
+    }
+}
+/// Distinct component kinds of a package, in review order.
+fn package_kinds(package: &ExtensionPackage) -> Vec<ComponentKind> {
+    review_groups(package)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect()
+}
+/// Whether a component runs code and so has a setup to configure.
+fn configurable(kind: &ComponentKind) -> bool {
+    matches!(
+        kind,
+        ComponentKind::Hooks | ComponentKind::Mcp | ComponentKind::LanguageServer
+    )
+}
+/// What enabling a component group allows, in one line.
+fn component_risk(kind: &ComponentKind) -> &'static str {
+    match kind {
+        ComponentKind::Skill => "Instructions the agent can load when relevant.",
+        ComponentKind::Command => "Prompts you can run by name.",
+        ComponentKind::Agent => "Helpers the agent can delegate work to.",
+        ComponentKind::Hooks => {
+            "Run local commands automatically around tool use, once configured and enabled per event."
+        }
+        ComponentKind::Mcp => "Run local server programs that provide tools.",
+        ComponentKind::LanguageServer => "Run local language servers for code intelligence.",
+        ComponentKind::HostedIntegration => "Need a separate connection before they can be used.",
+    }
+}
+/// Indices of the package's components grouped by kind, in review order.
+fn review_groups(package: &ExtensionPackage) -> Vec<(ComponentKind, Vec<usize>)> {
+    const ORDER: [ComponentKind; 7] = [
+        ComponentKind::Hooks,
+        ComponentKind::Mcp,
+        ComponentKind::LanguageServer,
+        ComponentKind::Command,
+        ComponentKind::Agent,
+        ComponentKind::Skill,
+        ComponentKind::HostedIntegration,
+    ];
+    ORDER
+        .into_iter()
+        .filter_map(|kind| {
+            let rows: Vec<usize> = package
+                .components
+                .iter()
+                .enumerate()
+                .filter(|(_, component)| component.kind == kind)
+                .map(|(index, _)| index)
+                .collect();
+            (!rows.is_empty()).then_some((kind, rows))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "extensions/tests.rs"]
+mod tests;

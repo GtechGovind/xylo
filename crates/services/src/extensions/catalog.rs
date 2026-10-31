@@ -27,7 +27,18 @@ impl ExtensionService {
             .write(true)
             .open(self.root.join("catalog.lock"))?;
         f.lock_exclusive()?;
+        self.remove_unreadable_stores()?;
         Ok(f)
+    }
+    /// Catalog and runtime setup files that no longer decode (corrupt or from
+    /// an older format) are deleted, not migrated: their packages read as not
+    /// installed and their setups as not configured. Caller holds the lock.
+    fn remove_unreadable_stores(&self) -> Result<()> {
+        let catalog = self.root.join("catalog.json");
+        if decodes::<Vec<ExtensionPackage>>(&catalog)? == Some(false) {
+            fs::remove_file(&catalog)?;
+        }
+        self.remove_unreadable_runtime()
     }
     pub fn list(&self) -> Result<Vec<ExtensionPackage>> {
         let _lock = self.lock()?;
@@ -35,7 +46,7 @@ impl ExtensionService {
     }
     pub(super) fn read_catalog(&self) -> Result<Vec<ExtensionPackage>> {
         match fs::read(self.root.join("catalog.json")) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
             Err(e) => Err(e.into()),
         }
@@ -63,6 +74,7 @@ impl ExtensionService {
         fallback: &str,
     ) -> Result<ExtensionPackage> {
         let _lock = self.lock()?;
+        self.remove_abandoned_staging();
         let staging = tempfile::tempdir_in(&self.root)?;
         let content = staging.path().join("content");
         let mut total = 0;
@@ -72,13 +84,15 @@ impl ExtensionService {
         let (name, version, components) = inspect(&content, fallback)?;
         let mut hash = Sha256::new();
         hash_tree(&content, &content, &mut hash)?;
-        let digest = format!("{:x}", hash.finalize());
+        let digest = hex::encode(hash.finalize());
         let id = format!(
             "extension-{}",
-            &format!("{:x}", Sha256::digest(provenance.as_bytes()))[..24]
+            &hex::encode(Sha256::digest(provenance.as_bytes()))[..24]
         );
         let mut packages = self.read_catalog()?;
         let prior = packages.iter().find(|p| p.id == id);
+        // Changed content is a new package to review: an update never keeps
+        // the previous version's enablement.
         let mut package = ExtensionPackage {
             id: id.clone(),
             name,
@@ -86,7 +100,7 @@ impl ExtensionService {
             source: provenance.into(),
             revision,
             digest: digest.clone(),
-            enabled: prior.is_some_and(|p| p.enabled),
+            enabled: prior.is_some_and(|p| p.enabled && p.digest == digest),
             components,
         };
         if let Some(prior) = prior.filter(|p| p.digest == digest) {
@@ -102,6 +116,20 @@ impl ExtensionService {
         packages.push(package.clone());
         self.save(&packages)?;
         Ok(package)
+    }
+    /// Staging directories left by an interrupted install. Callers hold the
+    /// catalog lock, so no install is in progress and every one is abandoned.
+    fn remove_abandoned_staging(&self) {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if entry.file_name().to_string_lossy().starts_with(".tmp")
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
     }
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<()> {
         let _lock = self.lock()?;
@@ -327,6 +355,7 @@ impl ExtensionService {
         let body = substitute(&template, arguments, &root.to_string_lossy());
         Ok(LoadedSkill {
             id: id.into(),
+            description: c.description.clone(),
             body,
             package_root: root,
             allowed_tools,
@@ -350,6 +379,14 @@ impl ExtensionService {
             "Resource exceeds 256 KiB; use a scoped file tool"
         );
         Ok(fs::read_to_string(path)?)
+    }
+}
+/// Whether the JSON file at `path` decodes as `T`; `None` when it is absent.
+pub(super) fn decodes<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<bool>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice::<T>(&bytes).is_ok())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 fn copy_tree(
@@ -430,12 +467,12 @@ fn substitute(body: &str, args: &str, root: &str) -> String {
             output.push_str(root);
             rest = tail;
         } else if let Some(tail) = rest.strip_prefix("$ARGUMENTS") {
-            if let Some(tail2) = tail.strip_prefix('[').and_then(|s| s.split_once(']')) {
-                if let Ok(i) = tail2.0.parse::<usize>() {
-                    output.push_str(words.get(i).map(String::as_str).unwrap_or(""));
-                    rest = tail2.1;
-                    continue;
-                }
+            if let Some((index, tail)) = tail.strip_prefix('[').and_then(|s| s.split_once(']'))
+                && let Ok(i) = index.parse::<usize>()
+            {
+                output.push_str(words.get(i).map(String::as_str).unwrap_or(""));
+                rest = tail;
+                continue;
             }
             output.push_str(args);
             rest = tail;

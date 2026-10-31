@@ -2,6 +2,10 @@
 //! regression checks. No account, clipboard device or paid image service is used.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -145,9 +149,7 @@ mod xylo {
                 ImageGenerationService::new(paths.data.clone(), paths.artifacts.clone()).unwrap();
             let (client, window, view) = open(cx, paths);
             cx.update_window(window, |_, window, cx| {
-                view.update(cx, |view, cx| view.navigate(Page::Providers, cx));
-                window.render_frame(cx);
-                window.click("configure-image-provider", cx);
+                view.update(cx, |view, cx| view.navigate(Page::Images, cx));
                 window.render_frame(cx);
                 assert!(view.read(cx).settings_open);
                 assert!(window.try_find("image-provider-settings").is_some());
@@ -156,6 +158,8 @@ mod xylo {
                     "Image generation happens in chat, not Settings"
                 );
                 assert!(window.try_find("refresh-image-history").is_none());
+                window.click("add-image-provider", cx);
+                window.render_frame(cx);
                 view.update(cx, |view, cx| {
                     view.image_generation.name.update(cx, |input, cx| {
                         input.set_value("Fresh image connection", window, cx)
@@ -196,12 +200,16 @@ mod xylo {
                 window.render_frame(cx);
                 window.click("image-provider-back", cx);
                 window.render_frame(cx);
-                assert_eq!(view.read(cx).page, Page::Providers);
+                assert_eq!(view.read(cx).page, Page::Images);
+                assert!(
+                    window.try_find("image-save-provider").is_none(),
+                    "Leaving the form returns to the provider list"
+                );
                 assert_eq!(
                     service.configured_provider().unwrap().unwrap().model,
                     "explicit-image-model"
                 );
-                window.click("configure-image-provider", cx);
+                window.click("image-provider-item", cx);
             })
             .unwrap();
             wait(cx, &view, "reopened saved image connection", |view, cx| {
@@ -309,8 +317,8 @@ mod xylo {
                     view.messages.push(crate::state::message(view.session,"user","Generate an image".into()));
                     let action=Uuid::new_v4();
                     let turn=view.turns.entry(view.session).or_default();
-                    turn.apply(EngineEvent::ToolStarted { action_id:action,name:"image_generate".into(),arguments:serde_json::json!({"prompt":"A native fixture image"}) });
-                    turn.apply(EngineEvent::ToolFinished { action_id:action,name:"image_generate".into(),result:serde_json::json!({"summary":{"images":[generated.clone()]},"artifacts":["/untrusted/path-must-not-be-used.png"]}).to_string(),success:true });
+                    turn.apply(EngineEvent::ToolStarted { parent_id: None, action_id:action,name:"image_generate".into(),arguments:serde_json::json!({"prompt":"A native fixture image"}) });
+                    turn.apply(EngineEvent::ToolFinished { parent_id: None, action_id:action,name:"image_generate".into(),result:serde_json::json!({"summary":{"images":[generated.clone()]},"artifacts":["/untrusted/path-must-not-be-used.png"]}).to_string(),success:true });
                     view.sync_history_list(cx);
                 });
                 window.render_frame(cx);
@@ -356,9 +364,20 @@ mod xylo {
                     ImageFormat::Png,
                     PNG.to_vec(),
                 )));
+                view.update(cx, |view, cx| {
+                    view.composer
+                        .update(cx, |input, cx| input.focus(window, cx))
+                });
                 window.render_frame(cx);
-                window.click("composer-context-actions", cx);
-                window.within("popup-menu").click(1usize, cx);
+                // Clipboard pixels arrive through the composer's native ⌘V / Ctrl+V path.
+                window.press(
+                    if cfg!(target_os = "macos") {
+                        "cmd-v"
+                    } else {
+                        "ctrl-v"
+                    },
+                    cx,
+                );
             })
             .unwrap();
             wait(cx, &view, "native clipboard pixels", |view, _| {

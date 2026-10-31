@@ -232,5 +232,5 @@ fn hash_file_inner(file: &mut File, maximum: u64, pair: bool) -> Result<(String,
     } else {
         platform::regular(file)?;
     }
-    Ok((format!("{:x}", hasher.finalize()), length))
+    Ok((hex::encode(hasher.finalize()), length))
 }

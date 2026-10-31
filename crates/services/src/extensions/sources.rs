@@ -8,7 +8,15 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[path = "marketplace.rs"]
+mod marketplace;
+pub use marketplace::{
+    DIRECTORY_TTL_SECONDS, DirectoryEndpoints, DirectoryEntry, DirectoryFreshness, DirectoryPage,
+    DirectoryQuery, DirectorySourceStatus,
+};
+
+/// A GitHub repository (optionally one folder of it) offering extensions.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionSource {
     pub name: String,
     pub repository: String,
@@ -73,12 +81,19 @@ fn directory_valid(path: &str) -> bool {
                 .split('/')
                 .all(|p| !p.is_empty() && p != "." && p != ".." && !p.contains('\\')))
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A package that can be installed from a pinned GitHub commit.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DiscoveredExtension {
     pub source: ExtensionSource,
+    /// Package folder inside the repository, `.` for the root.
     pub path: String,
     pub name: String,
+    /// Full commit SHA the package is installed from.
     pub revision: String,
+    /// Identity of the package's content (its git tree hash, or the pinned
+    /// commit of an external plugin), used to detect updates. `None` when
+    /// unknown.
+    pub content: Option<String>,
 }
 pub fn default_sources() -> Vec<ExtensionSource> {
     vec![
@@ -94,12 +109,6 @@ pub fn default_sources() -> Vec<ExtensionSource> {
             revision: "main".into(),
             subdirectory: String::new(),
         },
-        ExtensionSource {
-            name: "OpenAI skills (legacy)".into(),
-            repository: "openai/skills".into(),
-            revision: "main".into(),
-            subdirectory: String::new(),
-        },
     ]
 }
 fn client() -> Result<reqwest::Client> {
@@ -109,7 +118,7 @@ fn client() -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(60))
         .build()?)
 }
-fn repository_valid(repo: &str) -> bool {
+pub(super) fn repository_valid(repo: &str) -> bool {
     let p: Vec<_> = repo.split('/').collect();
     p.len() == 2
         && p.iter().all(|p| {
@@ -119,41 +128,6 @@ fn repository_valid(repo: &str) -> bool {
                 && p.chars()
                     .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
         })
-}
-pub async fn discover(source: &ExtensionSource) -> Result<Vec<DiscoveredExtension>> {
-    ensure!(
-        repository_valid(&source.repository),
-        "Expected a GitHub owner/repository"
-    );
-    let mut commit_url = reqwest::Url::parse(&format!(
-        "https://api.github.com/repos/{}/commits/",
-        source.repository
-    ))?;
-    commit_url
-        .path_segments_mut()
-        .map_err(|_| anyhow::anyhow!("Invalid source"))?
-        .pop_if_empty()
-        .push(&source.revision);
-    let commit: serde_json::Value = client()?
-        .get(commit_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let revision = commit["sha"].as_str().context("Source commit missing")?;
-    let url = format!(
-        "https://api.github.com/repos/{}/git/trees/{revision}",
-        source.repository
-    );
-    let response = client()?
-        .get(url)
-        .query(&[("recursive", "1")])
-        .send()
-        .await?
-        .error_for_status()?;
-    let tree: serde_json::Value = response.json().await?;
-    packages_from_tree(&tree, source, revision)
 }
 pub(super) fn packages_from_tree(
     tree: &serde_json::Value,
@@ -165,9 +139,15 @@ pub(super) fn packages_from_tree(
         "Source tree is too large; add a narrower source"
     );
     let files = tree["tree"].as_array().context("Source tree missing")?;
-    let scoped_files = files.iter().filter(|file| {
-        source.subdirectory.is_empty() || file["path"].as_str().is_some_and(|path| path.starts_with(&format!("{}/", source.subdirectory)))
-    }).collect::<Vec<_>>();
+    let scoped_files = files
+        .iter()
+        .filter(|file| {
+            source.subdirectory.is_empty()
+                || file["path"]
+                    .as_str()
+                    .is_some_and(|path| path.starts_with(&format!("{}/", source.subdirectory)))
+        })
+        .collect::<Vec<_>>();
     let files = &scoped_files;
     let mut packages = std::collections::BTreeMap::new();
     for file in files {
@@ -221,13 +201,11 @@ pub(super) fn packages_from_tree(
         if let Some(path) = file["path"]
             .as_str()
             .and_then(|p| p.strip_suffix("/SKILL.md"))
-        {
-            if !packages
+            && !packages
                 .keys()
                 .any(|root| root == "." || path.starts_with(&format!("{root}/")))
-            {
-                packages.insert(path.into(), path.rsplit('/').next().unwrap_or(path).into());
-            }
+        {
+            packages.insert(path.into(), path.rsplit('/').next().unwrap_or(path).into());
         }
     }
     Ok(packages
@@ -242,14 +220,24 @@ pub(super) fn packages_from_tree(
             path,
             name,
             revision: revision.into(),
+            content: None,
         })
         .collect())
 }
 impl ExtensionService {
+    /// Configured sources, or the defaults. A sources file that does not
+    /// decode is deleted and the defaults apply.
     pub fn sources(&self) -> Result<Vec<ExtensionSource>> {
         let _lock = self.lock()?;
-        match std::fs::read(self.root.join("sources.json")) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        let path = self.root.join("sources.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(sources) => Ok(sources),
+                Err(_) => {
+                    std::fs::remove_file(&path)?;
+                    Ok(default_sources())
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(default_sources()),
             Err(e) => Err(e.into()),
         }
@@ -308,7 +296,7 @@ impl ExtensionService {
         }
         let service = self.clone();
         let item = item.clone();
-        tokio::task::spawn_blocking(move || {
+        let installed = tokio::task::spawn_blocking(move || {
             let staging = tempfile::tempdir()?;
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
             let mut total = 0u64;
@@ -351,24 +339,29 @@ impl ExtensionService {
                     }
                 }
             }
-            service.install_snapshot(
-                staging.path(),
-                &format!(
-                    "https://github.com/{}/tree/{}/{}",
-                    item.source.repository, item.source.revision, item.path
-                ),
-                Some(item.revision),
-                if item.path == "." {
-                    item.source
-                        .repository
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("plugin")
-                } else {
-                    item.path.rsplit('/').next().unwrap_or("plugin")
-                },
-            )
+            service
+                .install_snapshot(
+                    staging.path(),
+                    &format!(
+                        "https://github.com/{}/tree/{}/{}",
+                        item.source.repository, item.source.revision, item.path
+                    ),
+                    Some(item.revision.clone()),
+                    if item.path == "." {
+                        item.source
+                            .repository
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("plugin")
+                    } else {
+                        item.path.rsplit('/').next().unwrap_or("plugin")
+                    },
+                )
+                .map(|package| (package, item))
         })
-        .await?
+        .await??;
+        let (package, item) = installed;
+        self.record_installed_content(&item)?;
+        Ok(package)
     }
 }

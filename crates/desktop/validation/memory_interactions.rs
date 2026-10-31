@@ -2,6 +2,10 @@
 //! durable write. Native dialogs, model inference and external accounts stay idle.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -253,6 +257,7 @@ mod xylo {
                 window.click(("connector-remove", 0usize), cx);
             })
             .unwrap();
+            cx.simulate_prompt_answer("Remove connection");
             wait(cx, &view, |view, _| {
                 view.connector_pending.is_none() && view.connectors.is_empty()
             });
@@ -261,10 +266,10 @@ mod xylo {
                     view.read(cx).connector_editing.is_none(),
                     "Removing edited connection must exit edit identity"
                 );
-                assert_eq!(
-                    view.read(cx).connector_name.read(cx).value().as_ref(),
-                    "Local fixture"
-                );
+                // Removing it from its own page returns to an empty list,
+                // so nothing stale pre-fills the next Add connection.
+                assert!(!view.read(cx).connector_form_open);
+                assert!(view.read(cx).connector_name.read(cx).value().is_empty());
             });
             client.shutdown().unwrap();
         }
@@ -709,7 +714,7 @@ mod xylo {
                 window.render_frame(cx);
                 assert!(window.find("memory-new").visible());
                 assert!(window.try_find_by_label("Unsaved Memory entry").is_none());
-                assert!(window.try_find("refresh-learning").is_none());
+                assert!(window.try_find("skills-browse-plugins").is_none());
                 window.click("memory-new", cx);
                 window.render_frame(cx);
                 assert!(window.find_by_label("Unsaved Memory entry").visible());

@@ -1,43 +1,45 @@
-//! The only adapter that constructs community engine types. UI and protocol types
-//! stay application-owned. Local storage and tools are injected explicitly.
-
+//! The worker's engine: admits a turn, restores its durable context, runs the
+//! agent loop and settles the outcome.
+//!
+//! A turn ends in exactly one terminal event. Completed turns commit their
+//! checkpoint, reply and receipt atomically (a lost `Completed` event is
+//! replayed from the receipt without a model call). A first turn's generated
+//! title follows `Completed` as a best-effort `TitleUpdated`. Cancelled and failed turns
+//! keep their last durable checkpoint and store what had streamed as an
+//! interrupted or failed reply. Failures are classified into an
+//! [`ErrorKind`] with an honest `retryable` flag.
 use crate::{
-    AppPaths,
-    tools::{ApprovalGate, ToolBroker},
+    AppPaths, ProviderCredentialResolver,
+    agent_loop::{AgentLoop, Journal, LoopFailure, MAX_MODEL_CALLS, error_result},
+    attachments::{AttachmentProvider, user_message},
+    broker_tools::BrokerTools,
+    model::{Message, ModelError, ModelProvider, ModelRequest, Role},
+    provider_guard::{ContextBudget, GuardedProvider},
+    steering::SteeringControl,
+    subagent::{CHILD_TIMEOUT, Delegation, MAX_CONCURRENT_CHILDREN},
+    tools::{ToolBroker, ToolSession},
 };
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use hermes_agent::agent_loop::ToolRegistry;
-use hermes_agent::{
-    AgentCallbacks, AgentConfig, AgentLoop, InterruptController, SubAgentOrchestrator,
-    SubAgentOrchestratorConfig,
-};
-use hermes_core::{AgentError, LlmProvider, Message, MessageRole, ToolError, ToolSchema};
-use parking_lot::Mutex;
 use serde_json::{Value, json};
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use xylo_capabilities::CapabilityConfig;
-use xylo_core::{EngineBackend, EngineEvent, ProviderConfig, TurnRequest, Usage};
-use xylo_services::{CredentialVault, LearningService, Store};
+use xylo_core::{
+    EngineBackend, EngineEvent, ErrorKind, MessageStatus, PermissionMode, ProviderConfig,
+    TitleSource, TurnPhase, TurnRequest, WorkerCredential,
+};
+use xylo_services::{LearningService, Store};
 
-/// Upper bound on model calls in one turn, a runaway guard rather than a budget.
-const MAX_MODEL_CALLS: u32 = 200;
-
-fn bounded_memory_excerpt(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
-    }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{} [excerpt; remainder omitted]", &text[..end])
-}
+/// Output limit of the title request.
+const TITLE_TOKENS: u32 = 64;
+/// The title request's deadline.
+const TITLE_DEADLINE: Duration = Duration::from_secs(10);
+/// Most reply text sent to the title request.
+const TITLE_REPLY_BYTES: usize = 2000;
+/// Longest stored title.
+const TITLE_CHARS: usize = 80;
 
 /// Covers every error return, cancellation and future drop after turn admission.
 /// A process kill is covered by Store recovery's same-transaction evidence enqueue.
@@ -47,6 +49,7 @@ struct LearningTurnGuard {
     turn: uuid::Uuid,
     completed: bool,
 }
+
 impl Drop for LearningTurnGuard {
     fn drop(&mut self) {
         if !self.completed
@@ -57,61 +60,95 @@ impl Drop for LearningTurnGuard {
     }
 }
 
-pub struct HermesEngine {
+/// Xylo's native agent engine.
+pub struct AgentEngine {
     store: Store,
     paths: AppPaths,
-    approvals: ApprovalGate,
-    interrupt: InterruptController,
-    steering: crate::steering::SteeringControl,
-    provider_credential: Option<xylo_core::WorkerCredential>,
-    credential_resolver: Option<Arc<dyn crate::ProviderCredentialResolver>>,
+    session: ToolSession,
+    steering: SteeringControl,
+    provider_credential: Option<WorkerCredential>,
+    credential_resolver: Option<Arc<dyn ProviderCredentialResolver>>,
 }
 
-impl HermesEngine {
-    pub fn new(store: Store, paths: AppPaths, approvals: ApprovalGate) -> Self {
+impl AgentEngine {
+    /// An engine for one worker. `session` carries the approval gate, the live
+    /// permission mode and the unlocked secret vault.
+    pub fn new(store: Store, paths: AppPaths, session: ToolSession) -> Self {
         Self {
-            steering: crate::steering::SteeringControl::new(store.clone()),
+            steering: SteeringControl::new(store.clone()),
             provider_credential: None,
             credential_resolver: None,
             store,
             paths,
-            approvals,
-            interrupt: InterruptController::new(),
+            session,
         }
     }
 
+    /// Wakes the running turn to apply newly queued guidance at its next
+    /// boundary.
     pub fn notify_steering(&self) {
         self.steering.notify();
     }
 
-    pub fn with_provider_credential(mut self, credential: xylo_core::WorkerCredential) -> Self {
+    /// Uses the host-authorized provider credential instead of the vault.
+    pub fn with_provider_credential(mut self, credential: WorkerCredential) -> Self {
         self.provider_credential = Some(credential);
         self
     }
 
-    pub fn with_provider_credential_resolver(mut self, resolver: Arc<dyn crate::ProviderCredentialResolver>) -> Self {
+    /// Asks `resolver` for renewed provider credentials.
+    pub fn with_provider_credential_resolver(
+        mut self,
+        resolver: Arc<dyn ProviderCredentialResolver>,
+    ) -> Self {
         self.credential_resolver = Some(resolver);
         self
     }
 
-    fn provider(&self, config: &ProviderConfig, cancel: CancellationToken) -> Result<Arc<dyn LlmProvider>> {
+    fn provider(&self, config: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
         if let Some(credential) = &self.provider_credential {
             ensure!(
                 config.credential_ref.is_none() || credential.0.is_some(),
                 "Host did not authorize the provider credential"
             );
-            return crate::providers::build_renewable(config, credential.clone(), self.credential_resolver.clone(), cancel);
+            return crate::providers::build_renewable(
+                config,
+                credential.clone(),
+                self.credential_resolver.clone(),
+            );
         }
         let key = match &config.credential_ref {
-            Some(reference) => CredentialVault::new(xylo_core::CREDENTIAL_SERVICE)?
-                .get(reference)?
-                .with_context(|| format!("Credential {reference} is not configured"))
-                .map(Some)?,
+            Some(reference) => Some(
+                self.session
+                    .vault()
+                    .get(reference)?
+                    .with_context(|| format!("Credential {reference} is not configured"))?,
+            ),
             None => None,
         };
         crate::providers::build(config, key)
     }
 
+    fn broker(
+        &self,
+        request: &TurnRequest,
+        events: mpsc::Sender<EngineEvent>,
+        cancel: CancellationToken,
+    ) -> Result<ToolBroker> {
+        ToolBroker::new(
+            request.clone(),
+            self.store.clone(),
+            self.capability_config(request)?,
+            self.session.clone(),
+            events,
+            cancel,
+        )
+    }
+
+    /// The conversation to continue: the checkpoint with every pending tool
+    /// call of an earlier turn settled from the journal, plus this turn's user
+    /// message unless the same turn is resuming. Nothing is dispatched here;
+    /// calls of a resuming turn that never ran are left for the loop.
     async fn restored_messages(
         &self,
         request: &TurnRequest,
@@ -119,92 +156,30 @@ impl HermesEngine {
         cancel: CancellationToken,
     ) -> Result<Vec<Message>> {
         let checkpoint = self.store.checkpoint(request.session_id)?;
-        let resuming_same_turn = checkpoint
-            .as_ref()
-            .is_some_and(|checkpoint| checkpoint.turn_id == request.turn_id);
-        let mut messages: Vec<Message> = match &checkpoint {
-            Some(checkpoint) => serde_json::from_value(checkpoint.messages.clone())
-                .context("Engine checkpoint is incompatible")?,
-            None => Vec::new(),
+        let Some(checkpoint) = checkpoint else {
+            return Ok(vec![user_message(request)]);
         };
-        if let Some(checkpoint) = checkpoint {
-            let mut previous_request = (*request).clone();
-            previous_request.turn_id = checkpoint.turn_id;
-            let previous_broker = ToolBroker::new(
-                previous_request,
-                self.store.clone(),
-                self.capability_config(request)?,
-                self.approvals.clone(),
-                events.clone(),
-                cancel.clone(),
-            )?;
-            let restored = restore_pending_tools(&mut messages, &previous_broker);
-            let shutdown = previous_broker.shutdown().await;
-            restored?;
-            shutdown?;
-            // Preserve the original key namespace until all recovered tool results
+        let mut messages: Vec<Message> = serde_json::from_value(checkpoint.messages)
+            .context("The saved conversation could not be read")?;
+        let resuming = checkpoint.turn_id == request.turn_id;
+        let mut previous = request.clone();
+        previous.turn_id = checkpoint.turn_id;
+        let broker = self.broker(&previous, events, cancel)?;
+        let settled = settle_pending_tools(&mut messages, &broker, resuming);
+        let shutdown = broker.shutdown().await;
+        settled?;
+        shutdown?;
+        if !resuming {
+            // Keep the earlier turn's key namespace until its settled results
             // have a durable checkpoint of their own.
             self.store.save_checkpoint(
                 request.session_id,
                 checkpoint.turn_id,
                 &serde_json::to_value(&messages)?,
             )?;
-        }
-        // Hermes constructs the current application system policy and hints on
-        // every invocation. Checkpoints include that old leading prefix; feeding
-        // it back would duplicate policy and grow prefill after each restart.
-        // Later in-loop system notes and all native provider content stay intact.
-        let prefix = messages
-            .iter()
-            .take_while(|message| message.role == MessageRole::System)
-            .count();
-        let summaries = messages[..prefix]
-            .iter()
-            .filter_map(|message| {
-                let content = message.content.as_deref()?;
-                let start = content
-                    .find("# Summary of earlier work in this task")
-                    .or_else(|| content.find("[Conversation summary]"))?;
-                Some(Message::system(content[start..].to_owned()))
-            })
-            .collect::<Vec<_>>();
-        messages.splice(..prefix, summaries);
-        if !resuming_same_turn {
-            messages.push(crate::attachments::user_message(request)?);
+            messages.push(user_message(request));
         }
         Ok(messages)
-    }
-
-    /// A provider may observe our token before Hermes observes its interrupt.
-    /// Its typed Interrupted error has no AgentResult, so retain the last role-safe
-    /// durable checkpoint. Cleanup or checkpoint faults must still fail the run.
-    async fn finish_interrupted_generation(
-        &self,
-        request: &TurnRequest,
-        events: &mpsc::Sender<EngineEvent>,
-        shutdown: Result<()>,
-        emission: Result<()>,
-    ) -> Result<()> {
-        shutdown?;
-        emission?;
-        let store = self.store.clone();
-        let session = request.session_id;
-        let turn = request.turn_id;
-        tokio::task::spawn_blocking(move || {
-            let checkpoint = store
-                .checkpoint(session)?
-                .context("Cancellation has no durable checkpoint")?;
-            ensure!(
-                checkpoint.turn_id == turn,
-                "Cancellation checkpoint belongs to another turn"
-            );
-            let _: Vec<Message> = serde_json::from_value(checkpoint.messages)
-                .context("Cancellation checkpoint is incompatible")?;
-            Ok::<_, anyhow::Error>(())
-        })
-        .await??;
-        events.send(EngineEvent::Cancelled).await?;
-        Ok(())
     }
 
     fn capability_config(&self, request: &TurnRequest) -> Result<CapabilityConfig> {
@@ -220,23 +195,122 @@ impl HermesEngine {
         config.management_root = Some(self.paths.data.join("native-management"));
         Ok(config)
     }
-}
 
-#[async_trait]
-impl EngineBackend for HermesEngine {
-    fn name(&self) -> &str {
-        "Hermes Ultra"
+    /// The system prompt for this turn: environment, permission policy,
+    /// project instructions and the skill and fact indexes.
+    fn system_prompt(
+        &self,
+        request: &TurnRequest,
+        broker: &ToolBroker,
+        mode: PermissionMode,
+    ) -> Result<String> {
+        let mut context =
+            crate::prompts::PromptContext::detect(&request.workspace, mode, xylo_core::now_ms());
+        context.skills_index = broker.project_skill_context().unwrap_or_else(|error| {
+            tracing::warn!(error=%error, "Skill index unavailable");
+            String::new()
+        });
+        let facts = broker.project_facts()?;
+        context.facts_index = crate::prompts::facts_index(
+            facts
+                .iter()
+                .map(|fact| fact.content.lines().next().unwrap_or_default()),
+        );
+        Ok(crate::prompts::system(&context))
     }
 
-    fn steer(&self, message: String) {
-        self.interrupt
-            .interrupt(Some(hermes_agent::format_steer_marker(&message)));
+    /// Generates, stores and announces a title after the first completed
+    /// turn of a conversation, i.e. while it still has its prompt-derived
+    /// title. Runs after the turn is committed and `Completed` was sent, with
+    /// its own short deadline; the caller logs and ignores its errors. Never
+    /// replaces a user's title.
+    async fn title_conversation(
+        &self,
+        request: &TurnRequest,
+        reply: &str,
+        provider: &dyn ModelProvider,
+        events: &mpsc::Sender<EngineEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let untitled = self
+            .store
+            .conversation(request.session_id)?
+            .is_some_and(|conversation| conversation.title_source == TitleSource::Prompt);
+        if !untitled || request.prompt.trim().is_empty() {
+            return Ok(());
+        }
+        let mut conversation = request.prompt.trim().to_owned();
+        let reply = crate::provider_guard::context_excerpt(reply.trim(), TITLE_REPLY_BYTES);
+        if !reply.is_empty() {
+            conversation.push_str("\n\n");
+            conversation.push_str(&reply);
+        }
+        let title_request = ModelRequest {
+            messages: vec![
+                Message::system(crate::prompts::title()),
+                Message::user(conversation),
+            ],
+            tools: Vec::new(),
+            max_tokens: TITLE_TOKENS,
+            reasoning: crate::model::Reasoning::Lowest,
+        };
+        let cancel = cancel.child_token();
+        let reply = tokio::time::timeout(
+            TITLE_DEADLINE,
+            provider.complete(title_request, cancel.clone()),
+        )
+        .await;
+        cancel.cancel();
+        let title = match reply {
+            Ok(Ok(reply)) => clean_title(&reply.message.content),
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "Title generation failed");
+                None
+            }
+            Err(_) => None,
+        };
+        let Some(title) = title else {
+            return Ok(());
+        };
+        let store = self.store.clone();
+        let session = request.session_id;
+        let stored = tokio::task::spawn_blocking(move || {
+            store.rename_conversation(session, &title, TitleSource::Generated)
+        })
+        .await?;
+        match stored {
+            Ok(Some(conversation)) if conversation.title_source == TitleSource::Generated => {
+                events
+                    .send(EngineEvent::TitleUpdated {
+                        title: conversation.title,
+                    })
+                    .await?;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "Could not store the generated title"),
+        }
+        Ok(())
     }
 
-    async fn run(
+    /// Stores what a stopped or failed turn had streamed.
+    async fn keep_partial_reply(
+        &self,
+        request: &TurnRequest,
+        text: String,
+        status: MessageStatus,
+    ) -> Result<()> {
+        let store = self.store.clone();
+        let (session, turn) = (request.session_id, request.turn_id);
+        tokio::task::spawn_blocking(move || {
+            store.record_interrupted_reply(session, turn, &text, status)
+        })
+        .await?
+    }
+
+    async fn run_turn(
         &self,
         request: TurnRequest,
-        events: mpsc::Sender<EngineEvent>,
+        events: &mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
         if let Some(completed) = self
@@ -255,7 +329,11 @@ impl EngineBackend for HermesEngine {
             events.send(EngineEvent::Cancelled).await?;
             return Ok(());
         }
-        let admission_start = Instant::now();
+        events
+            .send(EngineEvent::Phase {
+                phase: TurnPhase::Preparing,
+            })
+            .await?;
         request.provider.validate()?;
         let attachment_store =
             xylo_services::attachments::AttachmentStore::new(self.paths.artifacts.clone())?;
@@ -270,37 +348,23 @@ impl EngineBackend for HermesEngine {
             request.workspace.is_absolute() && request.workspace.is_dir(),
             "Select an existing workspace directory"
         );
-        self.interrupt.clear_interrupt();
         let mut learning_turn = LearningTurnGuard {
             service: LearningService::new(self.store.clone()),
             session: request.session_id,
             turn: request.turn_id,
             completed: false,
         };
-        let broker_start = Instant::now();
-        let broker = Arc::new(ToolBroker::new(
-            request.clone(),
-            self.store.clone(),
-            self.capability_config(&request)?,
-            self.approvals.clone(),
-            events.clone(),
-            cancel.clone(),
-        )?);
-        tracing::debug!(session_id=%request.session_id, turn_id=%request.turn_id,
-            elapsed_ms=broker_start.elapsed().as_millis(),
-            advertised_tools=broker.initial_definitions().len(), "Turn tool manifest assembled");
+        let broker = Arc::new(self.broker(&request, events.clone(), cancel.clone())?);
         if cancel.is_cancelled() {
             events.send(EngineEvent::Cancelled).await?;
             return Ok(());
         }
-        // Inspect exact inner receipts before blocking resume on the outer
-        // journal. This pass never dispatches a tool or probes its target, and
-        // uses each saved intent's original ID, turn and key, including children.
-        // Checkpoint restoration may dispatch absent calls, so it stays AFTER
-        // the unresolved-action gate rather than serving as this recovery pass.
+        // Inspect exact native receipts before blocking resume on the journal.
+        // This pass never dispatches a tool or probes its target.
         for action in self.store.unresolved_actions(request.session_id)? {
             if action.state == "outcome_unknown" && action.intent.name == "environment_execute" {
-                tokio::task::block_in_place(|| broker.recover_native_action(action))?;
+                let broker = broker.clone();
+                tokio::task::spawn_blocking(move || broker.recover_native_action(action)).await??;
             }
         }
         let unresolved = self.store.unresolved_actions(request.session_id)?;
@@ -310,265 +374,187 @@ impl EngineBackend for HermesEngine {
                 .any(|a| matches!(a.state.as_str(), "outcome_unknown" | "running")),
             "This task has an outcome-unknown action. Reconcile it before resuming"
         );
-        let start = Instant::now();
-        let provider: Arc<dyn LlmProvider> = Arc::new(crate::provider_guard::GuardedProvider::new(
-            Arc::new(crate::attachments::AttachmentProvider::new(
-                self.provider(&request.provider, cancel.clone())?,
+        let guarded = GuardedProvider::new(
+            Arc::new(AttachmentProvider::new(
+                self.provider(&request.provider)?,
                 attachment_store,
                 request.session_id,
-                cancel.clone(),
             )),
             &request.provider,
             self.paths.data.join("local-inference.lock"),
-            cancel.clone(),
             managed_endpoint(&self.paths, &request.provider.endpoint)?,
-        ));
+        );
+        let summary_deadline = guarded.timeout();
+        let provider: Arc<dyn ModelProvider> = Arc::new(guarded);
+        let budget = ContextBudget::new(&request.provider);
         let messages = self
             .restored_messages(&request, events.clone(), cancel.clone())
             .await?;
-        let registry = build_registry(broker.clone(), None)?;
-        let facts = broker.project_facts()?;
-        let memory_context = facts
-            .iter()
-            .take(8)
-            .map(|m| {
-                format!(
-                    "- {} (source: {})",
-                    bounded_memory_excerpt(&m.content, 2000),
-                    bounded_memory_excerpt(&m.source, 200)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let skill_context = broker.project_skill_context().unwrap_or_else(|error| {
-            tracing::warn!(error=%error,"Optional procedural context unavailable");
-            String::new()
-        });
-        let home = self
-            .paths
-            .data
-            .join("tasks")
-            .join(request.session_id.to_string());
-        std::fs::create_dir_all(&home)?;
-        let config = AgentConfig {
-            native_product_finalization: true,
-            external_context_management: true,
-            allow_model_fallbacks: false,
-            // Coding work routinely needs dozens of tool rounds; the user can
-            // stop or steer at any time, and context is compacted as needed.
-            max_turns: MAX_MODEL_CALLS,
-            model: request.provider.model.clone(),
-            stream: true,
-            max_tokens: Some(request.provider.output_tokens),
-            session_id: Some(request.session_id.to_string()),
-            hermes_home: Some(home.to_string_lossy().into_owned()),
-            system_prompt: Some(crate::prompt::system_prompt(
-                &request.workspace,
-                &memory_context,
-                &skill_context,
+        let mode = self.session.permissions().get();
+        let system = self.system_prompt(&request, &broker, mode)?;
+        // Model calls admit their own memory when the model runs locally;
+        // a child holds no lease of its own while it waits on tools.
+        let resources = xylo_resources::ResourceManager::new();
+        let delegation = Arc::new(Delegation {
+            provider: provider.clone(),
+            budget: budget.clone(),
+            summary_deadline,
+            max_tokens: request.provider.output_tokens,
+            parent: Arc::downgrade(&broker),
+            events: events.clone(),
+            slots: Arc::new(tokio::sync::Semaphore::new(
+                resources
+                    .suggested_parallelism(64 * 1024 * 1024)?
+                    .clamp(1, MAX_CONCURRENT_CHILDREN),
             )),
-            skip_memory: true,
-            skip_context_files: true,
-            code_index_enabled: false,
-            lsp_context_enabled: false,
-            background_review_enabled: false,
-            rollback_on_tool_error_threshold: 0,
-            max_concurrent_delegates: 2,
-            max_delegate_depth: 2,
-            ..AgentConfig::default()
-        };
-        let checkpoint_store = self.store.clone();
-        let session_id = request.session_id;
-        let turn_id = request.turn_id;
-        let status_events = events.clone();
-        let steering = self.steering.clone();
-        let steering_events = events.clone();
-        let steering_cancel = cancel.clone();
-        let callbacks = AgentCallbacks {
-            on_application_guidance: Some(Arc::new(move |messages| {
-                steering.apply(
-                    session_id,
-                    turn_id,
-                    messages,
-                    &steering_events,
-                    &steering_cancel,
-                )
-            })),
-            on_checkpoint: Some(Arc::new(move |messages| {
-                let value =
-                    serde_json::to_value(messages).map_err(|e| AgentError::Io(e.to_string()))?;
-                tokio::task::block_in_place(|| {
-                    checkpoint_store.save_checkpoint(session_id, turn_id, &value)
-                })
-                .map_err(|e| AgentError::Io(e.to_string()))
-            })),
-            status_callback: Some(Arc::new(move |category, message| {
-                tracing::info!(category, detail = message, "Agent progress");
-                let _ = status_events.try_send(EngineEvent::Status {
-                    text: product_status(message).into(),
-                });
-            })),
-            ..AgentCallbacks::default()
-        };
-        let child_config = config.clone();
-        let child_provider = provider.clone();
-        let child_interrupt = self.interrupt.clone();
-        let child_home = home.clone();
-        let child_broker = Arc::downgrade(&broker);
-        let child_session = request.session_id.to_string();
-        let handle = tokio::runtime::Handle::current();
-        let delegate_cancel = cancel.clone();
-        let helper_resources = xylo_runtime::resources::ResourceManager::new();
-        let helper_slots = Arc::new(tokio::sync::Semaphore::new(
-            helper_resources
-                .suggested_parallelism(64 * 1024 * 1024)?
-                .min(child_config.max_concurrent_delegates.max(1) as usize),
-        ));
-        let helper_demand =
-            xylo_runtime::resources::TaskDemand::interactive(request.provider.context_tokens);
-        broker.set_delegate(Arc::new(move|parent_call_key,args|{
-            let task=args.get("task").and_then(Value::as_str).filter(|s|!s.trim().is_empty()).context("Subtask text is required")?;
-            let _permit=handle.block_on(async{tokio::select!{_ = delegate_cancel.cancelled()=>Err(anyhow::anyhow!("Delegation cancelled")),permit=helper_slots.acquire()=>permit.map_err(Into::into)}})?;
-            let _resource_lease=handle.block_on(helper_resources.acquire(helper_demand,delegate_cancel.clone()))?;
-            let mut scoped_child=child_broker.upgrade().context("Parent task has ended")?.scoped_child()?;
-            if let Some(allowed) = args.get("allowed_tools") {
-                let allowed = allowed.as_array().context("allowed_tools must be an array")?.iter().map(|value| value.as_str().map(str::to_owned).context("allowed_tools entries must be strings")).collect::<Result<Vec<_>>>()?;
-                scoped_child.restrict_tools(&allowed)?;
-            }
-            let child_broker=Arc::new(scoped_child);
-            let child_cancel=child_broker.cancellation_token();
-            let child_registry=build_registry(child_broker.clone(),Some(parent_call_key.to_owned()))?;
-            let schemas=child_registry.schemas();
-            let orchestrator=Arc::new(SubAgentOrchestrator::new(SubAgentOrchestratorConfig{
-                parent_config:child_config.clone(),tool_registry:child_registry,llm_provider:child_provider.clone(),parent_credential_pool:None,parent_interrupt:child_interrupt.clone(),hermes_home:child_home.clone(),parent_session_id:Some(child_session.clone()),timeout:Duration::from_secs(900),background_delegation_callback:None,
-            }).with_child_cancellation(Arc::new(move || child_cancel.cancel())));
-            let result=handle.block_on(orchestrator.execute(hermes_agent::SubAgentRequest{task:task.into(),context:args.get("context").and_then(Value::as_str).map(str::to_owned),child_depth:1,max_depth:1,inherited_tool_schemas:schemas,..Default::default()}));
-            handle.block_on(child_broker.shutdown())?;
-            serde_json::from_str(&result).context("Read subagent result")
-        }));
-        let agent =
-            AgentLoop::with_interrupt(config, registry.clone(), provider, self.interrupt.clone())
-                .with_callbacks(callbacks);
+            cancel: cancel.clone(),
+            timeout: CHILD_TIMEOUT,
+            runtime: tokio::runtime::Handle::current(),
+            workspace: request.workspace.clone(),
+            permissions: self.session.permissions().clone(),
+        });
+        broker.set_delegate(delegation.handler());
         self.store.save_checkpoint(
             request.session_id,
             request.turn_id,
             &serde_json::to_value(&messages)?,
         )?;
-        tracing::debug!(session_id=%request.session_id, turn_id=%request.turn_id,
-            elapsed_ms=admission_start.elapsed().as_millis(), "Turn admission prepared");
         events.send(EngineEvent::Started).await?;
-
-        let deltas = Arc::new(Mutex::new(String::new()));
-        let delta_input = deltas.clone();
-        let delta_stop = CancellationToken::new();
-        let emitter = tokio::spawn(emit_deltas(deltas, events.clone(), delta_stop.clone()));
-        let interrupt = self.interrupt.clone();
-        let interrupt_cancel = cancel.clone();
-        let interrupt_task = tokio::spawn(async move {
-            interrupt_cancel.cancelled().await;
-            interrupt.interrupt(None);
-        });
-        let schemas = broker.initial_definitions().iter().map(|definition|serde_json::from_value(json!({
-            "name":definition.name,"description":definition.description,"parameters":definition.parameters})))
-            .collect::<std::result::Result<Vec<ToolSchema>,_>>()?;
-        let completion = agent
-            .run_stream(
-                messages,
-                Some(schemas),
-                Some(Box::new(move |chunk| {
-                    if let Some(text) = chunk.delta.and_then(|d| d.content) {
-                        delta_input.lock().push_str(&text);
-                    }
-                })),
-            )
-            .await;
-        delta_stop.cancel();
-        let emission = emitter
-            .await
-            .context("Delta emitter stopped")
-            .and_then(|result| result);
-        interrupt_task.abort();
-        let shutdown = broker.shutdown().await;
-        let result = match completion {
-            Ok(result) => result,
-            Err(AgentError::Interrupted { .. }) if cancel.is_cancelled() => {
-                return self
-                    .finish_interrupted_generation(&request, &events, shutdown, emission)
-                    .await;
-            }
-            // Cancellation does not turn I/O, checkpoint, provider or cleanup
-            // faults into success. The worker reports these as actual errors.
-            Err(error) => return Err(error.into()),
+        let agent = AgentLoop {
+            provider: provider.clone(),
+            budget,
+            summary_deadline,
+            tools: Arc::new(BrokerTools::root(broker.clone())),
+            system,
+            max_tokens: request.provider.output_tokens,
+            max_model_calls: MAX_MODEL_CALLS,
+            events: events.clone(),
+            permissions: Some((self.session.permissions().clone(), mode)),
+            journal: Some(Journal {
+                store: self.store.clone(),
+                session: request.session_id,
+                turn: request.turn_id,
+                steering: Some(self.steering.clone()),
+            }),
+            cancel: cancel.clone(),
         };
-
-        let text = result
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == MessageRole::Assistant)
-            .and_then(|m| m.content.clone())
-            .unwrap_or_default();
-        if !result.finished_naturally && !result.interrupted && !cancel.is_cancelled() {
-            self.store.save_checkpoint(
-                request.session_id,
-                request.turn_id,
-                &serde_json::to_value(&result.messages)?,
-            )?;
-            shutdown?;
-            emission?;
-            anyhow::bail!(
-                "Agent stopped before finishing. Partial progress is saved; resume the task with an adjusted context budget or further instructions"
-            );
+        let outcome = agent.run(messages).await;
+        let shutdown = broker.shutdown().await;
+        match outcome {
+            Ok(outcome) => {
+                shutdown?;
+                if outcome.stopped_early {
+                    tracing::warn!(session_id=%request.session_id, "Turn reached its step limit");
+                }
+                self.store.complete_turn(
+                    request.session_id,
+                    request.turn_id,
+                    &serde_json::to_value(&outcome.messages)?,
+                    &outcome.text,
+                    &outcome.usage,
+                )?;
+                learning_turn.completed = true; // Receipt and evidence job committed atomically.
+                events
+                    .send(EngineEvent::Completed {
+                        text: outcome.text.clone(),
+                        usage: outcome.usage,
+                    })
+                    .await?;
+                // The turn is committed and reported; a title is an extra
+                // that can neither delay nor fail it.
+                if let Err(error) = self
+                    .title_conversation(&request, &outcome.text, provider.as_ref(), events, &cancel)
+                    .await
+                {
+                    tracing::warn!(%error, "Conversation title was not updated");
+                }
+                Ok(())
+            }
+            Err(failure) if failure.cancelled() && cancel.is_cancelled() => {
+                self.keep_partial_reply(&request, failure.streamed, MessageStatus::Interrupted)
+                    .await?;
+                // Cleanup faults are still errors after a requested stop.
+                shutdown?;
+                events.send(EngineEvent::Cancelled).await?;
+                Ok(())
+            }
+            Err(LoopFailure { error, streamed }) => {
+                if let Err(stored) = self
+                    .keep_partial_reply(&request, streamed, MessageStatus::Failed)
+                    .await
+                {
+                    tracing::error!(error=%stored, "Could not keep the failed reply");
+                }
+                if let Err(cleanup) = shutdown {
+                    tracing::error!(error=%cleanup, "Tool cleanup failed after a turn error");
+                }
+                Err(error)
+            }
         }
-        if cancel.is_cancelled() || result.interrupted {
-            self.store.save_checkpoint(
-                request.session_id,
-                request.turn_id,
-                &serde_json::to_value(&result.messages)?,
-            )?;
-            shutdown?;
-            emission?;
-            events.send(EngineEvent::Cancelled).await?;
-        } else {
-            let (input_tokens, output_tokens) = result.usage.map_or((0, 0), |usage| {
-                (usage.prompt_tokens, usage.completion_tokens)
-            });
-            let usage = Usage {
-                input_tokens,
-                output_tokens,
-                elapsed_ms: start.elapsed().as_millis() as u64,
-            };
-            self.store.complete_turn(
-                request.session_id,
-                request.turn_id,
-                &serde_json::to_value(&result.messages)?,
-                &text,
-                &usage,
-            )?;
-            learning_turn.completed = true; // Receipt and evidence job committed atomically.
-            shutdown?;
-            emission?;
-            events.send(EngineEvent::Completed { text, usage }).await?;
-        }
-        Ok(())
     }
 }
 
-fn product_status(detail: &str) -> &'static str {
-    let detail = detail.to_ascii_lowercase();
-    if detail.contains("rate limit") {
-        "Waiting for the provider's rate limit…"
-    } else if detail.contains("retry") {
-        "Retrying the model request…"
-    } else if detail.contains("compress") || detail.contains("compact") {
-        "Condensing earlier context…"
-    } else if detail.contains("context") || detail.contains("prompt") {
-        "Preparing conversation…"
-    } else if detail.contains("delegat") || detail.contains("subagent") {
-        "Running a helper agent…"
-    } else {
-        "Working…"
+#[async_trait]
+impl EngineBackend for AgentEngine {
+    fn name(&self) -> &str {
+        "Xylo"
     }
+
+    /// Runs a turn and always ends with one terminal event: failures are sent
+    /// as a classified [`EngineEvent::Error`]. Only a closed event channel is
+    /// returned as an error.
+    async fn run(
+        &self,
+        request: TurnRequest,
+        events: mpsc::Sender<EngineEvent>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let Err(error) = self.run_turn(request, &events, cancel).await else {
+            return Ok(());
+        };
+        if events.is_closed() {
+            return Err(error);
+        }
+        let (kind, retryable) = classify(&error);
+        events
+            .send(EngineEvent::Error {
+                message: format!("{error:#}"),
+                retryable,
+                kind,
+            })
+            .await
+            .map_err(|_| error)
+            .context("Task event consumer disconnected")
+    }
+}
+
+/// The product classification of a turn failure.
+fn classify(error: &anyhow::Error) -> (ErrorKind, bool) {
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ModelError>())
+    {
+        Some(model) => (model.kind(), model.retryable()),
+        None => (ErrorKind::Internal, false),
+    }
+}
+
+/// A model reply reduced to one plain line, or `None` if nothing usable.
+fn clean_title(reply: &str) -> Option<String> {
+    let line = reply
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .trim_matches(|c: char| {
+            matches!(c, '"' | '\'' | '`' | '*' | '#' | '.') || c.is_whitespace()
+        });
+    let title: String = line
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(TITLE_CHARS)
+        .collect();
+    let title = title.trim();
+    (!title.is_empty()).then(|| title.to_owned())
 }
 
 /// Only application-owned endpoints with an explicit internal capability marker
@@ -591,87 +577,94 @@ fn managed_endpoint(paths: &AppPaths, endpoint: &str) -> Result<bool> {
         == Some(true))
 }
 
-fn build_registry(broker: Arc<ToolBroker>, namespace: Option<String>) -> Result<Arc<ToolRegistry>> {
-    let mut registry = ToolRegistry::new();
-    for definition in broker.definitions() {
-        if namespace.is_some() && definition.name == "agent_delegate" {
-            continue;
-        }
-        let schema: ToolSchema = serde_json::from_value(
-            json!({"name":definition.name,"description":definition.description,"parameters":definition.parameters}),
-        )?;
-        let name = definition.name.clone();
-        let tool_broker = broker.clone();
-        let namespace = namespace.clone();
-        registry.register_with_call_id(
-            &definition.name,
-            schema,
-            Arc::new(move |call_id, args| {
-                tokio::task::block_in_place(|| match &namespace {
-                    Some(namespace) => tool_broker.execute_child(namespace, call_id, &name, args),
-                    None => tool_broker.execute(call_id, &name, args),
-                })
-                .map_err(|error| ToolError::ExecutionFailed(format!("{error:#}")))
-            }),
-        );
+/// The journal operation of a call: `call_tool` is journaled under its target.
+fn journaled_operation(name: &str, arguments: &Value) -> Result<(String, Value)> {
+    if name == "call_tool" {
+        Ok((
+            arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .context("Missing restored tool name")?
+                .to_owned(),
+            arguments
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        ))
+    } else {
+        Ok((name.to_owned(), arguments.clone()))
     }
-    Ok(Arc::new(registry))
 }
 
-fn restore_pending_tools(messages: &mut Vec<Message>, broker: &ToolBroker) -> Result<()> {
+/// Settles the unanswered calls of the newest assistant message from the
+/// journal. A call that already ran gets its recorded result; one that never
+/// ran stays pending for a resuming turn and is reported as not run for a new
+/// turn. Unknown outcomes block until the user reconciles them.
+fn settle_pending_tools(
+    messages: &mut Vec<Message>,
+    broker: &ToolBroker,
+    resuming: bool,
+) -> Result<()> {
     refresh_operator_observations(messages, broker)?;
-    let Some(index) = messages.iter().rposition(|message| {
-        message.role == MessageRole::Assistant && message.tool_calls.is_some()
-    }) else {
+    let Some(index) = messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant && !message.tool_calls.is_empty())
+    else {
         return Ok(());
     };
-    let calls = messages[index].tool_calls.clone().unwrap_or_default();
-    let completed: std::collections::HashSet<_> = messages[index + 1..]
+    let answered: HashSet<_> = messages[index + 1..]
         .iter()
         .filter_map(|m| m.tool_call_id.clone())
         .collect();
-    for call in calls {
-        if completed.contains(&call.id) {
+    let calls = messages[index].tool_calls.clone();
+    for call in calls
+        .into_iter()
+        .filter(|call| !answered.contains(&call.id))
+    {
+        let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
+            if !resuming {
+                messages.push(Message::tool_result(
+                    call.id,
+                    error_result("Not run: the arguments were not valid JSON."),
+                ));
+            }
             continue;
-        }
-        let arguments: Value = serde_json::from_str(&call.function.arguments)?;
-        // call_tool aliases use their target operation in the durable journal.
-        let (name, args) = if call.function.name == "call_tool" {
-            (
-                arguments
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .context("Missing restored tool name")?
-                    .to_owned(),
-                arguments
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-            )
-        } else {
-            (call.function.name.clone(), arguments.clone())
         };
-        let result = if let Some(action) =
-            tokio::task::block_in_place(|| broker.recover_journaled(&call.id))?
-        {
-            ensure!(
-                action.intent.name == name && action.intent.arguments == args,
-                "Restored tool call does not match its durable intent"
-            );
-            match action.state.as_str(){
-                "succeeded"=>serde_json::to_string(&broker.model_result(action.intent.id,action.result.context("Successful action has no stored result")?))?,
-                "failed"=>if let Some(result)=action.result {serde_json::to_string(&broker.model_result(action.intent.id,result))?}else{json!({"status":"error","summary":action.error.unwrap_or_else(||"Action failed".into())}).to_string()},
-                "denied"=>json!({"status":"error","summary":action.error.unwrap_or_else(||"Action denied".into())}).to_string(),
-                "outcome_unknown"|"running"|"pending"=>anyhow::bail!("Interrupted action requires recovery/reconciliation before continuing"),
-                _=>anyhow::bail!("Invalid persisted action state"),
+        let (name, args) = journaled_operation(&call.name, &arguments)?;
+        let result = match tokio::task::block_in_place(|| broker.recover_journaled(&call.id))? {
+            Some(action) => {
+                ensure!(
+                    action.intent.name == name && action.intent.arguments == args,
+                    "Restored tool call does not match its durable intent"
+                );
+                match action.state.as_str() {
+                    "succeeded" => serde_json::to_string(
+                        &broker.model_result(
+                            action.intent.id,
+                            action
+                                .result
+                                .context("Successful action has no stored result")?,
+                        ),
+                    )?,
+                    "failed" => match action.result {
+                        Some(result) => {
+                            serde_json::to_string(&broker.model_result(action.intent.id, result))?
+                        }
+                        None => {
+                            error_result(action.error.unwrap_or_else(|| "Action failed".into()))
+                        }
+                    },
+                    "denied" => {
+                        error_result(action.error.unwrap_or_else(|| "Action denied".into()))
+                    }
+                    "outcome_unknown" | "running" | "pending" => anyhow::bail!(
+                        "Interrupted action requires recovery/reconciliation before continuing"
+                    ),
+                    _ => anyhow::bail!("Invalid persisted action state"),
+                }
             }
-        } else {
-            match tokio::task::block_in_place(|| {
-                broker.execute(&call.id, &call.function.name, arguments)
-            }) {
-                Ok(result) => result,
-                Err(error) => json!({"status":"error","summary":format!("{error:#}")}).to_string(),
-            }
+            None if resuming => continue,
+            None => error_result("Not run: the earlier task stopped before this call started."),
         };
         messages.push(Message::tool_result(call.id, result));
     }
@@ -682,48 +675,20 @@ fn restore_pending_tools(messages: &mut Vec<Message>, broker: &ToolBroker) -> Re
 /// exact current-turn operator receipts visible without appending duplicate
 /// results or treating their manual observation as verified native output.
 fn refresh_operator_observations(messages: &mut [Message], broker: &ToolBroker) -> Result<()> {
-    let reviewed = broker.operator_reviewed_action_keys()?;
-    if reviewed.is_empty() {
-        return Ok(());
-    }
-    for (expected_id, key) in reviewed {
+    for (expected_id, key) in broker.operator_reviewed_action_keys()? {
         let Some(call_id) = key.strip_prefix("root:") else {
             continue;
         };
-        let Some((index, call)) = messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, message)| {
-                if message.role != MessageRole::Assistant {
-                    return None;
-                }
-                message
-                    .tool_calls
-                    .as_ref()?
-                    .iter()
-                    .find(|call| call.id == call_id)
-                    .map(|call| (index, call.clone()))
-            })
-        else {
+        let Some((index, call)) = messages.iter().enumerate().rev().find_map(|(index, m)| {
+            (m.role == Role::Assistant)
+                .then(|| m.tool_calls.iter().find(|call| call.id == call_id))
+                .flatten()
+                .map(|call| (index, call.clone()))
+        }) else {
             continue;
         };
-        let arguments: Value = serde_json::from_str(&call.function.arguments)?;
-        let (name, args) = if call.function.name == "call_tool" {
-            (
-                arguments
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .context("Missing reviewed tool name")?
-                    .to_owned(),
-                arguments
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-            )
-        } else {
-            (call.function.name, arguments)
-        };
+        let arguments: Value = serde_json::from_str(&call.arguments)?;
+        let (name, args) = journaled_operation(&call.name, &arguments)?;
         let action = broker
             .journaled(call_id)?
             .context("Reviewed tool action is unavailable")?;
@@ -745,36 +710,13 @@ fn refresh_operator_observations(messages: &mut [Message], broker: &ToolBroker) 
         );
         let presented = serde_json::to_string(&broker.model_result(expected_id, result))?;
         for message in &mut messages[index + 1..] {
-            if message.role == MessageRole::Assistant {
+            if message.role == Role::Assistant {
                 break;
             }
-            if message.role == MessageRole::Tool && message.tool_call_id.as_deref() == Some(call_id)
-            {
-                message.content = Some(presented.clone());
+            if message.role == Role::Tool && message.tool_call_id.as_deref() == Some(call_id) {
+                message.content = presented.clone();
                 break;
             }
-        }
-    }
-    Ok(())
-}
-
-async fn emit_deltas(
-    buffer: Arc<Mutex<String>>,
-    events: mpsc::Sender<EngineEvent>,
-    stop: CancellationToken,
-) -> Result<()> {
-    loop {
-        tokio::select! { _=tokio::time::sleep(Duration::from_millis(32))=>{}, _=stop.cancelled()=>{} }
-        let text = std::mem::take(&mut *buffer.lock());
-        if !text.is_empty() {
-            if stop.is_cancelled() {
-                let _ = events.try_send(EngineEvent::Delta { text });
-            } else {
-                tokio::select! {result=events.send(EngineEvent::Delta{text})=>result?,_ = stop.cancelled()=>{}}
-            }
-        }
-        if stop.is_cancelled() {
-            break;
         }
     }
     Ok(())

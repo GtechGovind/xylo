@@ -50,6 +50,21 @@ impl SetupUi {
     pub(in super::super) fn identity(&self) -> Uuid {
         self.identity
     }
+    /// The saved setup meets every requirement of the component's entries.
+    fn setup_complete(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|status| status.entries.iter().all(|e| e.requirements.is_empty()))
+    }
+    /// Events this form would turn on beyond the saved setup.
+    fn newly_enabled_events(&self) -> bool {
+        let saved = self
+            .saved
+            .as_ref()
+            .map(|setup| setup.enabled_events.as_slice())
+            .unwrap_or_default();
+        self.events.iter().any(|event| !saved.contains(event))
+    }
     fn value(&self, cx: &App) -> anyhow::Result<ComponentSetup> {
         let mut environment = BTreeMap::new();
         for line in self
@@ -103,6 +118,7 @@ impl Xylo {
             .as_ref()
             .is_some_and(|form| form.dirty(cx));
         if !dirty {
+            self.focus_plugins_page(window, cx);
             self.extensions.setup = None;
             if let Some(tab) = tab {
                 self.extensions.tab = tab;
@@ -124,11 +140,12 @@ impl Xylo {
         );
         cx.spawn_in(window, async move |view, cx| {
             let answer = answer.await;
-            let _ = view.update_in(cx, |view, _, cx| {
+            let _ = view.update_in(cx, |view, window, cx| {
                 if matches!(answer, Ok(1))
                     && view.extensions.setup.as_ref().map(|form| form.identity) == identity
                     && view.extensions.setup.as_ref().map(|form| form.revision(cx)) == revision
                 {
+                    view.focus_plugins_page(window, cx);
                     view.extensions.setup = None;
                     if let Some(tab) = tab {
                         view.extensions.tab = tab;
@@ -191,6 +208,7 @@ impl Xylo {
                 }
             }));
         form.initial = form.revision(cx);
+        self.focus_plugins_page(window, cx);
         self.extensions.setup = Some(form);
         self.extension_request(
             "extension_component_status",
@@ -265,6 +283,7 @@ impl Xylo {
         }
     }
     #[cfg(test)]
+    #[allow(dead_code)] // Exercised by the separate native validation test target.
     pub(in super::super) fn validation_setup_secret(
         &mut self,
         value: &str,
@@ -277,6 +296,7 @@ impl Xylo {
         form.identity
     }
     #[cfg(test)]
+    #[allow(dead_code)] // Exercised by the separate native validation test target.
     pub(in super::super) fn validation_setup_stale_picker(
         &mut self,
         identity: Uuid,
@@ -285,6 +305,7 @@ impl Xylo {
         self.extension_apply_workspace(identity, path);
     }
     #[cfg(test)]
+    #[allow(dead_code)] // Exercised by the separate native validation test target.
     pub(in super::super) fn validation_setup_workspace(&self) -> Option<PathBuf> {
         self.extensions
             .setup
@@ -309,6 +330,7 @@ impl Xylo {
         })
         .detach();
     }
+    /// The setup sub-page of one executable component: "Plugins / <package>".
     pub(super) fn extension_setup_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(form) = &self.extensions.setup else {
             return div().into_any_element();
@@ -319,170 +341,205 @@ impl Xylo {
             .ok()
             .as_ref()
             .is_some_and(|value| Some(value) == form.saved.as_ref());
-        let mut body = div()
-            .id("extension-setup")
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        button("extension-setup-back", "Back")
-                            .disabled(busy)
-                            .on_click(cx.listener(|v, _, window, cx| {
-                                v.extension_leave_setup(None, window, cx)
-                            })),
-                    )
-                    .child(
-                        div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                            match form.kind {
-                                ComponentKind::Mcp => "MCP servers",
-                                ComponentKind::Hooks => "Hooks",
-                                ComponentKind::LanguageServer => "Language servers",
-                                _ => &form.component,
-                            }
-                            .to_owned(),
-                        ),
-                    ),
+        let title = match form.kind {
+            ComponentKind::Mcp => "MCP servers".to_owned(),
+            ComponentKind::Hooks => "Hooks".to_owned(),
+            ComponentKind::LanguageServer => "Language servers".to_owned(),
+            _ => form.component.clone(),
+        };
+        let mut page = settings_ui::settings_page("extension-setup", title)
+            .description(
+                "Saving never runs the component. Verification runs it once with this setup.",
             )
-            .child(subtitle(form.package_name.clone()))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child("Project folder")
-                            .child(subtitle(
-                                form.workspace
-                                    .as_ref()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_else(|| {
-                                        "Choose where this component can work".into()
-                                    }),
-                            )),
-                    )
-                    .child(
-                        button("extension-setup-folder", "Choose folder")
-                            .disabled(busy)
-                            .on_click(
-                                cx.listener(|v, _, w, cx| v.extension_setup_pick_workspace(w, cx)),
-                            ),
-                    ),
-            );
+            .breadcrumb(settings_ui::breadcrumb(
+                [settings_ui::crumb("extension-setup-back", "Plugins")
+                    .disabled(busy)
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.extension_leave_setup(None, window, cx)
+                    }))],
+                display_name(&form.package_name),
+            ));
+        if let Some(status) = self.extension_status(cx) {
+            page = page.child(status);
+        }
+        page = page.child(settings_ui::section(
+            "Project folder",
+            None,
+            settings_ui::setting_row(
+                "Works in",
+                Some(
+                    form.workspace
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "Choose where this component can work.".into())
+                        .into(),
+                ),
+                Some(
+                    settings_ui::secondary_button("extension-setup-folder", "Choose folder")
+                        .disabled(busy)
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.extension_setup_pick_workspace(window, cx)
+                        }))
+                        .into_any_element(),
+                ),
+            ),
+        ));
         if form.kind == ComponentKind::Hooks {
-            let mut events = div().flex().flex_wrap().gap_2();
-            for (index, event) in ["PreToolUse", "PostToolUse"].into_iter().enumerate() {
-                events = events.child(
-                    button(
-                        ("extension-hook-event", index),
-                        if event == "PreToolUse" {
+            let setup_complete = form.setup_complete();
+            let events =
+                ["PreToolUse", "PostToolUse"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, event)| {
+                        let on = form.events.iter().any(|enabled| enabled == event);
+                        let label = if event == "PreToolUse" {
                             "Before tools"
                         } else {
                             "After tools"
-                        },
-                    )
-                    .disabled(busy)
-                    .bg(rgb(if form.events.iter().any(|e| e == event) {
-                        selected()
+                        };
+                        settings_ui::setting_row(
+                            label,
+                            None,
+                            Some(
+                                settings_ui::switch(("extension-hook-event", index), label, on)
+                                    .disabled(busy || (!on && !setup_complete))
+                                    .on_change(cx.listener(move |view, _: &bool, _, cx| {
+                                        if let Some(form) = view.extensions.setup.as_mut() {
+                                            if form.events.iter().any(|enabled| enabled == event) {
+                                                form.events.retain(|enabled| enabled != event);
+                                            } else {
+                                                form.events.push(event.into());
+                                            }
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .into_any_element(),
+                            ),
+                        )
+                        .into_any_element()
+                    });
+            page = page.child(settings_ui::section(
+                "Automatic events",
+                Some(
+                    if setup_complete {
+                        "Enable only the events this hook should handle."
                     } else {
-                        panel()
-                    }))
-                    .on_click(cx.listener(move |v, _, _, cx| {
-                        if let Some(form) = v.extensions.setup.as_mut() {
-                            if form.events.iter().any(|e| e == event) {
-                                form.events.retain(|e| e != event);
-                            } else {
-                                form.events.push(event.into());
-                            }
-                        }
-                        cx.notify();
-                    })),
-                );
-            }
-            body = body.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child("Automatic events")
-                    .child(subtitle("Enable only the events this hook should handle."))
-                    .child(events),
-            );
+                        "Complete and save the setup below before enabling automatic events."
+                    }
+                    .into(),
+                ),
+                settings_ui::rows(events),
+            ));
         }
-        body = body.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child("Network access")
-                .child(
-                    Input::new(&form.domains)
+        page = page.child(settings_ui::section(
+            "Network access",
+            None,
+            settings_ui::field(
+                "Allowed hosts",
+                Input::new(&form.domains)
+                    .disabled(busy)
+                    .aria_label("Allowed network hosts"),
+                Some(
+                    "Leave empty for no network access. Use exact hostnames, separated by commas."
+                        .into(),
+                ),
+            ),
+        ));
+        let mut credentials: Vec<AnyElement> = form
+            .credentials
+            .keys()
+            .enumerate()
+            .map(|(index, name)| {
+                let remove = name.clone();
+                settings_ui::setting_row(
+                    name.clone(),
+                    Some("Stored securely".into()),
+                    Some(
+                        settings_ui::destructive_button(
+                            ("extension-secret-remove", index),
+                            "Remove access",
+                        )
                         .disabled(busy)
-                        .aria_label("Allowed network hosts"),
-                )
-                .child(subtitle(
-                    "Leave empty for no network access. Use exact hostnames, separated by commas.",
-                )),
-        );
-        let mut credentials = div().flex().flex_col().gap_2().child("Credentials");
-        for (index, (name, _)) in form.credentials.iter().enumerate() {
-            let name = name.clone();
-            let remove = name.clone();
-            credentials = credentials.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .child(format!("{name} · Stored securely")),
-                    )
-                    .child(
-                        button(("extension-secret-remove", index), "Remove access")
-                            .disabled(busy)
-                            .on_click(cx.listener(move |v, _, _, cx| {
-                                if let Some(form) = v.extensions.setup.as_mut() {
-                                    form.credentials.remove(&remove);
-                                }
-                                cx.notify();
-                            })),
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            if let Some(form) = view.extensions.setup.as_mut() {
+                                form.credentials.remove(&remove);
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element(),
                     ),
-            );
-        }
-        credentials = credentials.child(div().flex().gap_2()
-            .child(div().w(px(155.)).child(Input::new(&form.variable).disabled(busy).aria_label("Credential variable")))
-            .child(div().flex_1().min_w_0().child(Input::new(&form.secret).disabled(busy).aria_label("Credential secret")))
-            .child(button("extension-secret-save", "Store secret").disabled(busy).on_click(cx.listener(|v, _, _, cx| {
-                let Some(form) = &v.extensions.setup else { return; };
-                let variable = form.variable.read(cx).value().trim().to_owned();
-                let secret = form.secret.read(cx).value().to_string();
-                if variable.is_empty() || secret.is_empty() { v.extensions.notice = "Enter a variable name and secret value.".into(); cx.notify(); return; }
-                v.extension_request("extension_component_credential", json!({"id":form.package,"component":form.component,"variable":variable,"secret":secret}), cx);
-            }))));
-        body = body.child(credentials).child(
-            div().flex().child(
-                button(
+                )
+                .into_any_element()
+            })
+            .collect();
+        credentials.push(
+            div()
+                .w_full()
+                .pt(px(12.))
+                .flex()
+                .items_end()
+                .gap(px(8.))
+                .child(
+                    div().w(px(170.)).child(settings_ui::field(
+                        "Variable",
+                        Input::new(&form.variable)
+                            .disabled(busy)
+                            .aria_label("Credential variable"),
+                        None,
+                    )),
+                )
+                .child(
+                    div().flex_1().min_w_0().child(settings_ui::field(
+                        "Secret",
+                        Input::new(&form.secret)
+                            .disabled(busy)
+                            .aria_label("Credential secret"),
+                        None,
+                    )),
+                )
+                .child(
+                    settings_ui::busy(
+                        settings_ui::secondary_button("extension-secret-save", "Store secret").disabled(busy),
+                        self.extension_busy("extension_component_credential", None),
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                            let Some(form) = &view.extensions.setup else {
+                                return;
+                            };
+                            let variable = form.variable.read(cx).value().trim().to_owned();
+                            let secret = form.secret.read(cx).value().to_string();
+                            if variable.is_empty() || secret.is_empty() {
+                                view.extensions.notice =
+                                    "Enter a variable name and secret value.".into();
+                                cx.notify();
+                                return;
+                            }
+                            view.extension_request(
+                                "extension_component_credential",
+                                json!({"id": form.package, "component": form.component, "variable": variable, "secret": secret}),
+                                cx,
+                            );
+                        })),
+                )
+                .into_any_element(),
+        );
+        page = page.child(settings_ui::section(
+            "Credentials",
+            Some("Secrets are kept in Xylo's secret storage and passed to the component as environment variables.".into()),
+            settings_ui::rows(credentials),
+        ));
+        let mut advanced = div().flex().flex_col().gap(px(12.)).child(
+            div().child(
+                settings_ui::text_button(
                     "extension-setup-advanced",
                     if form.advanced {
-                        "Hide advanced"
+                        "Hide advanced settings"
                     } else {
-                        "Advanced"
+                        "Show advanced settings"
                     },
                 )
-                .on_click(cx.listener(|v, _, _, cx| {
-                    if let Some(form) = v.extensions.setup.as_mut() {
+                .on_click(cx.listener(|view, _, _, cx| {
+                    if let Some(form) = view.extensions.setup.as_mut() {
                         form.advanced = !form.advanced;
                     }
                     cx.notify();
@@ -490,86 +547,154 @@ impl Xylo {
             ),
         );
         if form.advanced {
-            let mut timeouts = div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().flex_1().child("Execution timeout"));
-            for seconds in [30, 60, 120, 300] {
-                timeouts = timeouts.child(
-                    button(
-                        ("extension-timeout", seconds as usize),
-                        format!("{seconds}s"),
+            let weak = cx.entity().downgrade();
+            let timeouts = [30, 60, 120, 300]
+                .into_iter()
+                .map(|seconds| {
+                    let weak = weak.clone();
+                    settings_ui::SelectOption::new(
+                        format!("{seconds} seconds"),
+                        form.timeout == seconds,
+                        move |_, cx| {
+                            let _ = weak.update(cx, |view, cx| {
+                                if let Some(form) = view.extensions.setup.as_mut() {
+                                    form.timeout = seconds;
+                                }
+                                cx.notify();
+                            });
+                        },
                     )
-                    .disabled(busy)
-                    .bg(rgb(if form.timeout == seconds {
-                        selected()
-                    } else {
-                        panel()
-                    }))
-                    .on_click(cx.listener(move |v, _, _, cx| {
-                        if let Some(form) = v.extensions.setup.as_mut() {
-                            form.timeout = seconds;
-                        }
-                        cx.notify();
-                    })),
-                );
-            }
-            body = body.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child("Environment variables")
-                    .child(
-                        Textarea::new(&form.environment)
-                            .disabled(busy)
-                            .aria_label("Non-secret environment variables"),
-                    )
-                    .child(subtitle("One NAME=value per line. Store secrets above."))
-                    .child(timeouts),
-            );
-        }
-        if let Some(status) = &form.status {
-            let mut entries = div().flex().flex_col().gap_2();
-            if !unchanged {
-                entries = entries.child(subtitle(
-                    "Unsaved changes. Save setup before verifying this configuration.",
+                })
+                .collect();
+            advanced = advanced
+                .child(settings_ui::field(
+                    "Environment variables",
+                    Textarea::new(&form.environment)
+                        .disabled(busy)
+                        .aria_label("Non-secret environment variables"),
+                    Some("One NAME=value per line. Store secrets above.".into()),
+                ))
+                .child(settings_ui::setting_row(
+                    "Execution timeout",
+                    Some("How long one run may take before it is stopped.".into()),
+                    Some(settings_ui::select(
+                        "extension-timeout",
+                        "Execution timeout",
+                        timeouts,
+                    )),
                 ));
-            }
-            for entry in &status.entries {
-                entries = entries.child(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(div().flex_1().text_sm().child(entry.name.clone()))
-                        .child(subtitle(entry.readiness.label())),
-                );
-                for requirement in &entry.requirements {
-                    entries = entries.child(subtitle(requirement.clone()));
-                }
-                if let Some(evidence) = &entry.evidence {
-                    entries = entries.child(subtitle(evidence.clone()));
-                }
-            }
-            body = body.child(entries).child(subtitle(format!(
-                "Package revision {}",
-                &form.digest[..form.digest.len().min(12)]
-            )));
         }
-        body.child(div().flex().items_center().gap_2()
-            .child(primary("extension-setup-save", "Save setup").disabled(busy || unchanged).opacity(if busy || unchanged { 0.4 } else { 1. }).on_click(cx.listener(|v, _, _, cx| {
-                let Some(form) = &v.extensions.setup else { return; };
-                match form.value(cx) { Ok(setup) => v.extension_request("extension_component_setup", json!({"id":form.package,"component":form.component,"setup":setup}), cx), Err(error) => { v.extensions.notice = error.to_string(); cx.notify(); } }
-            })))
-            .child(button("extension-setup-verify", "Run verification").disabled(busy || !unchanged).opacity(if busy || !unchanged { 0.4 } else { 1. }).on_click(cx.listener(|v, _, _, cx| {
-                let Some(form) = &v.extensions.setup else { return; };
-                if !form.value(cx).ok().as_ref().is_some_and(|setup| Some(setup) == form.saved.as_ref()) {
-                    v.extensions.notice = "Save your setup changes before verification.".into(); cx.notify(); return;
-                }
-                v.extension_request("extension_component_verify", json!({"id":form.package,"component":form.component}), cx);
-            }))))
-            .child(subtitle("Verification runs installed code with this setup. It may change files in the selected project."))
-            .into_any_element()
+        page = page.child(advanced);
+        if let Some(status) = &form.status {
+            let entries = status.entries.iter().map(|entry| {
+                let detail: Vec<&str> = entry
+                    .requirements
+                    .iter()
+                    .map(String::as_str)
+                    .chain(entry.evidence.as_deref())
+                    .collect();
+                let label = entry.readiness.label();
+                settings_ui::setting_row(
+                    entry.name.clone(),
+                    (!detail.is_empty()).then(|| detail.join(" · ").into()),
+                    Some(
+                        settings_ui::pill(
+                            label,
+                            match label {
+                                "Needs setup" => settings_ui::Tone::Warning,
+                                "Unsupported requirement" => settings_ui::Tone::Danger,
+                                _ => settings_ui::Tone::Success,
+                            },
+                        )
+                        .into_any_element(),
+                    ),
+                )
+                .inset()
+                .into_any_element()
+            });
+            page = page.child(settings_ui::section(
+                "Status",
+                Some(
+                    format!(
+                        "{}Package revision {}",
+                        if unchanged {
+                            ""
+                        } else {
+                            "Unsaved changes: save before verifying. "
+                        },
+                        &form.digest[..form.digest.len().min(12)]
+                    )
+                    .into(),
+                ),
+                settings_ui::list_container(entries),
+            ));
+        }
+        page.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(settings_ui::form_actions([
+                    settings_ui::busy(
+                        settings_ui::secondary_button("extension-setup-verify", "Run verification").disabled(busy || !unchanged),
+                        self.extension_busy("extension_component_verify", None),
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                            let Some(form) = &view.extensions.setup else {
+                                return;
+                            };
+                            if !form
+                                .value(cx)
+                                .ok()
+                                .as_ref()
+                                .is_some_and(|setup| Some(setup) == form.saved.as_ref())
+                            {
+                                view.extensions.notice =
+                                    "Save your setup changes before verification.".into();
+                                cx.notify();
+                                return;
+                            }
+                            view.extension_request(
+                                "extension_component_verify",
+                                json!({"id": form.package, "component": form.component}),
+                                cx,
+                            );
+                        }))
+                        .into_any_element(),
+                    settings_ui::busy(
+                        settings_ui::primary_button("extension-setup-save", "Save setup").disabled(busy || unchanged),
+                        self.extension_busy("extension_component_setup", None),
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                            let Some(form) = &view.extensions.setup else {
+                                return;
+                            };
+                            if form.kind == ComponentKind::Hooks
+                                && form.newly_enabled_events()
+                                && !form.setup_complete()
+                            {
+                                view.extensions.notice = "Complete and save the required setup before enabling automatic events.".into();
+                                cx.notify();
+                                return;
+                            }
+                            match form.value(cx) {
+                                Ok(setup) => view.extension_request(
+                                    "extension_component_setup",
+                                    json!({"id": form.package, "component": form.component, "setup": setup}),
+                                    cx,
+                                ),
+                                Err(error) => {
+                                    view.extensions.notice = error.to_string();
+                                    cx.notify();
+                                }
+                            }
+                        }))
+                        .into_any_element(),
+                ]))
+                .child(div().flex().justify_end().child(settings_ui::caption(
+                    "Verification runs installed code with this setup. It may change files in the selected project.",
+                ))),
+        )
+        .into_any_element()
     }
 }

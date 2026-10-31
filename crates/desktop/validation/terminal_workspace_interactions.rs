@@ -2,6 +2,10 @@
 //! routing assertion emits an explicit view event; it does not invoke a model.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/terminal_view.rs"]
 mod terminal_view;
 #[path = "../src/terminal_workspace.rs"]
@@ -153,11 +157,11 @@ mod tests {
                 view.read(cx).active_view().unwrap().entity_id(),
                 second.entity_id()
             );
-            assert_eq!(window.find_all_by_label("✦ Ask Xylo").len(), 2);
+            assert_eq!(window.find_all("terminal-surface").len(), 2);
             window.click("terminal-unsplit", cx);
             window.render_frame(cx);
             assert_eq!(view.read(cx).session_count(), 3);
-            assert_eq!(window.find_all_by_label("✦ Ask Xylo").len(), 1);
+            assert_eq!(window.find_all("terminal-surface").len(), 1);
             // A hidden tab remains selectable after collapsing the split.
             let tabs = tab_buttons(window);
             window.click(tabs[0].path().last().unwrap().clone(), cx);
@@ -182,7 +186,7 @@ mod tests {
             })
         });
         cx.update_window(window, |_, window, cx| {
-            let session = view.read(cx).active_session().unwrap();
+            let session = view.read(cx).active_session(cx).unwrap();
             session
                 .input(b"printf 'workspace-scrollmark\\n'\r".to_vec())
                 .unwrap();

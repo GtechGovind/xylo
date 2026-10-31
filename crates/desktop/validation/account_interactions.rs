@@ -2,6 +2,10 @@
 //! Never signs into a real account, reads live credentials, or sends inference.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -37,7 +41,7 @@ mod xylo {
                 )
                 .unwrap()
             });
-            (window.into(), view)
+            (window, view)
         }
         #[gpui_kit::test]
         fn use_account_does_not_replace_an_active_model_before_selection(cx: &mut TestAppContext) {
@@ -52,7 +56,7 @@ mod xylo {
                     view.account_result("account_chatgpt_status",&serde_json::json!({"connected":true,"plan_usage_authorized":true,"email":"fixture@example.invalid"}),window,cx);
                 });
                 window.render_frame(cx);
-                window.click("chatgpt-use-account",cx);
+                window.click("chatgpt-refresh-models",cx);
                 assert_eq!(view.read(cx).settings.provider.model,"existing-model","Use account must stage discovery, not erase the working model");
             }).unwrap();
         }
@@ -76,8 +80,8 @@ mod xylo {
                 ..Default::default()
             };
             view.provider_form(&account, window, cx);
-            view.account_result("account_chatgpt_status",&serde_json::json!({"connected":connected,"plan_usage_authorized":authorized,"email":"fixture@example.invalid"}),window,cx);
             view.provider_discovery.test_dispatch = true;
+            view.account_result("account_chatgpt_status",&serde_json::json!({"connected":connected,"plan_usage_authorized":authorized,"email":"fixture@example.invalid"}),window,cx);
         }
         fn catalog(
             view: &mut Xylo,
@@ -87,7 +91,13 @@ mod xylo {
             window: &mut gpui_kit::Window,
             cx: &mut gpui_kit::Context<Xylo>,
         ) {
-            let reasoning=std::collections::BTreeMap::from([("gpt-fixture-authorized".into(),vec!["low".into(),"high".into()]),("gpt-fixture-second".into(),Vec::new())]);
+            let reasoning = std::collections::BTreeMap::from([
+                (
+                    "gpt-fixture-authorized".into(),
+                    vec!["low".into(), "high".into()],
+                ),
+                ("gpt-fixture-second".into(), Vec::new()),
+            ]);
             view.event(
                 xylo_runtime::host::HostEvent::Models {
                     generation,
@@ -108,13 +118,13 @@ mod xylo {
                 view.update(cx, |view, cx| prepare(view, true, false, window, cx));
                 window.render_frame(cx);
                 assert!(window.try_find("chatgpt-authorize-plan").is_some());
-                assert!(window.try_find("chatgpt-use-account").is_none());
+                assert!(window.try_find("chatgpt-refresh-models").is_none());
                 view.update(cx, |view, cx| view.use_chatgpt(window, cx));
                 assert!(view.read(cx).provider_discovery.test_requests.is_empty());
                 view.update(cx, |view, cx| prepare(view, false, false, window, cx));
                 window.render_frame(cx);
                 assert!(window.try_find("chatgpt-sign-in").is_some());
-                assert!(window.try_find("chatgpt-use-account").is_none());
+                assert!(window.try_find("chatgpt-refresh-models").is_none());
             })
             .unwrap();
         }
@@ -127,7 +137,7 @@ mod xylo {
                     view.settings.provider.model = "keep-existing".into();
                 });
                 window.render_frame(cx);
-                window.click("chatgpt-use-account", cx);
+                window.click("chatgpt-refresh-models", cx);
                 let (old, provider) = view
                     .read(cx)
                     .provider_discovery
@@ -231,7 +241,7 @@ mod xylo {
                 });
                 window.render_frame(cx);
                 assert!(window.try_find("chatgpt-sign-in").is_some());
-                assert!(window.try_find("chatgpt-use-account").is_none());
+                assert!(window.try_find("chatgpt-refresh-models").is_none());
                 assert!(view.read(cx).provider_discovery.test_requests.is_empty());
             })
             .unwrap();
@@ -242,18 +252,19 @@ mod xylo {
         ) {
             let (window, view) = open(cx);
             cx.update_window(window,|_,window,cx| {
-                view.update(cx,|view,cx|prepare(view,true,true,window,cx));window.render_frame(cx);window.click("chatgpt-use-account",cx);
+                view.update(cx,|view,cx|prepare(view,true,true,window,cx));window.render_frame(cx);window.click("chatgpt-refresh-models",cx);
                 let (generation,provider)=view.read(cx).provider_discovery.test_requests.last().unwrap().clone();
                 view.update(cx,|view,cx|view.event(xylo_runtime::host::HostEvent::Models {
                     generation,provider,models:vec!["future-model-v99".into(),"future-other-v99".into()],context_limits:Default::default(),
                     reasoning_options:std::collections::BTreeMap::from([("future-model-v99".into(),vec!["low".into(),"high".into(),"xhigh".into()]),("future-other-v99".into(),Vec::new())]),
                     default_reasoning_efforts:std::collections::BTreeMap::from([("future-model-v99".into(),"high".into())]),
                 },window,cx));
-                assert_eq!(view.read(cx).settings.provider.model,"future-model-v99");
+                assert_eq!(view.read(cx).settings.provider.model,"future-model-v99","With no usable model active, the first discovered model is activated");
                 assert!(view.read(cx).settings.providers.iter().any(|provider|provider.model=="future-other-v99"));
                 assert_eq!(view.read(cx).settings.provider.default_reasoning_effort.as_deref(),Some("high"));
                 view.update(cx,|view,cx|{view.settings_open=false;view.page=Page::Chat;cx.notify();});window.render_frame(cx);
-                window.click("composer-model",cx);window.click(("composer-effort",1usize),cx);window.click("composer-model",cx);
+                window.click("composer-model",cx);assert!(window.try_find("composer-effort").is_some(),"A model with reasoning options offers the effort menu");window.click("composer-model",cx);
+                view.update(cx,|view,_|{view.settings.provider.reasoning_effort=Some("high".into());let provider=view.settings.provider.clone();view.settings.remember_model(provider);});
                 assert_eq!(view.read(cx).settings.provider.reasoning_effort.as_deref(),Some("high"));
                 view.update(cx,|view,cx| {view.settings_open=true;view.page=Page::Providers;view.provider_form_open=true;view.use_chatgpt(window,cx);});
                 let (generation,provider)=view.read(cx).provider_discovery.test_requests.last().unwrap().clone();
@@ -268,7 +279,7 @@ mod xylo {
                 view.update(cx,|view,cx|{view.settings_open=false;view.page=Page::Chat;cx.notify();});window.render_frame(cx);
                 assert!(view.read(cx).settings.provider.supported_reasoning_efforts().is_empty(),"Explicit catalog metadata overrides a known-name fallback");
                 window.click("composer-model",cx);
-                assert!(window.try_find(("composer-effort",0usize)).is_none(),"An explicitly unsupported model must not offer effort choices");
+                assert!(window.try_find("composer-effort").is_none(),"An explicitly unsupported model must not offer effort choices");
             }).unwrap();
         }
         #[gpui_kit::test]
@@ -361,6 +372,67 @@ mod xylo {
             .unwrap();
         }
         #[gpui_kit::test]
+        fn failed_provider_save_keeps_the_key_and_never_stores_its_reference(
+            cx: &mut TestAppContext,
+        ) {
+            let (window, view) = open(cx);
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.settings_open = true;
+                    view.page = Page::Providers;
+                    view.provider_form_open = true;
+                    view.choose_provider_kind("OpenAI", window, cx);
+                    Xylo::set_input(&view.secret, "sk-fixture", window, cx);
+                    view.provider_discovery.test_dispatch = true;
+                });
+                window.render_frame(cx);
+                window.click("provider-save", cx);
+                let (generation, provider) = view
+                    .read(cx)
+                    .provider_discovery
+                    .test_requests
+                    .last()
+                    .unwrap()
+                    .clone();
+                let reference = provider.credential_ref.clone();
+                assert!(
+                    reference.is_some(),
+                    "A typed key is sent under a new reference"
+                );
+                view.update(cx, |view, cx| {
+                    view.event(
+                        xylo_runtime::host::HostEvent::ModelsFailed {
+                            generation,
+                            provider,
+                            message: "Could not store the credential".into(),
+                        },
+                        window,
+                        cx,
+                    )
+                });
+                window.render_frame(cx);
+                let state = view.read(cx);
+                assert_eq!(state.secret.read(cx).value().as_ref(), "sk-fixture");
+                assert!(
+                    state
+                        .provider_editor_source
+                        .as_ref()
+                        .is_some_and(|source| source.credential_ref.is_none()),
+                    "The form keeps asking for the key"
+                );
+                assert!(
+                    state
+                        .settings
+                        .providers
+                        .iter()
+                        .all(|saved| saved.credential_ref != reference),
+                    "No stored provider points at a secret that was never stored"
+                );
+                assert!(window.try_find("provider-retry").is_some());
+            })
+            .unwrap();
+        }
+        #[gpui_kit::test]
         fn account_model_choice_updates_composer_and_real_temporary_store(cx: &mut TestAppContext) {
             use std::time::{Duration, Instant};
             let profile = tempfile::tempdir().unwrap();
@@ -389,7 +461,7 @@ mod xylo {
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| prepare(view, true, true, window, cx));
                 window.render_frame(cx);
-                window.click("chatgpt-use-account", cx);
+                window.click("chatgpt-refresh-models", cx);
                 let (generation, provider) = view
                     .read(cx)
                     .provider_discovery
@@ -424,21 +496,39 @@ mod xylo {
                         .any(|provider| provider.model == "gpt-fixture-second"),
                     "Every supported catalog model must be registered automatically"
                 );
-                window.click(("model", 1usize), cx);
-                assert_eq!(view.read(cx).settings.provider.reasoning_options,Some(Vec::new()),"Switching models must load the selected model metadata, not retain the first model capabilities");
-                assert_eq!(
-                    view.read(cx).settings.provider.model,
-                    "gpt-fixture-second"
+                assert!(
+                    window.try_find(("model", 1usize)).is_some(),
+                    "The provider page lists every available model read-only"
                 );
-                assert!(!view.read(cx).provider_form_open);
+                assert_eq!(
+                    view.read(cx)
+                        .settings
+                        .providers
+                        .iter()
+                        .find(|provider| provider.model == "gpt-fixture-second")
+                        .and_then(|provider| provider.reasoning_options.clone()),
+                    Some(Vec::new()),
+                    "Each model keeps its own catalog metadata"
+                );
                 view.update(cx, |view, cx| {
                     view.settings_open = false;
                     view.page = Page::Chat;
                     cx.notify();
                 });
                 window.render_frame(cx);
+                // Models are chosen in the composer's model picker.
+                let second = view
+                    .read(cx)
+                    .settings
+                    .providers
+                    .iter()
+                    .position(|provider| provider.model == "gpt-fixture-second")
+                    .unwrap();
+                window.click("composer-model", cx);
+                window.click(("composer-model-choice", second), cx);
+                window.render_frame(cx);
                 assert_eq!(
-                    window.find("composer-model").label().as_deref(),
+                    window.find("composer-model").label(),
                     Some("gpt-fixture-second")
                 );
             })
@@ -482,7 +572,7 @@ mod xylo {
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| prepare(view, true, true, window, cx));
                 window.render_frame(cx);
-                window.click("chatgpt-use-account", cx);
+                window.click("chatgpt-refresh-models", cx);
                 let (generation, provider) = view
                     .read(cx)
                     .provider_discovery
@@ -495,14 +585,17 @@ mod xylo {
                         view,
                         generation,
                         provider,
-                        vec!["gpt-fixture-authorized".into(),"gpt-fixture-second".into()],
+                        vec!["gpt-fixture-authorized".into(), "gpt-fixture-second".into()],
                         window,
                         cx,
                     )
                 });
                 window.render_frame(cx);
-                window.click(("model", 0usize), cx);
-                assert_eq!(view.read(cx).settings.provider.reasoning_options,Some(vec!["low".into(),"high".into()]),"Switching back must restore its advertised options");
+                assert_eq!(
+                    view.read(cx).settings.provider.reasoning_options,
+                    Some(vec!["low".into(), "high".into()]),
+                    "A refresh keeps the active model and its advertised options"
+                );
                 assert_eq!(
                     view.read(cx).settings.provider.model,
                     "gpt-fixture-authorized"

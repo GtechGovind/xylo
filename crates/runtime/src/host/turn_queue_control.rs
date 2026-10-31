@@ -8,36 +8,37 @@ pub(super) struct PreparedStop {
     fence: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
     pending: Option<Uuid>,
 }
+/// Weak views of one worker's queue state, readable without the workers lock.
+struct Fence {
+    stopped: std::sync::Weak<AtomicBool>,
+    epoch: std::sync::Weak<std::sync::atomic::AtomicU64>,
+    active: std::sync::Weak<AtomicBool>,
+}
+
 #[derive(Default)]
 pub(super) struct TurnQueueControl {
     gates: Mutex<HashMap<Uuid, std::sync::Weak<Mutex<()>>>>,
-    fences: parking_lot::Mutex<
-        HashMap<
-            Uuid,
-            (
-                std::sync::Weak<AtomicBool>,
-                std::sync::Weak<std::sync::atomic::AtomicU64>,
-            ),
-        >,
-    >,
+    fences: parking_lot::Mutex<HashMap<Uuid, Fence>>,
 }
 impl TurnQueueControl {
-    pub(super) fn register(
-        &self,
-        session: Uuid,
-        stopped: &Arc<AtomicBool>,
-        epoch: &Arc<std::sync::atomic::AtomicU64>,
-    ) {
+    pub(super) fn register(&self, session: Uuid, worker: &super::worker_control::WorkerHandle) {
         let mut fences = self.fences.lock();
-        fences.retain(|_, (stop, _)| stop.strong_count() > 0);
-        fences.insert(session, (Arc::downgrade(stopped), Arc::downgrade(epoch)));
+        fences.retain(|_, fence| fence.stopped.strong_count() > 0);
+        fences.insert(
+            session,
+            Fence {
+                stopped: Arc::downgrade(&worker.queue_stopped),
+                epoch: Arc::downgrade(&worker.queue_epoch),
+                active: Arc::downgrade(&worker.active),
+            },
+        );
     }
     pub(super) fn stop(&self, target: Option<Uuid>) {
         let mut fences = self.fences.lock();
-        fences.retain(|_, (stop, _)| stop.strong_count() > 0);
-        for (session, (stop, epoch)) in fences.iter() {
+        fences.retain(|_, fence| fence.stopped.strong_count() > 0);
+        for (session, fence) in fences.iter() {
             if target.is_none_or(|target| target == *session)
-                && let (Some(stop), Some(epoch)) = (stop.upgrade(), epoch.upgrade())
+                && let (Some(stop), Some(epoch)) = (fence.stopped.upgrade(), fence.epoch.upgrade())
             {
                 stop.store(true, Ordering::Release);
                 epoch.fetch_add(1, Ordering::AcqRel);
@@ -46,10 +47,27 @@ impl TurnQueueControl {
     }
     pub(super) fn fence(&self, session: Uuid) -> Option<(Arc<std::sync::atomic::AtomicU64>, u64)> {
         let fences = self.fences.lock();
-        let (_, epoch) = fences.get(&session)?;
-        let epoch = epoch.upgrade()?;
+        let epoch = fences.get(&session)?.epoch.upgrade()?;
         let expected = epoch.load(Ordering::Acquire);
         Some((epoch, expected))
+    }
+    /// Sessions with a running turn. Never waits for the workers lock, so a
+    /// Stop is captured even while admission holds it.
+    pub(super) fn active_sessions(&self) -> Vec<Uuid> {
+        self.fences
+            .lock()
+            .iter()
+            .filter(|(_, fence)| {
+                fence
+                    .active
+                    .upgrade()
+                    .is_some_and(|active| active.load(Ordering::Acquire))
+            })
+            .map(|(session, _)| *session)
+            .collect()
+    }
+    fn sessions(&self) -> Vec<Uuid> {
+        self.fences.lock().keys().copied().collect()
     }
 
     pub(super) async fn gate(&self, session: Uuid) -> Result<tokio::sync::OwnedMutexGuard<()>> {
@@ -87,22 +105,10 @@ impl HostClient {
         self.enqueue(HostCommand::RunQueuedTurn(request_id, session, item))
     }
 }
-pub(super) fn tighter(captured: PermissionMode, current: PermissionMode) -> PermissionMode {
-    fn rank(mode: PermissionMode) -> u8 {
-        match mode {
-            PermissionMode::ReadOnly => 0,
-            PermissionMode::AskForWrites => 1,
-            PermissionMode::AcceptEdits => 2,
-            PermissionMode::Auto => 3,
-        }
-    }
-    if rank(current) < rank(captured) {
-        current
-    } else {
-        captured
-    }
-}
 impl HostState {
+    /// The one Stop implementation, captured synchronously at intake so no
+    /// later admission or dispatch can overtake it. A Stop without a target
+    /// applies only when exactly one chat is running or starting.
     pub(super) fn capture_stop(&self, command: HostCommand) -> HostCommand {
         let HostCommand::Worker(target, WorkerCommand::Cancel) = command else {
             return command;
@@ -110,14 +116,7 @@ impl HostState {
         let target = if let Some(session) = target {
             Some(session)
         } else {
-            let Ok(workers) = self.workers.try_lock() else {
-                return HostCommand::RefusedCancel;
-            };
-            let mut sessions = workers
-                .iter()
-                .filter(|(_, worker)| worker.active.load(Ordering::Acquire))
-                .map(|(session, _)| *session)
-                .collect::<Vec<_>>();
+            let mut sessions = self.turn_queue.active_sessions();
             sessions.extend(self.queued.lock().keys().copied());
             sessions.sort();
             sessions.dedup();
@@ -129,7 +128,7 @@ impl HostState {
         self.turn_queue.stop(target);
         let mut sessions = target.into_iter().collect::<Vec<_>>();
         if target.is_none() {
-            sessions.extend(self.turn_queue.fences.lock().keys().copied());
+            sessions.extend(self.turn_queue.sessions());
         }
         let queued = self.queued.lock();
         for (session, (_, token)) in queued.iter() {
@@ -173,24 +172,9 @@ impl HostState {
             }
         }
     }
-    pub(super) async fn publish_prepared_startup_stops(
-        &self,
-        stops: &[PreparedStop],
-    ) -> Result<()> {
-        for stop in stops {
-            if stop.pending.is_some() {
-                self.events
-                    .send(HostEvent::Engine(Envelope::new(
-                        Uuid::new_v4(),
-                        Some(stop.session),
-                        0,
-                        EngineEvent::Cancelled,
-                    )))
-                    .await?;
-            }
-        }
-        Ok(())
-    }
+    /// Cancels the running turn of each captured session and pauses its
+    /// queue. A pending admission was already cancelled at capture; it reports
+    /// its own `Cancelled` unless it had dispatched, so the UI sees exactly one.
     pub(super) async fn handle_prepared_stops(
         self: &Arc<Self>,
         stops: Vec<PreparedStop>,
@@ -199,19 +183,7 @@ impl HostState {
             if !self.stop_is_current(&stop) {
                 continue;
             }
-            if stop.pending.is_none() {
-                let workers = self.workers.lock().await;
-                if !self.stop_is_current(&stop) {
-                    continue;
-                }
-                if let Some(worker) = workers.get(&stop.session) {
-                    let message =
-                        Envelope::new(Uuid::new_v4(), Some(stop.session), 0, WorkerCommand::Cancel);
-                    if worker.commands.try_send(message).is_err() {
-                        worker.stop.cancel();
-                    }
-                }
-            }
+            self.stop_active_run(stop.session).await;
             let host = self.clone();
             tokio::spawn(async move {
                 let Ok(_guard) = host.turn_queue.gate(stop.session).await else {
@@ -223,10 +195,7 @@ impl HostState {
                 let store = host.store.clone();
                 let session = stop.session;
                 let _ = tokio::task::spawn_blocking(move || {
-                    store.pause_turn_queue(
-                        session,
-                        "The task stopped. Send a queued message when ready.",
-                    )
+                    store.pause_turn_queue(session, STOPPED_REASON)
                 })
                 .await;
                 let _ = host.emit_turn_queue(Uuid::nil(), session, None).await;
@@ -436,8 +405,8 @@ impl HostState {
             )
         })
         .await??;
-        let mut turn = selected.turn.clone();
-        turn.permissions = tighter(turn.permissions, self.settings.lock().await.permissions);
+        // Admission applies the current permission mode and standing approvals.
+        let turn = selected.turn.clone();
         let admitted = Arc::new(AtomicBool::new(false));
         let result = self
             .worker_command_with_queue_receipt(
@@ -487,6 +456,9 @@ impl HostState {
                 .await;
         }
     }
+    /// After a run ends, starts the next queued message or pauses the queue
+    /// with the reason shown on each item. Holds the `operations` read gate so
+    /// no worker starts while an update installs.
     pub(super) fn settle_turn_queue(
         self: &Arc<Self>,
         session: Uuid,
@@ -497,31 +469,36 @@ impl HostState {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
         let host = self.clone();
         Box::pin(async move {
+            let _operation = host.operations.read().await;
             let Ok(_guard) = host.turn_queue.gate(session).await else {
                 return;
             };
             if epoch.load(Ordering::Acquire) != expected {
                 return;
             }
-            if !successful || stopped.load(Ordering::Acquire) {
+            let pause = if stopped.load(Ordering::Acquire) {
+                Some(STOPPED_REASON)
+            } else if !successful {
+                Some(FAILED_REASON)
+            } else if host.installing.load(Ordering::Acquire) {
+                Some(INSTALLING_REASON)
+            } else {
+                None
+            };
+            if let Some(reason) = pause {
                 let store = host.store.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    store.pause_turn_queue(
-                        session,
-                        "The task stopped. Send a queued message when ready.",
-                    )
-                })
-                .await;
+                let _ =
+                    tokio::task::spawn_blocking(move || store.pause_turn_queue(session, reason))
+                        .await;
             } else {
                 let store = host.store.clone();
                 let rows = tokio::task::spawn_blocking(move || store.turn_queue(session)).await;
                 if let Ok(Ok(rows)) = rows
                     && let Some(item) = rows.first()
                     && !item.paused
+                    && host.run_queue_locked(session, item.id, true).await.is_err()
                 {
-                    if host.run_queue_locked(session, item.id, true).await.is_err() {
-                        tracing::debug!(%session,"Queued message could not start; message retained for retry");
-                    }
+                    tracing::debug!(%session, "Queued message could not start; message retained for retry");
                 }
             }
             let _ = host.emit_turn_queue(Uuid::nil(), session, None).await;
@@ -529,218 +506,10 @@ impl HostState {
     }
 }
 
+/// Queue pause reasons, shown on each paused item.
+const STOPPED_REASON: &str = "You stopped the task. Resume the queue when ready.";
+const FAILED_REASON: &str = "The task ended with an error. Resume the queue when ready.";
+const INSTALLING_REASON: &str = "Paused while an update installs. Resume the queue when ready.";
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn queued(host: &HostState) -> (TurnRequest, crate::drafts::DraftSubmission) {
-        let key = xylo_services::DraftKey {
-            session_id: Uuid::new_v4(),
-            workspace: Some(host.paths.data.clone()),
-        };
-        let current = host.store.draft(&key).unwrap();
-        let xylo_services::DraftSave::Saved(saved) = host
-            .store
-            .save_draft(&xylo_services::DraftWrite {
-                key: key.clone(),
-                expected_revision: current.revision,
-                mutation_id: Uuid::new_v4(),
-                text: "next task".into(),
-                attachments: vec![],
-            })
-            .unwrap()
-        else {
-            panic!("draft conflict")
-        };
-        let sub = crate::drafts::DraftSubmission {
-            key,
-            expected_revision: saved.revision,
-            text: saved.text,
-            attachments: saved.attachments,
-        };
-        let turn = TurnRequest {
-            session_id: sub.key.session_id,
-            turn_id: Uuid::new_v4(),
-            prompt: sub.text.clone(),
-            workspace: host.paths.data.clone(),
-            provider: ProviderConfig {
-                model: "fixture".into(),
-                ..Default::default()
-            },
-            permissions: PermissionMode::ReadOnly,
-            attachments: vec![],
-        };
-        (turn, sub)
-    }
-    #[tokio::test]
-    async fn idle_enqueue_preserves_manual_send_and_never_registers_transcript() {
-        let (_dir, host, events) = super::super::tests::state();
-        let (turn, sub) = queued(&host);
-        let session = turn.session_id;
-        let id = turn.turn_id;
-        host.handle_queue_draft(Uuid::new_v4(), turn, sub)
-            .await
-            .unwrap();
-        let HostEvent::QueueAdded {
-            result: Ok(receipt),
-            ..
-        } = events.recv().await.unwrap()
-        else {
-            panic!("missing queue receipt")
-        };
-        assert!(receipt.cleared);
-        assert!(receipt.item.paused);
-        assert!(host.store.messages(session, 10).unwrap().is_empty());
-        assert!(host.workers.lock().await.is_empty());
-        assert_eq!(host.store.turn_queue(session).unwrap()[0].id, id);
-    }
-    #[tokio::test]
-    async fn stopped_completion_pauses_tail_and_stale_settlement_cannot_touch_new_run() {
-        let (_dir, host, _events) = super::super::tests::state();
-        let (turn, sub) = queued(&host);
-        let session = turn.session_id;
-        let id = turn.turn_id;
-        host.store.queue_turn(&turn, &sub).unwrap();
-        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(3));
-        let stopped = Arc::new(AtomicBool::new(true));
-        host.settle_turn_queue(session, true, epoch.clone(), 3, stopped.clone())
-            .await;
-        assert!(host.store.queued_turn(session, id).unwrap().unwrap().paused);
-        host.store
-            .set_queued_turn_paused(session, id, false, None)
-            .unwrap();
-        epoch.store(4, Ordering::Release);
-        stopped.store(false, Ordering::Release);
-        host.settle_turn_queue(session, false, epoch, 3, stopped)
-            .await;
-        assert!(
-            !host.store.queued_turn(session, id).unwrap().unwrap().paused,
-            "old failure changed the newer run's tail"
-        );
-        assert!(host.workers.lock().await.is_empty());
-    }
-    #[tokio::test]
-    async fn update_refusal_returns_correlated_queue_receipt_without_clearing_draft() {
-        let (_dir, host, events) = super::super::tests::state();
-        let (turn, sub) = queued(&host);
-        let request = Uuid::new_v4();
-        host.installing.store(true, Ordering::Release);
-        assert!(
-            !host
-                .prepare_command(&HostCommand::QueueDraft(request, turn, sub.clone()))
-                .await
-                .unwrap()
-        );
-        assert!(
-            matches!(events.recv().await.unwrap(),HostEvent::QueueAdded {request_id,result:Err(_)} if request_id==request)
-        );
-        assert_eq!(host.store.draft(&sub.key).unwrap().text, sub.text);
-    }
-    #[tokio::test]
-    async fn successful_completion_admits_fifo_with_latest_policy_before_worker_dispatch() {
-        let (_dir, host, events) = super::super::tests::state();
-        let (mut turn, sub) = queued(&host);
-        turn.permissions = PermissionMode::Auto;
-        let session = turn.session_id;
-        let id = turn.turn_id;
-        host.store.queue_turn(&turn, &sub).unwrap();
-        let (mut incoming, _exit) = super::super::draft_tests::mock_worker(&host, session, 2).await;
-        host.settings.lock().await.permissions = PermissionMode::ReadOnly;
-        let (epoch, stopped) = {
-            let workers = host.workers.lock().await;
-            let worker = &workers[&session];
-            (worker.queue_epoch.clone(), worker.queue_stopped.clone())
-        };
-        host.settle_turn_queue(session, true, epoch, 0, stopped)
-            .await;
-        let HostEvent::QueuedTurnStarted { item, .. } = events.recv().await.unwrap() else {
-            panic!("admission receipt must precede dispatch")
-        };
-        assert_eq!(item.id, id);
-        let WorkerCommand::RunAuthorized { turn, .. } = incoming.recv().await.unwrap().payload
-        else {
-            panic!("queued turn was not dispatched")
-        };
-        assert_eq!(turn.turn_id, id);
-        assert_eq!(turn.permissions, PermissionMode::ReadOnly);
-        assert_eq!(host.store.messages(session, 10).unwrap().len(), 1);
-        assert!(host.store.turn_queue(session).unwrap().is_empty());
-        // A repeated old terminal receipt must not replay the admitted turn.
-        assert!(incoming.try_recv().is_err());
-    }
-    #[tokio::test]
-    async fn stop_after_manual_send_preparation_cancels_before_session_gate_admission() {
-        let (_dir, host, _events) = super::super::tests::state();
-        let (turn, sub) = queued(&host);
-        let session = turn.session_id;
-        let id = turn.turn_id;
-        host.store.queue_turn(&turn, &sub).unwrap();
-        let (mut incoming, _exit) = super::super::draft_tests::mock_worker(&host, session, 2).await;
-        let request = Uuid::new_v4();
-        let command = HostCommand::RunQueuedTurn(request, session, id);
-        assert!(host.prepare_command(&command).await.unwrap());
-        assert!(
-            host.prepare_command(&HostCommand::Worker(Some(session), WorkerCommand::Cancel))
-                .await
-                .unwrap()
-        );
-        // The older manual Send has not yet entered its async handler. Stop
-        // must cancel its prepared reservation rather than be reset by it.
-        host.handle(command).await.unwrap();
-        assert!(incoming.try_recv().is_err());
-        assert!(host.store.messages(session, 10).unwrap().is_empty());
-        assert!(host.store.queued_turn(session, id).unwrap().unwrap().paused);
-        assert!(host.queued.lock().is_empty());
-    }
-    #[tokio::test]
-    async fn older_prepared_stop_cannot_cancel_a_later_explicit_queued_send() {
-        let (_dir, host, _events) = super::super::tests::state();
-        let (turn, sub) = queued(&host);
-        let session = turn.session_id;
-        let id = turn.turn_id;
-        host.store.queue_turn(&turn, &sub).unwrap();
-        let (mut incoming, _exit) = super::super::draft_tests::mock_worker(&host, session, 3).await;
-        let stop = host.capture_stop(HostCommand::Worker(Some(session), WorkerCommand::Cancel));
-        assert!(host.prepare_command(&stop).await.unwrap());
-        let send = HostCommand::RunQueuedTurn(Uuid::new_v4(), session, id);
-        assert!(host.prepare_command(&send).await.unwrap());
-        host.handle(send).await.unwrap();
-        assert!(matches!(
-            incoming.recv().await.unwrap().payload,
-            WorkerCommand::RunAuthorized { .. }
-        ));
-        host.handle(stop).await.unwrap();
-        assert!(
-            incoming.try_recv().is_err(),
-            "older Stop cancelled the explicitly resumed run"
-        );
-        assert!(
-            !host.workers.lock().await[&session]
-                .queue_stopped
-                .load(Ordering::Acquire)
-        );
-    }
-    #[tokio::test]
-    async fn generic_stop_refuses_multiple_owners_without_marking_either_worker() {
-        let (_dir, host, _events) = super::super::tests::state();
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let (_a, _exit_a) = super::super::draft_tests::mock_worker(&host, a, 2).await;
-        let (_b, _exit_b) = super::super::draft_tests::mock_worker(&host, b, 2).await;
-        {
-            let workers = host.workers.lock().await;
-            for worker in workers.values() {
-                worker.active.store(true, Ordering::Release);
-            }
-        }
-        assert!(matches!(
-            host.capture_stop(HostCommand::Worker(None, WorkerCommand::Cancel)),
-            HostCommand::RefusedCancel
-        ));
-        let workers = host.workers.lock().await;
-        assert!(
-            workers
-                .values()
-                .all(|worker| !worker.queue_stopped.load(Ordering::Acquire))
-        );
-    }
-}
+mod tests;

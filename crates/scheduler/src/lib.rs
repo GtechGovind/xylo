@@ -1,6 +1,15 @@
 //! Cross-process durable UTC scheduling, independent of native capabilities.
 //! The host claims prompts, renews active leases, and acknowledges completion;
 //! this library never executes an agent or shell command.
+//!
+//! Each due time is one occurrence with a stable id (`ScheduleClaim::occurrence`,
+//! derived from the task id and due time). Dispatch is at most once per
+//! occurrence: a claim whose lease expires (its host died) is never handed out
+//! again; the task moves on to its next scheduled time and records the
+//! occurrence in `interrupted`. Completion is idempotent and advances the task
+//! from the claimed due time, so the cadence follows the schedule rather than
+//! how long a run took; occurrences missed while a run or the app was busy are
+//! coalesced into one catch-up run.
 
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Duration, Utc};
@@ -19,16 +28,72 @@ const MAX_TASKS: usize = 128;
 const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PROMPT_BYTES: usize = 8192;
 const LEASE_MINUTES: i64 = 5;
+/// Bound on the scan for the latest missed occurrence (an every-second cron
+/// that was offline for days would otherwise iterate for a long time).
+const MAX_MISSED_SCAN: usize = 100_000;
 
+/// A durable recurring prompt.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScheduledTask {
     pub id: Uuid,
     pub prompt: String,
     pub workspace: PathBuf,
+    /// Seven-field UTC cron expression.
     pub cron: String,
+    /// Due time of the next occurrence to dispatch.
     pub next_run: DateTime<Utc>,
     pub enabled: bool,
-    pub lease_until: Option<DateTime<Utc>>,
+    /// The occurrence a host is currently running, if any. Owned by the
+    /// scheduler: [`Scheduler::save`] never takes it from the caller.
+    pub claim: Option<ScheduleClaim>,
+    /// The most recent occurrence whose host stopped renewing its lease
+    /// before acknowledging it. It was not dispatched again.
+    pub interrupted: Option<Uuid>,
+}
+
+/// One claimed occurrence of a task.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleClaim {
+    /// Stable id of this occurrence; hosts use it as the session and turn id.
+    pub occurrence: Uuid,
+    /// The scheduled time this occurrence stands for.
+    pub due: DateTime<Utc>,
+    pub lease_until: DateTime<Utc>,
+}
+
+impl ScheduledTask {
+    /// The stable id of the occurrence due at `due`.
+    pub fn occurrence_at(id: Uuid, due: DateTime<Utc>) -> Uuid {
+        Uuid::new_v5(&id, due.to_rfc3339().as_bytes())
+    }
+}
+
+/// The occurrence after `due`. When that time has already passed (a run
+/// overlapped later occurrences or the app was not running), the most recent
+/// missed occurrence is returned so they coalesce into one catch-up run.
+fn following(
+    schedule: &cron::Schedule,
+    due: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let mut upcoming = schedule.after(&due);
+    let first = upcoming.next()?;
+    if first > now {
+        return Some(first);
+    }
+    let mut latest = first;
+    for (scanned, occurrence) in upcoming.enumerate() {
+        if occurrence > now {
+            return Some(latest);
+        }
+        if scanned >= MAX_MISSED_SCAN {
+            return Some(now);
+        }
+        latest = occurrence;
+    }
+    Some(latest)
 }
 
 /// No cached state: every operation locks and rereads the durable store.
@@ -39,6 +104,9 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Open the store at `path`; new schedules default to `workspace`. A store
+    /// that does not decode or validate is deleted and replaced by an empty
+    /// one; schedules are not carried across format changes.
     pub fn new(path: PathBuf, workspace: PathBuf) -> Result<Self> {
         ensure!(path.is_absolute(), "Schedule store path must be absolute");
         std::fs::create_dir_all(path.parent().context("Schedule path has no parent")?)?;
@@ -78,15 +146,17 @@ impl Scheduler {
             bytes.len() as u64 <= MAX_STORE_BYTES,
             "Schedule store exceeds 2MiB budget"
         );
-        let tasks: Vec<ScheduledTask> = serde_json::from_slice(&bytes)
-            .context("Invalid schedule store; preserve it for recovery")?;
-        ensure!(tasks.len() <= MAX_TASKS, "Schedule count exceeds limit");
-        let mut seen = std::collections::HashSet::new();
-        for task in &tasks {
-            Self::validate_task(task)?;
-            ensure!(seen.insert(task.id), "Duplicate schedule id");
-        }
-        Ok(tasks)
+        let decode = || -> Result<Vec<ScheduledTask>> {
+            let tasks: Vec<ScheduledTask> = serde_json::from_slice(&bytes)?;
+            ensure!(tasks.len() <= MAX_TASKS, "Schedule count exceeds limit");
+            let mut seen = std::collections::HashSet::new();
+            for task in &tasks {
+                Self::validate_task(task)?;
+                ensure!(seen.insert(task.id), "Duplicate schedule id");
+            }
+            Ok(tasks)
+        };
+        decode().map_err(|error| InvalidStore(format!("{error:#}")).into())
     }
 
     fn write(&self, tasks: &[ScheduledTask]) -> Result<()> {
@@ -142,7 +212,15 @@ impl Scheduler {
                 Err(error) => return Err(error.into()),
             }
         }
-        let mut tasks = self.read()?;
+        // An unreadable store is deleted under the lock and starts empty.
+        let mut tasks = match self.read() {
+            Ok(tasks) => tasks,
+            Err(error) if error.downcast_ref::<InvalidStore>().is_some() => {
+                std::fs::remove_file(&self.path)?;
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
         let previous = write.then(|| tasks.clone());
         let result = f(&mut tasks)?;
         if previous.as_ref().is_some_and(|previous| previous != &tasks) {
@@ -162,10 +240,15 @@ impl Scheduler {
         tokio::task::spawn_blocking(move || scheduler.transaction(write, f)).await?
     }
 
+    /// Every stored task.
     pub async fn list(&self) -> Result<Vec<ScheduledTask>> {
         self.transact(false, |tasks| Ok(tasks.clone())).await
     }
 
+    /// Insert or update a task's user-editable fields (prompt, workspace,
+    /// cron, enabled). The active claim and interruption record always come
+    /// from the store, so a stale copy cannot release a running occurrence.
+    /// Changing the cron expression reschedules from now.
     pub async fn save(&self, mut task: ScheduledTask) -> Result<ScheduledTask> {
         Self::validate_task(&task)?;
         task.workspace = std::fs::canonicalize(&task.workspace)?;
@@ -174,34 +257,42 @@ impl Scheduler {
             "Schedule workspace is not a directory"
         );
         self.transact(true, move |tasks| {
-            if let Some(index) = tasks.iter().position(|t| t.id == task.id) {
-                tasks[index] = task.clone();
+            if let Some(stored) = tasks.iter_mut().find(|t| t.id == task.id) {
+                if stored.cron != task.cron {
+                    stored.next_run = first_occurrence(&task.cron)?;
+                }
+                stored.prompt = task.prompt;
+                stored.workspace = task.workspace;
+                stored.cron = task.cron;
+                stored.enabled = task.enabled;
+                Ok(stored.clone())
             } else {
                 ensure!(tasks.len() < MAX_TASKS, "Schedule limit reached");
+                task.claim = None;
+                task.interrupted = None;
                 tasks.push(task.clone());
+                Ok(task)
             }
-            Ok(task)
         })
         .await
     }
 
+    /// Create an enabled task in this scheduler's workspace.
     pub async fn create(&self, prompt: String, expression: String) -> Result<ScheduledTask> {
-        let cron = cron::Schedule::from_str(&expression).context("Invalid UTC cron expression")?;
         let task = ScheduledTask {
             id: Uuid::new_v4(),
             prompt,
             workspace: self.workspace.clone(),
+            next_run: first_occurrence(&expression)?,
             cron: expression,
-            next_run: cron
-                .upcoming(Utc)
-                .next()
-                .context("No future schedule occurrence")?,
             enabled: true,
-            lease_until: None,
+            claim: None,
+            interrupted: None,
         };
         self.save(task).await
     }
 
+    /// Delete a task.
     pub async fn remove(&self, id: Uuid) -> Result<()> {
         self.transact(true, move |tasks| {
             let count = tasks.len();
@@ -212,16 +303,27 @@ impl Scheduler {
         .await
     }
 
+    /// Claim every enabled task whose next occurrence is due and hand each
+    /// out exactly once; the returned tasks carry their new `claim`. Claims
+    /// whose lease expired are retired first (see the module docs).
     pub async fn claim_due(&self) -> Result<Vec<ScheduledTask>> {
         self.transact(true, |tasks| {
             let now = Utc::now();
             let mut due = Vec::new();
             for task in tasks.iter_mut() {
-                if task.enabled
-                    && task.next_run <= now
-                    && task.lease_until.is_none_or(|lease| lease <= now)
+                if let Some(claim) = task.claim
+                    && claim.lease_until <= now
                 {
-                    task.lease_until = Some(now + Duration::minutes(LEASE_MINUTES));
+                    task.interrupted = Some(claim.occurrence);
+                    task.claim = None;
+                    advance(task, claim.due, now)?;
+                }
+                if task.enabled && task.claim.is_none() && task.next_run <= now {
+                    task.claim = Some(ScheduleClaim {
+                        occurrence: ScheduledTask::occurrence_at(task.id, task.next_run),
+                        due: task.next_run,
+                        lease_until: now + Duration::minutes(LEASE_MINUTES),
+                    });
                     due.push(task.clone());
                 }
             }
@@ -230,43 +332,48 @@ impl Scheduler {
         .await
     }
 
+    /// Acknowledge the claimed occurrence and advance to the next one. Calling
+    /// it again, or for a task with no claim, changes nothing.
     pub async fn complete(&self, id: Uuid) -> Result<()> {
         self.transact(true, move |tasks| {
             let task = tasks
                 .iter_mut()
                 .find(|t| t.id == id)
                 .context("Schedule not found")?;
-            task.next_run = cron::Schedule::from_str(&task.cron)?
-                .upcoming(Utc)
-                .next()
-                .context("Schedule has no future occurrence")?;
-            task.lease_until = None;
+            if let Some(claim) = task.claim.take() {
+                advance(task, claim.due, Utc::now())?;
+            }
             Ok(())
         })
         .await
     }
 
+    /// Extend the lease of the claimed occurrence while its run is active.
     pub async fn renew(&self, id: Uuid) -> Result<()> {
         self.transact(true, move |tasks| {
             let task = tasks
                 .iter_mut()
                 .find(|t| t.id == id)
                 .context("Schedule not found")?;
-            ensure!(task.lease_until.is_some(), "Schedule has not been claimed");
-            task.lease_until = Some(Utc::now() + Duration::minutes(LEASE_MINUTES));
+            let claim = task
+                .claim
+                .as_mut()
+                .context("Schedule has not been claimed")?;
+            claim.lease_until = Utc::now() + Duration::minutes(LEASE_MINUTES);
             Ok(())
         })
         .await
     }
 
-    /// Release a failed/cancelled attempt without advancing its due date.
+    /// Release a failed/cancelled attempt without advancing its due date, so
+    /// the same occurrence is offered again.
     pub async fn release(&self, id: Uuid) -> Result<()> {
         self.transact(true, move |tasks| {
             let task = tasks
                 .iter_mut()
                 .find(|t| t.id == id)
                 .context("Schedule not found")?;
-            task.lease_until = None;
+            task.claim = None;
             Ok(())
         })
         .await
@@ -281,12 +388,13 @@ impl Scheduler {
                 .find(|task| task.id == id)
                 .context("Schedule not found")?;
             task.enabled = false;
-            task.lease_until = None;
+            task.claim = None;
             Ok(())
         })
         .await
     }
 
+    /// Summary for capability status reports.
     pub async fn status(&self) -> Value {
         match self.list().await {
             Ok(tasks) => json!({"state":"available","count":tasks.len(),"timezone":"UTC"}),
@@ -294,6 +402,7 @@ impl Scheduler {
         }
     }
 
+    /// Run one of the agent schedule tools from [`definitions`].
     pub async fn execute(&self, name: &str, args: &Value) -> Result<ToolObservation> {
         let string = |key: &str| {
             args.get(key)
@@ -321,6 +430,32 @@ impl Scheduler {
     }
 }
 
+/// Unreadable schedule store contents (as opposed to an I/O failure).
+#[derive(Debug)]
+struct InvalidStore(String);
+impl std::fmt::Display for InvalidStore {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(output, "Invalid schedule store: {}", self.0)
+    }
+}
+impl std::error::Error for InvalidStore {}
+
+fn first_occurrence(expression: &str) -> Result<DateTime<Utc>> {
+    cron::Schedule::from_str(expression)
+        .context("Invalid UTC cron expression")?
+        .upcoming(Utc)
+        .next()
+        .context("No future schedule occurrence")
+}
+
+fn advance(task: &mut ScheduledTask, due: DateTime<Utc>, now: DateTime<Utc>) -> Result<()> {
+    task.next_run = following(&cron::Schedule::from_str(&task.cron)?, due, now)
+        .context("Schedule has no future occurrence")?;
+    Ok(())
+}
+
+/// Agent-visible schedule tools. `schedule_create` and `schedule_delete` are
+/// writes; creating a recurring prompt always needs the user's approval.
 pub fn definitions() -> Vec<ToolDefinition> {
     let tool = |name: &str, description: &str, properties: Value, required: Vec<&str>, writes| {
         ToolDefinition {
@@ -340,7 +475,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ),
         tool(
             "schedule_create",
-            "Create a task with its workspace and UTC cron. The app dispatches via its normal agent policy.",
+            "Create a recurring task with its workspace and UTC cron. Needs the user's approval; the app dispatches each occurrence once via its normal agent policy.",
             json!({"cron":{"type":"string","description":"Seven-field UTC cron: sec min hour day month weekday year"},"prompt":{"type":"string","maxLength":8192}}),
             vec!["cron", "prompt"],
             true,
@@ -356,114 +491,4 @@ pub fn definitions() -> Vec<ToolDefinition> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Invoked in a fresh test executable by the process-race test below.
-    #[test]
-    fn cross_process_writer_fixture() {
-        let Some(path) = std::env::var_os("XYLO_SCHEDULER_FIXTURE_FILE") else {
-            return;
-        };
-        let path = PathBuf::from(path);
-        let workspace = path.parent().unwrap().to_path_buf();
-        let scheduler = Scheduler::new(path, workspace).unwrap();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime
-            .block_on(scheduler.create(
-                format!("Process {}", std::process::id()),
-                "0 * * * * * *".into(),
-            ))
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn simultaneous_process_writers_do_not_lose_updates() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().canonicalize().unwrap();
-        let path = workspace.join("schedules.json");
-        let scheduler = Scheduler::new(path.clone(), workspace).unwrap();
-        let executable = std::env::current_exe().unwrap();
-        let spawn = || {
-            std::process::Command::new(&executable)
-                .args([
-                    "--exact",
-                    "tests::cross_process_writer_fixture",
-                    "--nocapture",
-                ])
-                .env("XYLO_SCHEDULER_FIXTURE_FILE", &path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap()
-        };
-        let mut first = spawn();
-        let mut second = spawn();
-        assert!(first.wait().unwrap().success());
-        assert!(second.wait().unwrap().success());
-        assert_eq!(scheduler.list().await.unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn independent_instances_reread_and_claim_exclusively() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().canonicalize().unwrap();
-        let path = workspace.join("schedules.json");
-        let first = Scheduler::new(path.clone(), workspace.clone()).unwrap();
-        let second = Scheduler::new(path.clone(), workspace.clone()).unwrap();
-        let a = first
-            .create("Task A".into(), "0 * * * * * *".into())
-            .await
-            .unwrap();
-        let b = second
-            .create("Task B".into(), "0 * * * * * *".into())
-            .await
-            .unwrap();
-        assert_eq!(first.list().await.unwrap().len(), 2);
-        let mut a = a;
-        a.next_run = Utc::now() - Duration::seconds(1);
-        first.save(a.clone()).await.unwrap();
-        let (claims_a, claims_b) = tokio::join!(first.claim_due(), second.claim_due());
-        assert_eq!(claims_a.unwrap().len() + claims_b.unwrap().len(), 1);
-        first.renew(a.id).await.unwrap();
-        assert!(second.claim_due().await.unwrap().is_empty());
-        first.release(a.id).await.unwrap();
-        assert_eq!(second.claim_due().await.unwrap().len(), 1);
-        second.complete(a.id).await.unwrap();
-        assert!(
-            first
-                .list()
-                .await
-                .unwrap()
-                .iter()
-                .find(|t| t.id == a.id)
-                .unwrap()
-                .next_run
-                > Utc::now()
-        );
-        first.remove(b.id).await.unwrap();
-        assert_eq!(second.list().await.unwrap().len(), 1);
-        let restored = Scheduler::new(path, workspace).unwrap();
-        assert_eq!(restored.list().await.unwrap().len(), 1);
-    }
-    #[tokio::test]
-    async fn rejected_mutation_preserves_store_and_prompt_budget() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().canonicalize().unwrap();
-        let path = workspace.join("schedules.json");
-        let scheduler = Scheduler::new(path, workspace).unwrap();
-        assert!(
-            scheduler
-                .create("x".repeat(MAX_PROMPT_BYTES + 1), "0 * * * * * *".into())
-                .await
-                .is_err()
-        );
-        assert!(scheduler.list().await.unwrap().is_empty());
-        assert!(
-            scheduler
-                .create("Task".into(), "invalid".into())
-                .await
-                .is_err()
-        );
-    }
-}
+mod tests;

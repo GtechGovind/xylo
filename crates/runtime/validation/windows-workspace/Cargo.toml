@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 anyhow = "=1.0.104"
+hex = "0.4"
 tokio-util = { version = "=0.7.20", features = ["rt"] }
 windows-sys = { version = "=0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 

@@ -39,13 +39,7 @@ struct PreparedRequest {
     _permit: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 
-#[cfg(test)]
-mod credential_tests;
-#[cfg(test)]
-mod dispatch_tests;
 mod pagination;
-#[cfg(test)]
-mod tests;
 mod validation;
 
 /// Native REST connectors reuse one pooled HTTP client. Every mutation is labelled
@@ -553,3 +547,6 @@ fn error_excerpt(text: &str, token: &str) -> String {
         .take(2048)
         .collect()
 }
+
+#[cfg(test)]
+mod tests;

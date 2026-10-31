@@ -2,6 +2,10 @@
 //! synthetic correlated host responses exclusively; no audio device is touched.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/state.rs"]
 mod state;
 #[path = "../src/terminal_view.rs"]
@@ -72,6 +76,25 @@ mod xylo {
                     "Timed out waiting for {description}"
                 );
                 std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        /// Waits until the project index revision has not changed for a
+        /// second, so late watcher events cannot invalidate a continuation.
+        fn wait_for_settled_index(cx: &mut TestAppContext, view: &gpui_kit::Entity<Xylo>) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut revision = cx.update(|cx| view.read(cx).project_search.validation_revision());
+            let mut since = Instant::now();
+            while since.elapsed() < Duration::from_secs(1) {
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(2));
+                cx.run_until_parked();
+                let current = cx.update(|cx| view.read(cx).project_search.validation_revision());
+                if current != revision {
+                    revision = current;
+                    since = Instant::now();
+                }
+                assert!(Instant::now() < deadline, "The project index kept changing");
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
         fn host_fixture(
@@ -288,6 +311,11 @@ mod xylo {
             wait_for(cx, &view, "search catalogue", |view, _| {
                 !view.file_browser.indexing && view.file_browser.file_count == 1
             });
+            // The watcher reports the fixture write after the explicit refresh
+            // and re-indexes. A continuation from the older index is refused
+            // ("The project changed"), as it should be, so page only once the
+            // index has stopped changing.
+            wait_for_settled_index(cx, &view);
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| {
                     view.open_project_search(window, cx);
@@ -297,33 +325,47 @@ mod xylo {
                 window.click("project-search-submit", cx);
             })
             .unwrap();
-            let mut lines = std::collections::BTreeSet::new();
+            // Scrolling to the end of the results loads the next page until
+            // none remain; pages extend the list without repeating a match.
+            let mut pages = 0;
             loop {
                 wait_for(cx, &view, "search page", |view, _| {
                     view.project_search.validation_request().is_none()
                 });
+                pages += 1;
                 cx.update(|cx| {
-                    let hits = view.read(cx).project_search.validation_hits();
-                    assert!(hits.len() <= 100);
-                    for hit in hits {
-                        assert!(lines.insert(hit.line), "Match repeated across pages");
-                    }
+                    assert!(view.read(cx).project_search.validation_hits().len() <= pages * 100);
                 });
                 let has_next = cx
                     .update_window(window, |_, window, cx| {
                         window.render_frame(cx);
-                        if window.try_find("project-search-more").is_some() {
-                            window.click("project-search-more", cx);
-                            true
-                        } else {
-                            false
+                        if !view.read(cx).project_search.validation_has_more() {
+                            return false;
                         }
+                        view.read(cx).project_search.validation_scroll_to_end();
+                        window.render_frame(cx);
+                        true
                     })
                     .unwrap();
                 if !has_next {
                     break;
                 }
+                cx.run_until_parked();
             }
+            let lines: std::collections::BTreeSet<_> = cx.update(|cx| {
+                let hits = view.read(cx).project_search.validation_hits();
+                let lines: std::collections::BTreeSet<_> =
+                    hits.iter().map(|hit| hit.line).collect();
+                assert_eq!(lines.len(), hits.len(), "Match repeated across pages");
+                lines
+            });
+            cx.update(|cx| {
+                assert_eq!(
+                    view.read(cx).project_search.validation_notice(),
+                    "2105 matching lines",
+                    "every page arrived from one index revision"
+                )
+            });
             assert_eq!(lines.len(), 2105);
             assert!(lines.contains(&2105));
             client.shutdown().unwrap();
@@ -343,6 +385,9 @@ mod xylo {
             wait_for(cx, &view, "query fixture catalogue", |view, _| {
                 !view.file_browser.indexing && view.file_browser.file_count == 1
             });
+            // The watcher may still report the fixture write and re-index;
+            // a continuation from the older index is rightly refused.
+            wait_for_settled_index(cx, &view);
             for change in ["query", "case", "regex"] {
                 cx.update_window(window, |_, window, cx| {
                     view.update(cx, |view, cx| {
@@ -359,7 +404,7 @@ mod xylo {
                 });
                 cx.update_window(window, |_, window, cx| {
                     window.render_frame(cx);
-                    assert!(window.try_find("project-search-more").is_some());
+                    assert!(view.read(cx).project_search.validation_has_more());
                     match change {
                         "query" => {
                             view.update(cx, |view, cx| view.open_project_search(window, cx));
@@ -374,7 +419,7 @@ mod xylo {
                 cx.run_until_parked();
                 cx.update_window(window, |_, window, cx| {
                     window.render_frame(cx);
-                    assert!(window.try_find("project-search-more").is_none());
+                    assert!(!view.read(cx).project_search.validation_has_more());
                     assert!(view.read(cx).project_search.validation_hits().is_empty());
                     if change == "query" {
                         window.click("project-search-submit", cx);
@@ -608,7 +653,7 @@ mod xylo {
                     !view.editor_dirty
                         && !view.project_search.external_conflict
                         && view.pending_saves.is_empty()
-                        && view.status.starts_with("Saved ")
+                        && view.status.text().starts_with("Saved ")
                 },
             );
             assert!(!cx.has_pending_prompt());
@@ -844,19 +889,18 @@ mod xylo {
                     assert_ne!(view.speech.recording_state, "recording");
                     assert_eq!(view.composer.read(cx).value().as_ref(), "Existing draft");
                     view.error = None;
-                    view.navigate(Page::Voice, cx);
+                    view.navigate(Page::Chat, cx);
                 });
+                // The transcript is inserted from the composer's own strip,
+                // once, and the strip then clears.
                 window.render_frame(cx);
-                window.click("speech-use-transcript", cx);
+                window.click("insert-transcript", cx);
                 assert_eq!(
                     view.read(cx).composer.read(cx).value().as_ref(),
-                    "Existing draft\nReviewed current transcript"
+                    "Existing draft Reviewed current transcript"
                 );
+                assert!(view.read(cx).speech.transcript.is_empty());
                 assert_eq!(view.read(cx).page, Page::Chat);
-                assert!(
-                    !view.read(cx).settings_open,
-                    "Add transcript must restore workspace navigation"
-                );
             })
             .unwrap();
         }
@@ -957,7 +1001,11 @@ mod xylo {
                         view.schedule_prompt.read(cx).value().as_ref(),
                         "Newer draft"
                     );
-                    assert!(view.schedule_notice.contains("Disk unavailable"));
+                    assert!(
+                        view.error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("could not be saved"))
+                    );
                     let id = Uuid::new_v4();
                     view.schedule_pending = Some((id, Some("Newer draft".into())));
                     view.event(
@@ -1001,6 +1049,7 @@ mod xylo {
                             xylo_core::EngineEvent::Error {
                                 message: "Provider unavailable".into(),
                                 retryable: true,
+                                kind: xylo_core::ErrorKind::Provider,
                             },
                         )),
                         window,
@@ -1010,7 +1059,8 @@ mod xylo {
                     assert_eq!(
                         view.turns
                             .get(&session)
-                            .and_then(|turn| turn.error.as_deref()),
+                            .and_then(|turn| turn.failure())
+                            .map(|failure| failure.message.as_str()),
                         Some("Provider unavailable")
                     );
                 });

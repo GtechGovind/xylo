@@ -58,10 +58,7 @@ pub fn capability_demand(name: &str) -> Option<TaskDemand> {
         | "document_save_copy"
         | "document_export_docx"
         | "document_export_xlsx" => 384,
-        "helper_plugin_inspect"
-        | "helper_plugin_install"
-        | "plugin_run"
-        | "plugin_run_installed" => 512,
+        "helper_plugin_inspect" | "helper_plugin_install" | "plugin_run_installed" => 512,
         _ => return None,
     };
     Some(TaskDemand {
@@ -99,7 +96,9 @@ impl TaskDemand {
 }
 
 struct State {
-    system: System,
+    /// The platform monitor, or why it could not start. Admission fails closed
+    /// while it is unavailable rather than guessing at free memory.
+    system: std::result::Result<System, String>,
     reservations: HashMap<Uuid, TaskDemand>,
 }
 struct Shared {
@@ -129,9 +128,16 @@ impl Default for ResourceManager {
 
 impl ResourceManager {
     pub fn new() -> Self {
-        let mut system = System::new();
-        system.refresh_memory();
-        system.refresh_cpu_usage();
+        let system = System::new()
+            .map(|mut system| {
+                system.refresh_memory();
+                system.refresh_cpu_usage();
+                system
+            })
+            .map_err(|error| {
+                tracing::error!(%error, "Hardware resource monitor unavailable");
+                error.to_string()
+            });
         Self(Arc::new(Shared {
             state: Mutex::new(State {
                 system,
@@ -147,9 +153,7 @@ impl ResourceManager {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("Resource monitor unavailable"))?;
-        state.system.refresh_memory();
-        state.system.refresh_cpu_usage();
-        Ok(snapshot(&state.system))
+        Ok(snapshot(refreshed(&mut state.system)?))
     }
 
     /// A queued task wakes when another lease ends or hardware availability changes.
@@ -179,9 +183,7 @@ impl ResourceManager {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("Resource monitor unavailable"))?;
-        state.system.refresh_memory();
-        state.system.refresh_cpu_usage();
-        let hardware = snapshot(&state.system);
+        let hardware = snapshot(refreshed(&mut state.system)?);
         let reserved_memory = state
             .reservations
             .values()
@@ -229,6 +231,16 @@ impl Drop for ResourceLease {
     }
 }
 
+/// Refreshes the monitored counters, or reports why no monitor is available.
+fn refreshed(system: &mut std::result::Result<System, String>) -> Result<&System> {
+    let system = system
+        .as_mut()
+        .map_err(|error| anyhow::anyhow!("Hardware resource monitor unavailable: {error}"))?;
+    system.refresh_memory();
+    system.refresh_cpu_usage();
+    Ok(system)
+}
+
 fn snapshot(system: &System) -> ResourceSnapshot {
     #[cfg(target_os = "macos")]
     let available_memory_bytes =
@@ -268,40 +280,4 @@ fn fits(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn live_pressure_changes_admission_on_the_same_machine() {
-        let mut hardware = ResourceSnapshot {
-            total_memory_bytes: 32 * 1024 * MIB,
-            available_memory_bytes: 20 * 1024 * MIB,
-            cpu_threads: 16,
-            cpu_busy_percent: 10.,
-        };
-        let demand = TaskDemand {
-            memory_bytes: 1024 * MIB,
-            cpu_share: 2.,
-        };
-        assert!(fits(hardware, demand, 0, 0.));
-        hardware.available_memory_bytes = 512 * MIB;
-        assert!(!fits(hardware, demand, 0, 0.));
-        hardware.available_memory_bytes = 20 * 1024 * MIB;
-        hardware.cpu_busy_percent = 99.;
-        assert!(!fits(hardware, demand, 0, 0.));
-    }
-    #[test]
-    fn reservations_prevent_oversubscription_without_ram_tiers() {
-        let hardware = ResourceSnapshot {
-            total_memory_bytes: 16 * 1024 * MIB,
-            available_memory_bytes: 4 * 1024 * MIB,
-            cpu_threads: 8,
-            cpu_busy_percent: 0.,
-        };
-        let demand = TaskDemand {
-            memory_bytes: 2 * 1024 * MIB,
-            cpu_share: 1.,
-        };
-        assert!(fits(hardware, demand, 0, 0.));
-        assert!(!fits(hardware, demand, 2 * 1024 * MIB, 1.));
-    }
-}
+mod tests;
