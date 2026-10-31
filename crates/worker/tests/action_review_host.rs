@@ -23,20 +23,32 @@ async fn real_host_denies_resolution_during_active_worker_then_records_after_can
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let provider = tokio::spawn(async move {
-        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(15), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
-        let mut received = Vec::new();
+        // The engine's served-context probe sends GETs first; this server
+        // reports no context, so they get 404.
         let mut buffer = [0; 8192];
-        let header = loop {
-            let count = socket.read(&mut buffer).await.unwrap();
-            assert!(count > 0);
-            received.extend_from_slice(&buffer[..count]);
-            if let Some(at) = received.windows(4).position(|v| v == b"\r\n\r\n") {
-                break at + 4;
+        let (mut socket, mut received, header) = loop {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(15), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut received = Vec::new();
+            let header = loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                received.extend_from_slice(&buffer[..count]);
+                if let Some(at) = received.windows(4).position(|v| v == b"\r\n\r\n") {
+                    break at + 4;
+                }
+                assert!(received.len() < 65536)
+            };
+            if !received.starts_with(b"GET ") {
+                break (socket, received, header);
             }
-            assert!(received.len() < 65536)
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
         };
         let length = String::from_utf8_lossy(&received[..header])
             .lines()

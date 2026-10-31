@@ -72,7 +72,7 @@ impl AssetManager {
                     assets.insert("lexicon", export(model, "lexicon")?);
                 }
                 Ok(
-                    json!({"executable":export(engine,"executable")?,"assets":assets,"args":[],"output_extension":"wav","synthesis_args":["--vits-model={model}","--vits-lexicon={lexicon}","--vits-tokens={tokens}","--num-threads={threads}","--output-filename={output}","{text}"]}),
+                    json!({"executable":export(engine,"executable")?,"assets":assets,"args":[],"output_extension":"wav","synthesis_args":SHERPA_SYNTHESIS_ARGS}),
                 )
             } else {
                 Ok(
@@ -164,6 +164,19 @@ impl AssetManager {
         write_json(&path, &configuration)
     }
 }
+
+/// sherpa-onnx's text-to-speech argv. Its option parser treats a lone `--`
+/// as the end of named options, so the model's text is always the
+/// positional text, never an option.
+const SHERPA_SYNTHESIS_ARGS: &[&str] = &[
+    "--vits-model={model}",
+    "--vits-lexicon={lexicon}",
+    "--vits-tokens={tokens}",
+    "--num-threads={threads}",
+    "--output-filename={output}",
+    "--",
+    "{text}",
+];
 
 #[cfg(test)]
 mod tests;

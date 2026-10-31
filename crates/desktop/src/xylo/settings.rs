@@ -16,6 +16,8 @@ pub(super) struct PermissionsUi {
     loading_since: Option<std::time::Instant>,
     error: Option<String>,
 }
+/// The tag next to a trusted connection's name in the Connections list.
+const TRUSTED_TAG: &str = "Trusted";
 fn allowed_since(created_at: i64) -> String {
     let seconds = now_ms().saturating_sub(created_at).max(0) / 1000;
     match seconds {
@@ -288,6 +290,7 @@ impl Xylo {
                 .map(str::to_owned)
                 .collect(),
             credential_ref,
+            trusted: self.connector_trusted,
         };
         let request_id = Uuid::new_v4();
         let result = self
@@ -377,6 +380,7 @@ impl Xylo {
         self.connector_editing = Some(id);
         self.connector_form_open = true;
         self.connector_transport = config.transport;
+        self.connector_trusted = config.trusted;
         self.connector_name
             .update(cx, |input, cx| input.set_value(config.name, window, cx));
         self.connector_command.update(cx, |input, cx| {
@@ -420,6 +424,7 @@ impl Xylo {
         self.connector_editing = None;
         self.connector_error = None;
         self.connector_transport = "stdio".into();
+        self.connector_trusted = false;
         for input in [
             &self.connector_name,
             &self.connector_command,
@@ -920,6 +925,28 @@ impl Xylo {
             );
         }
         fields.push(
+            settings_ui::setting_row(
+                "Trust read-only hints",
+                Some("Let read-only tools from this server run without asking and in parallel. Only turn on for servers you control.".into()),
+                Some(
+                    settings_ui::switch(
+                        "connector-trusted",
+                        "Trust read-only hints",
+                        self.connector_trusted,
+                    )
+                    .disabled(busy)
+                    .on_change(cx.listener(|view, checked, _, cx| {
+                        if view.connector_pending.is_none() {
+                            view.connector_trusted = *checked;
+                            cx.notify();
+                        }
+                    }))
+                    .into_any_element(),
+                ),
+            )
+            .into_any_element(),
+        );
+        fields.push(
             settings_ui::form_actions([
                 settings_ui::text_button("connector-cancel", "Cancel")
                     .disabled(busy)
@@ -967,12 +994,17 @@ impl Xylo {
             format!("{kind} · {target}").into()
         };
         let id_text = connection.id.to_string();
-        settings_ui::list_item(
+        let item = settings_ui::list_item(
             ("connector-edit", index),
             Some(settings_ui::monogram(&connection.name, &id_text).into_any_element()),
             connection.name.clone(),
             Some(subtitle),
-        )
+        );
+        if connection.trusted {
+            item.title_tag(TRUSTED_TAG, settings_ui::Tone::Success)
+        } else {
+            item
+        }
     }
 
     /// Connections: the saved list with Add connection, or the add/edit form

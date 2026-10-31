@@ -752,3 +752,116 @@ fn undelivered_hook_events_are_reported_per_entry_without_disabling_the_componen
         "An event Xylo never delivers cannot be enabled"
     );
 }
+
+#[tokio::test]
+async fn completed_mcp_call_keeps_its_output_when_only_the_close_fails() {
+    use super::super::runtime::finish_mcp_operation;
+    use std::time::Duration;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let output = || async { Ok(json!({"content":[{"type":"text","text":"done"}]})) };
+    // A close that errors or never finishes is logged; the call's result survives
+    // and the caller is told to abort the connection.
+    let (result, closed) = finish_mcp_operation(
+        output(),
+        async { anyhow::bail!("MCP shutdown timed out") },
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        &cancel,
+    )
+    .await;
+    assert_eq!(result.unwrap()["content"][0]["text"], "done");
+    assert!(!closed);
+    let started = std::time::Instant::now();
+    let (result, closed) = finish_mcp_operation(
+        output(),
+        std::future::pending(),
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        &cancel,
+    )
+    .await;
+    assert_eq!(result.unwrap()["content"][0]["text"], "done");
+    assert!(!closed);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let (result, closed) = finish_mcp_operation(
+        output(),
+        async { Ok(()) },
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        &cancel,
+    )
+    .await;
+    assert!(result.is_ok() && closed);
+    // A failed or timed-out operation still reports failure without a close.
+    let (result, closed) = finish_mcp_operation(
+        std::future::pending(),
+        async { panic!("close must not run after a deadline") },
+        Duration::from_millis(20),
+        Duration::from_secs(5),
+        &cancel,
+    )
+    .await;
+    assert!(result.unwrap_err().to_string().contains("deadline"));
+    assert!(!closed);
+}
+
+#[tokio::test]
+async fn hook_output_larger_than_a_pipe_buffer_does_not_deadlock_its_input() {
+    // Each hook writes far more than a pipe buffer before reading its input (or
+    // never reads it at all), while the host sends input larger than a pipe buffer.
+    for command in [
+        "yes a | head -c 300000; cat > /dev/null",
+        "yes a | head -c 300000",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(source.join("hooks")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            source.join("hooks/hooks.json"),
+            json!({"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":command}]}]}})
+                .to_string(),
+        )
+        .unwrap();
+        let service = ExtensionService::new(directory.path().join("profile/extensions"));
+        let package = service.install_local(&source).unwrap();
+        service.set_enabled(&package.id, true).unwrap();
+        service
+            .component_setup(
+                &package.id,
+                "hooks",
+                ComponentSetup {
+                    workspace: workspace.clone(),
+                    enabled_events: vec!["PreToolUse".into()],
+                    timeout_seconds: 20,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let store = crate::Store::open(directory.path().join("profile/store.db")).unwrap();
+        let vault = crate::CredentialVault::for_tests();
+        let input = json!({"tool_name":"Read","tool_input":{"text":"x".repeat(400_000)}});
+        let started = std::time::Instant::now();
+        let output = service
+            .run_hooks(
+                "PreToolUse",
+                input,
+                &workspace,
+                store,
+                vault,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{command}"
+        );
+        assert_eq!(output.len(), 1, "{command}");
+        assert!(
+            output[0].to_string().matches('a').count() >= 150_000,
+            "{command}"
+        );
+    }
+}

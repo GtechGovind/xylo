@@ -178,6 +178,7 @@ impl NativeProvider {
         } else {
             ""
         };
+        let overflow = context_overflow(status, code, reason);
         let reason = reason
             .map(|reason| format!(": {reason}"))
             .unwrap_or_default();
@@ -195,10 +196,7 @@ impl NativeProvider {
                 retry_after,
                 message,
             }
-        } else if matches!(
-            code,
-            "context_length_exceeded" | "string_above_max_length" | "request_too_large"
-        ) {
+        } else if overflow {
             ModelError::ContextOverflow(message)
         } else if unavailable_model
             || matches!(
@@ -215,6 +213,36 @@ impl NativeProvider {
             }
         }
     }
+}
+
+/// Whether a failed request was rejected for being longer than the model's
+/// context. Servers report it under different codes, and llama.cpp, vLLM,
+/// Anthropic and Gemini often only in the message, so the agent loop can
+/// compact and retry instead of failing the turn.
+fn context_overflow(status: u16, code: &str, reason: Option<&str>) -> bool {
+    if matches!(
+        code,
+        "context_length_exceeded"
+            | "string_above_max_length"
+            | "request_too_large"
+            | "exceed_context_size_error"
+    ) {
+        return true;
+    }
+    matches!(status, 400 | 413 | 422)
+        && reason.is_some_and(|reason| {
+            let reason = reason.to_ascii_lowercase();
+            [
+                "prompt is too long",
+                "exceeds the available context size",
+                "maximum context length",
+                "input token count",
+                "context length exceeded",
+                "exceeds the context window",
+            ]
+            .iter()
+            .any(|phrase| reason.contains(phrase))
+        })
 }
 
 impl ModelProvider for NativeProvider {
@@ -321,10 +349,12 @@ async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, ModelE
     Ok(bytes)
 }
 
+/// Usage without cache counts; add them with [`ModelUsage::with_cache`].
 fn usage(input_tokens: u64, output_tokens: u64) -> ModelUsage {
     ModelUsage {
         input_tokens,
         output_tokens,
+        ..ModelUsage::default()
     }
 }
 

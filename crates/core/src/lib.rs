@@ -56,9 +56,20 @@ pub struct ProviderConfig {
     pub endpoint: String,
     pub model: String,
     pub credential_ref: Option<String>,
+    /// The model's context window as configured or advertised by its catalog.
     pub context_tokens: u32,
     pub output_tokens: u32,
     pub timeout_seconds: u64,
+    /// The context a local server reported it actually serves for this model
+    /// (llama.cpp `n_ctx`, Ollama's loaded `context_length` or `num_ctx`,
+    /// LM Studio's loaded context). The engine probes loopback endpoints
+    /// when it starts a turn, past the unresolved-action gate, and remembers
+    /// each answer for its session (`xylo_services::providers::ServedContextCache`).
+    /// `None` when unknown or the endpoint is remote. Budgets use
+    /// the smaller of this and `context_tokens`; see
+    /// [`ProviderConfig::context_window`].
+    #[serde(default)]
+    pub served_context_tokens: Option<u32>,
     /// Explicit model reasoning choice. None leaves the provider default intact.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
@@ -89,6 +100,7 @@ impl Default for ProviderConfig {
             context_tokens: 8192,
             output_tokens: 2048,
             timeout_seconds: 120,
+            served_context_tokens: None,
             reasoning_effort: None,
             reasoning_options: None,
             default_reasoning_effort: None,
@@ -152,6 +164,17 @@ impl ProviderConfig {
             &[]
         };
         known.to_vec()
+    }
+
+    /// The window a request must fit: the configured context, lowered to
+    /// what a local server reported serving. A server that silently truncates
+    /// over-length prompts would otherwise drop the start of the conversation.
+    pub fn context_window(&self) -> u32 {
+        self.served_context_tokens
+            .filter(|served| *served > 0)
+            .map_or(self.context_tokens, |served| {
+                served.min(self.context_tokens)
+            })
     }
 
     /// Unsupported selections are never sent to a model after a model switch.
@@ -503,6 +526,15 @@ pub struct Usage {
     /// Prompt tokens of the turn's last model call: the context actually in use.
     #[serde(default)]
     pub context_tokens: u64,
+    /// Prompt tokens served from the provider's cache, summed over the
+    /// turn's model calls; `None` when no call reported it. Part of
+    /// `input_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    /// Prompt tokens written to the provider's cache, summed like
+    /// `cache_read_tokens`. Part of `input_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// What a running turn is doing right now, for the activity line.
@@ -530,7 +562,8 @@ pub enum TurnPhase {
 /// Token accounting of the context sent with the latest model request.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextUsage {
-    /// The configured context window.
+    /// The context window requests are fitted to: the configured window,
+    /// lowered to what a local server reported serving.
     pub capacity: u64,
     /// Tokens reserved for the model's output.
     pub output_reserve: u64,
@@ -551,6 +584,10 @@ pub struct ContextUsage {
     /// Prompt tokens the provider reported for the last request, when known.
     #[serde(default)]
     pub provider_input: Option<u64>,
+    /// Of `provider_input`, the tokens served from the provider's prompt
+    /// cache, when the provider reported them.
+    #[serde(default)]
+    pub provider_cache_read: Option<u64>,
 }
 
 impl ContextUsage {
@@ -572,9 +609,40 @@ pub enum ErrorKind {
     Provider,
     /// The task no longer fits the model's context window.
     ContextOverflow,
+    /// The harness's loop detector stopped the turn: the model kept
+    /// repeating itself after two warnings. Retrying the same request is
+    /// unlikely to help without new guidance.
+    Stalled,
+    /// The model returned no usable reply (no text and no valid tool call),
+    /// even when asked once more. Retrying the turn may succeed.
+    EmptyResponse,
     /// An application fault.
     #[default]
     Internal,
+}
+
+/// Which harness mechanism added an [`EngineEvent::HarnessNote`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteKind {
+    /// The reply reached the output limit and the model was asked to
+    /// continue it.
+    Continuation,
+    /// The answer still reached the output limit after the last allowed
+    /// continuation (or on the turn's final call); it is shown as far as it
+    /// got and stored with [`MessageStatus::Truncated`].
+    Truncated,
+    /// The reply or a tool call was unusable (empty, malformed, or cut off
+    /// by the output limit) and the model was asked to send it again.
+    Retry,
+    /// The loop detector's first note: the model is repeating itself and
+    /// was asked to change approach.
+    StallNotice,
+    /// The loop detector's second note: the task stops if the pattern
+    /// continues.
+    StallWarning,
+    /// The turn crossed 75% or 90% of its step limit.
+    StepBudget,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -595,6 +663,13 @@ pub enum EngineEvent {
         text: String,
     },
     Status {
+        text: String,
+    },
+    /// A note the harness added to the conversation and shows the user.
+    /// The model receives a matching application note; `text` is the user's
+    /// version and `kind` says which harness mechanism added it.
+    HarnessNote {
+        kind: NoteKind,
         text: String,
     },
     Steering {
@@ -697,6 +772,9 @@ pub enum MessageStatus {
     Interrupted,
     /// The turn failed; the text is what had streamed.
     Failed,
+    /// The answer reached the model's output limit, even after the harness
+    /// asked it to continue, and is shown as far as it got.
+    Truncated,
 }
 
 /// Stable keyset pagination in most-recently-updated order; IDs break timestamp ties.
@@ -740,6 +818,63 @@ pub struct HistoryPage {
     pub has_more: bool,
 }
 
+/// Where a remembered fact came from. The application sets it when the fact
+/// is written (the user's Memory form, an approval prompt, or the content
+/// the conversation had read so far); a model never chooses it. Variants are
+/// ordered from most to least trusted, so `max` is the least-trusted origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryOrigin {
+    /// Typed by the user in the Memory settings.
+    UserTyped,
+    /// Proposed by the agent and approved by the user in an approval prompt.
+    UserApproved,
+    /// Written by the agent in a conversation that had read nothing from
+    /// outside the project.
+    AgentInferred,
+    /// Written after the conversation read output from outside the project:
+    /// connectors, plugins, remote environments or files outside it.
+    ToolOutput,
+    /// Written after the conversation read web content (the browser or a
+    /// command with network access).
+    WebContent,
+}
+
+impl MemoryOrigin {
+    /// A short label for the Memory settings and the model's recalled context.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UserTyped => "stated by the user",
+            Self::UserApproved => "approved by the user",
+            Self::AgentInferred => "inferred by the agent",
+            Self::ToolOutput => "derived from tool output",
+            Self::WebContent => "derived from web content",
+        }
+    }
+
+    /// Whether the user vouched for the fact's exact text.
+    pub fn from_user(self) -> bool {
+        matches!(self, Self::UserTyped | Self::UserApproved)
+    }
+
+    /// Whether the fact may have been shaped by content from outside the
+    /// project, which can carry injected instructions.
+    pub fn untrusted(self) -> bool {
+        self > Self::AgentInferred
+    }
+
+    /// The trust tier used for corrections: a fact may replace another only
+    /// from the same or a more trusted tier. Both user origins share a tier.
+    pub fn tier(self) -> u8 {
+        match self {
+            Self::UserTyped | Self::UserApproved => 0,
+            Self::AgentInferred => 1,
+            Self::ToolOutput => 2,
+            Self::WebContent => 3,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemoryRecord {
     pub id: Uuid,
@@ -747,7 +882,11 @@ pub struct MemoryRecord {
     pub content: String,
     pub source: String,
     pub created_at: i64,
+    /// The earlier version this fact corrects; that version stays in the
+    /// fact's history, inactive.
     pub supersedes: Option<Uuid>,
+    /// Set by the application, never by the model; see [`MemoryOrigin`].
+    pub origin: MemoryOrigin,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -798,6 +937,10 @@ pub struct ConnectorConfig {
     pub command: Option<PathBuf>,
     pub args: Vec<String>,
     pub credential_ref: Option<String>,
+    /// The user trusts this server's read-only hints: its tools annotated
+    /// read-only may run without asking and in parallel with other reads.
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 /// Product-facing summary of a delegated task; engine metadata stays in the journal.

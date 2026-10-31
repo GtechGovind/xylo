@@ -25,17 +25,17 @@ pub struct AudioInfo {
 }
 
 pub fn normalize(
-    input: &Path,
+    input: File,
     output: &Path,
     max_seconds: u32,
     cancel: &CancellationToken,
 ) -> Result<AudioInfo> {
     ensure!(
-        input.is_file() && input.metadata()?.len() <= MAX_AUDIO_FILE,
+        input.metadata()?.len() <= MAX_AUDIO_FILE,
         "Audio file is missing or exceeds 64MiB"
     );
-    let decoder = Decoder::try_from(File::open(input)?)
-        .context("Open supported WAV, MP3, M4A, FLAC or Ogg audio")?;
+    let decoder =
+        Decoder::try_from(input).context("Open supported WAV, MP3, M4A, FLAC or Ogg audio")?;
     let rate = decoder.sample_rate().get();
     let channels = decoder.channels().get();
     ensure!(

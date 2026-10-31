@@ -528,13 +528,14 @@ fn only_the_answer_being_read_offers_stop(cx: &mut TestAppContext) {
     let (_, view) = open_chat(cx);
     cx.update(|cx| {
         view.update(cx, |view, _| {
-            view.reading_aloud = Some(super::text_key("First answer"));
+            let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+            view.reading_aloud = Some(first);
             view.speech.playing = true;
-            assert!(view.reading_answer("First answer"));
-            assert!(!view.reading_answer("Second answer"));
+            assert!(view.reading_answer(first));
+            assert!(!view.reading_answer(second));
             view.speech.playing = false;
             assert!(
-                !view.reading_answer("First answer"),
+                !view.reading_answer(first),
                 "Finished playback no longer reads as in progress"
             );
         })
@@ -556,7 +557,7 @@ fn speech_work_in_flight_can_be_cancelled_from_the_composer(cx: &mut TestAppCont
             view.speech
                 .validation_request(Uuid::new_v4(), "speech_synthesize");
             view.speech.notice = "Creating speech on this computer…".into();
-            view.reading_aloud = Some(super::text_key("An answer"));
+            view.reading_aloud = Some(Uuid::new_v4());
             cx.notify();
         });
         window.render_frame(cx);
@@ -572,4 +573,121 @@ fn speech_work_in_flight_can_be_cancelled_from_the_composer(cx: &mut TestAppCont
         assert_eq!(view.reading_aloud, None, "Read aloud is offered again");
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_deny_shortcut_never_denies_a_hidden_card(cx: &mut TestAppContext) {
+    let (window, view) = open_chat(cx);
+    let (probe, worker) = std::sync::mpsc::sync_channel(4);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.error = None;
+            view.validation_worker_commands = Some(probe);
+            approval(view);
+            view.sync_history_list(cx);
+            view.settings_open = true;
+            view.page = super::super::Page::Providers;
+            view.composer
+                .update(cx, |input, cx| input.focus(window, cx));
+            view.deny_or_stop_shortcut(window, cx);
+            assert!(
+                view.turns[&view.session].tools[0].approval,
+                "The hidden card still waits"
+            );
+        });
+        assert!(worker.try_recv().is_err());
+        view.update(cx, |view, cx| {
+            view.settings_open = false;
+            view.page = super::super::Page::Chat;
+            view.deny_or_stop_shortcut(window, cx);
+        });
+        let (_, command) = worker.try_recv().expect("The visible card is denied");
+        assert!(matches!(
+            command,
+            WorkerCommand::Approve { allow: false, .. }
+        ));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_background_chat_redraws_only_when_its_sidebar_mark_changes(cx: &mut TestAppContext) {
+    let (window, view) = open_chat(cx);
+    let background = Uuid::new_v4();
+    let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = renders.clone();
+    let _observer = cx.update(|cx| cx.observe(&view, move |_, _| counted.set(counted.get() + 1)));
+    let send = |cx: &mut TestAppContext, event: EngineEvent| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                engine(view, Some(background), event, window, cx)
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    send(cx, EngineEvent::Started);
+    let started = renders.get();
+    assert!(
+        started >= 1,
+        "Starting marks the chat as busy in the sidebar"
+    );
+    for _ in 0..5 {
+        send(
+            cx,
+            EngineEvent::Delta {
+                text: "token ".into(),
+            },
+        );
+    }
+    assert_eq!(renders.get(), started, "Hidden streaming draws nothing");
+    send(
+        cx,
+        EngineEvent::Completed {
+            text: "token token".into(),
+            usage: Usage::default(),
+        },
+    );
+    assert!(renders.get() > started, "Finishing clears the mark");
+}
+
+#[gpui_kit::test]
+fn an_answer_cut_off_by_the_output_limit_is_archived_as_truncated(cx: &mut TestAppContext) {
+    with_view(cx, |view, window, cx| {
+        let session = Some(view.session);
+        engine(view, session, EngineEvent::Started, window, cx);
+        engine(
+            view,
+            session,
+            EngineEvent::Delta {
+                text: "As far as it got".into(),
+            },
+            window,
+            cx,
+        );
+        engine(
+            view,
+            session,
+            EngineEvent::HarnessNote {
+                kind: xylo_core::NoteKind::Truncated,
+                text: "The answer reached the output limit again.".into(),
+            },
+            window,
+            cx,
+        );
+        engine(
+            view,
+            session,
+            EngineEvent::Completed {
+                text: "As far as it got".into(),
+                usage: Usage::default(),
+            },
+            window,
+            cx,
+        );
+        engine(view, session, EngineEvent::Started, window, cx);
+        assert_eq!(view.messages.len(), 1);
+        assert_eq!(view.messages[0].content, "As far as it got");
+        assert_eq!(view.messages[0].status, MessageStatus::Truncated);
+    });
 }

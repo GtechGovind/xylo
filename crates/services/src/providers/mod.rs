@@ -3,6 +3,8 @@
 mod aws_signing;
 mod discovery;
 pub use discovery::*;
+mod served_context;
+pub use served_context::{ServedContextCache, served_context_limits, served_context_tokens};
 mod chatgpt;
 pub use chatgpt::*;
 mod sign_in_service;

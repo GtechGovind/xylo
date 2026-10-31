@@ -1,5 +1,12 @@
 //! Request bodies for the four HTTP+SSE protocols, and the Responses API
 //! output parser used by its terminal stream event.
+//!
+//! Bodies are built for provider prompt caching. Anthropic gets its four
+//! breakpoints (tools, the static system prompt, the newest system block and
+//! the newest message); OpenAI requests carry a `prompt_cache_key` derived
+//! from the conversation's stable prefix. Tool definitions are emitted in a
+//! fixed order with no per-call content, and OpenAI functions are `strict`
+//! wherever their schema already meets strict mode's rules.
 use super::*;
 use crate::model::{
     FinishReason, InlineImage, Message, NativeContent, Reasoning, Role, ToolCall, ToolSchema,
@@ -40,7 +47,104 @@ fn data_url(image: &InlineImage) -> Result<String, ModelError> {
 }
 
 fn function(tool: &ToolSchema) -> Value {
-    json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false})
+    json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":strict_compatible(&tool.parameters)})
+}
+
+/// Keywords OpenAI's strict function calling accepts in every schema node.
+const STRICT_KEYWORDS: &[&str] = &[
+    "type",
+    "description",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "enum",
+    "anyOf",
+    "const",
+];
+
+/// Whether `schema` already meets strict mode's rules, so `strict: true`
+/// changes nothing but the guarantee: an object root, only
+/// [`STRICT_KEYWORDS`], and every object closed (`additionalProperties:
+/// false`) with all of its properties required. Schemas with optional
+/// parameters or bounds stay non-strict rather than being rewritten, since
+/// strict mode would force the model to send every optional field.
+pub(super) fn strict_compatible(schema: &Value) -> bool {
+    fn node(schema: &Value) -> bool {
+        let Some(fields) = schema.as_object() else {
+            return false;
+        };
+        if !fields
+            .keys()
+            .all(|key| STRICT_KEYWORDS.contains(&key.as_str()))
+        {
+            return false;
+        }
+        let object = fields.get("type").and_then(Value::as_str) == Some("object")
+            || fields.contains_key("properties");
+        if object {
+            let properties = match fields.get("properties") {
+                Some(Value::Object(properties)) => properties.clone(),
+                None => serde_json::Map::new(),
+                Some(_) => return false,
+            };
+            let required: Vec<&str> = fields
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|names| names.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if fields.get("additionalProperties") != Some(&Value::Bool(false))
+                || required.len() != properties.len()
+                || !properties
+                    .keys()
+                    .all(|name| required.contains(&name.as_str()))
+                || !properties.values().all(node)
+            {
+                return false;
+            }
+        }
+        fields.get("items").is_none_or(node)
+            && fields.get("anyOf").is_none_or(|options| {
+                options
+                    .as_array()
+                    .is_some_and(|options| options.iter().all(node))
+            })
+    }
+    schema.get("type").and_then(Value::as_str) == Some("object") && node(schema)
+}
+
+/// A `prompt_cache_key` that is the same for every request of one
+/// conversation: a digest of the model, the system instructions and the
+/// first conversation message, which is exactly the prefix the provider's
+/// cache can match. It changes only when that prefix changes (a compaction
+/// that replaces the start of history, a new day in the system prompt), when
+/// the old cache entry could not be used anyway. No content leaves in clear.
+fn prompt_cache_key(model: &str, messages: &[Message]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(model.as_bytes());
+    for message in messages.iter().filter(|m| m.role == Role::System) {
+        digest.update([0]);
+        digest.update(message.content.as_bytes());
+    }
+    if let Some(first) = messages.iter().find(|m| m.role != Role::System) {
+        digest.update([1]);
+        digest.update(first.content.as_bytes());
+    }
+    format!("xylo-{}", &hex::encode(digest.finalize())[..32])
+}
+
+/// Whether the endpoint routes by `prompt_cache_key`: every Responses
+/// endpoint, and Chat Completions only on OpenAI itself, since local and
+/// third-party Chat Completions servers may reject unknown fields.
+fn routes_prompt_cache(provider: &NativeProvider) -> bool {
+    match provider.endpoint.protocol {
+        ProviderProtocol::Responses => true,
+        ProviderProtocol::ChatCompletions => {
+            provider.endpoint.base_url.host_str() == Some("api.openai.com")
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn body(
@@ -63,6 +167,9 @@ pub(super) fn body(
             return Err(invalid("Use the native Bedrock provider"));
         }
     };
+    if routes_prompt_cache(provider) {
+        body["prompt_cache_key"] = json!(prompt_cache_key(model, messages));
+    }
     // Apply only a capability-checked selection of reasoning effort.
     if let Some(effort) = reasoning_effort(&provider.config, reasoning) {
         match provider.endpoint.protocol {
@@ -283,10 +390,15 @@ fn anthropic_body(
             push_parts(&mut output, "content", role, content);
         }
     }
-    // Prompt-cache breakpoints: tools, system policy and the newest message.
-    // Agent loops resend the same prefix on every step, so later steps read
-    // it from cache instead of reprocessing it.
+    // Prompt-cache breakpoints (Anthropic allows four): tools, the static
+    // system prompt, the newest system block (a compaction summary, when
+    // there is one) and the newest message. Agent loops resend the same
+    // prefix on every step, so later steps read it from cache instead of
+    // reprocessing it, and a new summary leaves the static prompt cached.
     let ephemeral = json!({"type":"ephemeral"});
+    if let Some(first) = system.first_mut() {
+        first["cache_control"] = ephemeral.clone();
+    }
     if let Some(last) = system.last_mut() {
         last["cache_control"] = ephemeral.clone();
     }
@@ -477,9 +589,16 @@ pub(super) fn parse_responses(value: &Value) -> Result<ResponsesOutput, ModelErr
         },
         calls,
         items,
+        // `input_tokens` already includes the cached ones.
         usage: usage(
             value["usage"]["input_tokens"].as_u64().unwrap_or(0),
             value["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        )
+        .with_cache(
+            value
+                .pointer("/usage/input_tokens_details/cached_tokens")
+                .and_then(Value::as_u64),
+            None,
         ),
     })
 }

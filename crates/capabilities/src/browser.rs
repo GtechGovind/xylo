@@ -20,13 +20,20 @@ use chromiumoxide::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
+    future::Future,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use xylo_core::{ToolDefinition, ToolObservation};
+
+/// Download budget used when `browser_download` is called without `max_bytes`.
+const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 50 * 1024 * 1024;
+/// Hard ceiling for any single browser download; matches the tool schema's
+/// `max_bytes.maximum` so a caller cannot raise the budget past it.
+const DOWNLOAD_MAX_BYTES_CEILING: u64 = 100 * 1024 * 1024;
 
 struct Session {
     browser: Browser,
@@ -84,12 +91,20 @@ impl BrowserService {
                 }
             }
         });
-        let page = match browser.new_page("about:blank").await {
+        // Downloads are denied browser-wide from the start so that navigation,
+        // clicks, or page script cannot write files; only browser_download
+        // opens a short, budgeted window and closes it again.
+        let ready = async {
+            browser.execute(deny_downloads()).await?;
+            Ok::<_, anyhow::Error>(browser.new_page("about:blank").await?)
+        }
+        .await;
+        let page = match ready {
             Ok(page) => page,
             Err(error) => {
                 handler.abort();
                 let _ = tokio::fs::remove_dir_all(&profile).await;
-                return Err(error.into());
+                return Err(error);
             }
         };
         let weak = Arc::downgrade(&self.state);
@@ -241,68 +256,30 @@ impl BrowserService {
             }
             "browser_download" => {
                 let url = validate_url(required_str(args, "url")?)?;
-                session
-                    .browser
-                    .execute(
-                        SetDownloadBehaviorParams::builder()
-                            .behavior(SetDownloadBehaviorBehavior::AllowAndName)
-                            .download_path(session.downloads.to_string_lossy().to_string())
-                            .events_enabled(true)
-                            .build()
-                            .map_err(anyhow::Error::msg)?,
-                    )
-                    .await?;
-                let mut starts = session
-                    .browser
-                    .event_listener::<EventDownloadWillBegin>()
-                    .await?;
-                let mut progress = session
-                    .browser
-                    .event_listener::<EventDownloadProgress>()
-                    .await?;
-                // chromiumoxide recognizes Page.navigate and waits for normal
-                // navigation completion even through execute(). Attachments do
-                // not finish a page load: consume the download event while the
-                // single navigation request remains in flight.
-                let begin = {
-                    let navigation = page.execute(NavigateParams::new(url.as_str()));
-                    tokio::pin!(navigation);
-                    tokio::select! {
-                        event = starts.next() => event.context("Browser closed before download began")?,
-                        result = &mut navigation => {
-                            let _ = result?;
-                            starts.next().await.context("Browser closed before download began")?
-                        }
-                    }
-                };
-                let max = args
-                    .get("max_bytes")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(50 * 1024 * 1024)
-                    .clamp(1, 100 * 1024 * 1024);
-                while let Some(event) = progress.next().await {
-                    if event.guid != begin.guid {
-                        continue;
-                    }
-                    if event.received_bytes > max as f64 || event.total_bytes > max as f64 {
-                        session
-                            .browser
-                            .execute(CancelDownloadParams::new(begin.guid.clone()))
-                            .await?;
-                        anyhow::bail!("Download exceeded byte budget");
-                    }
-                    match event.state {
-                        DownloadProgressState::Canceled => anyhow::bail!("Download canceled"),
-                        DownloadProgressState::Completed => break,
-                        _ => (),
-                    }
-                }
-                let file = session.downloads.join(&begin.guid);
-                ensure!(
-                    tokio::fs::metadata(&file).await?.len() <= max,
-                    "Download exceeded byte budget"
-                );
-                let extension = std::path::Path::new(&begin.suggested_filename)
+                let max = download_budget(args);
+                // A download navigation never finishes loading, and
+                // chromiumoxide runs one navigation per page at a time: on the
+                // session page it would hold every later browser_navigate
+                // until the request timeout. It runs in a page of its own,
+                // closed afterwards, which drops that pending navigation.
+                let download_page = session.browser.new_page("about:blank").await?;
+                let closing = download_page.clone();
+                // The restore runs whether the download succeeds or fails, so a
+                // failed attempt cannot leave later pages able to download.
+                // Cancellation and timeouts drop this future instead; execute()
+                // then closes the whole browser, which is stricter still.
+                let (file, begin) = run_then_restore(
+                    download_to_staging(session, &download_page, &url, max),
+                    async {
+                        let denied = session.browser.execute(deny_downloads()).await;
+                        let closed = closing.close().await;
+                        denied?;
+                        closed.context("Failed to close the download page")?;
+                        Ok(())
+                    },
+                )
+                .await?;
+                let extension = Path::new(&begin.suggested_filename)
                     .extension()
                     .and_then(|s| s.to_str())
                     .filter(|s| s.len() <= 12 && s.chars().all(|c| c.is_ascii_alphanumeric()))
@@ -320,6 +297,147 @@ impl BrowserService {
             }
             _ => anyhow::bail!("Unknown browser tool: {name}"),
         }
+    }
+}
+
+/// Allows downloads into the session's private staging directory, navigates to
+/// `url`, and waits for the resulting download to finish within `max` bytes.
+///
+/// Returns the staged file and its begin event. The caller must re-deny
+/// downloads afterwards regardless of the outcome (see [`run_then_restore`]).
+async fn download_to_staging(
+    session: &Session,
+    page: &Page,
+    url: &url::Url,
+    max: u64,
+) -> Result<(PathBuf, Arc<EventDownloadWillBegin>)> {
+    session
+        .browser
+        .execute(
+            SetDownloadBehaviorParams::builder()
+                .behavior(SetDownloadBehaviorBehavior::AllowAndName)
+                .download_path(session.downloads.to_string_lossy().to_string())
+                .events_enabled(true)
+                .build()
+                .map_err(anyhow::Error::msg)?,
+        )
+        .await?;
+    let mut starts = session
+        .browser
+        .event_listener::<EventDownloadWillBegin>()
+        .await?;
+    let mut progress = session
+        .browser
+        .event_listener::<EventDownloadProgress>()
+        .await?;
+    // chromiumoxide recognizes Page.navigate and waits for normal
+    // navigation completion even through execute(). Attachments do
+    // not finish a page load: consume the download event while the
+    // single navigation request remains in flight.
+    let begin = {
+        let navigation = page.execute(NavigateParams::new(url.as_str()));
+        tokio::pin!(navigation);
+        tokio::select! {
+            event = starts.next() => event.context("Browser closed before download began")?,
+            result = &mut navigation => {
+                let _ = result?;
+                starts.next().await.context("Browser closed before download began")?
+            }
+        }
+    };
+    loop {
+        // A closed event stream means completion was never observed; the
+        // staged file may be partial, so treat it as a failure.
+        let event = progress
+            .next()
+            .await
+            .context("Browser closed before download completed")?;
+        if event.guid != begin.guid {
+            continue;
+        }
+        if download_exceeds_budget(event.received_bytes, event.total_bytes, max) {
+            // Stop the transfer early; the size check below and the session
+            // teardown on error still apply if the cancel itself fails.
+            if let Err(error) = session
+                .browser
+                .execute(CancelDownloadParams::new(begin.guid.clone()))
+                .await
+            {
+                anyhow::bail!("Download exceeded byte budget; cancelling it failed: {error}");
+            }
+            anyhow::bail!("Download exceeded byte budget");
+        }
+        match event.state {
+            DownloadProgressState::Canceled => anyhow::bail!("Download canceled"),
+            DownloadProgressState::Completed => break,
+            _ => (),
+        }
+    }
+    let file = session.downloads.join(&begin.guid);
+    // Progress events are reported by the page's server and Chromium; the
+    // bytes on disk are the authoritative measure.
+    enforce_file_budget(&file, max).await?;
+    Ok((file, begin))
+}
+
+/// Browser-wide parameters that forbid all downloads.
+fn deny_downloads() -> SetDownloadBehaviorParams {
+    SetDownloadBehaviorParams::new(SetDownloadBehaviorBehavior::Deny)
+}
+
+/// The caller's `max_bytes`, defaulted and clamped to the download ceiling.
+fn download_budget(args: &Value) -> u64 {
+    args.get("max_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_DOWNLOAD_MAX_BYTES)
+        .clamp(1, DOWNLOAD_MAX_BYTES_CEILING)
+}
+
+/// Whether a progress event shows a download past `max` bytes.
+///
+/// CDP reports byte counts as floats and `total_bytes` is 0 when unknown.
+/// Written as a negated "within budget" test so NaN fails closed.
+fn download_exceeds_budget(received: f64, total: f64, max: u64) -> bool {
+    let max = max as f64;
+    !(received <= max && total <= max)
+}
+
+/// Verifies the staged download is a regular file of at most `max` bytes,
+/// deleting it when it is not so an oversized payload never lingers.
+async fn enforce_file_budget(file: &Path, max: u64) -> Result<u64> {
+    // symlink_metadata: a link planted in place of the download must not be
+    // followed to some other file's size.
+    let metadata = tokio::fs::symlink_metadata(file)
+        .await
+        .context("Downloaded file is missing")?;
+    if metadata.is_file() && metadata.len() <= max {
+        return Ok(metadata.len());
+    }
+    let _ = tokio::fs::remove_file(file).await;
+    if metadata.is_file() {
+        anyhow::bail!("Download exceeded byte budget");
+    }
+    anyhow::bail!("Download did not produce a regular file")
+}
+
+/// Awaits `body`, then always awaits `restore`, returning the body's value
+/// only when both succeed.
+///
+/// A restore failure after a successful body is reported as the error; when
+/// both fail the body's error is kept with the restore failure attached.
+async fn run_then_restore<T>(
+    body: impl Future<Output = Result<T>>,
+    restore: impl Future<Output = Result<()>>,
+) -> Result<T> {
+    let result = body.await;
+    let restored = restore.await;
+    match (result, restored) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context("Failed to disable browser downloads again")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(restore)) => Err(error.context(format!(
+            "Also failed to disable browser downloads again: {restore:#}"
+        ))),
     }
 }
 

@@ -151,6 +151,9 @@ pub(super) struct SidebarUi {
     /// is fresh: the list is virtual, so a row scrolled back into view mounts
     /// again and would otherwise replay its entrance.
     changes: BTreeMap<Change, Instant>,
+    /// Chats archived here that no host page has confirmed yet. A page that
+    /// was already on its way still lists them; it must not bring them back.
+    archiving: BTreeSet<Uuid>,
 }
 impl Default for SidebarUi {
     fn default() -> Self {
@@ -160,6 +163,7 @@ impl Default for SidebarUi {
             collapsed: Default::default(),
             renaming: None,
             changes: BTreeMap::new(),
+            archiving: BTreeSet::new(),
         }
     }
 }
@@ -179,6 +183,15 @@ impl SidebarUi {
     }
     fn forget_settled(&mut self) {
         self.changes.retain(|_, at| at.elapsed() < motion::SLOW);
+    }
+    /// Whether `id` was archived here and no host page has confirmed it.
+    pub(super) fn archiving(&self, id: Uuid) -> bool {
+        self.archiving.contains(&id)
+    }
+    /// A host page that leaves out an archived chat was built after the
+    /// archive, so that chat no longer needs filtering.
+    pub(super) fn confirm_archived(&mut self, page: &BTreeSet<Uuid>) {
+        self.archiving.retain(|id| page.contains(id));
     }
     /// The title input while a rename started from the toolbar is open.
     pub(super) fn header_rename_input(&self) -> Option<Entity<InputState>> {
@@ -530,6 +543,7 @@ impl Xylo {
                                 let path = conversation.workspace.clone();
                                 let running = view.turns.get(&id).is_some_and(|turn| turn.running);
                                 let pinned = conversation.pinned;
+                                let busy = view.chat_busy(id);
                                 let weak = cx.entity().downgrade();
                                 let title = display_title(conversation);
                                 let state = &view.sidebar_state;
@@ -585,7 +599,13 @@ impl Xylo {
                                                 format!("Actions for {title}"),
                                             )
                                             .dropdown_menu(move |menu, _, _| {
-                                                chat_menu(menu, hover_weak.clone(), id, pinned)
+                                                chat_menu(
+                                                    menu,
+                                                    hover_weak.clone(),
+                                                    id,
+                                                    pinned,
+                                                    busy,
+                                                )
                                             }),
                                         );
                                 let row = sidebar_child_row(button)
@@ -594,7 +614,7 @@ impl Xylo {
                                     .group("sidebar-chat")
                                     .child(more)
                                     .context_menu(move |menu, _, _| {
-                                        chat_menu(menu, weak.clone(), id, pinned)
+                                        chat_menu(menu, weak.clone(), id, pinned, busy)
                                     });
                                 Some(match entrance {
                                     Some(from) => motion::fade_slide_in(
@@ -740,24 +760,46 @@ impl Xylo {
     /// Archiving needs no confirmation; a toast offers Undo. Archiving the
     /// open chat moves to a new chat.
     pub(super) fn archive_chat(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.chat_busy(id) || !self.conversations.iter().any(|chat| chat.id == id) {
+            return;
+        }
+        // Leave the open chat first; when leaving is blocked (unsaved draft,
+        // interrupted action) nothing is archived.
+        if self.session == id {
+            self.new_chat(cx);
+            if self.session == id {
+                return;
+            }
+        }
         let Some(index) = self.conversations.iter().position(|chat| chat.id == id) else {
             return;
         };
         let mut chat = self.conversations.remove(index);
         chat.archived = true;
+        self.sidebar_state.archiving.insert(id);
         self.sidebar_state.dirty = true;
-        if self.session == id {
-            self.new_chat(cx);
-        }
         self.status =
             StatusLine::with_undo("Chat archived", app_status::ToastUndo::Unarchive(chat));
         self.host_call(cx, |host| host.set_conversation_archived(id, true));
+    }
+    /// A chat with a running turn, an approval waiting or turns queued keeps
+    /// working; archiving it would hide that work, so Archive is off.
+    pub(super) fn chat_busy(&self, id: Uuid) -> bool {
+        self.turns
+            .get(&id)
+            .is_some_and(|turn| turn.running || turn.pending_approvals().next().is_some())
+            || self
+                .turn_queue
+                .items
+                .get(&id)
+                .is_some_and(|queued| !queued.is_empty())
     }
     /// Undo for Archive: the chat returns to its place in the list at once,
     /// even when it is older than the first page the host sends back.
     pub(super) fn unarchive_chat(&mut self, mut chat: Conversation, cx: &mut Context<Self>) {
         let id = chat.id;
         chat.archived = false;
+        self.sidebar_state.archiving.remove(&id);
         if !self.conversations.iter().any(|existing| existing.id == id) {
             self.conversations.push(chat);
             self.conversations.sort_by(|left, right| {
@@ -920,7 +962,13 @@ pub(super) fn person_name() -> String {
 /// How far chat rows sit in from their project row.
 const CHAT_INSET: f32 = 32.;
 /// The chat context menu, shared by right-click and the row's hover "…".
-fn chat_menu(menu: PopupMenu, view: WeakEntity<Xylo>, id: Uuid, pinned: bool) -> PopupMenu {
+fn chat_menu(
+    menu: PopupMenu,
+    view: WeakEntity<Xylo>,
+    id: Uuid,
+    pinned: bool,
+    busy: bool,
+) -> PopupMenu {
     let rename = view.clone();
     let pin = view.clone();
     menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
@@ -931,9 +979,25 @@ fn chat_menu(menu: PopupMenu, view: WeakEntity<Xylo>, id: Uuid, pinned: bool) ->
             let _ = pin.update(cx, |view, cx| view.set_chat_pinned(id, !pinned, cx));
         }),
     )
-    .item(PopupMenuItem::new("Archive").on_click(move |_, _, cx| {
+    .item(archive_item(busy, move |cx| {
         let _ = view.update(cx, |view, cx| view.archive_chat(id, cx));
     }))
+}
+/// Archive, or a greyed Archive that says why while the chat is busy.
+pub(super) fn archive_item(busy: bool, archive: impl Fn(&mut App) + 'static) -> PopupMenuItem {
+    if !busy {
+        return PopupMenuItem::new("Archive").on_click(move |_, _, cx| archive(cx));
+    }
+    PopupMenuItem::element(|_, _| {
+        div()
+            .id("archive-unavailable")
+            .tooltip(|_, cx| {
+                cx.new(|_| XyloTooltip("Stop the task before archiving".into()))
+                    .into()
+            })
+            .child("Archive")
+    })
+    .disabled(true)
 }
 /// All virtual rows share a 32px stride; chat rows are inset under their project.
 fn sidebar_child_row(button: impl IntoElement) -> Div {

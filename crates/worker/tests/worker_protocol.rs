@@ -111,7 +111,10 @@ fn provider_fixture(tool: &str, args: Value) -> (String, Arc<Mutex<Vec<Value>>>)
     let saved = requests.clone();
     let tool = tool.to_string();
     std::thread::spawn(move || {
-        for (index, connection) in listener.incoming().take(2).enumerate() {
+        let requests = listener
+            .incoming()
+            .filter(|connection| connection.as_ref().map_or(true, |c| !answer_probe(c)));
+        for (index, connection) in requests.take(2).enumerate() {
             let mut connection = connection.unwrap();
             connection
                 .set_read_timeout(Some(Duration::from_secs(20)))
@@ -376,7 +379,7 @@ async fn sse_validation_failure_is_correlated_once_and_retains_checkpointed_tool
     let server = tokio::spawn(async move {
         let mut recorded = Vec::new();
         for index in 0..2 {
-            let (socket, _) = listener.accept().await.unwrap();
+            let socket = accept_model_request(&listener).await;
             let mut socket = BufReader::new(socket);
             let mut line = String::new();
             socket.read_line(&mut line).await.unwrap();
@@ -579,4 +582,49 @@ async fn locked_worker_refuses_runs_and_failed_approvals_name_the_action() {
         other => panic!("expected an approval error, got {other:?}"),
     }
     worker.stop().await;
+}
+
+/// Answers the engine's served-context probe (a GET this fixture does not
+/// serve) with 404, as a server that reports no context; true when
+/// `connection` was such a probe.
+fn answer_probe(connection: &std::net::TcpStream) -> bool {
+    use std::io::{Read as _, Write as _};
+    let mut start = [0; 4];
+    if connection.peek(&mut start).unwrap_or(0) < 4 || &start != b"GET " {
+        return false;
+    }
+    let (mut reader, mut bytes, mut buffer) = (connection, Vec::new(), [0; 1024]);
+    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+        }
+    }
+    let _ = (&mut reader)
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    true
+}
+
+/// The next connection carrying a model request. The engine's served-context
+/// probe (a GET this fixture does not serve) gets 404, as from a server that
+/// reports no context.
+async fn accept_model_request(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    loop {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut start = [0; 4];
+        if socket.peek(&mut start).await.unwrap_or(0) < 4 || &start != b"GET " {
+            return socket;
+        }
+        let (mut bytes, mut buffer) = (Vec::new(), [0; 1024]);
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            match socket.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+            }
+        }
+        let _ = socket
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    }
 }

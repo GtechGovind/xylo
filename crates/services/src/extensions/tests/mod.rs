@@ -554,3 +554,63 @@ fn unreadable_catalog_and_runtime_setup_are_deleted() {
 }
 
 mod runtime;
+
+#[test]
+fn updates_remove_the_replaced_version_and_never_reuse_a_partial_snapshot() {
+    let source = tempfile::tempdir().unwrap();
+    skill(
+        source.path(),
+        "SKILL.md",
+        "---\nname: notes\ndescription: v1\n---\nFirst.",
+    );
+    skill(source.path(), "reference.md", "First reference.");
+    let home = tempfile::tempdir().unwrap();
+    let service = ExtensionService::new(home.path());
+    let first = service.install_local(source.path()).unwrap();
+    let first_root = service.package_root(&first).unwrap();
+    assert!(first_root.join("reference.md").is_file());
+
+    skill(
+        source.path(),
+        "SKILL.md",
+        "---\nname: notes\ndescription: v2\n---\nSecond.",
+    );
+    let second = service.install_local(source.path()).unwrap();
+    assert_ne!(first.digest, second.digest);
+    assert!(
+        !first_root.exists(),
+        "the replaced version's content is removed"
+    );
+    assert!(service.package_root(&second).unwrap().is_dir());
+
+    // An interrupted removal left a partial folder under the first digest.
+    fs::create_dir_all(&first_root).unwrap();
+    fs::write(
+        first_root.join("SKILL.md"),
+        "---\nname: notes\n---\nPartial",
+    )
+    .unwrap();
+    skill(
+        source.path(),
+        "SKILL.md",
+        "---\nname: notes\ndescription: v1\n---\nFirst.",
+    );
+    let reinstalled = service.install_local(source.path()).unwrap();
+    assert_eq!(reinstalled.digest, first.digest);
+    assert_eq!(
+        fs::read_to_string(first_root.join("reference.md")).unwrap(),
+        "First reference."
+    );
+    assert!(
+        fs::read_to_string(first_root.join("SKILL.md"))
+            .unwrap()
+            .contains("First.")
+    );
+    assert!(!service.package_root(&second).unwrap().exists());
+    let leftovers: Vec<_> = fs::read_dir(home.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty());
+}

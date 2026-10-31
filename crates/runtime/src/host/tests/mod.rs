@@ -112,6 +112,7 @@ pub(super) fn state() -> (tempfile::TempDir, Arc<HostState>, Receiver<HostEvent>
         secrets: parking_lot::RwLock::new(Ok(secrets)),
         store,
         settings: Mutex::new(AppSettings::default()),
+        latest_project_open: std::sync::atomic::AtomicU64::new(0),
         workers: Mutex::new(HashMap::new()),
         sequences: SessionSequences::default(),
         events,
@@ -893,6 +894,7 @@ async fn connector_mutation_ack_is_durable_when_catalog_read_is_corrupt() {
         command: Some(PathBuf::from("/usr/bin/true")),
         args: vec!["one".into(), "two".into()],
         credential_ref: None,
+        trusted: false,
     };
     let request_id = Uuid::new_v4();
     host.handle(HostCommand::MutateConnector(
@@ -988,6 +990,7 @@ async fn connector_failed_write_and_missing_reference_have_redacted_correlated_e
         command: None,
         args: vec![],
         credential_ref: None,
+        trusted: false,
     };
     let request_id = Uuid::new_v4();
     host.handle(HostCommand::MutateConnector(
@@ -1100,6 +1103,7 @@ async fn local_connector_inspection_without_project_is_rejected_before_launch() 
         command: Some(PathBuf::from("/usr/bin/true")),
         args: vec![],
         credential_ref: None,
+        trusted: false,
     };
     host.store.save_connector(&config).unwrap();
     host.handle(HostCommand::ConnectorTools(Uuid::new_v4(), config.id, None))
@@ -1135,6 +1139,7 @@ async fn connector_remove_gate_prevents_waiting_inspection_from_launching_delete
         command: Some(PathBuf::from("/bin/sh")),
         args: vec![script.to_string_lossy().into_owned()],
         credential_ref: None,
+        trusted: false,
     };
     host.store.save_connector(&config).unwrap();
     let held = host
@@ -1486,3 +1491,72 @@ async fn a_reopened_vault_that_keeps_its_key_elsewhere_corrects_the_setting() {
 }
 
 pub(super) mod draft;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_snapshot_received_before_a_project_open_cannot_undo_it() {
+    let (directory, host, _events) = state();
+    let project = directory.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    // The open (received 2nd) is applied before the older snapshot (received 1st)
+    // commits, because project opens run outside the settings commit order.
+    let _ = settings_control::with_receipt(2, host.handle(HostCommand::Workspace(project.clone())))
+        .await;
+    let stale = AppSettings {
+        theme: "from-older-snapshot".into(),
+        ..Default::default()
+    };
+    settings_control::with_receipt(1, host.handle(HostCommand::SaveSettings(stale)))
+        .await
+        .unwrap();
+    let saved = host.store.settings().unwrap();
+    assert_eq!(saved.theme, "from-older-snapshot");
+    assert_eq!(saved.last_workspace.as_ref(), Some(&project));
+    assert!(saved.ui.open_projects.contains(&project));
+    assert_eq!(
+        host.settings.lock().await.last_workspace.as_ref(),
+        Some(&project)
+    );
+    // A snapshot sent after the open decides the project fields again, so
+    // leaving the project still works.
+    let left = AppSettings {
+        ui: saved.ui.clone(),
+        ..Default::default()
+    };
+    settings_control::with_receipt(3, host.handle(HostCommand::SaveSettings(left)))
+        .await
+        .unwrap();
+    assert_eq!(host.store.settings().unwrap().last_workspace, None);
+}
+
+#[test]
+fn host_derived_settings_commit_keeps_live_project_fields() {
+    let live = AppSettings {
+        last_workspace: Some("/projects/new".into()),
+        ui: xylo_core::UiPreferences {
+            open_projects: vec!["/projects/old".into(), "/projects/new".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // remove_provider copies settings, then commits after an open may have landed.
+    let mut copy = AppSettings {
+        theme: "changed".into(),
+        last_workspace: Some("/projects/old".into()),
+        ui: xylo_core::UiPreferences {
+            open_projects: vec!["/projects/old".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    settings_control::merge_project_fields(
+        &mut copy,
+        &live,
+        settings_control::ProjectFields::Current,
+        Some(5),
+        0,
+    );
+    assert_eq!(copy.theme, "changed");
+    assert_eq!(copy.last_workspace, live.last_workspace);
+    assert_eq!(copy.ui.open_projects, live.ui.open_projects);
+}

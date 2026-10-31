@@ -124,11 +124,22 @@ pub(super) fn tool_input(arguments: &str) -> Option<Value> {
     serde_json::from_str(arguments).ok()
 }
 
+/// Maps a Chat Completions `finish_reason` or Anthropic `stop_reason`.
+///
+/// Every reason that means "the output ran out of room" is [`Length`]
+/// (Anthropic `model_context_window_exceeded`, Mistral `model_length`), so
+/// the loop keeps the partial answer and recovers instead of failing the
+/// turn. `eos`/`eos_token` are the plain stop of Text Generation Inference
+/// and llama.cpp-derived servers.
+///
+/// [`Length`]: FinishReason::Length
 fn finish_reason(reason: &str) -> Result<FinishReason, ModelError> {
     match reason {
-        "stop" | "end_turn" | "stop_sequence" => Ok(FinishReason::Stop),
+        "stop" | "end_turn" | "stop_sequence" | "eos" | "eos_token" => Ok(FinishReason::Stop),
         "tool_calls" | "tool_use" | "function_call" => Ok(FinishReason::ToolCalls),
-        "length" | "max_tokens" => Ok(FinishReason::Length),
+        "length" | "max_tokens" | "model_length" | "model_context_window_exceeded" => {
+            Ok(FinishReason::Length)
+        }
         "content_filter" | "refusal" => Err(failure("Provider filtered the response")),
         other => Err(failure(format!("Provider generation stopped ({other})"))),
     }
@@ -143,9 +154,16 @@ pub(super) struct EventState {
     tools: HashMap<u64, u32>,
     tool_arguments: HashMap<u64, String>,
     blocks: BTreeMap<u64, Value>,
+    /// Streamed text of an Anthropic block field, kept as a growing string
+    /// and written into its block when the block (or message) ends, so a
+    /// long block costs linear rather than quadratic time.
+    block_text: BTreeMap<(u64, &'static str), String>,
     gemini_parts: Vec<Value>,
     input: u64,
     output: u64,
+    /// Prompt-cache reads and writes, when the provider reports them.
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
     finish_reason: Option<FinishReason>,
     text_emitted: bool,
     /// A tool input stopped before it was valid JSON.
@@ -167,9 +185,12 @@ impl EventState {
             tools: HashMap::new(),
             tool_arguments: HashMap::new(),
             blocks: BTreeMap::new(),
+            block_text: BTreeMap::new(),
             gemini_parts: Vec::new(),
             input: 0,
             output: 0,
+            cache_read: None,
+            cache_write: None,
             finish_reason: None,
             text_emitted: false,
             truncated_input: false,
@@ -225,10 +246,19 @@ impl EventState {
     fn chat(&mut self, value: &Value) -> Result<Vec<StreamEvent>, ModelError> {
         let mut output = Vec::new();
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
-            output.push(StreamEvent::Usage(super::usage(
-                usage["prompt_tokens"].as_u64().unwrap_or(0),
-                usage["completion_tokens"].as_u64().unwrap_or(0),
-            )));
+            // `prompt_tokens` already includes the cached ones.
+            output.push(StreamEvent::Usage(
+                super::usage(
+                    usage["prompt_tokens"].as_u64().unwrap_or(0),
+                    usage["completion_tokens"].as_u64().unwrap_or(0),
+                )
+                .with_cache(
+                    usage
+                        .pointer("/prompt_tokens_details/cached_tokens")
+                        .and_then(Value::as_u64),
+                    None,
+                ),
+            ));
         }
         let Some(choice) = value.pointer("/choices/0") else {
             return Ok(output);
@@ -378,9 +408,11 @@ impl EventState {
         match kind {
             "message_start" => {
                 let usage = &value["message"]["usage"];
+                self.cache_read = usage["cache_read_input_tokens"].as_u64();
+                self.cache_write = usage["cache_creation_input_tokens"].as_u64();
                 self.input = usage["input_tokens"].as_u64().unwrap_or(0)
-                    + usage["cache_read_input_tokens"].as_u64().unwrap_or(0)
-                    + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                    + self.cache_read.unwrap_or(0)
+                    + self.cache_write.unwrap_or(0);
             }
             "content_block_start" => {
                 let raw = value["index"]
@@ -416,11 +448,14 @@ impl EventState {
                 let change = &value["delta"];
                 let block = self
                     .blocks
-                    .get_mut(&raw)
+                    .get(&raw)
                     .ok_or_else(|| failure("Anthropic delta arrived before its block"))?;
-                let mut append = |field: &str, text: &str| {
-                    let prior = block[field].as_str().unwrap_or("").to_owned();
-                    block[field] = json!(prior + text);
+                let block_text = &mut self.block_text;
+                let mut append = |field: &'static str, text: &str| {
+                    block_text
+                        .entry((raw, field))
+                        .or_insert_with(|| block[field].as_str().unwrap_or("").to_owned())
+                        .push_str(text);
                 };
                 match change["type"].as_str() {
                     Some("text_delta") => {
@@ -455,6 +490,7 @@ impl EventState {
                 let raw = value["index"]
                     .as_u64()
                     .ok_or_else(|| failure("Anthropic stop has no block index"))?;
+                self.settle_block_text(Some(raw));
                 if let Some(args) = self.tool_arguments.get(&raw) {
                     // A tool without arguments streams an empty input; input
                     // cut off by the output limit is settled at message_stop.
@@ -494,10 +530,14 @@ impl EventState {
                 if self.truncated_input && finish != FinishReason::Length {
                     return Err(failure("Anthropic tool input ended before valid JSON"));
                 }
+                self.settle_block_text(None);
                 output.push(StreamEvent::Native(NativeContent::Anthropic(
                     self.blocks.values().cloned().collect(),
                 )));
-                output.push(StreamEvent::Usage(super::usage(self.input, self.output)));
+                output.push(StreamEvent::Usage(
+                    super::usage(self.input, self.output)
+                        .with_cache(self.cache_read, self.cache_write),
+                ));
                 output.push(StreamEvent::Finished(finish));
                 self.terminal = true;
             }
@@ -506,10 +546,28 @@ impl EventState {
         Ok(output)
     }
 
+    /// Writes the streamed text of block `raw` (or of every block) into it.
+    fn settle_block_text(&mut self, raw: Option<u64>) {
+        let (settled, pending): (BTreeMap<_, _>, BTreeMap<_, _>) =
+            std::mem::take(&mut self.block_text)
+                .into_iter()
+                .partition(|((index, _), _)| raw.is_none_or(|raw| *index == raw));
+        self.block_text = pending;
+        for ((index, field), text) in settled {
+            if let Some(block) = self.blocks.get_mut(&index) {
+                block[field] = Value::String(text);
+            }
+        }
+    }
+
     fn gemini(&mut self, value: &Value) -> Result<Vec<StreamEvent>, ModelError> {
         let mut output = Vec::new();
         if let Some(usage) = value.get("usageMetadata") {
+            // `promptTokenCount` already includes the cached content.
             self.input = usage["promptTokenCount"].as_u64().unwrap_or(self.input);
+            self.cache_read = usage["cachedContentTokenCount"]
+                .as_u64()
+                .or(self.cache_read);
             self.output = usage["candidatesTokenCount"].as_u64().unwrap_or(0)
                 + usage["thoughtsTokenCount"].as_u64().unwrap_or(0);
         }
@@ -554,6 +612,9 @@ impl EventState {
                     "STOP" if self.tools.is_empty() => FinishReason::Stop,
                     "STOP" => FinishReason::ToolCalls,
                     "MAX_TOKENS" => FinishReason::Length,
+                    // A recoverable model mistake: the loop asks for the
+                    // call again instead of failing the turn.
+                    "MALFORMED_FUNCTION_CALL" => FinishReason::MalformedToolCall,
                     other => return Err(failure(format!("Gemini generation stopped ({other})"))),
                 });
                 self.terminal = true;
@@ -565,7 +626,9 @@ impl EventState {
             output.push(StreamEvent::Native(NativeContent::Gemini(
                 self.gemini_parts.clone(),
             )));
-            output.push(StreamEvent::Usage(super::usage(self.input, self.output)));
+            output.push(StreamEvent::Usage(
+                super::usage(self.input, self.output).with_cache(self.cache_read, self.cache_write),
+            ));
             if let Some(finish) = self.finish_reason {
                 output.push(StreamEvent::Finished(finish));
             }

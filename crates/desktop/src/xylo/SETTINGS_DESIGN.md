@@ -77,7 +77,8 @@ toasts are for global events only.
 `list_container([...])` holds grouped items (providers, environments,
 connectors, plugins, approval rules). An item is
 `list_item(id, Some(monogram(name, stable_id)), title, subtitle)` with
-`.trailing(status_pill(..))`, actions, `.tags(..)` for kinds and
+`.trailing(status_pill(..))`, actions, `.tags(..)` for kinds (`.toned_tag` for a
+warning such as "Not used automatically", `.title_tag` for "Trusted") and
 `.hover_detail(raw_id)`. `.on_click` turns the leading part into the button
 that opens the item and adds a chevron; trailing controls stay outside it.
 Monograms take initials from the name and a tint from the stable id, so

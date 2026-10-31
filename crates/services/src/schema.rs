@@ -17,7 +17,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior};
 use std::{path::Path, sync::OnceLock, time::Duration};
 
 /// Schema generation stored in `PRAGMA user_version`.
-pub(crate) const VERSION: i64 = 1;
+pub(crate) const VERSION: i64 = 2;
 
 /// Every table, index and trigger of the application database.
 pub(crate) const SCHEMA: &str = "
@@ -29,7 +29,8 @@ CREATE INDEX conversations_keyset ON conversations(updated_at DESC,id DESC);
 CREATE TABLE messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES conversations(id),json TEXT NOT NULL,created_at INTEGER NOT NULL);
 CREATE INDEX messages_session ON messages(session_id,created_at);
 CREATE INDEX messages_session_append ON messages(session_id);
-CREATE TABLE checkpoints(session_id TEXT PRIMARY KEY REFERENCES conversations(id),turn_id TEXT NOT NULL,messages TEXT NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE checkpoints(session_id TEXT PRIMARY KEY REFERENCES conversations(id),turn_id TEXT NOT NULL,length INTEGER NOT NULL,revision INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE checkpoint_messages(session_id TEXT NOT NULL REFERENCES checkpoints(session_id),position INTEGER NOT NULL,json TEXT NOT NULL,PRIMARY KEY(session_id,position)) WITHOUT ROWID;
 CREATE TABLE completed_turns(session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,json TEXT NOT NULL,completed_at INTEGER NOT NULL,PRIMARY KEY(session_id,turn_id));
 
 CREATE TABLE actions(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,action_key TEXT NOT NULL,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL,UNIQUE(session_id,turn_id,action_key));

@@ -107,6 +107,10 @@ fn mutate(data: &Path, update: impl FnOnce(&mut BTreeMap<String, Entry>)) -> Res
     } else {
         BTreeMap::new()
     };
+    // Drop removes an entry only on a clean exit. Without pruning, entries left
+    // by crashed or killed servers would accumulate until the count limit made
+    // every later local inference start fail.
+    entries.retain(|_, entry| process_alive(entry.pid));
     update(&mut entries);
     ensure!(
         entries.len() <= 256,
@@ -138,6 +142,30 @@ fn mutate(data: &Path, update: impl FnOnce(&mut BTreeMap<String, Entry>)) -> Res
         let _ = std::fs::remove_file(temporary);
     }
     result
+}
+
+/// Whether `pid` names a running process. A process owned by another user
+/// counts as running. A recycled PID keeps its entry, which only errs toward
+/// treating the slot as taken.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs only the existence and permission check.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Without a cheap liveness probe, keep every entry.
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 #[cfg(test)]

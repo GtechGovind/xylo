@@ -12,16 +12,23 @@ Every piece of text Xylo sends to a model as instructions lives here, in Markdow
 | `permission-change.md` | System note appended when the user changes the mode mid-task, so the cached system block stays unchanged | `prompts::permission_change(mode)` |
 | `system-project-instructions.md` | Wrapper for AGENTS.md / CLAUDE.md text, only when present | (inside `system`) |
 | `system-skills.md` | Wrapper for the skills index, only when skills exist | (inside `system`) |
-| `system-facts.md` | Wrapper for retained fact titles, only when facts exist | (inside `system`) |
+| `recalled-context.md`, `recalled-facts.md`, `recalled-procedures.md`, `recalled-skills.md` | Per-turn note after the user's message with the project facts and learned procedures retrieved for that prompt (quoted and dated as data) and any installed skill the prompt invokes by name; kept out of the system prompt so it stays byte-identical across turns | `prompts::recalled_context(facts, procedures, skills)` |
 | `subagent.md`, `subagent-task.md` | Delegated helper agent (`agent_delegate`): parent's environment, permissions and project instructions, then the task; no skill or fact indexes | `prompts::subagent(&PromptContext, task)` |
-| `compaction.md` | Context summarizer system prompt | `prompts::compaction()` |
+| `compaction.md` | Context summarizer system prompt; requires exact paths, identifiers, dates and a cited source (call id) for each decision | `prompts::compaction()` |
 | `compaction-request.md`, `compaction-update.md` | Summarizer user message, first summary or update of a previous one | `prompts::compaction_request(previous, transcript)` |
 | `compaction-summary.md` | Message that replaces condensed history | `prompts::compaction_summary(summary)` |
 | `compaction-excerpts.md`, `compaction-tool-notes.md` | Headers of the fallback excerpt notes | `prompts::compaction_excerpts_header()`, `prompts::compaction_tool_notes_header()` |
+| `compaction-record.md`, `compaction-record-omitted.md` | Harness record appended to every summary: the first and latest pinned user messages verbatim (the ones between counted in an "omitted" line) and the artifact ledger (files read and changed, commands and outcomes, latest todo list) the application derives from tool calls; parsed back and extended at the next summary | `prompts::compaction_record(&RecordSections)`, `prompts::compaction_record_markers()`, `prompts::compaction_record_omitted(count)` |
+| `masked-read-superseded.md`, `masked-read-changed.md`, `masked-saved.md`, `masked-aged.md` | Stub that replaces an old tool result when observations are masked: superseded by a later identical read, out of date after an edit, saved to a file, or aged out; each says how to get the content back | `prompts::masked_observation(call, bytes, reason)`, `prompts::is_masked_observation(content)` |
 | `title.md` | 3–6 word conversation title | `prompts::title()` |
 | `skill-permissions-note.md` | `permissions` value in a loaded skill's tool result | `prompts::skill_permissions_note()` |
 | `forked-skill-context.md` | Context for the child agent that runs a forked skill | `prompts::forked_skill_context(skill, package_root)` |
 | `step-limit.md` | Final call after the per-turn step limit | `prompts::step_limit()` |
+| `continue-answer.md`, `output-limit-without-answer.md`, `empty-answer.md`, `malformed-tool-call.md` | Application notes after a reply the output limit cut off, a reply whose reasoning used the whole limit, an empty reply, and a tool call the provider could not parse | `prompts::continue_answer()`, `output_limit_without_answer()`, `empty_answer()`, `malformed_tool_call()` |
+| `truncated-tool-call.md` | Tool error for a call the output limit cut off; the call is never run | `prompts::truncated_tool_call(tool, received)` |
+| `step-budget.md` | Application note at 75% and 90% of the per-turn step limit | `prompts::step_budget(step, limit)` |
+| `stall-note.md`, `stall-warning.md` | First and final application notes when the loop detector sees the model repeating itself | `prompts::stall_note(pattern)`, `prompts::stall_warning(pattern)` |
+| `stall-repeated-call.md`, `stall-alternating.md`, `stall-repeated-error.md` | The repeated pattern those notes describe | `prompts::stall_repeated_call(tools, count)`, `stall_alternating(tools, count)`, `stall_repeated_error(tool, count)` |
 
 Built-in skills: `../skills/<name>/SKILL.md` plus optional resource files, registered in `RAW_SKILLS` in `src/prompts/skills.rs`, reached with `prompts::bundled_skills()` and `prompts::bundled_skill(name)`.
 
@@ -40,15 +47,15 @@ Built-in skills: `../skills/<name>/SKILL.md` plus optional resource files, regis
 | --- | --- |
 | Identity, environment, working method, permission paragraph | Every call (system prompt) |
 | AGENTS.md / CLAUDE.md from repository root to workspace | Every call, bounded to 24 KiB |
-| Skills index: one `- name: description` line per built-in or installed skill | Every call, bounded to 8 KiB |
-| Retained fact titles | Every call, at most 24 titles |
+| Skills index: one `- name: description` line per built-in or installed skill the model may use on its own | Every call, bounded to 8 KiB |
+| Recalled facts (first lines, dated, with their origin) and learned procedure names | Once per turn, in a note after the user's message; at most 8 facts the user stated or approved or the agent wrote from project content, and 2 procedures |
 | Skill body (`SKILL.md` after the frontmatter) | When the model calls `extension_skill` |
 | Skill resources (`references/…`) | When the model calls `extension_resource` |
-| Learned procedures | `skill_list` / `skill_read` |
+| Learned procedure steps | `skill_list` / `skill_read` |
 | Fact text | `memory_search` |
 | Extra tool schemas | `search_tools` / `call_tool` |
 
-Budget of the fixed prompt, measured with the tests' sample context: about 3.7–3.9 KB (roughly 1,000 tokens) for identity, environment, method and permissions; about 6 KB with the six built-in skills listed. `fixed_system_prompt_stays_within_budget` fails if the prompt without project instructions (built-in skills and 24 fact titles included) exceeds 12 KiB.
+Budget of the fixed prompt, measured with the tests' sample context: about 3.7–3.9 KB (roughly 1,000 tokens) for identity, environment, method and permissions; about 6 KB with the six built-in skills listed. `fixed_system_prompt_stays_within_budget` fails if the prompt without project instructions (built-in skills included) exceeds 12 KiB.
 
 ### Project instructions
 

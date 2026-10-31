@@ -63,6 +63,7 @@ fn fact(scope: &str, text: &str, parent: Option<Uuid>) -> MemoryRecord {
         source: "Explicit fixture provenance".into(),
         created_at: 7,
         supersedes: parent,
+        origin: xylo_core::MemoryOrigin::UserTyped,
     }
 }
 fn setup() -> (tempfile::TempDir, Store, SqliteMemory) {
@@ -120,7 +121,7 @@ fn chain_survives_middle_deletion_and_forget_removes_all_derived_records_only_in
         conn.execute("INSERT INTO skills(name,version,json)VALUES('procedure',1,'{}')",[])?;
         conn.execute("INSERT INTO conversations(id,json,updated_at)VALUES('keep','{}',0)",[])?;
         conn.execute("INSERT INTO messages(id,session_id,json,created_at)VALUES('keep','keep','{}',0)",[])?;
-        conn.execute("INSERT INTO checkpoints(session_id,turn_id,messages,updated_at)VALUES('keep','turn','[]',0)",[])?;Ok(())
+        conn.execute("INSERT INTO checkpoints(session_id,turn_id,length,revision,updated_at)VALUES('keep','turn',0,1,0)",[])?;Ok(())
     }).unwrap();
     let receipt = delete(&memory, &store, "a", FactDeleteKind::Chain { id: c.id });
     assert_eq!(receipt.removed, 2);

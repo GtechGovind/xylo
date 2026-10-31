@@ -4,13 +4,15 @@
 //! environment, permission mode and project instructions), a scoped child
 //! broker (whose tool events carry the parent `agent_delegate` action as
 //! `parent_id`) and no further delegation (depth 1). At most two children run
-//! at once per turn, each bounded in time. The child's final answer, bounded
-//! to 64 KB, becomes the `agent_delegate` tool result.
+//! at once per turn, each bounded in time. The child's final answer becomes
+//! the `agent_delegate` tool result, bounded to a share of the model's
+//! effective window (see [`EffectiveWindow::subagent_result_bytes`]); its
+//! project instructions get the same window-scaled budget as the parent's.
 use crate::{
     agent_loop::{AgentLoop, MAX_MODEL_CALLS},
     broker_tools::BrokerTools,
     model::{Message, ModelProvider},
-    provider_guard::ContextBudget,
+    provider_guard::{ContextBudget, EffectiveWindow},
     tools::{DelegateCall, PermissionCell, ToolBroker},
 };
 use anyhow::{Context, Result, bail};
@@ -28,8 +30,6 @@ use xylo_core::EngineEvent;
 pub(crate) const MAX_CONCURRENT_CHILDREN: usize = 2;
 /// Longest a child may work.
 pub(crate) const CHILD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// Largest child answer returned to the parent model.
-const MAX_RESULT_BYTES: usize = 64 * 1024;
 
 /// Everything a child loop shares with its parent turn.
 pub(crate) struct Delegation {
@@ -101,8 +101,13 @@ impl Delegation {
             request.push_str(context);
         }
         let mode = self.permissions.get();
-        let context =
-            crate::prompts::PromptContext::detect(&self.workspace, mode, xylo_core::now_ms());
+        let window = self.budget.window();
+        let context = crate::prompts::PromptContext::detect(
+            &self.workspace,
+            mode,
+            xylo_core::now_ms(),
+            window.prompt_budget(),
+        );
         let child_loop = AgentLoop {
             provider: self.provider.clone(),
             budget: self.budget.clone(),
@@ -136,7 +141,7 @@ impl Delegation {
                 )})
             }
             Ok(Ok(outcome)) => {
-                json!({"status":"completed","result":bounded(&outcome.text)})
+                json!({"status":"completed","result":bounded(&outcome.text, window)})
             }
             Ok(Err(failure)) if failure.cancelled() && self.cancel.is_cancelled() => {
                 child.shutdown().await?;
@@ -151,16 +156,17 @@ impl Delegation {
     }
 }
 
-/// `text` cut at a character boundary to [`MAX_RESULT_BYTES`].
-fn bounded(text: &str) -> String {
-    if text.len() <= MAX_RESULT_BYTES {
+/// `text` cut at a character boundary to the window's helper-answer budget.
+fn bounded(text: &str, window: EffectiveWindow) -> String {
+    let limit = window.subagent_result_bytes();
+    if text.len() <= limit {
         return text.to_owned();
     }
-    let mut end = MAX_RESULT_BYTES;
+    let mut end = limit;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n[answer truncated at 64 KB]", &text[..end])
+    format!("{}\n[answer truncated at {limit} bytes]", &text[..end])
 }
 
 #[cfg(test)]

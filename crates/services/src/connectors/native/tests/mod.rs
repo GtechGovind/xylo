@@ -121,6 +121,7 @@ fn connector(base: &str, transport: &str) -> (NativeConnectors, ConnectorConfig)
             command: None,
             args: Vec::new(),
             credential_ref: Some("fixture".into()),
+            trusted: false,
         },
     )
 }
@@ -475,6 +476,7 @@ async fn invalid_argument_types_ranges_and_unknown_fields_fail_before_credential
         command: None,
         args: Vec::new(),
         credential_ref: None,
+        trusted: false,
     };
     for args in [
         json!({"query":"q","limit":"3"}),

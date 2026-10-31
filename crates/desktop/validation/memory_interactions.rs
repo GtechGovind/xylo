@@ -69,6 +69,7 @@ mod xylo {
                     source: "Explicit native fixture entry".into(),
                     created_at: 7,
                     supersedes: None,
+                    origin: xylo_core::MemoryOrigin::UserTyped,
                 })
                 .unwrap();
             let host = HostClient::spawn_at(paths.clone()).unwrap();
@@ -544,6 +545,7 @@ mod xylo {
                 source: "Explicit fixture".into(),
                 created_at: 1,
                 supersedes: None,
+                origin: xylo_core::MemoryOrigin::UserTyped,
             };
             memory.remember_sync(original.clone()).unwrap();
             let corrected = MemoryRecord {
@@ -551,6 +553,7 @@ mod xylo {
                 content: "Corrected fact".into(),
                 created_at: 2,
                 supersedes: Some(original.id),
+                origin: xylo_core::MemoryOrigin::UserTyped,
                 ..original.clone()
             };
             memory.remember_sync(corrected.clone()).unwrap();
@@ -612,6 +615,7 @@ mod xylo {
                     source: "Explicit fixture".into(),
                     created_at: 3,
                     supersedes: None,
+                    origin: xylo_core::MemoryOrigin::UserTyped,
                 })
                 .unwrap();
             cx.simulate_prompt_answer("Delete saved versions");

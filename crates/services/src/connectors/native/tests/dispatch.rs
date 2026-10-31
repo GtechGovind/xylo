@@ -13,6 +13,7 @@ fn fixture(endpoint: String) -> (NativeConnectors, ConnectorConfig, CredentialVa
         command: None,
         args: vec![],
         credential_ref: Some("fixture".into()),
+        trusted: false,
     };
     (client, config, vault)
 }

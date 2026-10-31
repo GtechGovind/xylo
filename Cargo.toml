@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/runtime", "crates/resources", "crates/worker", "crates/desktop", "crates/services", "crates/capabilities", "crates/engine", "crates/scheduler", "crates/helper-client", "crates/helper", "crates/distribution", "crates/notifications"]
+members = ["crates/core", "crates/runtime", "crates/resources", "crates/worker", "crates/desktop", "crates/services", "crates/capabilities", "crates/engine", "crates/scheduler", "crates/helper-client", "crates/helper", "crates/distribution", "crates/notifications", "crates/evals"]
 default-members = ["crates/desktop"]
 
 [workspace.package]

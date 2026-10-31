@@ -166,6 +166,7 @@ impl Xylo {
                 .into(),
                 created_at: now_ms(),
                 supersedes,
+                origin: xylo_core::MemoryOrigin::UserTyped,
             });
         self.facts.retry = Some(record.clone());
         self.facts.mutation = Some(Mutation {
@@ -529,14 +530,18 @@ impl Xylo {
                                 memory_title(&record.content),
                                 Some(
                                     format!(
-                                        "{} · {}",
+                                        "{} · {} · {}",
                                         memory_age(record.created_at),
+                                        origin_text(record.origin),
                                         record.source
                                     )
                                     .into(),
                                 ),
                             )
                             .tags([scope_label(&record.scope)])
+                            .when(record.origin.untrusted(), |item| {
+                                item.toned_tag(UNTRUSTED_TAG, settings_ui::Tone::Warning)
+                            })
                             .divider(index > 0)
                             .on_click(
                                 cx.listener(move |view, _, _, cx| view.open_fact_versions(id, cx)),
@@ -556,6 +561,21 @@ impl Xylo {
         settings_ui::list_frame().child(rows).into_any_element()
     }
 }
+
+/// How a memory came to exist, in the person's words. The model sees
+/// `MemoryOrigin::label`, which is worded for it instead.
+pub(super) fn origin_text(origin: xylo_core::MemoryOrigin) -> &'static str {
+    match origin {
+        xylo_core::MemoryOrigin::UserTyped => "You added this",
+        xylo_core::MemoryOrigin::UserApproved => "You approved this",
+        xylo_core::MemoryOrigin::AgentInferred => "Xylo inferred this",
+        xylo_core::MemoryOrigin::ToolOutput => "From a tool's output",
+        xylo_core::MemoryOrigin::WebContent => "From web content",
+    }
+}
+/// The warning tag on memories shaped by outside content: Xylo never recalls
+/// them on its own.
+pub(super) const UNTRUSTED_TAG: &str = "Not used automatically";
 
 /// The first line of a memory, short enough for a list title.
 pub(super) fn memory_title(content: &str) -> String {

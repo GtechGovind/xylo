@@ -982,6 +982,7 @@ async fn run_mcp(
         command: Some(program),
         args,
         credential_ref: None,
+        trusted: false,
     };
     let broker = ConnectorBroker::new(store, vault).with_local_scope(ConnectorLaunchScope {
         workspace: plan.setup.workspace.clone(),
@@ -992,7 +993,7 @@ async fn run_mcp(
     });
     let operation_cancel = cancel.child_token();
     let work = async {
-        let result = if operation == "verify" || operation == "tools/list" {
+        if operation == "verify" || operation == "tools/list" {
             broker
                 .tools(&config, &operation_cancel)
                 .await
@@ -1012,18 +1013,46 @@ async fn run_mcp(
                 .await
         } else {
             bail!("Unsupported MCP operation")
-        };
-        let shutdown = broker.disconnect(config.id).await;
-        let output = result?;
-        shutdown?;
-        Ok(output)
+        }
     };
-    let result = tokio::select! { _ = cancel.cancelled() => Err(anyhow::anyhow!("MCP component execution cancelled; effects may be incomplete")), result = tokio::time::timeout(duration(plan), work) => result.context("MCP component deadline exceeded; effects may be incomplete").and_then(|result| result) };
-    if result.is_err() {
+    let close = broker.disconnect(config.id);
+    let (result, closed) =
+        finish_mcp_operation(work, close, duration(plan), MCP_CLOSE_GRACE, &cancel).await;
+    if !closed {
         operation_cancel.cancel();
         broker.abort(config.id).await;
     }
     result
+}
+/// Bound on the graceful close that follows a completed MCP operation.
+const MCP_CLOSE_GRACE: Duration = Duration::from_secs(10);
+/// Runs `work` under the component deadline, then closes the connection. Once
+/// the operation has completed, its effects have happened: a failed, slow or
+/// cancelled close is logged rather than returned, because discarding a tool's
+/// result would report a call that ran as failed and invite a duplicate. The
+/// flag is false when the caller must still abort the connection.
+pub(super) async fn finish_mcp_operation(
+    work: impl Future<Output = Result<Value>>,
+    close: impl Future<Output = Result<()>>,
+    deadline: Duration,
+    grace: Duration,
+    cancel: &CancellationToken,
+) -> (Result<Value>, bool) {
+    let result = tokio::select! { _ = cancel.cancelled() => Err(anyhow::anyhow!("MCP component execution cancelled; effects may be incomplete")), result = tokio::time::timeout(deadline, work) => result.context("MCP component deadline exceeded; effects may be incomplete").and_then(|result| result) };
+    if result.is_err() {
+        return (result, false);
+    }
+    let closed = tokio::select! {
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("MCP shutdown cancelled")),
+        closed = tokio::time::timeout(grace, close) => closed.unwrap_or_else(|_| Err(anyhow::anyhow!("MCP shutdown timed out"))),
+    };
+    match closed {
+        Ok(()) => (result, true),
+        Err(error) => {
+            tracing::warn!(error=%format!("{error:#}"),"MCP component completed but its connection did not close cleanly; stopping it");
+            (result, false)
+        }
+    }
 }
 struct OwnedProcess {
     child: tokio::process::Child,
@@ -1091,15 +1120,22 @@ async fn run_hook(
     let mut stdin = process.child.stdin.take().context("Hook stdin missing")?;
     let stdout = process.child.stdout.take().context("Hook stdout missing")?;
     let work = async {
-        stdin.write_all(&bytes).await?;
-        stdin.shutdown().await?;
-        drop(stdin);
+        // Feed stdin while draining stdout: a hook that writes before it has read
+        // all of its input would otherwise fill the stdout pipe and deadlock both
+        // sides until the deadline. A hook may exit without reading all input.
+        let feed = async move {
+            match stdin.write_all(&bytes).await {
+                Ok(()) => stdin.shutdown().await,
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                Err(error) => Err(error),
+            }
+        };
         let mut output = Vec::new();
-        stdout
-            .take(1024 * 1024 + 1)
-            .read_to_end(&mut output)
-            .await?;
+        let mut limited = stdout.take(1024 * 1024 + 1);
+        let (fed, drained) = tokio::join!(feed, limited.read_to_end(&mut output));
+        drained?;
         ensure!(output.len() <= 1024 * 1024, "Hook output exceeds 1 MiB");
+        fed?;
         let status = process.child.wait().await?;
         if status.code() == Some(2) {
             return Ok(json!({"hookSpecificOutput":{"permissionDecision":"deny"},"exit_code":2}));

@@ -27,7 +27,7 @@ use xylo_engine::{
     tools::{PermissionCell, ToolSession},
 };
 use xylo_runtime::AppPaths;
-use xylo_services::{CredentialVault, Store, VaultKey};
+use xylo_services::{CredentialVault, Store, VaultKey, providers::ServedContextCache};
 
 struct ActiveTask {
     session_id: uuid::Uuid,
@@ -62,6 +62,10 @@ async fn main() -> Result<()> {
     let store = Store::open_existing(&paths.database)?;
     let permissions = PermissionCell::default();
     let mut session: Option<ToolSession> = None;
+    // One worker serves one session: the served contexts its turns learn are
+    // kept here, beside the tool session, so later turns neither probe again
+    // nor see a different window.
+    let served_contexts = ServedContextCache::default();
     let (output, mut pending) = mpsc::channel::<Envelope<EngineEvent>>(EVENT_QUEUE_CAPACITY);
     let sequence = Arc::new(AtomicU64::new(1));
     let writer = tokio::spawn(async move {
@@ -216,7 +220,8 @@ async fn main() -> Result<()> {
                 // The admitted turn carries the mode current at admission;
                 // later changes arrive as SetPermissions.
                 permissions.set(turn.permissions);
-                let engine = AgentEngine::new(store.clone(), paths.clone(), tools);
+                let engine = AgentEngine::new(store.clone(), paths.clone(), tools)
+                    .with_served_contexts(served_contexts.clone());
                 let engine = Arc::new(match credential {
                     Some(credential) => engine
                         .with_provider_credential(credential)
@@ -350,15 +355,9 @@ async fn main() -> Result<()> {
                 }
             },
             WorkerCommand::SteerDurable { guidance } => {
-                let receipt = steering::receive(store.clone(), active.as_ref(), guidance).await?;
-                send(
-                    &output,
-                    &sequence,
-                    request_id,
-                    Some(receipt.session_id),
-                    EngineEvent::Steering { receipt },
-                )
-                .await?;
+                let session = guidance.session_id;
+                let reply = steering::answer(store.clone(), active.as_ref(), guidance).await;
+                send(&output, &sequence, request_id, Some(session), reply).await?;
             }
             WorkerCommand::Approve {
                 action_id,

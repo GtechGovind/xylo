@@ -153,6 +153,8 @@ mod layout {
                             Some("2 models".into()),
                         )
                         .hover_detail("openai")
+                        .title_tag("Trusted", Tone::Success)
+                        .toned_tag("Not used automatically", Tone::Warning)
                         .tags(["Skills".into(), "MCP".into()])
                         .trailing(status_pill(Status::Connected))
                         .trailing(overflow_menu(

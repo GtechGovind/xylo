@@ -233,7 +233,9 @@ fn record(
             std::thread::sleep(Duration::from_millis(10));
         }
     });
-    let result = convert::normalize(&temporary.0, &path, max_seconds, &token);
+    let result = std::fs::File::open(&temporary.0)
+        .map_err(anyhow::Error::from)
+        .and_then(|input| convert::normalize(input, &path, max_seconds, &token));
     finished.store(true, Ordering::Release);
     let _ = watcher.join();
     let info = result?;

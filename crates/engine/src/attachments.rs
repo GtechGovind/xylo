@@ -1,11 +1,17 @@
-//! Hydrates managed images for one provider request. Checkpoints and events
+//! Hydrates managed images for provider requests. Checkpoints and events
 //! only ever carry the managed references in [`Message::attachments`].
+//!
+//! A turn sends the same images with every model call. Each image is read
+//! and integrity-checked (original and provider variant) on its first use in
+//! the turn, and its base64 encoding is kept for the rest of the turn, keyed
+//! by attachment id and content hash.
 use crate::model::{
     EventStream, InlineImage, Message, ModelError, ModelProvider, ModelRequest, Role,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
-use std::sync::Arc;
+use parking_lot::Mutex;
+use std::{collections::HashMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xylo_core::TurnRequest;
@@ -22,10 +28,15 @@ pub(crate) fn user_message(request: &TurnRequest) -> Message {
     message
 }
 
+/// Encoded images of one turn, by attachment id and content hash.
+type EncodedImages = Arc<Mutex<HashMap<(Uuid, String), Arc<InlineImage>>>>;
+
+/// Hydrates managed images for the model calls of one turn.
 pub(crate) struct AttachmentProvider {
     inner: Arc<dyn ModelProvider>,
     store: AttachmentStore,
     session: Uuid,
+    encoded: EncodedImages,
 }
 
 impl AttachmentProvider {
@@ -38,6 +49,7 @@ impl AttachmentProvider {
             inner,
             store,
             session,
+            encoded: EncodedImages::default(),
         }
     }
 }
@@ -46,6 +58,7 @@ impl AttachmentProvider {
 fn hydrate(
     store: &AttachmentStore,
     session: Uuid,
+    encoded: &Mutex<HashMap<(Uuid, String), Arc<InlineImage>>>,
     messages: &mut [Message],
     cancel: &CancellationToken,
 ) -> Result<(), ModelError> {
@@ -65,17 +78,27 @@ fn hydrate(
             if count > MAX_REQUEST_IMAGES {
                 return Err(ModelError::InvalidRequest("This conversation exceeds the 16-image provider budget. Start a new chat to attach more images.".into()));
             }
-            let image = store
-                .read_provider_image(session, attachment)
-                .map_err(|error| ModelError::InvalidRequest(error.to_string()))?;
-            encoded_size = encoded_size.saturating_add(image.bytes.len().div_ceil(3) * 4);
+            let key = (attachment.id, attachment.sha256.clone());
+            let cached = encoded.lock().get(&key).cloned();
+            let image = match cached {
+                Some(image) => image,
+                None => {
+                    let image = store
+                        .read_provider_image(session, attachment)
+                        .map_err(|error| ModelError::InvalidRequest(error.to_string()))?;
+                    let image = Arc::new(InlineImage {
+                        media_type: image.media_type,
+                        data: STANDARD.encode(image.bytes),
+                    });
+                    encoded.lock().insert(key, image.clone());
+                    image
+                }
+            };
+            encoded_size = encoded_size.saturating_add(image.data.len());
             if encoded_size > MAX_REQUEST_IMAGE_BYTES {
                 return Err(ModelError::InvalidRequest("This conversation exceeds the 16 MiB image transmission budget. Start a new chat or attach smaller images.".into()));
             }
-            message.images.push(InlineImage {
-                media_type: image.media_type,
-                data: STANDARD.encode(image.bytes),
-            });
+            message.images.push(InlineImage::clone(&image));
         }
     }
     Ok(())
@@ -86,12 +109,14 @@ impl ModelProvider for AttachmentProvider {
         let inner = self.inner.clone();
         let store = self.store.clone();
         let session = self.session;
+        let encoded = self.encoded.clone();
         Box::pin(async_stream::try_stream! {
             let mut request = request;
             if request.messages.iter().any(|m| !m.attachments.is_empty()) {
                 let hydrate_cancel = cancel.clone();
                 request = tokio::task::spawn_blocking(move || {
-                    hydrate(&store, session, &mut request.messages, &hydrate_cancel).map(|()| request)
+                    hydrate(&store, session, &encoded, &mut request.messages, &hydrate_cancel)
+                        .map(|()| request)
                 })
                 .await
                 .map_err(|error| ModelError::Io(format!("Image preparation failed: {error}")))??;
@@ -103,3 +128,6 @@ impl ModelProvider for AttachmentProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

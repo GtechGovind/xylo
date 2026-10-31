@@ -3,7 +3,8 @@
 //! Every directory from the repository root down to the workspace is checked
 //! for `AGENTS.md` then `CLAUDE.md` (outside a repository only the workspace
 //! itself). Files are emitted root first, so the nearest file comes last and
-//! wins on conflict. The byte budget is spent nearest first: when it runs
+//! wins on conflict. The byte budget (scaled to the model's window by the
+//! caller, at most [`INSTRUCTION_BYTES`]) is spent nearest first: when it runs
 //! out, the outermost files are the ones dropped or truncated. A file whose
 //! text duplicates one already included (for example `CLAUDE.md` symlinked
 //! to `AGENTS.md`) is skipped.
@@ -17,7 +18,7 @@ use super::environment::repository_root;
 
 /// Instruction file names, in the order they are read within one directory.
 const INSTRUCTION_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
-/// Upper bound on the bytes of instruction text placed in the system prompt.
+/// Largest instruction budget any window gets.
 pub(super) const INSTRUCTION_BYTES: usize = 24 * 1024;
 /// Below this remaining budget no further file is started.
 const MIN_FILE_BYTES: usize = 256;
@@ -26,8 +27,10 @@ const OMITTED: &str = "[Outer instruction files omitted: size limit reached]\n";
 
 /// Instruction files that apply to `workspace`, formatted as `## path`
 /// sections in precedence order (root first, nearest last), bounded by
-/// [`INSTRUCTION_BYTES`]. Empty when there are none.
-pub fn project_instructions(workspace: &Path) -> String {
+/// `budget` bytes (never more than [`INSTRUCTION_BYTES`]). Empty when there
+/// are none.
+pub fn project_instructions(workspace: &Path, budget: usize) -> String {
+    let budget = budget.min(INSTRUCTION_BYTES);
     let repository = repository_root(workspace);
     let base = repository.as_deref().unwrap_or(workspace);
     let directories: Vec<&Path> = match &repository {
@@ -47,13 +50,13 @@ pub fn project_instructions(workspace: &Path) -> String {
         let mut found = Vec::new();
         for name in INSTRUCTION_FILES {
             let path = directory.join(name);
-            let Some(text) = read_bounded(&path) else {
+            let Some(text) = read_bounded(&path, budget) else {
                 continue;
             };
             if text.is_empty() || texts.contains(&text) {
                 continue;
             }
-            let remaining = INSTRUCTION_BYTES.saturating_sub(used);
+            let remaining = budget.saturating_sub(used);
             if remaining < MIN_FILE_BYTES {
                 omitted = true;
                 sections.extend(found.into_iter().rev());
@@ -77,12 +80,10 @@ pub fn project_instructions(workspace: &Path) -> String {
 
 /// Reads at most one budget's worth of a file, trimmed; `None` when absent
 /// or unreadable.
-fn read_bounded(path: &Path) -> Option<String> {
+fn read_bounded(path: &Path, budget: usize) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
-    file.take(INSTRUCTION_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    file.take(budget as u64 + 1).read_to_end(&mut bytes).ok()?;
     Some(String::from_utf8_lossy(&bytes).trim().to_owned())
 }
 

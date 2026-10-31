@@ -293,6 +293,7 @@ impl Xylo {
         }
         let weak = cx.entity().downgrade();
         let session = self.session;
+        let busy = self.chat_busy(session);
         Some(
             icons::menu_trigger(
                 "conversation-actions",
@@ -330,7 +331,7 @@ impl Xylo {
                     return menu;
                 }
                 menu.separator()
-                    .item(PopupMenuItem::new("Archive").on_click(move |_, _, cx| {
+                    .item(sidebar::archive_item(busy, move |cx| {
                         let _ = archive.update(cx, |view, cx| view.archive_chat(session, cx));
                     }))
             })

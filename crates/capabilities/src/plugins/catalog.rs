@@ -324,6 +324,9 @@ fn stage_package(root: &Path, package: &Package, cancel: &CancellationToken) -> 
         file.sync_all()?;
     }
     checked(cancel)?;
+    // The staging directory's entries must be durable before the rename can
+    // publish it; otherwise a crash could expose the package without its files.
+    sync_directory(staging.path())?;
     // Rename of a fresh directory publishes all bytes together. Catalog readers
     // can reference it only after the subsequent durable catalog commit.
     std::fs::rename(staging.path(), &destination)?;

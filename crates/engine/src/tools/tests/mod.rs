@@ -47,6 +47,7 @@ async fn malformed_native_connector_writes_do_not_create_uncertain_actions_or_ap
                     command: None,
                     args: Vec::new(),
                     credential_ref: None,
+                    trusted: false,
                 })
                 .unwrap();
             let key = format!("invalid-native-{index}");
@@ -114,7 +115,12 @@ fn fixture_with(mode: PermissionMode, adjust: impl FnOnce(&mut TurnRequest)) -> 
         turn_id: Uuid::new_v4(),
         prompt: "fixture".into(),
         workspace: directory.path().into(),
-        provider: ProviderConfig::default(),
+        // A large window, so budgets match a typical cloud model; window
+        // scaling has its own tests.
+        provider: ProviderConfig {
+            context_tokens: 131_072,
+            ..Default::default()
+        },
         attachments: Vec::new(),
         permissions: mode,
         approved_rules: Vec::new(),
@@ -583,6 +589,7 @@ async fn native_connector_write_classification_cannot_be_overridden_by_arguments
         command: None,
         args: Vec::new(),
         credential_ref: None,
+        trusted: false,
     };
     broker.store.save_connector(&connector).unwrap();
     let id = connector.id;
@@ -834,12 +841,48 @@ async fn retrieved_verified_command_remains_advisory_and_cannot_bypass_read_only
             .await
             .unwrap();
     }
-    let context = broker.project_skill_context().unwrap();
-    assert!(context.contains("Learned procedure"), "{context}");
-    assert!(context.contains("skill_read"));
+    let procedures = broker.learned_procedures().unwrap();
+    assert_eq!(procedures.len(), 1, "{procedures:?}");
+    let context = format!("{procedures:?}");
     assert!(
         !context.contains("--offline"),
         "Procedure steps load on demand, never in the prompt: {context}"
+    );
+    assert!(
+        !broker
+            .project_skill_context()
+            .unwrap()
+            .contains(&procedures[0].0),
+        "Learned procedures stay out of the system prompt's skills index"
+    );
+    // Once a conversation it was learned from read web content, the
+    // procedure is no longer recalled, and reading it counts as that content.
+    let web = ActionIntent {
+        id: Uuid::new_v4(),
+        session_id: broker.request.session_id,
+        turn_id: broker.request.turn_id,
+        name: "browser_navigate".into(),
+        arguments: json!({"url":"https://example.com"}),
+        writes: false,
+        idempotency_key: "web".into(),
+    };
+    broker.store.begin_action(&web).unwrap();
+    broker.store.mark_action_running(web.id).unwrap();
+    broker
+        .store
+        .finish_action(web.id, &json!({"status":"success"}))
+        .unwrap();
+    assert!(broker.learned_procedures().unwrap().is_empty());
+    let learned = learning
+        .active_skill(
+            &broker.request.workspace.to_string_lossy(),
+            &procedures[0].0,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        broker.procedure_exposure(&learned).unwrap(),
+        xylo_core::MemoryOrigin::WebContent
     );
     let execute = broker.clone();
     let error = tokio::task::spawn_blocking(move || {
@@ -866,16 +909,21 @@ async fn retrieved_verified_command_remains_advisory_and_cannot_bypass_read_only
     );
 }
 
+/// Tools are gated at dispatch, not filtered: the offered list (the front
+/// of every cached prompt prefix) is byte-identical in every mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_only_turn_advertises_no_writing_tools() {
+async fn offered_tools_are_byte_identical_in_every_permission_mode() {
     let (_directory, broker, _events) = fixture(PermissionMode::ReadOnly);
-    assert!(broker.initial_definitions().iter().all(|tool| !tool.writes));
-    assert!(
-        broker
-            .initial_definitions()
-            .iter()
-            .any(|tool| tool.name == "file_read")
-    );
+    let offered = serde_json::to_string(&broker.initial_definitions()).unwrap();
+    assert!(offered.contains("\"file_read\"") && offered.contains("\"file_write\""));
+    for mode in PermissionMode::ALL {
+        broker.session.permissions().set(mode);
+        assert_eq!(
+            serde_json::to_string(&broker.initial_definitions()).unwrap(),
+            offered,
+            "{mode:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -916,6 +964,7 @@ async fn connector_discovery_snapshot_never_grants_execution_after_removal() {
             command: None,
             args: vec![],
             credential_ref: None,
+            trusted: false,
         })
         .unwrap();
     assert!(
@@ -1650,14 +1699,7 @@ async fn concurrent_edits_to_one_file_both_land() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permission_changes_apply_to_the_next_call_of_a_running_task() {
     let (directory, broker, mut events) = fixture(PermissionMode::AskForApproval);
-    assert!(
-        broker
-            .initial_definitions()
-            .iter()
-            .any(|tool| tool.name == "file_write")
-    );
     broker.session.permissions().set(PermissionMode::ReadOnly);
-    assert!(broker.initial_definitions().iter().all(|tool| !tool.writes));
     let refused = run(
         &broker,
         "read-only-write",
@@ -1907,8 +1949,61 @@ async fn network_requests_are_validated_approved_and_sandbox_denials_suggest_the
 #[cfg(unix)]
 mod action_review;
 
+mod memory_provenance;
+
 mod environment_recovery;
 
 mod native_connector_dispatch;
 
 mod permission_review;
+
+mod tool_catalog;
+
+fn window_fixture(context_tokens: u32) -> Fixture {
+    fixture_with(PermissionMode::ApproveForMe, |request| {
+        request.provider.context_tokens = context_tokens;
+        request.provider.output_tokens = 2048;
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn small_windows_keep_a_smaller_resident_tool_set() {
+    let (_small_directory, small, _small_events) = window_fixture(8192);
+    let (_large_directory, large, _large_events) = window_fixture(200_000);
+    let names = |broker: &ToolBroker| {
+        broker
+            .initial_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>()
+    };
+    let (small_names, large_names) = (names(&small), names(&large));
+    assert!(small_names.len() <= SMALL_WINDOW_CORE_TOOLS.len());
+    for name in ["file_read", "file_edit", "search_tools", "call_tool"] {
+        assert!(small_names.iter().any(|tool| tool == name), "{name}");
+    }
+    assert!(!small_names.iter().any(|tool| tool == "git_status"));
+    assert!(large_names.iter().any(|tool| tool == "git_status"));
+    // A served window below the configured one counts as small too.
+    let (_served_directory, served, _served_events) =
+        fixture_with(PermissionMode::ApproveForMe, |request| {
+            request.provider.context_tokens = 200_000;
+            request.provider.served_context_tokens = Some(8192);
+        });
+    assert_eq!(names(&served), small_names);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_results_are_shortened_to_the_window_budget() {
+    let (_small_directory, small, _small_events) = window_fixture(8192);
+    let (_large_directory, large, _large_events) = window_fixture(200_000);
+    let result = json!({"status":"success","output":"line of output\n".repeat(1500)});
+    let encoded = serde_json::to_vec(&result).unwrap().len();
+    assert!(encoded > small.window().tool_result_bytes());
+    assert!(encoded < large.window().tool_result_bytes());
+    let shortened = small.model_result(Uuid::new_v4(), result.clone());
+    assert!(serde_json::to_vec(&shortened).unwrap().len() <= small.window().tool_result_bytes());
+    assert_eq!(shortened["truncated"], true);
+    assert!(shortened["full_result"].is_string());
+    assert_eq!(large.model_result(Uuid::new_v4(), result.clone()), result);
+}

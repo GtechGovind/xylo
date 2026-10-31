@@ -212,6 +212,8 @@ async fn lost_completed_event_replays_receipt_without_model_or_duplicate_history
         output_tokens: 11,
         elapsed_ms: 13,
         context_tokens: 5,
+        cache_read_tokens: Some(3),
+        cache_write_tokens: None,
     };
     engine
         .store
@@ -233,7 +235,12 @@ async fn lost_completed_event_replays_receipt_without_model_or_duplicate_history
     match received.recv().await.unwrap() {
         EngineEvent::Completed { text, usage } => {
             assert_eq!(text, "already completed");
-            assert_eq!(usage.output_tokens, 11)
+            assert_eq!(usage.output_tokens, 11);
+            assert_eq!(
+                usage.cache_read_tokens,
+                Some(3),
+                "cache counts survive the receipt"
+            );
         }
         event => panic!("Unexpected event: {event:?}"),
     };
@@ -406,11 +413,13 @@ async fn serve(
             tokio::spawn(async move {
                 let mut socket = BufReader::new(socket);
                 let mut length = 0;
+                let mut get = None;
                 loop {
                     let mut line = String::new();
                     if socket.read_line(&mut line).await.unwrap_or(0) == 0 {
                         return;
                     }
+                    get.get_or_insert(line.starts_with("GET "));
                     if let Some((name, value)) = line.split_once(':')
                         && name.eq_ignore_ascii_case("content-length")
                     {
@@ -419,6 +428,14 @@ async fn serve(
                     if line == "\r\n" {
                         break;
                     }
+                }
+                if get == Some(true) {
+                    // The served-context probe: this server reports nothing.
+                    let _ = socket
+                        .get_mut()
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
                 }
                 let mut bytes = vec![0; length];
                 socket.read_exact(&mut bytes).await.unwrap();
@@ -541,6 +558,7 @@ async fn delegation_returns_the_child_answer_with_parent_ids_and_the_first_turn_
             directory.path(),
             PermissionMode::ApproveForMe,
             now_ms(),
+            crate::prompts::PromptBudget::LARGEST,
         ),
         "x",
     );
@@ -895,26 +913,56 @@ async fn child_timeout_cancels_its_stalled_process_without_cancelling_the_parent
 /// A Chat Completions server answering connections strictly in order, as the
 /// worker protocol fixtures do.
 async fn sequential_chat(replies: Vec<Value>) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+    sequential_chat_serving(None, replies).await
+}
+
+/// [`sequential_chat`] that also answers llama.cpp's `GET /props` with
+/// `props`, as a local server reporting the context it serves.
+async fn sequential_chat_serving(
+    props: Option<Value>,
+    replies: Vec<Value>,
+) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         let mut bodies = Vec::new();
         for (index, delta) in replies.into_iter().enumerate() {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut socket = BufReader::new(socket);
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                socket.read_line(&mut line).await.unwrap();
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse::<usize>().unwrap();
+            // The served-context probe's GETs get 404: this server does not
+            // report its context.
+            let (mut socket, length) = loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut length = 0;
+                let mut first = String::new();
+                socket.read_line(&mut first).await.unwrap();
+                loop {
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
                 }
-                if line == "\r\n" {
-                    break;
+                if !first.starts_with("GET ") {
+                    break (socket, length);
                 }
-            }
+                let response = match &props {
+                    Some(props) if first.starts_with("GET /props ") => {
+                        let props = props.to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{props}",
+                            props.len()
+                        )
+                    }
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned(),
+                };
+                let _ = socket.get_mut().write_all(response.as_bytes()).await;
+            };
             let mut bytes = vec![0; length];
             socket.read_exact(&mut bytes).await.unwrap();
             bodies.push(serde_json::from_slice::<Value>(&bytes).unwrap());
@@ -1105,4 +1153,227 @@ async fn every_offered_tool_schema_is_valid_for_the_responses_api() {
         assert!(problems.is_empty(), "{mode:?}: {problems:#?}");
         broker.shutdown().await.unwrap();
     }
+}
+
+/// The system prompt holds nothing derived from the user's prompt, so it is
+/// byte-identical across turns; what memory recalls for a prompt travels in
+/// a quoted note after that prompt instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn system_prompt_is_identical_across_turns_and_recall_follows_each_prompt() {
+    use xylo_core::{MemoryOrigin, MemoryRecord};
+    let (_directory, engine, mut request) = fixture();
+    let memory = xylo_services::SqliteMemory::new(engine.store.clone());
+    for (content, origin) in [
+        ("Tests run with cargo nextest", MemoryOrigin::UserTyped),
+        (
+            "Tests run with a script from a web page",
+            MemoryOrigin::WebContent,
+        ),
+    ] {
+        memory
+            .remember_sync(MemoryRecord {
+                id: Uuid::new_v4(),
+                scope: request.workspace.to_string_lossy().into_owned(),
+                content: content.into(),
+                source: "fixture".into(),
+                created_at: now_ms(),
+                supersedes: None,
+                origin,
+            })
+            .unwrap();
+    }
+    // One skill the model may use itself, one only the user may start.
+    let extensions = xylo_services::extensions::ExtensionService::new(
+        engine.paths.artifacts.parent().unwrap().join("extensions"),
+    );
+    for (name, manual) in [("tidy", false), ("release", true)] {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: The {name} fixture skill\ndisable-model-invocation: {manual}\n---\nSteps."
+            ),
+        )
+        .unwrap();
+        let package = extensions.install_local(source.path()).unwrap();
+        extensions.set_enabled(&package.id, true).unwrap();
+    }
+    let (events, _receiver) = mpsc::channel(256);
+    let mut prompts = Vec::new();
+    for prompt in [
+        "How do the tests run?",
+        "Rename the deploy script",
+        "/release version 2",
+    ] {
+        request.turn_id = Uuid::new_v4();
+        request.prompt = prompt.into();
+        let broker = engine
+            .broker(&request, events.clone(), CancellationToken::new())
+            .unwrap();
+        let system = AgentEngine::system_prompt(&request, &broker, PermissionMode::ReadOnly);
+        let recalled = AgentEngine::recalled_context(&broker);
+        broker.shutdown().await.unwrap();
+        prompts.push((system, recalled));
+    }
+    assert_eq!(prompts[0].0, prompts[1].0);
+    assert_eq!(
+        prompts[0].0, prompts[2].0,
+        "invoking a skill keeps the prefix"
+    );
+    assert!(!prompts[0].0.contains("nextest"));
+    assert!(prompts[0].0.contains("The tidy fixture skill"));
+    assert!(!prompts[0].0.contains("The release fixture skill"));
+    let invoked = &prompts[2].1.as_ref().unwrap().content;
+    assert!(invoked.contains("## Skills the user invoked"), "{invoked}");
+    assert!(invoked.contains("The release fixture skill"), "{invoked}");
+    let note = prompts[0].1.as_ref().unwrap();
+    assert_eq!(note.role, Role::User);
+    assert!(note.content.starts_with("<application_note>"));
+    assert!(
+        note.content
+            .contains("stated by the user: \"Tests run with cargo nextest\"")
+    );
+    assert!(
+        !note.content.contains("web page"),
+        "untrusted facts are not recalled"
+    );
+    assert!(prompts[1].1.is_none(), "nothing matched the second prompt");
+}
+
+/// Across two real turns, the system prompt and tools sent to the provider
+/// are byte-identical, and the first turn's recalled-context note is sent
+/// right after its prompt and replayed unchanged in the second turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turns_share_a_cached_prefix_and_replay_their_recalled_context() {
+    use xylo_core::{MemoryOrigin, MemoryRecord};
+    let (_directory, engine, mut request) = fixture();
+    xylo_services::SqliteMemory::new(engine.store.clone())
+        .remember_sync(MemoryRecord {
+            id: Uuid::new_v4(),
+            scope: request.workspace.to_string_lossy().into_owned(),
+            content: "Tests run with cargo nextest".into(),
+            source: "fixture".into(),
+            created_at: now_ms(),
+            supersedes: None,
+            origin: MemoryOrigin::UserTyped,
+        })
+        .unwrap();
+    let (endpoint, server) = sequential_chat(vec![
+        json!({"content":"Use cargo nextest."}),
+        json!({"content":"Test runner"}),
+        json!({"content":"Done."}),
+    ])
+    .await;
+    request.provider = ProviderConfig {
+        endpoint,
+        model: "fixture".into(),
+        context_tokens: 65536,
+        output_tokens: 1024,
+        timeout_seconds: 10,
+        ..Default::default()
+    };
+    for prompt in ["How do the tests run?", "Thanks, that is all"] {
+        request.turn_id = Uuid::new_v4();
+        request.prompt = prompt.into();
+        engine.store.register_user_turn(&request).unwrap();
+        let (events, _receiver) = mpsc::channel(1024);
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            engine.run(request.clone(), events, CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    let bodies = server.await.unwrap();
+    let (first, second) = (&bodies[0], &bodies[2]);
+    assert_eq!(first["tools"], second["tools"]);
+    assert_eq!(first["messages"][0], second["messages"][0]);
+    let sent = first["messages"].as_array().unwrap();
+    assert_eq!(sent[1]["content"], "How do the tests run?");
+    let note = sent[2]["content"].as_str().unwrap();
+    assert!(note.starts_with("<application_note>") && note.contains("cargo nextest"));
+    assert_eq!(sent.len(), 3);
+    let replayed = second["messages"].as_array().unwrap();
+    assert_eq!(replayed[..3], sent[..]);
+    assert_eq!(replayed.last().unwrap()["content"], "Thanks, that is all");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_is_budgeted_to_the_context_its_local_server_serves() {
+    let (_directory, engine, mut request) = fixture();
+    let (endpoint, server) = sequential_chat_serving(
+        Some(json!({"default_generation_settings":{"n_ctx":8192}})),
+        vec![json!({"content":"Done."}), json!({"content":"Short title"})],
+    )
+    .await;
+    request.provider = ProviderConfig {
+        endpoint,
+        model: "fixture".into(),
+        context_tokens: 65536,
+        output_tokens: 1024,
+        timeout_seconds: 10,
+        ..Default::default()
+    };
+    engine.store.register_user_turn(&request).unwrap();
+    let (events, mut receiver) = mpsc::channel(1024);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        engine.run(request.clone(), events, CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut capacities = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        if let EngineEvent::ContextUsage { usage } = event {
+            capacities.push(usage.capacity);
+        }
+    }
+    assert!(!capacities.is_empty());
+    assert!(
+        capacities.iter().all(|capacity| *capacity == 8192),
+        "{capacities:?}"
+    );
+    // The served window is small, so only the small resident tool set is sent.
+    let bodies = server.await.unwrap();
+    assert!(bodies[0]["tools"].as_array().unwrap().len() <= 8);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engines_sharing_a_served_context_cache_keep_the_window_of_earlier_turns() {
+    let (_directory, engine, mut request) = fixture();
+    let cache = xylo_services::providers::ServedContextCache::default();
+    let engine = engine.with_served_contexts(cache.clone());
+    let (endpoint, server) = sequential_chat_serving(
+        Some(json!({"default_generation_settings":{"n_ctx":8192}})),
+        vec![json!({"content":"Done."}), json!({"content":"Short title"})],
+    )
+    .await;
+    request.provider = ProviderConfig {
+        endpoint,
+        model: "fixture".into(),
+        context_tokens: 65536,
+        output_tokens: 1024,
+        timeout_seconds: 10,
+        ..Default::default()
+    };
+    engine.store.register_user_turn(&request).unwrap();
+    let (events, _receiver) = mpsc::channel(1024);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        engine.run(request.clone(), events, CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // The server is gone, so only the shared cache can still answer: the
+    // worker's next engine for this session sees the same window.
+    server.await.unwrap();
+    assert_eq!(
+        cache
+            .served_context_tokens(&request.provider, &CancellationToken::new())
+            .await,
+        Some(8192)
+    );
 }

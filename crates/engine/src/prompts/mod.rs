@@ -8,11 +8,15 @@
 //!
 //! Loading is lazy by design: the system prompt carries identity,
 //! environment, working method, the permission policy, project instruction
-//! files and two compact indexes (skill names with descriptions, fact
-//! titles). Skill bodies, skill resources, learned procedures and memory
-//! text reach the model only through tools. The system prompt depends only
-//! on [`PromptContext`] and its date has day granularity, so it is
-//! byte-identical across the calls of a task and stays provider-cacheable.
+//! files and a compact skills index (names with descriptions). Skill bodies,
+//! skill resources, learned procedure steps and full memory text reach the
+//! model only through tools. The system prompt depends only on
+//! [`PromptContext`], which holds nothing derived from the user's prompt,
+//! and its date has day granularity, so it is byte-identical across the
+//! calls and turns of a task and stays provider-cacheable. What is retrieved
+//! for a prompt (fact first lines, learned procedure names) travels in a
+//! [`recalled_context`] note after that prompt instead, where it becomes
+//! append-only history.
 
 mod environment;
 mod instructions;
@@ -21,7 +25,7 @@ mod skills;
 
 use std::path::Path;
 
-use xylo_core::PermissionMode;
+use xylo_core::{MemoryOrigin, PermissionMode};
 
 pub use environment::{GitInfo, utc_date};
 pub use instructions::project_instructions;
@@ -34,7 +38,6 @@ const PERMISSION_CHANGE: &str = include_str!("../../prompts/permission-change.md
 const SYSTEM_PROJECT_INSTRUCTIONS: &str =
     include_str!("../../prompts/system-project-instructions.md");
 const SYSTEM_SKILLS: &str = include_str!("../../prompts/system-skills.md");
-const SYSTEM_FACTS: &str = include_str!("../../prompts/system-facts.md");
 const PERMISSION_ASK_FOR_APPROVAL: &str =
     include_str!("../../prompts/permissions/ask-for-approval.md");
 const PERMISSION_APPROVE_FOR_ME: &str = include_str!("../../prompts/permissions/approve-for-me.md");
@@ -46,6 +49,12 @@ const COMPACTION_UPDATE: &str = include_str!("../../prompts/compaction-update.md
 const COMPACTION_SUMMARY: &str = include_str!("../../prompts/compaction-summary.md");
 const COMPACTION_EXCERPTS: &str = include_str!("../../prompts/compaction-excerpts.md");
 const COMPACTION_TOOL_NOTES: &str = include_str!("../../prompts/compaction-tool-notes.md");
+const COMPACTION_RECORD: &str = include_str!("../../prompts/compaction-record.md");
+const COMPACTION_RECORD_OMITTED: &str = include_str!("../../prompts/compaction-record-omitted.md");
+const MASKED_READ_SUPERSEDED: &str = include_str!("../../prompts/masked-read-superseded.md");
+const MASKED_READ_CHANGED: &str = include_str!("../../prompts/masked-read-changed.md");
+const MASKED_SAVED: &str = include_str!("../../prompts/masked-saved.md");
+const MASKED_AGED: &str = include_str!("../../prompts/masked-aged.md");
 const TITLE: &str = include_str!("../../prompts/title.md");
 const SUBAGENT: &str = include_str!("../../prompts/subagent.md");
 const SUBAGENT_TASK: &str = include_str!("../../prompts/subagent-task.md");
@@ -53,6 +62,41 @@ const SKILL_PERMISSIONS_NOTE: &str = include_str!("../../prompts/skill-permissio
 const FORKED_SKILL_CONTEXT: &str = include_str!("../../prompts/forked-skill-context.md");
 const STEP_LIMIT: &str = include_str!("../../prompts/step-limit.md");
 const APPLICATION_NOTE: &str = include_str!("../../prompts/application-note.md");
+const RECALLED_CONTEXT: &str = include_str!("../../prompts/recalled-context.md");
+const RECALLED_FACTS: &str = include_str!("../../prompts/recalled-facts.md");
+const RECALLED_PROCEDURES: &str = include_str!("../../prompts/recalled-procedures.md");
+const RECALLED_SKILLS: &str = include_str!("../../prompts/recalled-skills.md");
+const CONTINUE_ANSWER: &str = include_str!("../../prompts/continue-answer.md");
+const EMPTY_ANSWER: &str = include_str!("../../prompts/empty-answer.md");
+const OUTPUT_LIMIT_WITHOUT_ANSWER: &str =
+    include_str!("../../prompts/output-limit-without-answer.md");
+const MALFORMED_TOOL_CALL: &str = include_str!("../../prompts/malformed-tool-call.md");
+const TRUNCATED_TOOL_CALL: &str = include_str!("../../prompts/truncated-tool-call.md");
+const STEP_BUDGET: &str = include_str!("../../prompts/step-budget.md");
+const STALL_NOTE: &str = include_str!("../../prompts/stall-note.md");
+const STALL_WARNING: &str = include_str!("../../prompts/stall-warning.md");
+const STALL_REPEATED_CALL: &str = include_str!("../../prompts/stall-repeated-call.md");
+const STALL_ALTERNATING: &str = include_str!("../../prompts/stall-alternating.md");
+const STALL_REPEATED_ERROR: &str = include_str!("../../prompts/stall-repeated-error.md");
+
+/// Byte budgets of the variable system-prompt sections. The engine scales
+/// them to the model's effective window, so the fixed preamble stays a small
+/// share of a small window; [`PromptBudget::LARGEST`] is the ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptBudget {
+    /// Bytes of project instruction text (AGENTS.md, CLAUDE.md).
+    pub instruction_bytes: usize,
+    /// Bytes of the skills index.
+    pub skills_index_bytes: usize,
+}
+
+impl PromptBudget {
+    /// The budgets of a large window; no window gets more.
+    pub const LARGEST: Self = Self {
+        instruction_bytes: instructions::INSTRUCTION_BYTES,
+        skills_index_bytes: skills::SKILLS_INDEX_BYTES,
+    };
+}
 
 /// Everything the system prompt depends on. Two equal contexts render
 /// byte-identical prompts.
@@ -76,15 +120,19 @@ pub struct PromptContext<'a> {
     pub project_instructions: String,
     /// Output of [`skills_index`]; empty when no skills are available.
     pub skills_index: String,
-    /// Output of [`facts_index`]; empty when no facts are retained.
-    pub facts_index: String,
 }
 
 impl<'a> PromptContext<'a> {
     /// A context for `workspace` with the host environment, repository state,
-    /// today's date and the project instruction files filled in. The skill and
-    /// fact indexes start empty; set them before calling [`system`].
-    pub fn detect(workspace: &'a Path, permission_mode: PermissionMode, now_ms: i64) -> Self {
+    /// today's date and the project instruction files (within `budget`)
+    /// filled in. The skills index starts empty; set it before calling
+    /// [`system`].
+    pub fn detect(
+        workspace: &'a Path,
+        permission_mode: PermissionMode,
+        now_ms: i64,
+        budget: PromptBudget,
+    ) -> Self {
         PromptContext {
             workspace,
             os: std::env::consts::OS,
@@ -93,9 +141,8 @@ impl<'a> PromptContext<'a> {
             git: GitInfo::detect(workspace),
             date: utc_date(now_ms),
             permission_mode,
-            project_instructions: project_instructions(workspace),
+            project_instructions: project_instructions(workspace, budget.instruction_bytes),
             skills_index: String::new(),
-            facts_index: String::new(),
         }
     }
 }
@@ -110,13 +157,9 @@ pub fn system(ctx: &PromptContext) -> String {
         ],
     )];
     sections.extend(project_instructions_section(ctx));
-    for (template, index) in [
-        (SYSTEM_SKILLS, &ctx.skills_index),
-        (SYSTEM_FACTS, &ctx.facts_index),
-    ] {
-        if !index.trim().is_empty() {
-            sections.push(fill(template, &[("index", index.trim())]));
-        }
+    let skills = ctx.skills_index.trim();
+    if !skills.is_empty() {
+        sections.push(fill(SYSTEM_SKILLS, &[("index", skills)]));
     }
     sections.join("\n\n")
 }
@@ -241,6 +284,108 @@ pub fn compaction_tool_notes_header() -> &'static str {
     COMPACTION_TOOL_NOTES.trim_end()
 }
 
+/// The values of one harness record (see [`compaction_record`]): each list
+/// is already rendered as item lines.
+pub struct RecordSections<'a> {
+    pub user_messages: &'a str,
+    pub files_read: &'a str,
+    pub files_changed: &'a str,
+    pub commands: &'a str,
+    pub todos: &'a str,
+}
+
+/// The harness record appended to a summary: verbatim user messages and the
+/// artifact ledger the application derives from tool calls.
+pub fn compaction_record(sections: &RecordSections) -> String {
+    fill(
+        COMPACTION_RECORD,
+        &[
+            ("user_messages", sections.user_messages),
+            ("files_read", sections.files_read),
+            ("files_changed", sections.files_changed),
+            ("commands", sections.commands),
+            ("todos", sections.todos),
+        ],
+    )
+}
+
+/// The record's opening and closing lines and the label line before each
+/// list, in [`RecordSections`] order; parsing a stored record relies on them.
+pub fn compaction_record_markers() -> (&'static str, &'static str, Vec<&'static str>) {
+    let lines: Vec<&'static str> = COMPACTION_RECORD.trim_end().lines().collect();
+    let labels = lines
+        .windows(2)
+        .filter(|pair| pair[1].starts_with("{{"))
+        .map(|pair| pair[0])
+        .collect();
+    (
+        lines.first().copied().unwrap_or_default(),
+        lines.last().copied().unwrap_or_default(),
+        labels,
+    )
+}
+
+/// The record line standing for `count` pinned user messages dropped from
+/// the middle to keep the record within its budget.
+pub fn compaction_record_omitted(count: usize) -> String {
+    fill(COMPACTION_RECORD_OMITTED, &[("count", &count.to_string())])
+}
+
+/// The count of a line written by [`compaction_record_omitted`].
+pub fn parse_compaction_record_omitted(line: &str) -> Option<usize> {
+    let (prefix, suffix) = COMPACTION_RECORD_OMITTED
+        .trim_end()
+        .split_once("{{count}}")?;
+    line.strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+/// Why an older tool result left the context, which decides how the model
+/// can get it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskReason<'a> {
+    /// A later read of the same file with the same range is authoritative.
+    ReadSuperseded,
+    /// The file was edited or rewritten after this read.
+    ReadChanged,
+    /// The complete output is saved at this path.
+    Saved(&'a str),
+    /// Older than the tool's retention; repeating the call restores it.
+    Aged,
+}
+
+/// The stub that replaces a masked tool result. `call` names the tool and
+/// its key argument; `bytes` is the original size.
+pub fn masked_observation(call: &str, bytes: usize, reason: MaskReason) -> String {
+    let size = format!("{bytes} bytes");
+    let mut values = vec![("call", call), ("size", size.as_str())];
+    let template = match reason {
+        MaskReason::ReadSuperseded => MASKED_READ_SUPERSEDED,
+        MaskReason::ReadChanged => MASKED_READ_CHANGED,
+        MaskReason::Saved(path) => {
+            values.push(("path", path));
+            MASKED_SAVED
+        }
+        MaskReason::Aged => MASKED_AGED,
+    };
+    fill(template, &values)
+}
+
+/// Whether `content` is a stub written by [`masked_observation`].
+pub fn is_masked_observation(content: &str) -> bool {
+    [
+        MASKED_READ_SUPERSEDED,
+        MASKED_READ_CHANGED,
+        MASKED_SAVED,
+        MASKED_AGED,
+    ]
+    .iter()
+    .filter_map(|template| template.split("{{").next())
+    .any(|prefix| !prefix.is_empty() && content.starts_with(prefix))
+}
+
 /// System prompt for generating a 3–6 word conversation title.
 pub fn title() -> &'static str {
     TITLE.trim_end()
@@ -275,19 +420,154 @@ pub fn step_limit() -> &'static str {
     STEP_LIMIT.trim_end()
 }
 
-/// The compact index of retained project facts (titles only, bounded). The
-/// full text is recalled with `memory_search`. Empty when there are none.
-pub fn facts_index<'t>(titles: impl IntoIterator<Item = &'t str>) -> String {
-    /// Most fact titles listed in the system prompt.
-    const FACT_TITLES: usize = 24;
-    titles
-        .into_iter()
-        .map(|title| skills::one_line(title, 120))
-        .filter(|title| !title.is_empty())
-        .take(FACT_TITLES)
-        .map(|title| format!("- {title}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Application note after a reply the output limit cut off: the model
+/// continues the same answer.
+pub fn continue_answer() -> &'static str {
+    CONTINUE_ANSWER.trim_end()
+}
+
+/// Application note after a reply with neither text nor tool calls.
+pub fn empty_answer() -> &'static str {
+    EMPTY_ANSWER.trim_end()
+}
+
+/// Application note after a reply whose reasoning used the whole output
+/// limit before any answer text.
+pub fn output_limit_without_answer() -> &'static str {
+    OUTPUT_LIMIT_WITHOUT_ANSWER.trim_end()
+}
+
+/// Application note after a tool call the provider could not parse.
+pub fn malformed_tool_call() -> &'static str {
+    MALFORMED_TOOL_CALL.trim_end()
+}
+
+/// Tool error for a `tool` call the output limit cut off after `received`
+/// bytes of arguments.
+pub fn truncated_tool_call(tool: &str, received: usize) -> String {
+    fill(
+        TRUNCATED_TOOL_CALL,
+        &[("tool", tool), ("received", &received.to_string())],
+    )
+}
+
+/// Application note that the task is at `step` of at most `limit` model
+/// calls.
+pub fn step_budget(step: u32, limit: u32) -> String {
+    fill(
+        STEP_BUDGET,
+        &[("step", &step.to_string()), ("limit", &limit.to_string())],
+    )
+}
+
+/// First application note about a repeated pattern; `pattern` is one of the
+/// `stall_*` descriptions.
+pub fn stall_note(pattern: &str) -> String {
+    fill(STALL_NOTE, &[("pattern", pattern)])
+}
+
+/// Second, final application note about a repeated pattern before the
+/// harness stops the task.
+pub fn stall_warning(pattern: &str) -> String {
+    fill(STALL_WARNING, &[("pattern", pattern)])
+}
+
+/// Describes the same call (`tools`, already formatted) repeated `count`
+/// times in a row.
+pub fn stall_repeated_call(tools: &str, count: usize) -> String {
+    fill(
+        STALL_REPEATED_CALL,
+        &[("tools", tools), ("count", &count.to_string())],
+    )
+}
+
+/// Describes two steps (`tools`, already formatted) alternating `count`
+/// times with the same results.
+pub fn stall_alternating(tools: &str, count: usize) -> String {
+    fill(
+        STALL_ALTERNATING,
+        &[("tools", tools), ("count", &count.to_string())],
+    )
+}
+
+/// Describes `tool` failing with the same error `count` times recently.
+pub fn stall_repeated_error(tool: &str, count: usize) -> String {
+    fill(
+        STALL_REPEATED_ERROR,
+        &[("tool", tool), ("count", &count.to_string())],
+    )
+}
+
+/// One project fact in a [`recalled_context`] note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecalledFact<'a> {
+    /// The fact's text; only its first line is shown.
+    pub text: &'a str,
+    /// Who the fact came from.
+    pub origin: MemoryOrigin,
+    /// When it was saved, in milliseconds since the Unix epoch.
+    pub created_at: i64,
+}
+
+/// Longest fact or procedure line in a recalled-context note.
+const RECALLED_LINE_CHARS: usize = 160;
+
+/// The note that carries what was retrieved for one user prompt: dated,
+/// attributed, quoted fact lines, learned procedures as `(name, title)` and
+/// the installed skills the prompt invokes by name as `(id, description)`.
+/// Quoting (JSON string syntax with angle brackets escaped) keeps fact text
+/// from closing the note or posing as the application's own words. `None`
+/// when nothing was recalled.
+pub fn recalled_context(
+    facts: &[RecalledFact],
+    procedures: &[(String, String)],
+    skills: &[(String, String)],
+) -> Option<String> {
+    let facts: Vec<String> = facts
+        .iter()
+        .filter(|fact| !fact.text.trim().is_empty())
+        .map(|fact| {
+            format!(
+                "- {}, {}: {}",
+                utc_date(fact.created_at),
+                fact.origin.label(),
+                quoted(fact.text)
+            )
+        })
+        .collect();
+    let procedures: Vec<String> = procedures
+        .iter()
+        .map(|(name, title)| format!("- {}: {}", skills::one_line(name, 64), quoted(title)))
+        .collect();
+    let skills: Vec<String> = skills
+        .iter()
+        .map(|(id, description)| format!("- {}: {}", skills::one_line(id, 64), quoted(description)))
+        .collect();
+    let mut sections = Vec::new();
+    if !skills.is_empty() {
+        sections.push(fill(RECALLED_SKILLS, &[("skills", &skills.join("\n"))]));
+    }
+    if !facts.is_empty() {
+        sections.push(fill(RECALLED_FACTS, &[("facts", &facts.join("\n"))]));
+    }
+    if !procedures.is_empty() {
+        sections.push(fill(
+            RECALLED_PROCEDURES,
+            &[("procedures", &procedures.join("\n"))],
+        ));
+    }
+    (!sections.is_empty()).then(|| fill(RECALLED_CONTEXT, &[("sections", &sections.join("\n\n"))]))
+}
+
+/// The first line of `text`, bounded and quoted as a JSON string with `<`
+/// and `>` escaped.
+fn quoted(text: &str) -> String {
+    let first = text.trim().lines().next().unwrap_or_default();
+    let line = skills::one_line(first, RECALLED_LINE_CHARS);
+    serde_json::to_string(&line)
+        .unwrap_or_default()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
 }
 
 /// Renders a bundled template. Every bundled template and its value names

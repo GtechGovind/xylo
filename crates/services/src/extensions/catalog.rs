@@ -82,15 +82,16 @@ impl ExtensionService {
         copy_tree(source, &content, &mut total, &mut count, 0)?;
         let content = content.canonicalize()?;
         let (name, version, components) = inspect(&content, fallback)?;
-        let mut hash = Sha256::new();
-        hash_tree(&content, &content, &mut hash)?;
-        let digest = hex::encode(hash.finalize());
+        let digest = tree_digest(&content)?;
         let id = format!(
             "extension-{}",
             &hex::encode(Sha256::digest(provenance.as_bytes()))[..24]
         );
         let mut packages = self.read_catalog()?;
         let prior = packages.iter().find(|p| p.id == id);
+        let replaced = prior
+            .filter(|p| p.digest != digest)
+            .map(|p| p.digest.clone());
         // Changed content is a new package to review: an update never keeps
         // the previous version's enablement.
         let mut package = ExtensionPackage {
@@ -109,13 +110,46 @@ impl ExtensionService {
         let snapshots = self.root.join("packages");
         fs::create_dir_all(&snapshots)?;
         let target = snapshots.join(&digest);
+        // Reuse a snapshot only when it is complete. One left half-written or
+        // half-deleted by an older interrupted install or removal is replaced.
+        if target.exists() && !tree_digest(&target).is_ok_and(|existing| existing == digest) {
+            self.discard_snapshot(&target)?;
+        }
         if !target.exists() {
             fs::rename(&content, &target)?;
+            #[cfg(unix)]
+            fs::File::open(&snapshots)?.sync_all()?;
         }
         packages.retain(|p| p.id != id);
         packages.push(package.clone());
         self.save(&packages)?;
+        // An update leaves the previous version's content unreferenced.
+        if let Some(replaced) = replaced
+            && !packages.iter().any(|p| p.digest == replaced)
+            && let Err(error) = self.discard_snapshot(&snapshots.join(&replaced))
+        {
+            tracing::warn!(%error, "Could not remove the replaced extension version");
+        }
         Ok(package)
+    }
+    /// Removes a package snapshot without ever leaving a partial folder under
+    /// its digest name: it is first renamed to a staging name (atomic), then
+    /// deleted. A deletion interrupted midway leaves only staging, which the
+    /// next locked operation removes. Caller holds the catalog lock.
+    fn discard_snapshot(&self, snapshot: &Path) -> Result<()> {
+        if !snapshot.exists() {
+            return Ok(());
+        }
+        let staging = self
+            .root
+            .join(format!(".tmp-discarded-{}", uuid::Uuid::new_v4().simple()));
+        fs::rename(snapshot, &staging)?;
+        #[cfg(unix)]
+        if let Some(parent) = snapshot.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        fs::remove_dir_all(&staging)?;
+        Ok(())
     }
     /// Staging directories left by an interrupted install. Callers hold the
     /// catalog lock, so no install is in progress and every one is abandoned.
@@ -154,8 +188,10 @@ impl ExtensionService {
         self.save(&packages)?;
         // Unlink only content no other installed package references. Active turns
         // hold loaded text; subsequent loads must revalidate the catalog.
-        if !packages.iter().any(|p| p.digest == package.digest) {
-            let _ = fs::remove_dir_all(self.package_root(&package)?);
+        if !packages.iter().any(|p| p.digest == package.digest)
+            && let Err(error) = self.discard_snapshot(&self.package_root(&package)?)
+        {
+            tracing::warn!(%error, "Could not remove extension content");
         }
         Ok(())
     }
@@ -421,6 +457,12 @@ fn copy_tree(
         }
     }
     Ok(())
+}
+/// Content digest of a package folder: relative paths, executable bits and bytes.
+fn tree_digest(root: &Path) -> Result<String> {
+    let mut hash = Sha256::new();
+    hash_tree(root, root, &mut hash)?;
+    Ok(hex::encode(hash.finalize()))
 }
 fn hash_tree(root: &Path, dir: &Path, hash: &mut Sha256) -> Result<()> {
     let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;

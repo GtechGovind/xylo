@@ -421,12 +421,47 @@ fn credential(
     })
 }
 
+/// A refresh the authority answered. The authority rotates the single-use
+/// refresh token as soon as it accepts the exchange, so whatever happens
+/// afterwards the caller must persist `credential` before reporting `error`.
+pub struct RefreshedCredential {
+    /// The renewed credential; or, when the rotated tokens failed
+    /// validation, the previous one carrying the new refresh token and
+    /// marked expired, so the next attempt renews with a token that works.
+    pub credential: ChatGptCredential,
+    /// Why the rotated tokens were rejected, if they were.
+    pub error: Option<anyhow::Error>,
+}
+
 /// Serialize this operation per credential reference in the host. It never retries
 /// inference or a tool call. The host persists the replacement atomically in vault.
+///
+/// Only the preparation (the signing keys) honours `cancel`. Once the token
+/// request is sent, the exchange and its validation run to completion,
+/// bounded by the HTTP client's own timeouts, because the authority may
+/// already have rotated the refresh token.
 pub async fn refresh_chatgpt_credential(
     current: &ChatGptCredential,
     cancel: &CancellationToken,
-) -> Result<ChatGptCredential> {
+) -> Result<RefreshedCredential> {
+    let client = client()?;
+    refresh_with(
+        current,
+        cancel,
+        &client,
+        &format!("{AUTHORITY}/api/accounts/oauth/token"),
+        fetch_jwks(&client, cancel),
+    )
+    .await
+}
+
+async fn refresh_with(
+    current: &ChatGptCredential,
+    cancel: &CancellationToken,
+    client: &reqwest::Client,
+    token_url: &str,
+    jwks: impl Future<Output = Result<JwkSet>>,
+) -> Result<RefreshedCredential> {
     let refresh = current
         .refresh_token
         .as_deref()
@@ -435,28 +470,67 @@ pub async fn refresh_chatgpt_credential(
         current.client_id != DYNAMIC_CLIENT,
         "ChatGPT refresh requires the issued account client ID"
     );
-    let client = client()?;
+    // Everything that may fail or be cancelled happens before the exchange.
+    let keys = jwks.await?;
+    ensure!(!cancel.is_cancelled(), "ChatGPT token refresh cancelled");
     let form = [
         ("grant_type", "refresh_token"),
         ("client_id", current.client_id.as_str()),
         ("refresh_token", refresh),
         ("resource", RESOURCE),
     ];
-    let response = tokio::select! {_ = cancel.cancelled()=>bail!("ChatGPT token refresh cancelled"),response=client.post(format!("{AUTHORITY}/api/accounts/oauth/token")).form(&form).send()=>response?};
-    let mut tokens = bounded_json(response, cancel).await?;
+    let response = client.post(token_url).form(&form).send().await?;
+    let tokens = bounded_json(response, &CancellationToken::new()).await?;
+    let rotated = tokens["refresh_token"]
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned);
+    match renewed(current, tokens, &keys) {
+        Ok(credential) => Ok(RefreshedCredential {
+            credential,
+            error: None,
+        }),
+        Err(Rejected::OtherAccount(error)) => Err(error),
+        Err(Rejected::Invalid(error)) => match rotated {
+            Some(rotated) => {
+                let mut kept = current.clone();
+                kept.refresh_token = Some(rotated);
+                kept.expires_at_ms = 0;
+                Ok(RefreshedCredential {
+                    credential: kept,
+                    error: Some(error),
+                })
+            }
+            None => Err(error),
+        },
+    }
+}
+
+/// Why rotated tokens were not accepted.
+enum Rejected {
+    /// The tokens belong to another account; nothing of them is kept.
+    OtherAccount(anyhow::Error),
+    /// The tokens are malformed or their identity token is invalid.
+    Invalid(anyhow::Error),
+}
+
+/// The credential the token response renews `current` into.
+fn renewed(
+    current: &ChatGptCredential,
+    mut tokens: Value,
+    keys: &JwkSet,
+) -> std::result::Result<ChatGptCredential, Rejected> {
     if tokens.get("scope").is_none() {
         tokens["scope"] = Value::String(current.scopes.join(" "));
     }
     if tokens.get("refresh_token").is_none() {
-        tokens["refresh_token"] = serde_json::to_value(&current.refresh_token)?;
+        tokens["refresh_token"] = current
+            .refresh_token
+            .clone()
+            .map_or(Value::Null, Value::String);
     }
     let identity = if let Some(token) = tokens["id_token"].as_str() {
-        validate_identity(
-            token,
-            &current.client_id,
-            None,
-            &fetch_jwks(&client, cancel).await?,
-        )?
+        validate_identity(token, &current.client_id, None, keys).map_err(Rejected::Invalid)?
     } else {
         tokens["id_token"] = Value::String(current.id_token.clone());
         Identity {
@@ -466,16 +540,18 @@ pub async fn refresh_chatgpt_credential(
             email: current.email.clone(),
         }
     };
-    ensure!(
-        identity.sub == current.subject,
-        "ChatGPT refresh returned a different account"
-    );
+    if identity.sub != current.subject {
+        return Err(Rejected::OtherAccount(anyhow::anyhow!(
+            "ChatGPT refresh returned a different account"
+        )));
+    }
     credential(
         tokens,
         current.client_id.clone(),
         current.ext_agent_host_id.clone(),
         identity,
     )
+    .map_err(Rejected::Invalid)
 }
 
 /// An empty HTTP 200 confirms revocation. On failure the host may still clear local

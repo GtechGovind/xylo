@@ -185,3 +185,153 @@ fn enabling_previously_declined_plan_usage_requests_consent_without_forcing_ordi
         assert!(fields["scope"].contains("chatgpt.tokens.use.direct"));
     }
 }
+
+fn stored(refresh: &str) -> ChatGptCredential {
+    serde_json::from_value(json!({"type":"chatgpt","client_id":"oaiapp_fixture","subject":"fixture-account","issuer":AUTHORITY,"email":null,"ext_agent_host_id":"urn:uuid:00000000-0000-4000-8000-000000000000","id_token":"previous-id","access_token":"previous-access","refresh_token":refresh,"expires_at_ms":0,"scopes":["openid","chatgpt.tokens.use.direct"]})).unwrap()
+}
+
+/// A token endpoint that answers one request with `tokens`, running
+/// `on_request` after it has read the request and before it answers.
+async fn token_server(
+    tokens: Value,
+    on_request: impl FnOnce() + Send + 'static,
+) -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/token", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).await.unwrap();
+        on_request();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let payload = tokens.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        socket
+            .get_mut()
+            .write_all(response.as_bytes())
+            .await
+            .unwrap();
+        String::from_utf8(body).unwrap()
+    });
+    (url, server)
+}
+
+fn rotated_tokens(id_token: String) -> Value {
+    json!({"access_token":"rotated-access","refresh_token":"rotated-refresh","id_token":id_token,"token_type":"Bearer","expires_in":3600,"scope":"openid chatgpt.tokens.use.direct"})
+}
+
+fn valid_id_token() -> String {
+    signed(
+        &json!({"iss":AUTHORITY,"sub":"fixture-account","aud":"oaiapp_fixture","exp":xylo_core::now_ms()/1000+3600}),
+    )
+}
+
+#[tokio::test]
+async fn cancelling_after_the_token_request_still_returns_the_rotated_tokens() {
+    let cancel = CancellationToken::new();
+    let cancelled = cancel.clone();
+    let (url, server) =
+        token_server(rotated_tokens(valid_id_token()), move || cancelled.cancel()).await;
+    let refreshed = refresh_with(
+        &stored("old-refresh"),
+        &cancel,
+        &client().unwrap(),
+        &url,
+        async { Ok(jwks()) },
+    )
+    .await
+    .unwrap();
+    assert!(cancel.is_cancelled());
+    assert!(refreshed.error.is_none());
+    assert_eq!(refreshed.credential.access_token, "rotated-access");
+    assert_eq!(
+        refreshed.credential.refresh_token.as_deref(),
+        Some("rotated-refresh")
+    );
+    assert!(server.await.unwrap().contains("refresh_token=old-refresh"));
+}
+
+#[tokio::test]
+async fn signing_keys_are_fetched_before_the_exchange_so_cancelling_them_rotates_nothing() {
+    let cancel = CancellationToken::new();
+    let (url, server) = token_server(rotated_tokens(valid_id_token()), || {}).await;
+    let slow_keys = {
+        let cancel = cancel.clone();
+        async move {
+            cancel.cancel();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            anyhow::bail!("ChatGPT authentication cancelled")
+        }
+    };
+    let error = refresh_with(
+        &stored("old-refresh"),
+        &cancel,
+        &client().unwrap(),
+        &url,
+        slow_keys,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server)
+            .await
+            .is_err(),
+        "no token request may be sent"
+    );
+}
+
+#[tokio::test]
+async fn rotated_tokens_that_fail_validation_keep_the_new_refresh_token() {
+    let cancel = CancellationToken::new();
+    let (url, _server) = token_server(rotated_tokens("not-a-jwt".into()), || {}).await;
+    let refreshed = refresh_with(
+        &stored("old-refresh"),
+        &cancel,
+        &client().unwrap(),
+        &url,
+        async { Ok(jwks()) },
+    )
+    .await
+    .unwrap();
+    assert!(refreshed.error.is_some());
+    let kept = refreshed.credential;
+    assert_eq!(kept.refresh_token.as_deref(), Some("rotated-refresh"));
+    assert_eq!(kept.access_token, "previous-access");
+    assert_eq!(kept.expires_at_ms, 0, "the next use must refresh again");
+    // Tokens for another account are never kept.
+    let other = signed(
+        &json!({"iss":AUTHORITY,"sub":"someone-else","aud":"oaiapp_fixture","exp":xylo_core::now_ms()/1000+3600}),
+    );
+    let (url, _server) = token_server(rotated_tokens(other), || {}).await;
+    assert!(
+        refresh_with(
+            &stored("old-refresh"),
+            &cancel,
+            &client().unwrap(),
+            &url,
+            async { Ok(jwks()) }
+        )
+        .await
+        .is_err()
+    );
+}

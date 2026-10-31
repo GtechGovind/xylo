@@ -6,7 +6,9 @@
 //! binary event stream is decoded frame by frame with both CRCs validated,
 //! must end with `messageStop` carrying a real terminal reason, and its exact
 //! content blocks (signed reasoning, tool use) are kept for replay. Error
-//! messages never reflect response bodies.
+//! messages never reflect response bodies. Models that support prompt
+//! caching get `cachePoint` checkpoints after the tools, the system prompt
+//! and the newest message.
 use super::*;
 use crate::model::{FinishReason, Message, NativeContent, Role, StreamEvent, ToolSchema};
 use chrono::{DateTime, Utc};
@@ -300,10 +302,19 @@ impl StreamDecoder {
             output.push(StreamEvent::Finished(finish));
         }
         if let Some(usage) = event.pointer("/metadata/usage") {
-            output.push(StreamEvent::Usage(super::usage(
-                usage["inputTokens"].as_u64().unwrap_or(0),
-                usage["outputTokens"].as_u64().unwrap_or(0),
-            )));
+            // `inputTokens` leaves out the cached tokens, as Anthropic does;
+            // the usage counts every prompt token.
+            let read = usage["cacheReadInputTokens"].as_u64();
+            let write = usage["cacheWriteInputTokens"].as_u64();
+            output.push(StreamEvent::Usage(
+                super::usage(
+                    usage["inputTokens"].as_u64().unwrap_or(0)
+                        + read.unwrap_or(0)
+                        + write.unwrap_or(0),
+                    usage["outputTokens"].as_u64().unwrap_or(0),
+                )
+                .with_cache(read, write),
+            ));
         }
         Ok(output)
     }
@@ -320,11 +331,14 @@ impl StreamDecoder {
 
 /// Converse success requires a real terminal reason; an HTTP 200 or a
 /// `messageStop` envelope alone does not establish an unfiltered completion.
+/// Running out of room, whether the output limit or the model's context
+/// window, is [`FinishReason::Length`] so the loop continues the partial
+/// answer, as for the other protocols.
 fn terminal_reason(reason: Option<&str>) -> Result<FinishReason, ModelError> {
     match reason {
         Some("end_turn" | "stop_sequence") => Ok(FinishReason::Stop),
         Some("tool_use") => Ok(FinishReason::ToolCalls),
-        Some("max_tokens") => Ok(FinishReason::Length),
+        Some("max_tokens" | "model_context_window_exceeded") => Ok(FinishReason::Length),
         Some("content_filtered" | "guardrail_intervened") => {
             Err(ModelError::permanent("Bedrock filtered the response"))
         }
@@ -398,12 +412,23 @@ fn converse_body(
     {
         converted.push(json!({"role":"user","content":[{"text":" "}]}));
     }
+    let caching = cache_points(model);
+    if caching.messages
+        && let Some(content) = converted
+            .last_mut()
+            .and_then(|message| message["content"].as_array_mut())
+    {
+        content.push(cache_point());
+    }
+    if caching.system && !system.is_empty() {
+        system.push(cache_point());
+    }
     let mut body = json!({"messages": converted, "inferenceConfig": {"maxTokens": max_tokens}});
     if !system.is_empty() {
         body["system"] = Value::Array(system);
     }
     if !tools.is_empty() {
-        let specs = tools
+        let mut specs = tools
             .iter()
             .map(|tool| {
                 let schema = Some(tool.parameters.clone())
@@ -412,12 +437,55 @@ fn converse_body(
                 json!({"toolSpec":{"name":tool.name,"description":tool.description,"inputSchema":{"json":schema}}})
             })
             .collect::<Vec<_>>();
+        if caching.tools {
+            specs.push(cache_point());
+        }
         body["toolConfig"] = json!({"tools": specs});
     }
     if is_anthropic_model(model) {
         body["additionalModelRequestFields"] = json!({"anthropic_beta": ANTHROPIC_BETAS});
     }
     Ok(body)
+}
+
+/// Where a model accepts Converse cache checkpoints.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CachePoints {
+    tools: bool,
+    system: bool,
+    messages: bool,
+}
+
+/// Claude models cache tools, system and messages (three of their four
+/// checkpoints); Amazon Nova caches system and messages but not tools.
+/// Other models get none, since Bedrock rejects checkpoints a model does
+/// not support.
+fn cache_points(model: &str) -> CachePoints {
+    let lower = model.trim().to_ascii_lowercase();
+    let nova = lower.starts_with("amazon.nova")
+        || lower
+            .split_once('.')
+            .is_some_and(|(_, rest)| rest.starts_with("amazon.nova"));
+    if is_anthropic_model(model) {
+        CachePoints {
+            tools: true,
+            system: true,
+            messages: true,
+        }
+    } else if nova {
+        CachePoints {
+            tools: false,
+            system: true,
+            messages: true,
+        }
+    } else {
+        CachePoints::default()
+    }
+}
+
+/// A Converse prompt-cache checkpoint: everything before it is cached.
+fn cache_point() -> Value {
+    json!({"cachePoint": {"type": "default"}})
 }
 
 fn text_or_placeholder(text: &str) -> Vec<Value> {

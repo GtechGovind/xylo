@@ -551,3 +551,120 @@ fn scoped_correction_checks_source_before_creating_or_suspending_any_version() {
     assert!(service.skills(&scope, 10).unwrap().is_empty());
     assert!(service.record_scoped_correction(&scope, &input).is_ok());
 }
+
+fn busy() -> anyhow::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some("database is locked".into()),
+    )
+    .into()
+}
+
+#[test]
+fn busy_errors_retry_with_bounded_attempts_and_other_errors_do_not() {
+    assert!(persistence::transient(
+        &busy().context("claim learning job")
+    ));
+    assert!(persistence::transient(&anyhow::anyhow!(
+        "The database is busy; retry later"
+    )));
+    assert!(!persistence::transient(&anyhow::anyhow!("no such table")));
+    let mut calls = 0;
+    let value = persistence::retry_transient(3, Duration::from_millis(1), || {
+        calls += 1;
+        if calls < 3 { Err(busy()) } else { Ok(calls) }
+    })
+    .unwrap();
+    assert_eq!(value, 3);
+    let mut calls = 0;
+    let error = persistence::retry_transient(3, Duration::from_millis(1), || -> Result<()> {
+        calls += 1;
+        Err(busy())
+    })
+    .unwrap_err();
+    assert!(persistence::transient(&error));
+    assert_eq!(calls, 3, "attempts stay bounded");
+    let mut calls = 0;
+    persistence::retry_transient(3, Duration::from_millis(1), || -> Result<()> {
+        calls += 1;
+        anyhow::bail!("corrupt evidence")
+    })
+    .unwrap_err();
+    assert_eq!(calls, 1, "permanent errors are not retried");
+}
+
+#[tokio::test]
+async fn failure_is_recorded_only_by_the_current_lease_owner() {
+    let (_directory, store, service, _session, _scope) = setup();
+    // A job whose source conversation is gone fails permanently for its owner.
+    let missing = Uuid::new_v4();
+    service.queue_turn(missing, Uuid::new_v4()).unwrap();
+    assert_eq!(drain(&service).await.failed_jobs, 1);
+    let state = |store: &Store| {
+        store
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT state,owner FROM learning_jobs ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )?)
+            })
+            .unwrap()
+    };
+    assert_eq!(state(&store).0, "failed");
+    // After this service's lease expired another owner reclaimed the job; a late
+    // failure report from the old owner must not overwrite the live claim.
+    let id: i64 = store
+        .call(|conn| {
+            conn.execute(
+                "UPDATE learning_jobs SET state='processing',owner='live-owner',lease_until=?1",
+                [now_ms() + 60_000],
+            )?;
+            Ok(conn.query_row("SELECT MAX(id) FROM learning_jobs", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    assert!(!service.mark_failed(id).unwrap());
+    assert_eq!(
+        state(&store),
+        ("processing".to_owned(), Some("live-owner".to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn background_learning_survives_a_failed_pass_and_resumes_queued_jobs() {
+    let (_directory, store, service, session, scope) = setup();
+    command(&store, session, &scope, json!(["check", "--offline"]));
+    let hide = |store: &Store, from: &'static str, to: &'static str| {
+        store
+            .call(move |conn| {
+                conn.execute_batch(&format!("ALTER TABLE {from} RENAME TO {to}"))?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    // Every claim and backfill fails while the job table is unreachable.
+    hide(&store, "learning_jobs", "learning_jobs_hidden");
+    let cancel = CancellationToken::new();
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let cancel = cancel.clone();
+        async move { service.run(cancel).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !worker.is_finished(),
+        "a failed pass must not stop learning"
+    );
+    hide(&store, "learning_jobs_hidden", "learning_jobs");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while service.status(&scope).unwrap().pending_jobs > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queued job never resumed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(service.skills(&scope, 10).unwrap().len(), 1);
+    cancel.cancel();
+    worker.await.unwrap().unwrap();
+}

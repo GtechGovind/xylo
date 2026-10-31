@@ -1,0 +1,28 @@
+[package]
+name = "xylo-evals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Replayable traces, scripted task suites and multi-trial metrics for Xylo's agent engine"
+
+[[bin]]
+name = "xylo-evals"
+path = "src/main.rs"
+
+[dependencies]
+xylo-core.workspace = true
+xylo-engine.workspace = true
+xylo-services.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+parking_lot = "0.12"
+futures-util = "0.3"
+async-stream = "0.3"
+tempfile = "3"
+sha2 = "0.11"
+hex = "0.4"
+regex = "1"

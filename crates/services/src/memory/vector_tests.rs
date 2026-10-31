@@ -80,6 +80,7 @@ fn broken_optional_runtime_keeps_lexical_save_and_recall_available() {
         source: "Explicit user choice".into(),
         created_at: 7,
         supersedes: None,
+        origin: xylo_core::MemoryOrigin::UserTyped,
     };
     memory.remember_sync(record.clone()).unwrap();
     assert_eq!(
@@ -218,4 +219,64 @@ fn vec0_knn_uses_scope_partition_and_forget_removes_index_row() {
         let id:String=conn.query_row(&format!("SELECT id FROM {table} WHERE embedding MATCH ?1 AND k=1 AND scope='project-a' ORDER BY distance"),[query],|r|r.get(0))?;assert_eq!(id,"a");
         delete_vectors(conn,"a")?;let count:i64=conn.query_row(&format!("SELECT count(*) FROM {table} WHERE id='a'"),[],|r|r.get(0))?;assert_eq!(count,0);Ok(())
     }).unwrap();
+}
+
+#[test]
+fn reindex_skips_memories_forgotten_or_superseded_while_embedding() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path().join("reindex.db")).unwrap();
+    let memory = SqliteMemory::new(store.clone());
+    let record = |content: &str, supersedes| xylo_core::MemoryRecord {
+        id: Uuid::new_v4(),
+        scope: "project-a".into(),
+        content: content.into(),
+        source: "Explicit user choice".into(),
+        created_at: 1,
+        supersedes,
+        origin: xylo_core::MemoryOrigin::UserTyped,
+    };
+    let old = memory.remember_sync(record("Use tabs", None)).unwrap();
+    let current = memory
+        .remember_sync(record("Use spaces", Some(old.id)))
+        .unwrap();
+    let forgotten = memory
+        .remember_sync(record("Temporary note", None))
+        .unwrap();
+    // Each of these was selected for reindex before the change below.
+    memory.forget_sync(forgotten.id).unwrap();
+    let blob: Vec<u8> = [1.0_f32, 0.0, 0.0]
+        .iter()
+        .flat_map(|n| n.to_le_bytes())
+        .collect();
+    store
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            assert!(!store_reindexed_vector(
+                &tx,
+                &forgotten.id.to_string(),
+                "fixture",
+                &blob
+            )?);
+            assert!(!store_reindexed_vector(
+                &tx,
+                &old.id.to_string(),
+                "fixture",
+                &blob
+            )?);
+            assert!(store_reindexed_vector(
+                &tx,
+                &current.id.to_string(),
+                "fixture",
+                &blob
+            )?);
+            let table = ensure_vector_table(&tx, "fixture", 3)?;
+            let ids = tx
+                .prepare(&format!("SELECT id FROM {table}"))?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(ids, vec![current.id.to_string()]);
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
 }

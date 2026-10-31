@@ -49,6 +49,51 @@ fn helper_templates_preserve_argument_boundaries_and_fail_unknown_assets() {
     );
     assert!(expand_arguments(&["{model}".into()], &values).is_err());
 }
+#[test]
+fn speech_text_is_substituted_once_and_never_read_as_an_option() {
+    let values = BTreeMap::from([
+        ("output".to_owned(), "/out/speech.wav".to_owned()),
+        ("threads".to_owned(), "4".to_owned()),
+        (
+            "text".to_owned(),
+            "--vits-model=/evil {threads} {output} }{".to_owned(),
+        ),
+    ]);
+    let template: Vec<String> = [
+        "--output-filename={output}",
+        "--num-threads={threads}",
+        "--",
+        "{text}",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_eq!(
+        expand_arguments(&template, &values).unwrap(),
+        vec![
+            "--output-filename=/out/speech.wav",
+            "--num-threads=4",
+            "--",
+            "--vits-model=/evil {threads} {output} }{",
+        ]
+    );
+    // Without `--` the text could be taken for an option.
+    let unguarded: Vec<String> = ["--output-filename={output}", "{text}"]
+        .map(String::from)
+        .to_vec();
+    assert!(expand_arguments(&unguarded, &values).is_err());
+    // Embedded in a larger argument the text stays that argument's value.
+    assert_eq!(
+        expand_arguments(&["--text={text}".to_owned()], &values).unwrap(),
+        vec!["--text=--vits-model=/evil {threads} {output} }{"]
+    );
+    for broken in ["{output", "output}", "{}", "a}{b"] {
+        assert!(
+            expand_arguments(&[broken.to_owned()], &values).is_err(),
+            "{broken}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn unconfigured_server_does_not_start_or_claim_readiness() {
     let service = ModelService::new(CapabilityConfig::default());
