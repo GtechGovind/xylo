@@ -1,4 +1,13 @@
 use super::*;
+use xylo_core::ProviderConfig;
+
+fn window(context_tokens: u32) -> EffectiveWindow {
+    EffectiveWindow::of(&ProviderConfig {
+        context_tokens,
+        output_tokens: 2048,
+        ..Default::default()
+    })
+}
 
 #[test]
 fn ranged_reads_number_lines_and_report_continuation() {
@@ -6,7 +15,7 @@ fn ranged_reads_number_lines_and_report_continuation() {
     let file = dir.path().join("a.txt");
     let body: String = (1..=50).map(|n| format!("line {n}\n")).collect();
     std::fs::write(&file, body).unwrap();
-    let first = read(&file, "a.txt", &json!({"limit": 10})).unwrap();
+    let first = read(&file, "a.txt", &json!({"limit": 10}), &window(200_000)).unwrap();
     assert_eq!(first["end_line"], 10);
     assert_eq!(first["total_lines"], 50);
     assert_eq!(first["next_offset"], 11);
@@ -16,10 +25,10 @@ fn ranged_reads_number_lines_and_report_continuation() {
             .unwrap()
             .starts_with("     1\tline 1\n")
     );
-    let tail = read(&file, "a.txt", &json!({"offset": 45})).unwrap();
+    let tail = read(&file, "a.txt", &json!({"offset": 45}), &window(200_000)).unwrap();
     assert_eq!(tail["start_line"], 45);
     assert_eq!(tail["truncated"], false);
-    assert!(read(&file, "a.txt", &json!({"offset": 51})).is_err());
+    assert!(read(&file, "a.txt", &json!({"offset": 51}), &window(200_000)).is_err());
 }
 
 #[test]
@@ -27,9 +36,35 @@ fn large_reads_stop_on_the_byte_budget() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("big.txt");
     std::fs::write(&file, format!("{}\n", "x".repeat(100)).repeat(5000)).unwrap();
-    let value = read(&file, "big.txt", &json!({})).unwrap();
-    assert!(value["content"].as_str().unwrap().len() <= READ_BYTES);
+    let large = window(200_000);
+    let value = read(&file, "big.txt", &json!({}), &large).unwrap();
+    assert!(value["content"].as_str().unwrap().len() <= large.file_read_bytes());
     assert_eq!(value["truncated"], true);
+}
+
+#[test]
+fn default_reads_shrink_with_the_context_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("long.rs");
+    std::fs::write(&file, "let x = 1;\n".repeat(5000)).unwrap();
+    let small = window(8192);
+    let large = window(200_000);
+    let narrow = read(&file, "long.rs", &json!({}), &small).unwrap();
+    let wide = read(&file, "long.rs", &json!({}), &large).unwrap();
+    let narrow_end = narrow["end_line"].as_u64().unwrap();
+    assert!(narrow_end <= small.file_read_lines());
+    assert!(narrow["content"].as_str().unwrap().len() <= small.file_read_bytes());
+    assert!(wide["end_line"].as_u64().unwrap() > narrow_end);
+    assert_eq!(narrow["next_offset"], narrow_end + 1);
+    // An explicit limit still pages, within the window's byte bound.
+    let paged = read(
+        &file,
+        "long.rs",
+        &json!({"offset": 4990, "limit": 5}),
+        &small,
+    )
+    .unwrap();
+    assert_eq!(paged["end_line"], 4994);
 }
 
 #[test]

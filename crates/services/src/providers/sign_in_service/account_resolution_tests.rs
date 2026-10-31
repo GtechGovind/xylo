@@ -42,6 +42,12 @@ fn allow_renewal(vault: &CredentialVault) {
         )
         .unwrap();
 }
+fn refreshed(credential: ChatGptCredential) -> RefreshedCredential {
+    RefreshedCredential {
+        credential,
+        error: None,
+    }
+}
 fn renewed(mut credential: ChatGptCredential) -> ChatGptCredential {
     credential.access_token = "fixture-renewed-access".into();
     credential.refresh_token = Some("fixture-rotated-refresh".into());
@@ -62,7 +68,7 @@ async fn rejected_future_dated_token_forces_one_refresh_and_persists_rotation() 
             &CancellationToken::new(),
             |credential, _| {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async move { Ok(renewed(credential)) }
+                async move { Ok(refreshed(renewed(credential))) }
             },
         )
         .await
@@ -171,7 +177,7 @@ async fn parallel_rejections_of_old_token_share_one_rotating_refresh() {
         calls.fetch_add(1, Ordering::SeqCst);
         async move {
             tokio::time::sleep(Duration::from_millis(25)).await;
-            Ok(renewed(credential))
+            Ok(refreshed(renewed(credential)))
         }
     };
     let (first, second) = tokio::join!(
@@ -200,9 +206,11 @@ async fn cancelled_rejection_refresh_does_not_write_or_return_credentials() {
         vault.clone(),
         &digest,
         &cancel,
-        move |_, _| async move {
+        // Before its request is sent, a refresh stops on cancellation.
+        move |_, cancel: CancellationToken| async move {
             signal.notify_one();
-            std::future::pending::<Result<ChatGptCredential>>().await
+            cancel.cancelled().await;
+            anyhow::bail!("ChatGPT token refresh cancelled")
         },
     );
     let cancelling = async {
@@ -227,7 +235,7 @@ async fn nonrenewable_and_denied_registrations_never_refresh() {
                 &CancellationToken::new(),
                 |credential, _| {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    async move { Ok(renewed(credential)) }
+                    async move { Ok(refreshed(renewed(credential))) }
                 },
             )
             .await;
@@ -256,7 +264,7 @@ async fn renewed_denied_grant_is_persisted_but_never_returned_as_authorized() {
             |credential, _| async move {
                 let mut credential = renewed(credential);
                 credential.scopes.clear();
-                Ok(credential)
+                Ok(refreshed(credential))
             },
         )
         .await;
@@ -290,7 +298,7 @@ async fn changed_account_identity_or_custom_endpoint_cannot_replace_registration
             |credential, _| async move {
                 let mut credential = renewed(credential);
                 credential.subject = "different-account".into();
-                Ok(credential)
+                Ok(refreshed(credential))
             },
         )
         .await;
@@ -333,7 +341,7 @@ async fn waiting_rejection_does_not_resurrect_signed_out_registration() {
     let refresh =
         service.refresh_rejected_with(&config, vault.clone(), &digest, &cancel, |credential, _| {
             calls.fetch_add(1, Ordering::SeqCst);
-            async move { Ok(renewed(credential)) }
+            async move { Ok(refreshed(renewed(credential))) }
         });
     tokio::pin!(refresh);
     tokio::select! {result=&mut refresh=>panic!("Refresh must wait for sign-out lease: {:?}",result.is_ok()),_=tokio::time::sleep(Duration::from_millis(20))=>{}}
@@ -373,7 +381,7 @@ async fn cancellation_after_known_rotation_commits_tokens_without_returning_them
             &cancel,
             move |credential, _| async move {
                 cancelled.cancel();
-                Ok(renewed(credential))
+                Ok(refreshed(renewed(credential)))
             },
         )
         .await;
@@ -418,5 +426,78 @@ async fn dropped_refresh_waiter_keeps_lease_until_blocking_commit_finishes() {
     assert_eq!(
         vault.get("selected-account").unwrap().as_deref(),
         Some("committed-rotation")
+    );
+}
+
+#[tokio::test]
+async fn a_rotation_cancelled_mid_exchange_is_persisted_before_cancellation_is_reported() {
+    let (_directory, service, vault, config) =
+        fixture("chatgpt.tokens.use.direct", now_ms() + 3_600_000);
+    allow_renewal(&vault);
+    let cancel = CancellationToken::new();
+    let digest = rejected_digest();
+    let exchanged = std::sync::Arc::new(tokio::sync::Notify::new());
+    let signal = exchanged.clone();
+    let refresh = service.refresh_rejected_with(
+        &config,
+        vault.clone(),
+        &digest,
+        &cancel,
+        move |credential, _| async move {
+            // The authority has accepted the exchange; the answer is slow.
+            signal.notify_one();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(refreshed(renewed(credential)))
+        },
+    );
+    let cancelling = async {
+        exchanged.notified().await;
+        cancel.cancel();
+    };
+    let (result, ()) = tokio::join!(refresh, cancelling);
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stored: ChatGptCredential =
+            serde_json::from_str(&vault.get("selected-account").unwrap().unwrap()).unwrap();
+        if stored.refresh_token.as_deref() == Some("fixture-rotated-refresh") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "rotation was lost");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_rotation_that_fails_validation_saves_the_new_refresh_token_and_reports_it() {
+    let (_directory, service, vault, config) =
+        fixture("chatgpt.tokens.use.direct", now_ms() + 3_600_000);
+    allow_renewal(&vault);
+    let error = service
+        .refresh_rejected_with(
+            &config,
+            vault.clone(),
+            &rejected_digest(),
+            &CancellationToken::new(),
+            |mut credential, _| async move {
+                credential.refresh_token = Some("fixture-rotated-refresh".into());
+                credential.expires_at_ms = 0;
+                Ok(RefreshedCredential {
+                    credential,
+                    error: Some(anyhow::anyhow!("invalid identity token")),
+                })
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid identity token"),
+        "{error:#}"
+    );
+    let stored: ChatGptCredential =
+        serde_json::from_str(&vault.get("selected-account").unwrap().unwrap()).unwrap();
+    assert_eq!(
+        stored.refresh_token.as_deref(),
+        Some("fixture-rotated-refresh")
     );
 }

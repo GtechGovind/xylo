@@ -1,7 +1,39 @@
 //! Worker-side verification and acknowledgement of persisted guidance identities.
 use super::*;
 use xylo_core::{SteeringReceipt, SteeringRequest, SteeringState};
-pub(super) async fn receive(
+/// The reply to one `SteerDurable`: the guidance's receipt, or an error event
+/// for that request when the journal could not be read or settled. A store
+/// failure (SQLite busy, I/O) must never end the worker and with it the turn
+/// it runs: the guidance stays as durable as the store left it, the matching
+/// running turn is woken to look for it at its next boundary, and the turn's
+/// end settles whatever is still pending.
+pub(super) async fn answer(
+    store: Store,
+    active: Option<&ActiveTask>,
+    guidance: SteeringRequest,
+) -> EngineEvent {
+    let (session, turn) = (guidance.session_id, guidance.turn_id);
+    match receive(store, active, guidance).await {
+        Ok(receipt) => EngineEvent::Steering { receipt },
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "Guidance could not be checked");
+            if let Some(task) = active
+                && task.session_id == session
+                && task.turn_id == turn
+                && task.busy.load(Ordering::Acquire)
+            {
+                task.engine.notify_steering();
+            }
+            EngineEvent::Error {
+                message: format!("Guidance could not be checked: {error:#}"),
+                retryable: true,
+                kind: ErrorKind::Internal,
+            }
+        }
+    }
+}
+
+async fn receive(
     store: Store,
     active: Option<&ActiveTask>,
     guidance: SteeringRequest,

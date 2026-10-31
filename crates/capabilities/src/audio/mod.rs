@@ -5,7 +5,7 @@ mod capture;
 pub mod convert;
 mod playback;
 
-use crate::{CapabilityConfig, input_path};
+use crate::{CapabilityConfig, InputRoot, open_input};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -259,9 +259,9 @@ impl AudioService {
                     args.get("user_initiated").and_then(Value::as_bool) == Some(true),
                     "Audio playback requires an explicit user Play action"
                 );
-                let path = input_path(&self.0.config, crate::required_str(args, "path")?)?;
+                let input = open_input(&self.0.config, crate::required_str(args, "path")?)?;
                 ensure!(
-                    path.starts_with(&self.0.config.artifacts),
+                    input.root == InputRoot::Artifacts,
                     "Playback requires a recording or generated audio in Xylo artifacts"
                 );
                 let volume = args
@@ -306,7 +306,7 @@ impl AudioService {
                         }
                     }
                     let _guard = PlaybackGuard(service, id);
-                    playback::play(&path, volume as f32, &stop)
+                    playback::play(&input.path, input.file, volume as f32, &stop)
                 })
                 .await?
             }

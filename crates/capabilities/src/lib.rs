@@ -9,6 +9,7 @@ pub mod browser;
 pub mod desktop;
 pub mod documents;
 pub mod environments;
+mod input;
 mod managed_endpoints;
 pub mod models;
 pub mod plugins;
@@ -16,6 +17,7 @@ pub mod process;
 mod speech;
 
 use anyhow::{Result, ensure};
+pub(crate) use input::{InputRoot, open_input};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -291,6 +293,15 @@ impl CapabilityService {
         Ok(())
     }
 
+    /// Closes what a helper agent opened for itself: its browser session.
+    /// Local models and environment sessions are shared with the parent
+    /// turn, which stops them in its own [`Self::shutdown`]; a helper never
+    /// takes the machine-wide model activity lease, so helpers finishing at
+    /// the same time cannot fail each other.
+    pub async fn shutdown_helper_sessions(&self) -> Result<()> {
+        self.browser.shutdown().await
+    }
+
     /// Stop idle services and retain exclusive model activity ownership through
     /// a validated configuration replacement. Busy chats fail before any stop.
     pub async fn prepare_configuration_change(&self) -> Result<models::IdleActivityLease> {
@@ -338,30 +349,6 @@ pub(crate) fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("Missing nonempty string: {key}"))
-}
-
-/// Restrict inputs to the selected workspace or the app's capability artifacts.
-pub(crate) fn input_path(config: &CapabilityConfig, raw: &str) -> Result<PathBuf> {
-    let requested = Path::new(raw);
-    let joined = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        config.workspace.join(requested)
-    };
-    let canonical = std::fs::canonicalize(joined)?;
-    ensure!(
-        !config
-            .management_root
-            .as_ref()
-            .is_some_and(|root| canonical.starts_with(root)),
-        "Application management files are outside the tool filesystem scope"
-    );
-    ensure!(
-        canonical.starts_with(&config.workspace) || canonical.starts_with(&config.artifacts),
-        "Input is outside the workspace and artifacts roots"
-    );
-    ensure!(canonical.is_file(), "Input must be a regular file");
-    Ok(canonical)
 }
 
 pub(crate) fn output_path(

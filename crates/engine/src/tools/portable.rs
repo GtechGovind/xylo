@@ -213,14 +213,18 @@ pub(super) fn execute(
         json!({"skill":skill.id,"description":skill.description,"instructions":skill.body,"package_root":skill.package_root,"resource_tool":"extension_resource","permissions":prompts::skill_permissions_note()}),
     )
 }
-/// Index entries for installed portable skills that apply to this turn and
-/// for local MCP and language server components the model can inspect.
+/// Index entries for the installed portable skills the model may use on its
+/// own and for local MCP and language server components it can inspect.
+/// Nothing here depends on the turn's prompt or on a component's live state
+/// (the model asks `extension_component` for its status), so the system
+/// prompt that carries the index stays byte-identical across turns. Skills
+/// the user invokes by name are announced per turn by [`invoked`].
 pub(super) fn index(broker: &ToolBroker) -> Result<Vec<(String, String)>> {
     let service = service(broker);
     let mut entries: Vec<(String, String)> = service
         .skill_metadata()?
         .into_iter()
-        .filter(|skill| skill.automatic || explicit_invocation(&broker.request.prompt, &skill.id))
+        .filter(|skill| skill.automatic)
         .map(|skill| (skill.id, skill.description))
         .collect();
     for package in service
@@ -238,11 +242,23 @@ pub(super) fn index(broker: &ToolBroker) -> Result<Vec<(String, String)>> {
             entries.push((
                 format!("{}:{}", package.id, component.name),
                 format!(
-                    "Not a skill: an installed {:?} component ({:?}). Use extension_component with id {} and component {}, starting with operation status",
-                    component.kind, component.readiness, package.id, component.name
+                    "Not a skill: an installed {:?} component. Use extension_component with id {} and component {}, starting with operation status",
+                    component.kind, package.id, component.name
                 ),
             ));
         }
     }
     Ok(entries)
+}
+
+/// The installed skills that only the user may start and that this turn's
+/// prompt invokes by name (`/name` or `$name`), as `(id, description)`. They
+/// travel in the turn's recalled-context note, not in the cached index.
+pub(super) fn invoked(broker: &ToolBroker) -> Result<Vec<(String, String)>> {
+    Ok(service(broker)
+        .skill_metadata()?
+        .into_iter()
+        .filter(|skill| !skill.automatic && explicit_invocation(&broker.request.prompt, &skill.id))
+        .map(|skill| (skill.id, skill.description))
+        .collect())
 }

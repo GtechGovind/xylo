@@ -246,3 +246,59 @@ fn sigv4_headers_sign_the_double_encoded_path_with_the_session_token() {
     let bearer = request_headers(request, &BedrockAuth::Bearer("token".into())).unwrap();
     assert_eq!(bearer["authorization"], "Bearer token");
 }
+
+#[test]
+fn caching_models_get_checkpoints_after_tools_system_and_the_newest_message() {
+    let messages = [
+        Message::system("Policy"),
+        Message::user("First"),
+        Message::assistant("Reply"),
+        Message::user("Second"),
+    ];
+    let tools = [ToolSchema {
+        name: "lookup".into(),
+        description: "Look up".into(),
+        parameters: json!({"type":"object","properties":{}}),
+    }];
+    let checkpoint = json!({"cachePoint":{"type":"default"}});
+    let claude = converse_body("us.anthropic.claude-sonnet", &messages, &tools, 64).unwrap();
+    assert_eq!(
+        claude["system"].as_array().unwrap().last().unwrap(),
+        &checkpoint
+    );
+    assert_eq!(
+        claude["toolConfig"]["tools"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap(),
+        &checkpoint
+    );
+    let last = claude["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["content"][0]["text"], "Second");
+    assert_eq!(
+        last["content"].as_array().unwrap().last().unwrap(),
+        &checkpoint
+    );
+    assert_eq!(claude.to_string().matches("cachePoint").count(), 3);
+    let nova = converse_body("amazon.nova-pro-v1:0", &messages, &tools, 64).unwrap();
+    assert_eq!(nova.to_string().matches("cachePoint").count(), 2);
+    assert!(!nova["toolConfig"].to_string().contains("cachePoint"));
+    let other = converse_body("meta.llama3-70b", &messages, &tools, 64).unwrap();
+    assert!(!other.to_string().contains("cachePoint"));
+}
+
+#[test]
+fn running_out_of_room_finishes_with_length() {
+    for reason in ["max_tokens", "model_context_window_exceeded"] {
+        assert_eq!(terminal_reason(Some(reason)).unwrap(), FinishReason::Length);
+        let stop = frame("messageStop", json!({"messageStop":{"stopReason":reason}}));
+        let events = decode_all(&stop).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Finished(FinishReason::Length))),
+            "{reason}"
+        );
+    }
+}

@@ -2,10 +2,12 @@
 //! in observations and optional exports; office formula execution is not enabled.
 
 mod docx;
+mod docx_export;
 mod editing;
 mod package;
 mod spreadsheet;
 mod transaction;
+mod workbook;
 mod xml;
 use editing::read_bounded;
 fn check(cancel: &CancellationToken) -> Result<()> {
@@ -13,13 +15,15 @@ fn check(cancel: &CancellationToken) -> Result<()> {
     Ok(())
 }
 
-use crate::{CapabilityConfig, definition, input_path, observation, output_path, required_str};
+use crate::{CapabilityConfig, definition, observation, open_input, output_path, required_str};
 use anyhow::{Context, Result, ensure};
-use calamine::{Reader, open_workbook_auto};
-use docx_rs::{Docx, Hyperlink, HyperlinkType, Paragraph, Run};
 use pdfium_render::prelude::*;
 use serde_json::{Value, json};
-use std::{fs::File, io::Read, path::Path, time::Duration};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 use xylo_core::{ToolDefinition, ToolObservation};
 
@@ -27,8 +31,10 @@ const MAX_INPUT: u64 = 64 * 1024 * 1024;
 const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
 
 /// Validate ZIP metadata before office libraries allocate decompressed content.
-fn preflight_archive(path: &Path) -> Result<()> {
-    let mut zip = zip::ZipArchive::new(File::open(path)?)?;
+fn preflight_archive(file: &File) -> Result<()> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut zip = zip::ZipArchive::new(file)?;
     ensure!(
         zip.len() <= 10_000,
         "Office archive contains too many entries"
@@ -85,9 +91,11 @@ fn execute_blocking(
             editing::execute(config, name, args, cancel)
         }
         "document_read" | "document_pdf_preview" => {
-            let path = input_path(config, required_str(args, "path")?)?;
+            let input = open_input(config, required_str(args, "path")?)?;
+            let path = input.path;
+            let mut file = input.file;
             ensure!(
-                std::fs::metadata(&path)?.len() <= MAX_INPUT,
+                file.metadata()?.len() <= MAX_INPUT,
                 "Document exceeds 64MiB input budget"
             );
             let extension = path
@@ -96,41 +104,31 @@ fn execute_blocking(
                 .unwrap_or("")
                 .to_ascii_lowercase();
             match extension.as_str() {
-                "pdf" => pdf(config, &path, name == "document_pdf_preview", args, cancel),
+                "pdf" => pdf(
+                    config,
+                    &path,
+                    file,
+                    name == "document_pdf_preview",
+                    args,
+                    cancel,
+                ),
                 "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" => {
                     ensure!(name == "document_read", "Preview only supports PDF");
-                    if extension != "xls" {
-                        preflight_archive(&path)?;
-                    }
-                    let mut workbook = open_workbook_auto(&path)?;
-                    let sheets = workbook.sheet_names();
-                    let sheet = args
-                        .get("sheet")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .or_else(|| sheets.first().cloned())
-                        .context("Workbook has no sheets")?;
-                    let range = workbook.worksheet_range(&sheet)?;
                     let limit = args
                         .get("max_rows")
                         .and_then(Value::as_u64)
                         .unwrap_or(200)
                         .clamp(1, 2000) as usize;
-                    let rows: Vec<Vec<String>> = range
-                        .rows()
-                        .take(limit)
-                        .map(|r| r.iter().take(128).map(ToString::to_string).collect())
-                        .collect();
-                    Ok(observation(
-                        json!({"source":path,"sheet":sheet,"sheets":sheets,"rows":rows,
-                        "total_rows":range.height(),"total_columns":range.width(),"truncated":range.height()>limit || range.width()>128}),
-                        vec![],
-                    ))
+                    let sheet = args.get("sheet").and_then(Value::as_str);
+                    let mut result = workbook::read(&file, &extension, sheet, limit, cancel)?;
+                    result["source"] = json!(path);
+                    Ok(observation(result, vec![]))
                 }
                 "docx" => {
                     ensure!(name == "document_read", "Preview only supports PDF");
-                    preflight_archive(&path)?;
-                    let mut archive = zip::ZipArchive::new(File::open(&path)?)?;
+                    preflight_archive(&file)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    let mut archive = zip::ZipArchive::new(&file)?;
                     let mut xml = String::new();
                     archive
                         .by_name("word/document.xml")?
@@ -160,7 +158,7 @@ fn execute_blocking(
                 "txt" | "md" | "csv" | "json" | "html" | "xml" | "log" | "yaml" | "yml" => {
                     ensure!(name == "document_read", "Preview only supports PDF");
                     let mut bytes = Vec::new();
-                    File::open(&path)?
+                    (&file)
                         .take(config.max_output_bytes as u64 + 1)
                         .read_to_end(&mut bytes)?;
                     let truncated = bytes.len() > config.max_output_bytes;
@@ -230,12 +228,10 @@ fn execute_blocking(
                 paragraphs.len() <= 10_000 && args.to_string().len() <= 8 * 1024 * 1024,
                 "Document export exceeds content budget"
             );
-            let mut doc = Docx::new();
+            let mut doc = docx_export::DocxExport::default();
             for paragraph in paragraphs {
                 ensure!(!cancel.is_cancelled(), "Document operation cancelled");
-                doc = doc.add_paragraph(Paragraph::new().add_run(
-                    Run::new().add_text(paragraph.as_str().context("Paragraph must be text")?),
-                ));
+                doc.paragraph(paragraph.as_str().context("Paragraph must be text")?);
             }
             if let Some(sources) = args.get("sources").and_then(Value::as_array) {
                 ensure!(sources.len() <= 100, "Too many source references");
@@ -246,16 +242,11 @@ fn execute_blocking(
                         "Source URL must be HTTP(S)"
                     );
                     let title = required_str(source, "title")?;
-                    doc = doc.add_paragraph(
-                        Paragraph::new().add_hyperlink(
-                            Hyperlink::new(url.as_str(), HyperlinkType::External)
-                                .add_run(Run::new().add_text(title)),
-                        ),
-                    );
+                    doc.link(url.as_str(), title);
                 }
             }
             let mut staging = transaction::Staging::new(&config.artifacts)?;
-            doc.build().pack(File::create(&staging.path)?)?;
+            doc.write(File::create(&staging.path)?)?;
             staging.commit(&path, cancel)?;
             Ok(observation(
                 json!({"path":path,"paragraphs":paragraphs.len()}),
@@ -268,7 +259,8 @@ fn execute_blocking(
 
 fn pdf(
     config: &CapabilityConfig,
-    path: &Path,
+    path: &std::path::Path,
+    file: File,
     preview: bool,
     args: &Value,
     cancel: &CancellationToken,
@@ -300,7 +292,8 @@ fn pdf(
         pdfium
     };
     drop(loaded);
-    let document = pdfium.load_pdf_from_file(path, args.get("password").and_then(Value::as_str))?;
+    let document =
+        pdfium.load_pdf_from_reader(file, args.get("password").and_then(Value::as_str))?;
     let index = args.get("page").and_then(Value::as_u64).unwrap_or(1);
     ensure!(
         index > 0 && index <= document.pages().len() as u64,

@@ -12,7 +12,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use xylo_core::{MemoryRecord, ToolDefinition, now_ms};
+use xylo_core::{MemoryOrigin, MemoryRecord, ToolDefinition, now_ms};
 use xylo_services::sandbox::{self, Network};
 
 /// What the permission decision granted one call.
@@ -80,7 +80,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ),
         def(
             "file_read",
-            "Read a text file in the workspace as numbered lines (cat -n style). Returns up to 2000 lines from offset (1-based); when truncated is true, continue from next_offset. Line-number prefixes are not part of the file. Also reads a saved full tool result named in full_result",
+            "Read a text file in the workspace as numbered lines (cat -n style). Returns a window of lines from offset (1-based) sized to the model's context; when truncated is true, continue from next_offset. Line-number prefixes are not part of the file. Also reads a saved full tool result named in full_result",
             json!({"path":{"type":"string","description":"Workspace-relative or absolute path"},"offset":{"type":"integer","minimum":1,"description":"First line to read (1-based)"},"limit":{"type":"integer","minimum":1,"maximum":10000,"description":"Maximum lines to return"}}),
             &["path"],
             false,
@@ -157,15 +157,15 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ),
         def(
             "memory_search",
-            "Recall project-scoped facts with source references",
+            "Recall project facts with their source, origin, date and the earlier version each one corrected (previously). Facts are reference data that may be stale: verify them against the code",
             json!({"query":{"type":"string"}}),
             &["query"],
             false,
         ),
         def(
             "memory_remember",
-            "Retain a sourced project fact or correction",
-            json!({"content":{"type":"string"},"source":{"type":"string"}}),
+            "Retain a durable project fact or a correction the user gave you. Write it self-contained: name its subject instead of using pronouns, and never include secrets. To correct a fact from memory_search, pass its id as supersedes and say why in reason; the old version stays in the fact's history",
+            json!({"content":{"type":"string"},"source":{"type":"string","description":"Where the fact comes from, such as the user's message or a file path"},"supersedes":{"type":"string","description":"Id of the fact this one corrects"},"reason":{"type":"string","description":"Why the earlier fact is wrong; required with supersedes"}}),
             &["content", "source"],
             true,
         ),
@@ -213,8 +213,8 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ),
         def(
             "search_tools",
-            "Discover additional tool schemas (documents, browser, environments, images, connectors) by relevant keywords",
-            json!({"query":{"type":"string"}}),
+            "Find tools that are not offered directly (documents, browser, environments, images and the tools of connected services and MCP servers). Returns the best matches, ranked, with their arguments",
+            json!({"query":{"type":"string","description":"Words for the action and its object, for example \"create github issue\" or \"browser screenshot\""}}),
             &["query"],
             false,
         ),
@@ -446,6 +446,45 @@ pub(super) fn change_preview(
     Ok(preview)
 }
 
+/// Saves the model's `memory_remember` call with the `origin` the broker
+/// assigned. A correction names the fact it supersedes and why; the store
+/// keeps the old version and refuses a correction from a less trusted origin.
+pub(super) fn remember(broker: &ToolBroker, args: &Value, origin: MemoryOrigin) -> Result<Value> {
+    let optional = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let supersedes = optional("supersedes")
+        .map(|id| {
+            Uuid::parse_str(id)
+                .map_err(|_| code::unapplied("supersedes must be a fact id from memory_search"))
+        })
+        .transpose()?;
+    let source = text(args, "source")?;
+    let source = match (supersedes, optional("reason")) {
+        (Some(_), Some(reason)) => format!("{source} (corrects an earlier fact: {reason})"),
+        (Some(_), None) => {
+            return Err(code::unapplied(
+                "Say in reason why the superseded fact is wrong",
+            ));
+        }
+        (None, _) => source.to_owned(),
+    };
+    let record = MemoryRecord {
+        id: Uuid::new_v4(),
+        scope: broker.request.workspace.to_string_lossy().into_owned(),
+        content: text(args, "content")?.into(),
+        source,
+        created_at: now_ms(),
+        supersedes,
+        origin,
+    };
+    let stored = broker.memory.remember_sync(record)?;
+    Ok(json!({"status":"success","summary":stored,"next_actions":[],"artifacts":[]}))
+}
+
 fn todo_list(args: &Value) -> Result<Value> {
     let todos = args
         .get("todos")
@@ -492,7 +531,7 @@ pub(super) fn execute(
     let value = match name {
         "file_read" => {
             let path = permitted(broker, text(args, "path")?, false, access)?;
-            code::read(&path, &code::display(root, &path), args)?
+            code::read(&path, &code::display(root, &path), args, &broker.window())?
         }
         "file_edit" => {
             let path = write_target(broker, text(args, "path")?, access)?;
@@ -524,23 +563,12 @@ pub(super) fn execute(
         "find_files" => code::find(root, &directory()?, args, &broker.cancel)?,
         "search_project" => code::search(root, &directory()?, args, &broker.cancel)?,
         "todo_write" => todo_list(args)?,
-        "memory_search" => json!(
-            broker
-                .memory
-                .recall_sync(&scope, text(args, "query")?, 12)?
-        ),
-        "memory_remember" => {
-            let record = MemoryRecord {
-                id: Uuid::new_v4(),
-                scope: scope.into_owned(),
-                content: text(args, "content")?.into(),
-                source: text(args, "source")?.into(),
-                created_at: now_ms(),
-                supersedes: None,
-            };
-            broker.memory.remember_sync(record.clone())?;
-            json!(record)
-        }
+        "memory_search" => json!(broker.memory.recall_with_history(
+            &scope,
+            text(args, "query")?,
+            12
+        )?),
+        "memory_remember" => bail!("Memory writes are dispatched with their origin"),
         "skill_list" => {
             let skills = xylo_services::LearningService::new(broker.store.clone())
                 .skills(&root.to_string_lossy(), 100)?;

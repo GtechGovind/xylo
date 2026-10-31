@@ -40,6 +40,7 @@ fn memory(scope: &str, text: &str) -> MemoryRecord {
         source: "test fixture".into(),
         created_at: now_ms(),
         supersedes: None,
+        origin: xylo_core::MemoryOrigin::UserTyped,
     }
 }
 fn vault() -> CredentialVault {
@@ -673,6 +674,7 @@ async fn native_connector_sends_correct_route_and_reports_provider_failure() {
         command: None,
         args: Vec::new(),
         credential_ref: Some("github-token".into()),
+        trusted: false,
     };
     let error = connector
         .call(
@@ -708,6 +710,7 @@ async fn mcp_discovery_call_and_metadata_cache_use_real_protocol() {
         command: None,
         args: Vec::new(),
         credential_ref: None,
+        trusted: false,
     };
     assert!(broker.cached_tools(&config).unwrap().is_empty());
     let tools = broker.tools(&config, &Default::default()).await.unwrap();
@@ -745,7 +748,7 @@ fn completion_receipt_checkpoint_and_assistant_history_commit_once() {
         input_tokens: 10,
         output_tokens: 20,
         elapsed_ms: 30,
-        context_tokens: 0,
+        ..Default::default()
     };
     let checkpoint = json!([{"role":"assistant","content":"finished"}]);
     store
@@ -774,6 +777,26 @@ fn completion_receipt_checkpoint_and_assistant_history_commit_once() {
             .complete_turn(session, turn, &checkpoint, "different", &usage)
             .is_err()
     );
+}
+#[test]
+fn a_cut_off_answer_keeps_its_truncated_status_in_history() {
+    let (directory, store, session) = database();
+    let turn = Uuid::new_v4();
+    store
+        .complete_turn_as(
+            session,
+            turn,
+            &json!([{"role":"assistant","content":"as far as it got"}]),
+            "as far as it got",
+            &xylo_core::Usage::default(),
+            xylo_core::MessageStatus::Truncated,
+        )
+        .unwrap();
+    let reopened = Store::open(directory.path().join("xylo.db")).unwrap();
+    let history = reopened.messages(session, 10).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].content, "as far as it got");
+    assert_eq!(history[0].status, xylo_core::MessageStatus::Truncated);
 }
 fn user_version(store: &Store) -> i64 {
     store
@@ -1157,6 +1180,7 @@ async fn authenticated_http_mcp_uses_isolated_vault_and_rejects_missing_token() 
         command: None,
         args: vec![],
         credential_ref: None,
+        trusted: false,
     };
     assert!(broker.tools(&config, &Default::default()).await.is_err());
     assert_eq!(accepted.load(Ordering::SeqCst), 0);
@@ -1202,6 +1226,7 @@ for line in sys.stdin:
         command: Some(script.clone()),
         args: vec![],
         credential_ref: None,
+        trusted: false,
     };
     let mut scope = crate::ConnectorLaunchScope {
         workspace: first.clone(),

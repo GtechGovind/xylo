@@ -271,6 +271,8 @@ pub struct Xylo {
     connector_editing: Option<Uuid>,
     connector_credential: Entity<InputState>,
     connector_transport: String,
+    /// The form's "Trust read-only hints" switch.
+    connector_trusted: bool,
     /// The Connections page shows its add/edit form only after Add or Edit.
     connector_form_open: bool,
     connectors: Vec<ConnectorConfig>,
@@ -297,9 +299,9 @@ pub struct Xylo {
     conversation_query: Entity<InputState>,
     expanded_tools: BTreeSet<Uuid>,
     raw_tool_details: BTreeSet<Uuid>,
-    /// The answer being read aloud, by content hash, so only its action row
-    /// offers "Stop reading".
-    reading_aloud: Option<u64>,
+    /// The answer being read aloud (a message id, or the live answer's
+    /// key), so only its action row offers "Stop reading".
+    reading_aloud: Option<Uuid>,
     schedules: Vec<xylo_runtime::scheduler::ScheduledTask>,
     schedule_prompt: Entity<TextareaState>,
     schedule_time: Entity<InputState>,
@@ -554,6 +556,7 @@ impl Xylo {
                     .masked(true)
             }),
             connector_transport: "stdio".into(),
+            connector_trusted: false,
             connector_form_open: false,
             connectors: vec![],
             connector_tools: vec![],
@@ -1217,7 +1220,9 @@ impl Xylo {
                     );
                     return;
                 };
+                // `engine_event` redraws only for what is on screen.
                 self.engine_event(session, envelope.payload, window, cx);
+                return;
             }
         }
         cx.notify();
@@ -1285,6 +1290,7 @@ impl Xylo {
     fn conversation_page(&mut self, page: ConversationPage, cx: &mut Context<Self>) {
         let advance = self.conversations_loading_more || self.conversations.is_empty();
         let before = self.conversations.clone();
+        let listed: BTreeSet<Uuid> = page.conversations.iter().map(|chat| chat.id).collect();
         let mut merged: BTreeMap<_, _> = self
             .conversations
             .drain(..)
@@ -1293,11 +1299,15 @@ impl Xylo {
         for conversation in page.conversations {
             merged.insert(conversation.id, conversation);
         }
-        // Pages leave archived chats out; a merged copy must not keep one.
+        // Pages leave archived chats out; a merged copy must not keep one, and
+        // a page sent before a local archive must not bring it back.
         self.conversations = merged
             .into_values()
-            .filter(|conversation| !conversation.archived)
+            .filter(|conversation| {
+                !conversation.archived && !self.sidebar_state.archiving(conversation.id)
+            })
             .collect();
+        self.sidebar_state.confirm_archived(&listed);
         self.conversations.sort_by(|left, right| {
             right
                 .updated_at
@@ -1857,7 +1867,9 @@ impl Render for Xylo {
             .on_action(cx.listener(|view, _: &AllowPendingAction, window, cx| {
                 view.allow_pending(window, cx)
             }))
-            .on_action(cx.listener(|view, _: &DenyOrStop, _, cx| view.deny_or_stop(cx)))
+            .on_action(cx.listener(|view, _: &DenyOrStop, window, cx| {
+                view.deny_or_stop_shortcut(window, cx)
+            }))
             .on_action(
                 cx.listener(|view, _: &EscapePressed, window, cx| view.escape_pressed(window, cx)),
             )

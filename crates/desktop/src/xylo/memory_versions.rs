@@ -657,6 +657,28 @@ impl Xylo {
             )
             .into_any_element(),
             settings_ui::setting_row(
+                "Origin",
+                record
+                    .origin
+                    .untrusted()
+                    .then(|| "Shaped by content from outside the project, so Xylo never recalls it on its own.".into()),
+                Some(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .when(record.origin.untrusted(), |control| {
+                            control.child(settings_ui::toned_tag(
+                                super::memory::UNTRUSTED_TAG,
+                                settings_ui::Tone::Warning,
+                            ))
+                        })
+                        .child(settings_ui::value_text(super::memory::origin_text(record.origin)))
+                        .into_any_element(),
+                ),
+            )
+            .into_any_element(),
+            settings_ui::setting_row(
                 "Project",
                 None,
                 Some(

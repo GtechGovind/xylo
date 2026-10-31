@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 fn config(root: &Path) -> CapabilityConfig {
     CapabilityConfig {
         workspace: root.canonicalize().unwrap(),

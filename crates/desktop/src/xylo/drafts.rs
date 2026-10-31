@@ -456,7 +456,7 @@ impl Xylo {
     /// Subscribe composer InputEvent::Change here. Matching programmatic text is
     /// ignored, so restores do not manufacture mutations or per-token writes.
     pub(super) fn draft_changed(&mut self, cx: &mut Context<Self>) {
-        self.drafts.composer_hint = None;
+        let hint_was_shown = self.drafts.composer_hint.take().is_some();
         let key = self
             .drafts
             .active
@@ -466,8 +466,7 @@ impl Xylo {
             return;
         }
         self.drafts.active = Some(key.clone());
-        let text = self.composer.read(cx).value().to_string();
-        if text.len() > MAX_DRAFT_BYTES {
+        if self.composer.read(cx).text().len() > MAX_DRAFT_BYTES {
             if !self.drafts.oversize {
                 let entry = self.drafts.entries.get_mut(&key).unwrap();
                 entry.generation = entry.generation.wrapping_add(1);
@@ -482,16 +481,34 @@ impl Xylo {
             cx.notify();
             return;
         }
-        self.drafts.oversize = false;
-        let entry = self.drafts.entries.get_mut(&key).unwrap();
-        if entry.text == text {
+        let was_oversize = std::mem::replace(&mut self.drafts.oversize, false);
+        // Compare against the composer's rope and copy into the draft's own
+        // buffer: no fresh copy of the whole text per keystroke, and the
+        // comparison stops at the first difference (usually the length).
+        let Some(change) = ({
+            let text = self.composer.read(cx).text();
+            let entry = self.drafts.entries.get_mut(&key).unwrap();
+            if *text == entry.text {
+                None
+            } else {
+                let before = TextShape::of(&entry.text);
+                entry.text.clear();
+                entry.text.reserve(text.len());
+                for chunk in text.chunks() {
+                    entry.text.push_str(chunk);
+                }
+                Some(before != TextShape::of(&entry.text))
+            }
+        }) else {
+            if hint_was_shown || was_oversize {
+                cx.notify();
+            }
             return;
-        }
-        entry.text = text;
+        };
+        let entry = self.drafts.entries.get_mut(&key).unwrap();
         entry.generation = entry.generation.wrapping_add(1);
         entry.dirty = true;
-        entry.error = None;
-        entry.send_error = None;
+        let had_error = entry.error.take().is_some() | entry.send_error.take().is_some();
         let needs_load = entry.revision.is_none() && entry.load.is_none();
         self.cancel_memory_forms_flush(cx);
         self.cancel_document_drafts_flush(cx);
@@ -500,7 +517,19 @@ impl Xylo {
             self.load_draft_key(&key, cx);
         }
         self.schedule_draft_save(cx);
-        cx.notify();
+        // The composer redraws itself as it is typed in. The workspace only
+        // redraws when something it shows depends on the text: whether the
+        // draft is empty (Send, Retry, the starter prompts), a hint or error
+        // that typing clears, the draft status footer, or pending guidance.
+        if change
+            || hint_was_shown
+            || had_error
+            || was_oversize
+            || self.draft_needs_attention()
+            || self.pending_guidance_text().is_some()
+        {
+            cx.notify();
+        }
     }
     fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
         self.drafts.timer_generation = self.drafts.timer_generation.wrapping_add(1);
@@ -1913,6 +1942,26 @@ impl Xylo {
     }
 }
 
+/// What the workspace shows about the draft's text: whether it is empty, and
+/// whether it is blank (only whitespace). Typing that changes neither needs no
+/// workspace redraw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextShape {
+    empty: bool,
+    blank: bool,
+}
+impl TextShape {
+    fn of(text: &str) -> Self {
+        Self {
+            empty: text.is_empty(),
+            blank: text.trim().is_empty(),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "drafts/admission_feedback_tests.rs"]
 mod admission_feedback_tests;
+#[cfg(test)]
+#[path = "drafts/text_shape_tests.rs"]
+mod text_shape_tests;

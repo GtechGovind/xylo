@@ -15,6 +15,8 @@ mod schema;
 pub use schema::DatabaseReset;
 mod store;
 pub use store::*;
+mod checkpoint;
+pub use checkpoint::CheckpointBase;
 pub mod action_review;
 pub use action_review::*;
 mod credentials;

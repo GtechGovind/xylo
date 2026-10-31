@@ -287,6 +287,45 @@ fn evaluate(conn: &Connection, skill: &mut LearnedSkill) -> Result<()> {
     skill.evaluation = Some(evaluation);
     Ok(())
 }
+/// Attempts per job step before a busy database defers the job to a later pass.
+const PROCESS_ATTEMPTS: u32 = 3;
+const PROCESS_BACKOFF: Duration = Duration::from_millis(250);
+/// Lock contention from another connection or a full database queue. Both clear
+/// on their own, unlike corrupt evidence or a missing source conversation.
+pub(super) fn transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(|error| {
+                matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                )
+            })
+            || cause.to_string().starts_with("The database is busy")
+    })
+}
+/// Runs `operation` up to `attempts` times, sleeping with exponential backoff
+/// between attempts that fail transiently. Other errors return immediately.
+/// Blocking: call from a blocking thread, never an async worker.
+pub(super) fn retry_transient<T>(
+    attempts: u32,
+    backoff: Duration,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut delay = backoff;
+    for attempt in 1..attempts.max(1) {
+        match operation() {
+            Err(error) if transient(&error) => {
+                tracing::debug!(attempt,error=%error,"Retrying busy learning database step");
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+            }
+            result => return result,
+        }
+    }
+    operation()
+}
 impl LearningService {
     pub(super) fn active_impl(&self, scope: &str, name: &str) -> Result<Option<LearnedSkill>> {
         let scope = scope.to_owned();
@@ -308,7 +347,51 @@ impl LearningService {
         let Some((id, session, turn)) = job else {
             return Ok(None);
         };
-        let result=self.store.call(move|conn|{
+        let result = retry_transient(PROCESS_ATTEMPTS, PROCESS_BACKOFF, || {
+            self.process_job(id, owner.clone(), session.clone(), turn.clone())
+        });
+        match result {
+            Ok(batch) => Ok(Some(batch)),
+            // Contention outlasted every bounded attempt. Keep the lease so a later
+            // pass resumes the job once it expires; busy is never a permanent failure.
+            Err(error) if transient(&error) => {
+                tracing::warn!(job_id=id,error=%error,"Procedural learning job deferred while the database is busy");
+                Ok(Some(LearningBatch::default()))
+            }
+            Err(error) => {
+                tracing::warn!(job_id=id,error=%error,"Procedural learning job failed");
+                let failed_jobs = match self.mark_failed(id) {
+                    Ok(marked) => usize::from(marked),
+                    // The job stays leased; it is retried after the lease expires.
+                    Err(error) => {
+                        tracing::warn!(job_id=id,error=%error,"Could not record the failed learning job");
+                        0
+                    }
+                };
+                Ok(Some(LearningBatch {
+                    failed_jobs,
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+    /// Records a permanent failure only while this service still owns the lease;
+    /// a job reclaimed by another owner after expiry is left to that owner.
+    pub(super) fn mark_failed(&self, id: i64) -> Result<bool> {
+        let owner = self.owner.to_string();
+        retry_transient(PROCESS_ATTEMPTS, PROCESS_BACKOFF, || {
+            let owner = owner.clone();
+            self.store.call(move|conn|Ok(conn.execute("UPDATE learning_jobs SET state='failed',owner=NULL,lease_until=0,error='Evidence processing failed; retry after reviewing the source',updated_at=?1 WHERE id=?2 AND owner=?3 AND state='processing'",params![now_ms(),id,owner])?==1))
+        })
+    }
+    fn process_job(
+        &self,
+        id: i64,
+        owner: String,
+        session: String,
+        turn: String,
+    ) -> Result<LearningBatch> {
+        self.store.call(move|conn|{
             let tx=crate::store::write_transaction(conn)?;
             let owned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM learning_jobs WHERE id=?1 AND owner=?2 AND state='processing')",params![id,owner],|row|row.get(0))?;
             ensure!(owned,"Learning job lease changed");
@@ -349,18 +432,7 @@ impl LearningService {
             }
             tx.execute("UPDATE learning_jobs SET state='done',owner=NULL,lease_until=0,error=NULL,updated_at=?1 WHERE id=?2",params![now_ms(),id])?;
             tx.commit()?;Ok(batch)
-        });
-        match result {
-            Ok(batch) => Ok(Some(batch)),
-            Err(error) => {
-                tracing::warn!(job_id=id,error=%error,"Procedural learning job failed");
-                self.store.call(move|conn|{conn.execute("UPDATE learning_jobs SET state='failed',owner=NULL,lease_until=0,error='Evidence processing failed; retry after reviewing the source',updated_at=?1 WHERE id=?2",params![now_ms(),id])?;Ok(())})?;
-                Ok(Some(LearningBatch {
-                    failed_jobs: 1,
-                    ..Default::default()
-                }))
-            }
-        }
+        })
     }
     pub(super) fn backfill_impl(
         &self,

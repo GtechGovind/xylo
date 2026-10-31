@@ -18,10 +18,10 @@ chromiumoxide = { version = "0.9.1", default-features = false, features = ["byte
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "image_025", "thread_safe"] }
+# Enables PNG encoding for PDF previews and screenshots saved through pdfium and xcap.
 image = { version = "0.25", default-features = false, features = ["png"] }
 calamine = "0.37"
 rust_xlsxwriter = "0.102"
-docx-rs = "0.4.22"
 xcap = "0.9.8"
 enigo = "0.6.1"
 wasmtime = { version = "50", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "reexport-wasmparser", "runtime", "std", "wat"] }
@@ -53,3 +53,7 @@ tempfile = "3"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Ioctl", "Win32_System_SystemServices"] }
+
+[package.metadata.cargo-machete]
+# Used only to enable the `png` feature of the image types pdfium and xcap return.
+ignored = ["image"]

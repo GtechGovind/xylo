@@ -527,3 +527,62 @@ async fn public_marketplaces_produce_rich_entries() {
         .count();
     assert!(described * 10 >= page.entries.len() * 9, "{page:#?}");
 }
+
+#[tokio::test]
+async fn bodies_without_a_length_are_cut_off_at_the_limit() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request).await;
+                // Close-delimited: no Content-Length, so only streaming can bound it.
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = stream.write_all(&[b'x'; 5000]).await;
+            });
+        }
+    });
+    let url = format!("http://{address}/tree");
+    let response = client().unwrap().get(&url).send().await.unwrap();
+    assert!(response.content_length().is_none());
+    let error = bounded_text(response, 1024).await.unwrap_err();
+    assert!(error.to_string().contains("size limit"));
+    let response = client().unwrap().get(&url).send().await.unwrap();
+    assert_eq!(bounded_text(response, 8192).await.unwrap().len(), 5000);
+}
+
+#[test]
+fn concurrent_install_records_are_all_kept() {
+    let home = tempfile::tempdir().unwrap();
+    let service = ExtensionService::new(home.path());
+    let item = |index: usize| DiscoveredExtension {
+        source: ExtensionSource {
+            name: "Fixture".into(),
+            repository: CLAUDE.into(),
+            revision: "main".into(),
+            subdirectory: String::new(),
+        },
+        path: format!("plugins/p{index}"),
+        name: format!("p{index}"),
+        revision: "a".repeat(40),
+        content: Some(format!("tree-{index}")),
+    };
+    std::thread::scope(|scope| {
+        for index in 0..16 {
+            let service = service.clone();
+            let item = item(index);
+            scope.spawn(move || service.record_installed_content(&item).unwrap());
+        }
+    });
+    let recorded = service.installed_content();
+    assert_eq!(recorded.len(), 16);
+    for index in 0..16 {
+        assert_eq!(
+            recorded.get(&provenance(&item(index))),
+            Some(&format!("tree-{index}"))
+        );
+    }
+}

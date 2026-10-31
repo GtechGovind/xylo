@@ -1,6 +1,6 @@
 use super::{
-    ChatGptCredential, PendingChatGptSignIn, ProviderCredential, normalize_provider,
-    refresh_chatgpt_credential, revoke_chatgpt_credential,
+    ChatGptCredential, PendingChatGptSignIn, ProviderCredential, RefreshedCredential,
+    normalize_provider, refresh_chatgpt_credential, revoke_chatgpt_credential,
 };
 use crate::CredentialVault;
 use anyhow::{Context, Result, bail, ensure};
@@ -90,6 +90,24 @@ impl ChatGptSignInService {
             let _lease = lease;
             commit()
         })
+    }
+    /// Persists what a refresh the authority answered left behind, and
+    /// returns the renewed credential, or the error that made the refresh
+    /// keep only the rotated refresh token (after that token is saved).
+    async fn persist_refreshed(
+        vault: CredentialVault,
+        reference: String,
+        refreshed: RefreshedCredential,
+        lease: File,
+    ) -> Result<ChatGptCredential> {
+        let RefreshedCredential { credential, error } = refreshed;
+        Self::save_rotated(vault, reference, credential.clone(), lease).await?;
+        match error {
+            Some(error) => Err(error.context(
+                "ChatGPT refresh returned tokens that failed validation; the new refresh token was kept for the next attempt",
+            )),
+            None => Ok(credential),
+        }
     }
     async fn save_rotated(
         vault: CredentialVault,
@@ -197,10 +215,16 @@ impl ChatGptSignInService {
             );
             return Ok(Some(record));
         }
-        let renewed = refresh_chatgpt_credential(&credential, cancel).await?;
+        // As in `refresh_rejected_with`: once the token request may have
+        // been sent, the commit runs on its own task and cannot be dropped.
+        let (reference, cancel) = (reference.to_owned(), cancel.clone());
+        let renewed = tokio::spawn(async move {
+            let refreshed = refresh_chatgpt_credential(&credential, &cancel).await?;
+            Self::persist_refreshed(vault, reference, refreshed, _lease).await
+        })
+        .await??;
         let authorized = renewed.plan_usage_authorized();
         let record = serde_json::to_string(&renewed)?;
-        Self::save_rotated(vault, reference.into(), renewed, _lease).await?;
         ensure!(
             authorized,
             "ChatGPT plan usage is not authorized; reconnect and allow plan usage"
@@ -228,7 +252,7 @@ impl ChatGptSignInService {
     ) -> Result<String>
     where
         F: FnOnce(ChatGptCredential, CancellationToken) -> Fut,
-        Fut: Future<Output = Result<ChatGptCredential>>,
+        Fut: Future<Output = Result<RefreshedCredential>> + Send + 'static,
     {
         ensure!(!cancel.is_cancelled(), "ChatGPT token refresh cancelled");
         ensure!(
@@ -280,29 +304,35 @@ impl ChatGptSignInService {
                 .is_some_and(|token| !token.is_empty()),
             "Reconnect ChatGPT; this account has no renewable session"
         );
-        let renewed = tokio::select! { biased;
-            result=tokio::time::timeout(Duration::from_secs(60),refresh(credential.clone(),cancel.clone()))=>result.context("ChatGPT token refresh timed out")??,
-            _=cancel.cancelled()=>bail!("ChatGPT token refresh cancelled"),
-        };
-        ensure!(
-            serde_json::to_value(&renewed)?["type"] == "chatgpt"
-                && renewed.subject == credential.subject
-                && renewed.issuer == credential.issuer
-                && renewed.client_id == credential.client_id
-                && renewed.ext_agent_host_id == credential.ext_agent_host_id,
-            "ChatGPT refresh returned a different account registration"
-        );
-        ensure!(
-            !renewed.access_token.is_empty(),
-            "ChatGPT refresh returned no access token"
-        );
+        // The refresh honours `cancel` only until it sends the token request
+        // (its HTTP client bounds the rest). From then on the authority may
+        // have rotated the refresh token, so the exchange, its checks and the
+        // durable replacement run on their own task: neither cancellation nor
+        // a dropped caller can lose the rotated token. Sign-out holds the same lease and follows
+        // this commit; no cancelled request receives the renewed credential.
+        let exchange = refresh(credential.clone(), cancel.clone());
+        let reference = reference.to_owned();
+        let commit = tokio::spawn(async move {
+            let refreshed = exchange.await?;
+            ensure!(
+                refreshed.error.is_some()
+                    || (serde_json::to_value(&refreshed.credential)?["type"] == "chatgpt"
+                        && refreshed.credential.subject == credential.subject
+                        && refreshed.credential.issuer == credential.issuer
+                        && refreshed.credential.client_id == credential.client_id
+                        && refreshed.credential.ext_agent_host_id == credential.ext_agent_host_id
+                        && !refreshed.credential.access_token.is_empty()),
+                "ChatGPT refresh returned a different account registration"
+            );
+            Self::persist_refreshed(vault, reference, refreshed, _lease).await
+        });
+        // `refresh` stops promptly on cancellation until it sends the
+        // request; after that, waiting for the commit is what keeps a
+        // cancelled caller from racing a sign-out past the rotated tokens.
+        let renewed = commit.await??;
         let authorized = renewed.plan_usage_authorized();
         let usable = renewed.expires_at_ms > now_ms() + 30_000;
         let record = serde_json::to_string(&renewed)?;
-        // Once OAuth has rotated credentials, finish its durable replacement even
-        // if cancellation arrives now. Sign-out holds the same lease and follows
-        // this commit; no cancelled request receives the renewed credential.
-        Self::save_rotated(vault, reference.into(), renewed, _lease).await?;
         ensure!(
             authorized,
             "ChatGPT plan usage is not authorized; reconnect and allow plan usage"

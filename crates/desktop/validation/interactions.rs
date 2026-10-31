@@ -1025,6 +1025,73 @@ mod xylo {
             .unwrap();
         }
         #[gpui_kit::test]
+        fn archive_waits_for_busy_chats_blocked_switches_and_stale_pages(cx: &mut TestAppContext) {
+            let (handle, view) = fixture(cx);
+            cx.update_window(handle, |_, window, cx| {
+                let root = PathBuf::from("/fixture/xylo");
+                let open = uuid::Uuid::new_v4();
+                let busy = uuid::Uuid::new_v4();
+                let older = uuid::Uuid::new_v4();
+                let chat = |id, title: &str, updated_at| Conversation {
+                    title_source: Default::default(),
+                    pinned: false,
+                    archived: false,
+                    id,
+                    title: title.into(),
+                    workspace: root.clone(),
+                    updated_at,
+                };
+                let listed = [
+                    chat(open, "Open chat", 3),
+                    chat(busy, "Busy chat", 2),
+                    chat(older, "Older chat", 1),
+                ];
+                view.update(cx, |view, cx| {
+                    view.workspace = Some(root.clone());
+                    view.session = open;
+                    view.conversations = listed.to_vec();
+                    // A running turn keeps its chat out of the archive.
+                    view.turns
+                        .entry(busy)
+                        .or_default()
+                        .apply(EngineEvent::Started);
+                    view.archive_chat(busy, cx);
+                    assert!(view.conversations.iter().any(|chat| chat.id == busy));
+                    assert!(view.status.undo().is_none());
+                    // Leaving the open chat is blocked by a draft too large to
+                    // save, so it is not archived either.
+                    view.composer.update(cx, |input, cx| {
+                        input.set_value("x".repeat(300 * 1024), window, cx)
+                    });
+                    view.archive_chat(open, cx);
+                    assert_eq!(view.session, open);
+                    assert!(view.conversations.iter().any(|chat| chat.id == open));
+                    assert!(view.status.undo().is_none());
+                    view.composer
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                    // A page already on its way still lists the archived chat;
+                    // it must not come back until a later page confirms it.
+                    view.archive_chat(older, cx);
+                    assert!(view.status.undo().is_some());
+                    let stale = xylo_core::ConversationPage {
+                        conversations: listed.to_vec(),
+                        before: None,
+                        has_more: false,
+                    };
+                    view.conversation_page(stale, cx);
+                    assert!(view.conversations.iter().all(|chat| chat.id != older));
+                    let confirmed = xylo_core::ConversationPage {
+                        conversations: listed[..2].to_vec(),
+                        before: None,
+                        has_more: false,
+                    };
+                    view.conversation_page(confirmed, cx);
+                    assert!(!view.sidebar_state.archiving(older));
+                });
+            })
+            .unwrap();
+        }
+        #[gpui_kit::test]
         fn settings_routes_and_controls_preserve_the_active_chat(cx: &mut TestAppContext) {
             let (handle, view) = super::design_tests::fixture(cx);
             cx.update_window(handle, |_, window, cx| {

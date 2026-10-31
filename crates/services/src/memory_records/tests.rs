@@ -8,6 +8,7 @@ fn record(scope: &str, text: &str) -> MemoryRecord {
         source: "Explicit test entry".into(),
         created_at: 7,
         supersedes: None,
+        origin: xylo_core::MemoryOrigin::UserTyped,
     }
 }
 #[test]
@@ -133,5 +134,125 @@ fn export_accepts_valid_content_that_expands_when_json_escaped() {
     assert_eq!(
         json["records"][0]["record"]["content"].as_str().unwrap(),
         content
+    );
+}
+#[test]
+fn saved_facts_are_redacted_and_returned_as_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("mem.db")).unwrap();
+    let memory = crate::SqliteMemory::new(store.clone());
+    let mut entry = record(
+        "project",
+        "Deploy with DEPLOY_TOKEN=abcd1234efgh to staging",
+    );
+    entry.source = "Read from .env: api_key=zz9-plural".into();
+    let stored = memory.remember_sync(entry.clone()).unwrap();
+    assert_eq!(
+        stored.content,
+        "Deploy with DEPLOY_TOKEN=[REDACTED] to staging"
+    );
+    assert_eq!(stored.source, "Read from .env: api_key=[REDACTED]");
+    // A retry of the unredacted record is the same save, not an id reuse.
+    assert_eq!(memory.remember_sync(entry).unwrap().content, stored.content);
+    let page = store.memory_page("project", None, 10).unwrap();
+    assert!(!format!("{:?}", page.records).contains("abcd1234"));
+}
+#[test]
+fn corrections_need_an_equally_trusted_origin_and_keep_the_old_version() {
+    use xylo_core::MemoryOrigin;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("mem.db")).unwrap();
+    let memory = crate::SqliteMemory::new(store.clone());
+    let typed = record("project", "The release branch is main");
+    memory.remember_sync(typed.clone()).unwrap();
+    for origin in [
+        MemoryOrigin::AgentInferred,
+        MemoryOrigin::ToolOutput,
+        MemoryOrigin::WebContent,
+    ] {
+        let mut attempt = record("project", "The release branch is next");
+        attempt.supersedes = Some(typed.id);
+        attempt.origin = origin;
+        let error = memory.remember_sync(attempt).unwrap_err();
+        assert!(error.to_string().contains("stated by the user"), "{error}");
+    }
+    let mut approved = record("project", "The release branch is release");
+    approved.supersedes = Some(typed.id);
+    approved.origin = MemoryOrigin::UserApproved;
+    approved.created_at = 9;
+    memory.remember_sync(approved.clone()).unwrap();
+    let recalled = memory
+        .recall_with_history("project", "release branch", 5)
+        .unwrap();
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].record.id, approved.id);
+    let previously = recalled[0].previously.as_ref().unwrap();
+    assert_eq!(previously.id, typed.id);
+    assert_eq!(previously.content, "The release branch is main");
+    assert_eq!(previously.origin, MemoryOrigin::UserTyped);
+    assert_eq!(previously.until, 9);
+    let mut inferred = record("project", "Agent fact");
+    inferred.origin = MemoryOrigin::AgentInferred;
+    memory.remember_sync(inferred.clone()).unwrap();
+    let mut from_web = record("project", "Web correction");
+    from_web.origin = MemoryOrigin::WebContent;
+    from_web.supersedes = Some(inferred.id);
+    assert!(memory.remember_sync(from_web).is_err());
+}
+#[test]
+fn session_provenance_lists_actions_that_ran_with_requested_details_only() {
+    use crate::ActionIntent;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("mem.db")).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .upsert_conversation(&xylo_core::Conversation {
+            id: session,
+            title: "Provenance".into(),
+            workspace: dir.path().into(),
+            updated_at: 1,
+            title_source: xylo_core::TitleSource::Prompt,
+            pinned: false,
+            archived: false,
+        })
+        .unwrap();
+    let turn = Uuid::new_v4();
+    let begin = |key: &str, name: &str, arguments: serde_json::Value| {
+        let intent = ActionIntent {
+            id: Uuid::new_v4(),
+            session_id: session,
+            turn_id: turn,
+            name: name.into(),
+            arguments,
+            writes: false,
+            idempotency_key: key.into(),
+        };
+        store.begin_action(&intent).unwrap();
+        intent.id
+    };
+    let read = begin("a", "file_read", serde_json::json!({"path":"/etc/hosts"}));
+    store.mark_action_running(read).unwrap();
+    store
+        .finish_action(read, &serde_json::json!({"content":"large"}))
+        .unwrap();
+    let search = begin("b", "memory_search", serde_json::json!({"query":"x"}));
+    store.mark_action_running(search).unwrap();
+    store
+        .finish_action(search, &serde_json::json!([{"origin":"web_content"}]))
+        .unwrap();
+    let denied = begin("c", "browser_open", serde_json::json!({}));
+    store.deny_action(denied).unwrap();
+    begin("d", "connector_call", serde_json::json!({}));
+    let actions = store
+        .session_action_provenance(session, &["file_read"], &["memory_search"])
+        .unwrap();
+    let names: Vec<_> = actions.iter().map(|action| action.name.as_str()).collect();
+    assert_eq!(names, ["file_read", "memory_search"]);
+    assert_eq!(actions[0].arguments.as_ref().unwrap()["path"], "/etc/hosts");
+    assert!(actions[0].result.is_none());
+    assert!(actions[1].arguments.is_none());
+    assert_eq!(
+        actions[1].result.as_ref().unwrap()[0]["origin"],
+        "web_content"
     );
 }

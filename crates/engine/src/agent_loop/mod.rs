@@ -1,10 +1,26 @@
 //! Xylo's agent loop.
 //!
-//! One step: fit the conversation to the context window (condensing older
-//! history into a durable summary when needed), stream a model call, flush its
+//! One step: fit the conversation to the context window (masking old tool
+//! results in batches and condensing older history into a durable summary
+//! when needed; a request the provider rejects as too long is compacted
+//! harder and sent once more), stream a model call, flush its
 //! text deltas, and finish if it asked for no tools. Otherwise checkpoint the
 //! assistant message, execute the tool batch, append the results in call
 //! order, checkpoint again, apply any queued user guidance, and repeat.
+//!
+//! Recovery is deterministic and driven by what the harness observes, never
+//! by the model's own account:
+//! - **Finish reasons.** A reply without tools is classified by its finish
+//!   reason ([`recovery`]): one the output limit cut off is continued and
+//!   joined into one answer, an empty or unparseable reply is asked for once
+//!   more. A tool call the output limit cut off is never dispatched; it gets
+//!   an error result asking for smaller arguments, checkpointed with the
+//!   call before anything runs so a resume cannot dispatch it either.
+//! - **Stalls.** Every tool round feeds a loop detector ([`stall`]) that
+//!   escalates from a note to a warning to stopping the turn with
+//!   [`ModelError::Stalled`].
+//! - **Step budget.** Notes at 75% and 90% of the step limit ask the model to
+//!   prioritize finishing.
 //!
 //! Invariants:
 //! - **Checkpoint before and after every tool batch.** The assistant message
@@ -20,21 +36,25 @@
 //! - **Ordered events.** A response's text deltas are flushed before any tool
 //!   event of that response.
 //! - **No hidden prompting.** The only prompt text is the caller's system
-//!   prompt, a note when the user changes the permission mode mid-task, and
-//!   the step-limit note on the final call of a runaway turn. Both notes are
-//!   user-role application notes at their place in the conversation, so the
-//!   cached system block holds only the system prompt.
+//!   prompt and application notes: the permission-mode change, the step-limit
+//!   note on the final call of a runaway turn, and the recovery, stall and
+//!   step-budget notes above. Notes are user-role messages at their place in
+//!   the conversation, so the cached system block holds only the system
+//!   prompt, and a root loop shows each recovery note to the user as it is
+//!   added.
 mod dispatch;
+mod recovery;
 mod retry;
+mod stall;
 
 pub(crate) use dispatch::{Access, ToolExecutor, error_result};
 
 use crate::{
     model::{
         Assembler, Message, ModelError, ModelProvider, ModelRequest, ModelResponse, Role,
-        StreamEvent, ToolSchema,
+        StreamEvent, ToolSchema, TruncatedCall,
     },
-    provider_guard::ContextBudget,
+    provider_guard::{ContextBudget, Pressure},
     steering::SteeringControl,
     tools::PermissionCell,
 };
@@ -48,7 +68,7 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use xylo_core::{EngineEvent, PermissionMode, TurnPhase, Usage};
+use xylo_core::{ContextUsage, EngineEvent, NoteKind, PermissionMode, TurnPhase, Usage};
 use xylo_services::Store;
 
 /// Runaway guard on model calls per turn; not a budget.
@@ -62,15 +82,66 @@ pub(crate) struct Journal {
     pub session: Uuid,
     pub turn: Uuid,
     pub steering: Option<SteeringControl>,
+    /// The checkpoint this journal last wrote, so the next write sends only
+    /// the messages that changed since.
+    written: tokio::sync::Mutex<Option<Written>>,
+}
+
+/// One checkpoint write: its store revision and each message serialized.
+struct Written {
+    revision: u64,
+    rows: Arc<[String]>,
 }
 
 impl Journal {
+    pub(crate) fn new(
+        store: Store,
+        session: Uuid,
+        turn: Uuid,
+        steering: Option<SteeringControl>,
+    ) -> Self {
+        Self {
+            store,
+            session,
+            turn,
+            steering,
+            written: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Saves `messages` as the turn's checkpoint. Serialization and the write
+    /// run off the async threads, and only the messages from the first one
+    /// that differs from the previous write are stored again: a tool round
+    /// appends, while masking or compaction rewrites from the first message
+    /// it changed.
     async fn checkpoint(&self, messages: &[Message]) -> anyhow::Result<()> {
-        let value = serde_json::to_value(messages)?;
+        let mut written = self.written.lock().await;
+        // Cleared until this write succeeds; the store then finds the
+        // changed suffix by comparing with what it holds.
+        let previous = written.take();
+        let messages = messages.to_vec();
         let (store, session, turn) = (self.store.clone(), self.session, self.turn);
-        tokio::task::spawn_blocking(move || store.save_checkpoint(session, turn, &value))
-            .await
-            .context("Checkpoint task stopped")?
+        let saved = tokio::task::spawn_blocking(move || {
+            let rows = messages
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<serde_json::Result<Arc<[String]>>>()?;
+            let base = previous.map(|previous| xylo_services::CheckpointBase {
+                revision: previous.revision,
+                unchanged: previous
+                    .rows
+                    .iter()
+                    .zip(rows.iter())
+                    .take_while(|(before, now)| before == now)
+                    .count(),
+            });
+            let revision = store.save_checkpoint_messages(session, turn, rows.clone(), base)?;
+            anyhow::Ok(Written { revision, rows })
+        })
+        .await
+        .context("Checkpoint task stopped")??;
+        *written = Some(saved);
+        Ok(())
     }
 }
 
@@ -105,6 +176,8 @@ pub(crate) struct LoopOutcome {
     pub usage: Usage,
     /// The step limit ended the run; `text` is the model's own summary.
     pub stopped_early: bool,
+    /// The answer reached the output limit and is shown as far as it got.
+    pub cut_off: bool,
 }
 
 /// A run that did not finish. `streamed` is the text the user saw.
@@ -129,6 +202,8 @@ struct Run {
     started: Instant,
     usage: Usage,
     streamed: String,
+    /// The final answer reached the output limit.
+    cut_off: bool,
 }
 
 impl AgentLoop {
@@ -195,6 +270,7 @@ impl AgentLoop {
             started: Instant::now(),
             usage: Usage::default(),
             streamed: String::new(),
+            cut_off: false,
         };
         let mut messages = messages;
         match self.steps(&mut messages, &mut run).await {
@@ -205,6 +281,7 @@ impl AgentLoop {
                     text,
                     usage: run.usage,
                     stopped_early,
+                    cut_off: run.cut_off,
                 })
             }
             Err(error) => Err(LoopFailure {
@@ -233,6 +310,8 @@ impl AgentLoop {
         let mut calls = 0;
         let mut announced = self.permissions.as_ref().map(|(_, mode)| *mode);
         let mut issued = call_ids(messages);
+        let mut answer = recovery::AnswerRecovery::default();
+        let mut stall = stall::StallDetector::default();
         loop {
             if self.cancel.is_cancelled() {
                 return Err(ModelError::Interrupted.into());
@@ -247,19 +326,75 @@ impl AgentLoop {
             }
             calls += 1;
             let final_call = calls >= self.max_model_calls;
-            let response = self.model_call(messages, final_call, run).await?;
-            let mut assistant = response.message;
+            if !final_call && step_budget_warning(calls, self.max_model_calls) {
+                messages.push(application_note(&crate::prompts::step_budget(
+                    calls,
+                    self.max_model_calls,
+                )));
+                self.show_note(
+                    NoteKind::StepBudget,
+                    format!(
+                        "Step {calls} of at most {}: Xylo asked the model to prioritize finishing.",
+                        self.max_model_calls
+                    ),
+                )
+                .await?;
+            }
+            let ModelResponse {
+                message: mut assistant,
+                finish,
+                truncated_calls,
+                ..
+            } = self.model_call(messages, final_call, run).await?;
             self.assign_call_ids(&mut issued, &mut assistant).await?;
             let text = assistant.content.clone();
             if assistant.tool_calls.is_empty() {
-                messages.push(assistant);
-                // Guidance that arrived while the answer streamed continues
-                // the task instead of being left unread.
-                if !final_call && self.apply_guidance(messages).await? > 0 {
-                    continue;
+                match answer.reply(finish, &text, final_call) {
+                    recovery::Reply::Answer { text, cut_off } => {
+                        if cut_off {
+                            self.show_note(
+                                NoteKind::Truncated,
+                                "The answer reached the output limit again; it is shown as far as it got."
+                                    .into(),
+                            )
+                            .await?;
+                        }
+                        messages.push(assistant);
+                        // Guidance that arrived while the answer streamed
+                        // continues the task instead of being left unread.
+                        if !final_call && self.apply_guidance(messages).await? > 0 {
+                            continue;
+                        }
+                        run.cut_off = cut_off;
+                        return Ok((text, false));
+                    }
+                    recovery::Reply::Continue => {
+                        messages.push(assistant);
+                        messages.push(application_note(crate::prompts::continue_answer()));
+                        self.show_note(
+                            NoteKind::Continuation,
+                            "The reply reached the output limit; Xylo asked the model to continue it."
+                                .into(),
+                        )
+                        .await?;
+                    }
+                    recovery::Reply::Retry { note, keep_reply } => {
+                        if keep_reply {
+                            messages.push(assistant);
+                        }
+                        messages.push(application_note(note));
+                        self.show_note(
+                            NoteKind::Retry,
+                            "The model's reply had no usable answer or tool call; Xylo asked it once more."
+                                .into(),
+                        )
+                        .await?;
+                    }
+                    recovery::Reply::Fail(error) => return Err(error.into()),
                 }
-                return Ok((text, false));
+                continue;
             }
+            answer.reset();
             if final_call {
                 let ids = assistant
                     .tool_calls
@@ -281,24 +416,109 @@ impl AgentLoop {
                 };
                 return Ok((summary, true));
             }
-            let prepared = assistant
-                .tool_calls
-                .clone()
-                .into_iter()
-                .map(|call| {
-                    let prepared = dispatch::prepare(&call, self.tools.as_ref());
-                    if let dispatch::Prepared::Run { name, .. } = &prepared
-                        && *name != call.name
-                    {
-                        assistant.rename_tool_call(&call.id, name);
-                    }
-                    (call.id, prepared)
-                })
-                .collect::<Vec<_>>();
+            let (prepared, refused) = self.prepare_calls(&mut assistant, &truncated_calls).await?;
+            let order = call_order(&assistant);
             messages.push(assistant);
+            let index = messages.len() - 1;
+            // A cut-off call's arguments are already cleared, so a resume
+            // could not tell it from a real call without arguments: its
+            // refusal is durable together with the call it answers.
+            let refusals = !refused.is_empty();
+            messages.extend(refused);
             self.checkpoint(messages).await?;
             self.run_batch(messages, prepared).await?;
+            if refusals {
+                messages[index + 1..].sort_by_key(|result| {
+                    result
+                        .tool_call_id
+                        .as_ref()
+                        .and_then(|id| order.iter().position(|call| call == id))
+                });
+                self.checkpoint(messages).await?;
+            }
+            self.watch_progress(&mut stall, messages, index).await?;
         }
+    }
+
+    /// Validates the calls of `assistant` for dispatch, recording each call
+    /// as it will run, and returns them with the error results of calls the
+    /// output limit cut off. Those are never dispatched: their partial
+    /// arguments could still parse after repair and do the wrong thing, so
+    /// each gets an error asking for smaller arguments instead.
+    async fn prepare_calls(
+        &self,
+        assistant: &mut Message,
+        truncated: &[TruncatedCall],
+    ) -> anyhow::Result<(Vec<(String, dispatch::Prepared)>, Vec<Message>)> {
+        let mut prepared = Vec::with_capacity(assistant.tool_calls.len());
+        let mut refused = Vec::new();
+        for (position, call) in assistant.tool_calls.clone().into_iter().enumerate() {
+            if let Some(cut) = truncated.iter().find(|cut| cut.position == position) {
+                let error = crate::prompts::truncated_tool_call(&call.name, cut.received);
+                refused.push(Message::tool_result(call.id, error_result(error)));
+                self.show_note(NoteKind::Retry, format!(
+                    "The output limit cut off a `{}` call; Xylo asked the model to send it again in smaller parts.",
+                    call.name
+                ))
+                .await?;
+                continue;
+            }
+            let ready = dispatch::prepare(&call, self.tools.as_ref());
+            dispatch::record(assistant, &call, &ready);
+            prepared.push((call.id, ready));
+        }
+        Ok((prepared, refused))
+    }
+
+    /// Feeds the tool round of the assistant message at `index` (its results
+    /// follow it) to the stall detector and acts on its verdict: a note or a
+    /// warning is appended after the results; a third strike stops the turn.
+    async fn watch_progress(
+        &self,
+        stall: &mut stall::StallDetector,
+        messages: &mut Vec<Message>,
+        index: usize,
+    ) -> anyhow::Result<()> {
+        let step = stall::Step::new(&messages[index].tool_calls, &messages[index + 1..]);
+        let (kind, note, shown) = match stall.observe(step) {
+            None => return Ok(()),
+            Some(stall::Verdict::Note(pattern)) => (
+                NoteKind::StallNotice,
+                crate::prompts::stall_note(&pattern.describe()),
+                format!(
+                    "Xylo noticed {} and asked the model to change approach.",
+                    pattern.summary()
+                ),
+            ),
+            Some(stall::Verdict::Warning(pattern)) => (
+                NoteKind::StallWarning,
+                crate::prompts::stall_warning(&pattern.describe()),
+                format!(
+                    "Xylo noticed {} again and warned the model that the task stops if it continues.",
+                    pattern.summary()
+                ),
+            ),
+            Some(stall::Verdict::Stop(pattern)) => {
+                return Err(ModelError::Stalled(format!(
+                    "Xylo stopped the task: the model kept repeating itself ({}) after two warnings. \
+                     Add guidance and send the task again.",
+                    pattern.summary()
+                ))
+                .into());
+            }
+        };
+        tracing::info!(%shown, "Stall detected");
+        messages.push(application_note(&note));
+        self.show_note(kind, shown).await
+    }
+
+    /// Shows a harness note to the user of a root loop. The model-facing note
+    /// itself travels in the conversation as an application note.
+    async fn show_note(&self, kind: NoteKind, text: String) -> anyhow::Result<()> {
+        if self.root() {
+            self.emit(EngineEvent::HarnessNote { kind, text }).await?;
+        }
+        Ok(())
     }
 
     /// Applies queued user guidance at a role-safe boundary; returns how many
@@ -331,11 +551,7 @@ impl AgentLoop {
             .into_iter()
             .map(|call| {
                 let prepared = dispatch::prepare(&call, self.tools.as_ref());
-                if let dispatch::Prepared::Run { name, .. } = &prepared
-                    && *name != call.name
-                {
-                    assistant.rename_tool_call(&call.id, name);
-                }
+                dispatch::record(&mut assistant, &call, &prepared);
                 (call.id, prepared)
             })
             .collect();
@@ -372,79 +588,121 @@ impl AgentLoop {
         run: &mut Run,
     ) -> anyhow::Result<ModelResponse> {
         let tools = self.tools.schemas();
-        let view = self.fit(messages, &tools).await?;
-        let mut request_messages = view;
-        if final_call {
-            request_messages.push(application_note(crate::prompts::step_limit()));
-        }
-        let request = ModelRequest {
-            messages: request_messages,
-            tools,
-            max_tokens: self.max_tokens,
-            reasoning: crate::model::Reasoning::Configured,
-        };
         let mut shown = String::new();
-        let mut attempt = 0;
-        loop {
-            self.phase(TurnPhase::Thinking).await?;
-            let error = match self.stream_once(request.clone(), &mut shown, run).await {
-                Ok(response) => {
-                    if let Some(usage) = response.usage {
-                        run.usage.input_tokens += usage.input_tokens;
-                        run.usage.output_tokens += usage.output_tokens;
-                        run.usage.context_tokens = usage.input_tokens;
-                        if self.root() {
-                            let mut context = self.budget.usage(
+        // A context overflow (estimated before sending, or reported by the
+        // provider) is recovered once: compact harder and send again.
+        let mut pressure = Pressure::Normal;
+        'fitting: loop {
+            let (mut request_messages, mut fitted) =
+                match self.fit(messages, &tools, pressure).await {
+                    Err(error) if pressure == Pressure::Normal && context_overflow(&error) => {
+                        tracing::warn!(%error, "Request does not fit; compacting harder");
+                        pressure = Pressure::Overflow;
+                        continue;
+                    }
+                    fitted => fitted?,
+                };
+            if final_call {
+                let note = application_note(crate::prompts::step_limit());
+                fitted.messages += self.budget.message_cost(&note) as u64;
+                request_messages.push(note);
+            }
+            let request = ModelRequest {
+                messages: request_messages,
+                tools: tools.clone(),
+                max_tokens: self.max_tokens,
+                reasoning: crate::model::Reasoning::Configured,
+            };
+            let mut attempt = 0;
+            loop {
+                self.phase(TurnPhase::Thinking).await?;
+                let error = match self.stream_once(request.clone(), &mut shown, run).await {
+                    Ok(response) => {
+                        if let Some(usage) = response.usage {
+                            run.usage.input_tokens += usage.input_tokens;
+                            run.usage.output_tokens += usage.output_tokens;
+                            run.usage.context_tokens = usage.input_tokens;
+                            add_reported(&mut run.usage.cache_read_tokens, usage.cache_read_tokens);
+                            add_reported(
+                                &mut run.usage.cache_write_tokens,
+                                usage.cache_write_tokens,
+                            );
+                            if self.root() {
+                                // The request as fitted; it is not measured again.
+                                let mut context = fitted.clone();
+                                context.provider_input = Some(usage.input_tokens);
+                                context.provider_cache_read = usage.cache_read_tokens;
+                                self.emit(EngineEvent::ContextUsage { usage: context })
+                                    .await?;
+                            }
+                            self.budget.observe(
                                 &request.messages,
                                 &request.tools,
-                                self.max_tokens,
+                                usage.input_tokens,
                             );
-                            context.deferred_tool_count = self.tools.deferred_count() as u32;
-                            context.provider_input = Some(usage.input_tokens);
-                            self.emit(EngineEvent::ContextUsage { usage: context })
-                                .await?;
                         }
+                        return Ok(response);
                     }
-                    return Ok(response);
+                    Err(StreamFailure::Fatal(error)) => return Err(error),
+                    Err(StreamFailure::Model(ModelError::ContextOverflow(error)))
+                        if pressure == Pressure::Normal =>
+                    {
+                        tracing::warn!(%error, "Provider rejected the request as too long; compacting harder");
+                        self.budget.penalize_overflow();
+                        pressure = Pressure::Overflow;
+                        continue 'fitting;
+                    }
+                    Err(StreamFailure::Model(error)) => error,
+                };
+                attempt += 1;
+                let Some(delay) = retry::delay(&error, attempt) else {
+                    return Err(error.into());
+                };
+                tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, %error, "Retrying model request");
+                self.phase(TurnPhase::Retrying {
+                    attempt,
+                    delay_ms: delay.as_millis() as u64,
+                })
+                .await?;
+                tokio::select! {
+                    _ = self.cancel.cancelled() => return Err(ModelError::Interrupted.into()),
+                    _ = tokio::time::sleep(delay) => {}
                 }
-                Err(StreamFailure::Fatal(error)) => return Err(error),
-                Err(StreamFailure::Model(error)) => error,
-            };
-            attempt += 1;
-            let Some(delay) = retry::delay(&error, attempt) else {
-                return Err(error.into());
-            };
-            tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, %error, "Retrying model request");
-            self.phase(TurnPhase::Retrying {
-                attempt,
-                delay_ms: delay.as_millis() as u64,
-            })
-            .await?;
-            tokio::select! {
-                _ = self.cancel.cancelled() => return Err(ModelError::Interrupted.into()),
-                _ = tokio::time::sleep(delay) => {}
             }
         }
     }
 
-    /// The request view of `messages`: the system prompt plus history,
-    /// condensed into a durable summary when it passes the threshold.
+    /// The request view of `messages`: the system prompt plus history, with
+    /// its accounting. Old tool results are masked in batches and history
+    /// past the threshold is condensed into a summary; both change `messages`
+    /// itself and are checkpointed, so later calls and resumes send identical
+    /// bytes.
     async fn fit(
         &self,
         messages: &mut Vec<Message>,
         tools: &[ToolSchema],
-    ) -> anyhow::Result<Vec<Message>> {
+        pressure: Pressure,
+    ) -> anyhow::Result<(Vec<Message>, ContextUsage)> {
         let system = vec![Message::system(&self.system)];
         let assemble = |history: &[Message]| {
             let mut view = system.clone();
             view.extend_from_slice(history);
             view
         };
+        if let Some(plan) =
+            self.budget
+                .mask_plan(&system, messages, tools, self.max_tokens, pressure)
+        {
+            tracing::debug!(results = plan.stubs.len(), "Masking old tool results");
+            plan.apply(messages);
+            self.checkpoint(messages).await?;
+        }
         let mut view = assemble(messages);
-        if self.budget.over_threshold(&view, tools, self.max_tokens)
-            && let Some(plan) = self
-                .budget
-                .summary_plan(&system, messages, tools, self.max_tokens)
+        if (pressure == Pressure::Overflow
+            || self.budget.over_threshold(&view, tools, self.max_tokens))
+            && let Some(plan) =
+                self.budget
+                    .summary_plan(&system, messages, tools, self.max_tokens, pressure)
         {
             self.phase(TurnPhase::Compacting).await?;
             match self
@@ -469,13 +727,16 @@ impl AgentLoop {
                 }
             }
         }
-        let view = self.budget.fit(&view, tools, self.max_tokens)?;
+        let (view, costs) = self.budget.fit(view, tools, self.max_tokens)?;
+        let mut usage = self.budget.usage_of(&view, &costs, tools, self.max_tokens);
         if self.root() {
-            let mut usage = self.budget.usage(&view, tools, self.max_tokens);
             usage.deferred_tool_count = self.tools.deferred_count() as u32;
-            self.emit(EngineEvent::ContextUsage { usage }).await?;
+            self.emit(EngineEvent::ContextUsage {
+                usage: usage.clone(),
+            })
+            .await?;
         }
-        Ok(view)
+        Ok((view, usage))
     }
 
     /// Streams one attempt. Text the user already saw in an earlier attempt
@@ -588,11 +849,46 @@ fn unanswered(messages: &[Message]) -> impl Iterator<Item = &crate::model::ToolC
         .filter(move |call| !answered.contains(call.id.as_str()))
 }
 
+/// Whether model call `call` (1-based) of at most `limit` crosses 75% or
+/// 90% of the step limit. Thresholds that would coincide with the final call
+/// are skipped: that call already carries the step-limit note.
+fn step_budget_warning(call: u32, limit: u32) -> bool {
+    [75, 90]
+        .into_iter()
+        .map(|percent| (u64::from(limit) * percent).div_ceil(100))
+        .any(|threshold| threshold < u64::from(limit) && u64::from(call) == threshold)
+}
+
+/// Whether `error` is a context overflow, which a stronger compaction may fix.
+fn context_overflow(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<ModelError>(),
+        Some(ModelError::ContextOverflow(_))
+    )
+}
+
 /// A note from the application (not the user) at its place in the
 /// conversation. Notes are user-role messages so every protocol keeps their
 /// position and the cached system block holds only the system prompt.
+/// Adds a count some calls may not report: the total stays `None` until a
+/// call reports one.
+fn add_reported(total: &mut Option<u64>, reported: Option<u64>) {
+    if let Some(reported) = reported {
+        *total = Some(total.unwrap_or_default() + reported);
+    }
+}
+
 pub(crate) fn application_note(text: &str) -> Message {
     Message::user(crate::prompts::application_note(text))
+}
+
+/// The call ids of `assistant` in call order.
+fn call_order(assistant: &Message) -> Vec<String> {
+    assistant
+        .tool_calls
+        .iter()
+        .map(|call| call.id.clone())
+        .collect()
 }
 
 /// Every tool call id in `messages`.

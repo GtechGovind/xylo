@@ -130,14 +130,36 @@ pub(super) fn answer_segment(turn: &TurnState) -> Option<usize> {
 }
 
 /// Whether a finished turn did anything besides answering, so it has work to
-/// summarise.
+/// summarise. Harness notes alone are not work.
 pub(super) fn has_work(turn: &TurnState) -> bool {
-    turn.segments.len() > usize::from(answer_segment(turn).is_some())
+    let answer = answer_segment(turn);
+    turn.segments
+        .iter()
+        .enumerate()
+        .any(|(index, segment)| Some(index) != answer && !matches!(segment, Segment::Note { .. }))
+}
+
+/// A harness note in the transcript: quiet, one line per sentence, marked as
+/// coming from Xylo rather than the model.
+fn note_row(text: SharedString) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .items_start()
+        .gap_2()
+        .py_1()
+        .text_size(px(13.))
+        .text_color(rgb(text_secondary()))
+        .child(div().pt(px(2.)).child(icons::status(AppIcon::Info)))
+        .child(div().flex_1().min_w_0().whitespace_normal().child(text))
+        .into_any_element()
 }
 
 /// Headline for a failed turn, chosen from the engine's classification.
 pub(super) fn failure_title(failure: &TurnFailure) -> &'static str {
     match failure.kind {
+        ErrorKind::Stalled => "The model kept repeating itself, so Xylo stopped the task",
+        ErrorKind::EmptyResponse => "The model returned no usable reply",
         ErrorKind::Authentication => "The provider did not accept the saved credentials",
         ErrorKind::RateLimited => "The provider is limiting requests right now",
         ErrorKind::Provider => "The model provider could not be reached",
@@ -180,6 +202,15 @@ impl Xylo {
         if folded && Some(index) != answer {
             return self.folded_segment(turn, index, cx);
         }
+        // A finished turn's notes are steps: they live inside its work, and a
+        // turn that only answered has no steps to show.
+        if !turn.running
+            && turn.outcome.is_some()
+            && !has_work(turn)
+            && matches!(turn.segments[index], Segment::Note { .. })
+        {
+            return div().into_any_element();
+        }
         let row = match &turn.segments[index] {
             Segment::Text(text) => text_segment(
                 self.session,
@@ -189,6 +220,7 @@ impl Xylo {
             ),
             Segment::Tools(ids) => self.tool_group_row(turn, ids, window, cx),
             Segment::Subagent(id) => self.subagent_row(turn, *id, window, cx),
+            Segment::Note { text, .. } => note_row(text.clone()),
         };
         motion::fade_slide_in(
             ElementId::NamedInteger(format!("live-row-{}", self.session).into(), index as u64),
@@ -634,10 +666,13 @@ impl Xylo {
             .pb(px(6.))
             .child(self.answer_actions(
                 index,
-                text.to_string(),
-                turn.finished_at.unwrap_or_else(now_ms),
-                None,
-                true,
+                super::Answer {
+                    id: super::live_answer_key(self.session, turn),
+                    text: text.clone(),
+                    at_ms: turn.finished_at.unwrap_or_else(now_ms),
+                    note: turn.answer_note.clone(),
+                    latest: true,
+                },
                 cx,
             ))
             .into_any_element()

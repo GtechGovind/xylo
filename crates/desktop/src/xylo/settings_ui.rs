@@ -672,7 +672,8 @@ pub(super) struct ListItem {
     title: SharedString,
     subtitle: Option<SharedString>,
     detail: Option<SharedString>,
-    tags: Vec<SharedString>,
+    tags: Vec<(SharedString, Tone)>,
+    title_tag: Option<(SharedString, Tone)>,
     trailing: Vec<AnyElement>,
     divider: bool,
     selected: bool,
@@ -692,6 +693,7 @@ pub(super) fn list_item(
         subtitle,
         detail: None,
         tags: Vec::new(),
+        title_tag: None,
         trailing: Vec::new(),
         divider: false,
         selected: false,
@@ -706,7 +708,20 @@ impl ListItem {
     }
     /// Small chips after the subtitle (component kinds, transports).
     pub(super) fn tags(mut self, tags: impl IntoIterator<Item = SharedString>) -> Self {
-        self.tags.extend(tags);
+        self.tags
+            .extend(tags.into_iter().map(|label| (label, Tone::Neutral)));
+        self
+    }
+    /// A chip after the subtitle in a status colour, such as a warning that
+    /// an item is held back.
+    pub(super) fn toned_tag(mut self, label: impl Into<SharedString>, tone: Tone) -> Self {
+        self.tags.push((label.into(), tone));
+        self
+    }
+    /// A chip right after the title, for a property of the item itself
+    /// ("Trusted").
+    pub(super) fn title_tag(mut self, label: impl Into<SharedString>, tone: Tone) -> Self {
+        self.title_tag = Some((label.into(), tone));
         self
     }
     /// A trailing element: status pill, version, switch, button or menu.
@@ -743,6 +758,9 @@ impl RenderOnce for ListItem {
             .gap(px(8.))
             .min_w_0()
             .child(label_text(self.title.clone()).min_w_0().single_line())
+            .when_some(self.title_tag, |line, (label, tone)| {
+                line.child(toned_tag(label, tone))
+            })
             .when_some(self.detail, |line, detail| {
                 line.child(
                     // Takes no width until hovered, so the title keeps the
@@ -774,8 +792,8 @@ impl RenderOnce for ListItem {
                     .child(subtitle),
             );
         }
-        for item_tag in self.tags {
-            second_line = second_line.child(tag(item_tag));
+        for (label, tone) in self.tags {
+            second_line = second_line.child(toned_tag(label, tone));
         }
         let main = div()
             .flex_1()
@@ -919,8 +937,10 @@ impl Xylo {
     }
 }
 
-/// A small neutral chip for kinds and attributes ("Skills", "MCP").
-pub(super) fn tag(label: impl Into<SharedString>) -> Div {
+/// A small chip for kinds and attributes ("Skills", "MCP"), neutral or in
+/// a status colour ("Not used automatically").
+pub(super) fn toned_tag(label: impl Into<SharedString>, tone: Tone) -> Div {
+    let (background, foreground) = tone_colors(tone);
     // Short tags keep their width; a long value (a licence, a path) stops at
     // the cap and truncates, so tags never push into the trailing controls.
     div()
@@ -932,10 +952,10 @@ pub(super) fn tag(label: impl Into<SharedString>) -> Div {
         .flex()
         .items_center()
         .rounded(px(5.))
-        .bg(rgb(well()))
+        .bg(rgb(background))
         .text_size(px(11.))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(text_secondary()))
+        .text_color(rgb(foreground))
         .child(div().min_w_0().single_line().child(label.into()))
 }
 
@@ -1000,15 +1020,19 @@ impl Status {
 pub(super) fn status_pill(status: Status) -> Div {
     pill(status.label(), status.tone())
 }
-/// A status pill with custom wording ("Disabled after update").
-pub(super) fn pill(label: impl Into<SharedString>, tone: Tone) -> Div {
-    let (background, foreground) = match tone {
+/// The (background, text) colours of a tone, shared by pills and tags.
+fn tone_colors(tone: Tone) -> (u32, u32) {
+    match tone {
         Tone::Neutral => (well(), text_secondary()),
         Tone::Accent => (brand_soft(), accent_text()),
         Tone::Success => (success_bg(), success()),
         Tone::Warning => (warning_bg(), warning()),
         Tone::Danger => (danger_bg(), danger()),
-    };
+    }
+}
+/// A status pill with custom wording ("Disabled after update").
+pub(super) fn pill(label: impl Into<SharedString>, tone: Tone) -> Div {
+    let (background, foreground) = tone_colors(tone);
     div()
         .flex_shrink_0()
         .h(px(22.))

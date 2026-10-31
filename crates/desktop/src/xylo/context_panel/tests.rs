@@ -14,6 +14,7 @@ fn usage() -> ContextUsage {
         compacted: true,
         autocompact_threshold: 160_000,
         provider_input: Some(51_000),
+        provider_cache_read: None,
     }
 }
 

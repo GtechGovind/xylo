@@ -1,6 +1,9 @@
 //! Coding tools: ranged reads, exact edits, project search, file discovery and
 //! command resolution. Callers check workspace boundaries before any I/O here.
+//! A read's default line window and its byte bound scale with the model's
+//! effective context window, so one read never fills a small window.
 
+use crate::provider_guard::EffectiveWindow;
 use anyhow::{Context, Result, ensure};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
@@ -12,11 +15,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Default and maximum line window for one read.
-const READ_LINES: u64 = 2000;
+/// Most lines one read may request explicitly.
 const READ_MAX_LINES: u64 = 10_000;
-/// Keeps one read comfortably inside the model-facing result budget.
-const READ_BYTES: usize = 40 * 1024;
 const LINE_CHARS: usize = 2000;
 const READ_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const EDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -76,8 +76,15 @@ impl Shown {
     }
 }
 
-/// Numbered lines (`cat -n` style) from a 1-based offset, bounded by lines and bytes.
-pub(crate) fn read(path: &Path, shown: &str, args: &Value) -> Result<Value> {
+/// Numbered lines (`cat -n` style) from a 1-based offset, bounded by lines
+/// (the call's `limit`, or the window's default) and the window's read bytes.
+pub(crate) fn read(
+    path: &Path,
+    shown: &str,
+    args: &Value,
+    window: &EffectiveWindow,
+) -> Result<Value> {
+    let read_bytes = window.file_read_bytes();
     let metadata = std::fs::metadata(path)?;
     ensure!(
         metadata.is_file(),
@@ -95,7 +102,7 @@ pub(crate) fn read(path: &Path, shown: &str, args: &Value) -> Result<Value> {
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
-        .unwrap_or(READ_LINES)
+        .unwrap_or_else(|| window.file_read_lines())
         .clamp(1, READ_MAX_LINES);
     let mut reader = BufReader::new(std::fs::File::open(path)?);
     ensure!(
@@ -126,7 +133,7 @@ pub(crate) fn read(path: &Path, shown: &str, args: &Value) -> Result<Value> {
         } else {
             format!("{number:>6}\t{decoded}\n")
         };
-        if end != 0 && content.len() + row.len() > READ_BYTES {
+        if end != 0 && content.len() + row.len() > read_bytes {
             full = true;
             continue;
         }

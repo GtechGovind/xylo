@@ -14,20 +14,26 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(super) fn play(path: &Path, volume: f32, cancel: &CancellationToken) -> Result<Value> {
+/// Plays the already opened `file` (shown as `path`).
+pub(super) fn play(
+    path: &Path,
+    file: std::fs::File,
+    volume: f32,
+    cancel: &CancellationToken,
+) -> Result<Value> {
     ensure!(
         volume.is_finite() && (0.0..=1.0).contains(&volume),
         "Volume must be between 0 and 1"
     );
     ensure!(
-        path.is_file() && path.metadata()?.len() <= MAX_AUDIO_FILE,
+        file.metadata()?.len() <= MAX_AUDIO_FILE,
         "Audio file is missing or exceeds 64MiB"
     );
     ensure!(
         !cancel.is_cancelled(),
         "Playback cancelled before opening an audio device"
     );
-    let decoder = Decoder::try_from(std::fs::File::open(path)?)
+    let decoder = Decoder::try_from(file)
         .context("Audio format cannot be played; use WAV, MP3, M4A, FLAC or Ogg")?;
     let duration = decoder.total_duration();
     if let Some(duration) = duration {

@@ -75,6 +75,7 @@ fn reply_status_label(status: MessageStatus) -> Option<&'static str> {
         MessageStatus::Complete => None,
         MessageStatus::Interrupted => Some("Stopped · the reply ended early"),
         MessageStatus::Failed => Some("Failed · the reply is incomplete"),
+        MessageStatus::Truncated => Some("Cut off · the answer reached the output limit"),
     }
 }
 
@@ -145,12 +146,24 @@ fn speakable_text(markdown: &str) -> String {
     spoken.join("\n")
 }
 
-/// A stable key for an answer's text, to tell which answer is being read.
-fn text_key(text: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::hash::DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
+/// What an answer's action row acts on and shows.
+struct Answer {
+    /// The message id, or the live answer's key.
+    id: Uuid,
+    text: SharedString,
+    /// When it was written, in milliseconds.
+    at_ms: i64,
+    /// Why it is incomplete (stopped, failed, cut off), if it is.
+    note: Option<SharedString>,
+    /// The answer that ends the conversation: its row is always shown.
+    latest: bool,
+}
+
+/// The identity of a live turn's answer until history stores it; the
+/// archived reply takes the same id.
+pub(super) fn live_answer_key(session: Uuid, turn: &TurnState) -> Uuid {
+    let started = turn.started_at.unwrap_or_default();
+    Uuid::new_v5(&session, format!("answer-{started}").as_bytes())
 }
 
 /// Image files attach as images; every other file is referenced by path in
@@ -318,6 +331,7 @@ impl Xylo {
             self.refresh_schedules(cx);
         }
         let running = self.turns.get(&session).is_some_and(|turn| turn.running);
+        let marked_before = self.chat_busy(session);
         let opens_turn = matches!(event, EngineEvent::Started)
             || (!running
                 && matches!(
@@ -354,8 +368,8 @@ impl Xylo {
                 .turns
                 .get(&session)
                 .and_then(|turn| turn.tool(action))
-                .and_then(|tool| tool.presentation.parsed_output.clone())
-                .and_then(|value| value.get("artifacts").and_then(|v| v.as_array()).cloned())
+                .and_then(|tool| tool.presentation.parsed_output.as_deref())
+                .and_then(|value| value.get("artifacts").and_then(|v| v.as_array()))
                 .into_iter()
                 .flatten()
                 .filter_map(|path| path.as_str().map(PathBuf::from))
@@ -376,7 +390,11 @@ impl Xylo {
             self.recovery_activate(window, cx);
             self.refresh_action_reviews(cx);
         }
-        cx.notify();
+        // A chat in the background is drawn only as its sidebar row, so its
+        // events redraw the window only when that row's mark changes.
+        if session == self.session || marked_before != self.chat_busy(session) {
+            cx.notify();
+        }
     }
     /// Rows after the history messages: the turn's work summary, one row per
     /// transcript segment, and its activity or outcome row.
@@ -410,10 +428,14 @@ impl Xylo {
         // A retried turn resumes under the same id; its partial reply is not history.
         let reply = turn.reply().filter(|_| !turn.resend);
         let finished_at = turn.finished_at;
+        let answer = live_answer_key(session, turn);
         turn.archive();
         if let Some((text, status)) = reply {
             if session == self.session {
                 let mut reply = message(session, "assistant", text);
+                // The answer keeps its identity, so a reading in progress
+                // still belongs to it.
+                reply.id = answer;
                 reply.status = status;
                 if let Some(at) = finished_at {
                     reply.created_at = at;
@@ -466,7 +488,7 @@ impl Xylo {
     /// The prompt "Retry" under the latest answer asks again: the person's
     /// last message, when it was text only and nothing else is in flight or
     /// typed.
-    fn retry_prompt(&self, cx: &App) -> Option<String> {
+    fn retry_prompt(&self, cx: &App) -> Option<&str> {
         if self.running()
             || self.sending_turn()
             || !self.composer.read(cx).value().trim().is_empty()
@@ -478,12 +500,12 @@ impl Xylo {
             .rev()
             .find(|message| message.role == "user")
             .filter(|message| message.attachments.is_empty() && !message.content.trim().is_empty())
-            .map(|message| message.content.clone())
+            .map(|message| message.content.as_str())
     }
     /// Asks the latest question again through the normal send path, so drafts,
     /// admission and the queue treat it like any other message.
     fn retry_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(prompt) = self.retry_prompt(cx) else {
+        let Some(prompt) = self.retry_prompt(cx).map(str::to_owned) else {
             return;
         };
         self.composer
@@ -493,10 +515,10 @@ impl Xylo {
     }
     /// Puts a sent message back in the composer to edit and send again. A
     /// draft already being typed is kept above it.
-    fn edit_message(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn edit_message(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let draft = self.composer.read(cx).value().trim_end().to_owned();
         let value = if draft.is_empty() {
-            text
+            text.to_owned()
         } else {
             format!("{draft}\n\n{text}")
         };
@@ -507,22 +529,21 @@ impl Xylo {
         self.draft_changed(cx);
         cx.notify();
     }
-    /// Whether the answer with this text is the one being read aloud (its
-    /// speech is still being made or playing).
-    fn reading_answer(&self, markdown: &str) -> bool {
-        self.reading_aloud == Some(text_key(markdown))
-            && (self.speech.playing || self.speech.busy())
+    /// Whether the answer `answer` (a message id, or the live answer's key)
+    /// is the one being read aloud: its speech is still being made or plays.
+    fn reading_answer(&self, answer: Uuid) -> bool {
+        self.reading_aloud == Some(answer) && (self.speech.playing || self.speech.busy())
     }
     /// Reads an answer aloud with the selected voice, or stops it when it is
     /// the one being read.
-    fn read_aloud(&mut self, markdown: &str, cx: &mut Context<Self>) {
-        if self.reading_answer(markdown) {
+    fn read_aloud(&mut self, answer: Uuid, markdown: &str, cx: &mut Context<Self>) {
+        if self.reading_answer(answer) {
             self.reading_aloud = None;
             self.stop_speech(cx);
             cx.notify();
             return;
         }
-        self.reading_aloud = Some(text_key(markdown));
+        self.reading_aloud = Some(answer);
         self.speech_speak_text(speakable_text(markdown), cx);
     }
     fn chat_row(&self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -626,10 +647,13 @@ impl Xylo {
                     .bottom_0()
                     .child(self.answer_actions(
                         index,
-                        message.content.clone(),
-                        message.created_at,
-                        reply_status_label(message.status),
-                        index == self.messages.len() && !self.has_live_transcript(),
+                        Answer {
+                            id: message.id,
+                            text: self.message_text(message),
+                            at_ms: message.created_at,
+                            note: reply_status_label(message.status).map(SharedString::from),
+                            latest: index == self.messages.len() && !self.has_live_transcript(),
+                        },
                         cx,
                     )),
             )
@@ -643,8 +667,9 @@ impl Xylo {
         message: &ChatMessage,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let copy_text = message.content.clone();
-        let edit_text = message.content.clone();
+        let content = self.message_text(message);
+        let copy_text = content.clone();
+        let edit_text = content.clone();
         let bubble = div()
             .id(("message-body", index))
             .test_support()
@@ -665,11 +690,8 @@ impl Xylo {
             })
             .when(!message.content.is_empty(), |row| {
                 row.child(
-                    TextView::markdown(
-                        SharedString::from(message.id.to_string()),
-                        message.content.clone(),
-                    )
-                    .selectable(true),
+                    TextView::markdown(SharedString::from(message.id.to_string()), content)
+                        .selectable(true),
                 )
             })
             .when(!message.attachments.is_empty(), |row| {
@@ -683,7 +705,7 @@ impl Xylo {
             .child(
                 message_action(("copy-message", index), AppIcon::Copy, "Copy", false).on_click(
                     move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()))
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.to_string()))
                     },
                 ),
             )
@@ -691,7 +713,7 @@ impl Xylo {
                 row.child(
                     message_action(("edit-message", index), AppIcon::Edit, "Edit", false).on_click(
                         cx.listener(move |view, _, window, cx| {
-                            view.edit_message(edit_text.clone(), window, cx)
+                            view.edit_message(&edit_text, window, cx)
                         }),
                     ),
                 )
@@ -731,7 +753,7 @@ impl Xylo {
                 row.child(
                     TextView::markdown(
                         SharedString::from(message.id.to_string()),
-                        message.content.clone(),
+                        self.message_text(message),
                     )
                     .selectable(true),
                 )
@@ -743,20 +765,21 @@ impl Xylo {
     }
     /// Copy, Retry (latest answer only), Read aloud and when it was written.
     /// The latest answer shows the row; earlier ones reveal it on hover.
-    fn answer_actions(
-        &self,
-        index: usize,
-        text: String,
-        at_ms: i64,
-        note: Option<&'static str>,
-        latest: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn answer_actions(&self, index: usize, answer: Answer, cx: &mut Context<Self>) -> AnyElement {
+        let Answer {
+            id: answer,
+            text,
+            at_ms,
+            note,
+            latest,
+        } = answer;
         let copy_text = text.clone();
-        let reading = self.reading_answer(&text);
+        let reading = self.reading_answer(answer);
         // Another answer (or a recording) is using the speaker.
         let speech_busy = (self.speech.busy() || self.speech.playing) && !reading;
         let retry = latest && self.retry_prompt(cx).is_some();
+        // A status note (stopped, failed, cut off) is always shown.
+        let show_time = latest || note.is_some();
         // The glyph sits 6 px inside its hit area; pull the row left so the
         // first icon lines up with the answer text.
         div()
@@ -767,7 +790,7 @@ impl Xylo {
             .child(
                 message_action(("copy-message", index), AppIcon::Copy, "Copy", latest).on_click(
                     move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()))
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.to_string()))
                     },
                 ),
             )
@@ -793,7 +816,7 @@ impl Xylo {
                     latest || reading,
                 )
                 .disabled(speech_busy)
-                .on_click(cx.listener(move |view, _, _, cx| view.read_aloud(&text, cx))),
+                .on_click(cx.listener(move |view, _, _, cx| view.read_aloud(answer, &text, cx))),
             )
             .child(reveal_on_hover(
                 div()
@@ -815,7 +838,7 @@ impl Xylo {
                                 .child(note),
                         )
                     }),
-                latest || note.is_some(),
+                show_time,
             ))
             .into_any_element()
     }
@@ -907,6 +930,18 @@ impl Xylo {
             }
             None => {}
         }
+    }
+    /// ⌘.: stops the task from anywhere, but denies a pending action only
+    /// when its card is in front of the person (as ⌘⇧↩ allows only then).
+    pub(super) fn deny_or_stop_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = self
+            .turns
+            .get(&self.session)
+            .is_some_and(|turn| turn.pending_approvals().next().is_some());
+        if pending && !self.approval_shortcut_applies(window, cx) {
+            return;
+        }
+        self.deny_or_stop(cx);
     }
     fn can_populate_chat_starter(&self, cx: &Context<Self>) -> bool {
         self.messages.is_empty()

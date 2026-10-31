@@ -91,8 +91,8 @@ fn private_management_files_are_not_part_of_the_plugin_input_scope() {
         ..Default::default()
     })
     .unwrap();
-    assert!(input_path(&service.config, "notes.txt").is_ok());
-    assert!(input_path(&service.config, "native-management/catalog.json").is_err());
+    assert!(open_input(&service.config, "notes.txt").is_ok());
+    assert!(open_input(&service.config, "native-management/catalog.json").is_err());
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(
@@ -100,7 +100,7 @@ fn private_management_files_are_not_part_of_the_plugin_input_scope() {
             workspace.join("alias.json"),
         )
         .unwrap();
-        assert!(input_path(&service.config, "alias.json").is_err());
+        assert!(open_input(&service.config, "alias.json").is_err());
     }
 }
 
@@ -163,4 +163,25 @@ async fn ordinary_tools_cannot_dispatch_application_management_controls() {
             "Management control {name} was rejected at the wrong boundary: {error:#}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_helper_shutdown_never_needs_the_model_activity_lease() {
+    let root = tempfile::tempdir().unwrap();
+    let config = CapabilityConfig {
+        workspace: root.path().canonicalize().unwrap(),
+        artifacts: root.path().join("artifacts"),
+        management_root: Some(root.path().join("management")),
+        ..Default::default()
+    };
+    let parent = CapabilityService::new(config.clone()).unwrap();
+    let helper = CapabilityService::new(config).unwrap();
+    // Another helper (or the parent) is in the middle of a configuration
+    // change and holds the exclusive lease.
+    let _held = parent.models.idle_activity_lease().unwrap();
+    assert!(
+        helper.shutdown().await.is_err(),
+        "a full shutdown contends for the lease"
+    );
+    helper.shutdown_helper_sessions().await.unwrap();
 }

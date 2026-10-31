@@ -296,9 +296,7 @@ impl Store {
                 tx.commit()?;
                 return Ok(SteeringApplication { messages:Value::Array(messages), applied:Vec::new(), has_more:false });
             }
-            let checkpoint: Option<String> = tx.query_row(
-                "SELECT turn_id FROM checkpoints WHERE session_id=?1", [session.to_string()], |row|row.get(0),
-            ).optional()?;
+            let checkpoint = crate::checkpoint::checkpoint_turn(&tx, session)?;
             if checkpoint.as_deref() != Some(&turn.to_string()) {
                 let finished: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM completed_turns WHERE session_id=?1 AND turn_id=?2)",
@@ -341,10 +339,8 @@ impl Store {
                     request:record.request,draft,cleared_revision,
                 });
             }
-            tx.execute(
-                "UPDATE checkpoints SET turn_id=?1,messages=?2,updated_at=?3 WHERE session_id=?4",
-                params![turn.to_string(),serde_json::to_string(&messages)?,now_ms(),session.to_string()],
-            )?;
+            let rows = messages.iter().map(serde_json::to_string).collect::<serde_json::Result<Vec<_>>>()?;
+            crate::checkpoint::write_rows(&tx, session, turn, &rows, None, now_ms())?;
             let has_more: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM user_guidance WHERE session_id=?1 AND turn_id=?2 AND state='queued')",
                 params![session.to_string(),turn.to_string()], |row|row.get(0),

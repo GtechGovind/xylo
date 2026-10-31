@@ -500,24 +500,37 @@ pub(super) async fn provider_fixture() -> (String, tokio::task::JoinHandle<Value
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(10), async {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut socket = BufReader::new(socket);
-            let mut length = 0;
-            let mut headers_bytes = 0;
-            loop {
-                let mut line = String::new();
-                assert!(socket.read_line(&mut line).await.unwrap() > 0);
-                headers_bytes += line.len();
-                assert!(headers_bytes <= 32 * 1024);
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse::<usize>().unwrap();
+            // The served-context probe's GETs are answered 404, as by a
+            // server that does not report its context.
+            let (mut socket, length) = loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut length = 0;
+                let mut headers_bytes = 0;
+                let mut get = false;
+                loop {
+                    let mut line = String::new();
+                    assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                    get |= headers_bytes == 0 && line.starts_with("GET ");
+                    headers_bytes += line.len();
+                    assert!(headers_bytes <= 32 * 1024);
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
                 }
-                if line == "\r\n" {
-                    break;
+                if !get {
+                    break (socket, length);
                 }
-            }
+                let _ = socket
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            };
             assert!((1..=1024 * 1024).contains(&length));
             let mut body = vec![0; length];
             socket.read_exact(&mut body).await.unwrap();

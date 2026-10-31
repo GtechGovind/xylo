@@ -97,18 +97,25 @@ pub fn bundled_skill(name: &str) -> Option<&'static BundledSkill> {
 const INDEX_DESCRIPTION_CHARS: usize = 400;
 /// Description length used when the full index would exceed its budget.
 const INDEX_SHORT_DESCRIPTION_CHARS: usize = 100;
-/// Byte budget for the whole skills index in the system prompt.
+/// Largest skills-index budget any window gets.
 pub(super) const SKILLS_INDEX_BYTES: usize = 8 * 1024;
+/// Room kept for the final "more skills" line.
+const OMISSION_LINE_BYTES: usize = 64;
 
 /// The compact `- name: description` index of available skills: the only
 /// skill content placed in the system prompt. Descriptions are flattened to
-/// one line and bounded. When the index exceeds [`SKILLS_INDEX_BYTES`],
+/// one line and bounded. When the index exceeds `budget` bytes (scaled to
+/// the model's window by the caller, at most [`SKILLS_INDEX_BYTES`]),
 /// descriptions are shortened first, then the remaining skills are counted
 /// in a final line instead of listed. Empty when there are no skills.
-pub fn skills_index<'s>(skills: impl IntoIterator<Item = (&'s str, &'s str)>) -> String {
+pub fn skills_index<'s>(
+    skills: impl IntoIterator<Item = (&'s str, &'s str)>,
+    budget: usize,
+) -> String {
+    let budget = budget.clamp(2 * OMISSION_LINE_BYTES, SKILLS_INDEX_BYTES);
     let skills: Vec<(&str, &str)> = skills.into_iter().collect();
     let full = index_lines(&skills, INDEX_DESCRIPTION_CHARS);
-    let lines = if full.iter().map(|line| line.len() + 1).sum::<usize>() <= SKILLS_INDEX_BYTES {
+    let lines = if full.iter().map(|line| line.len() + 1).sum::<usize>() <= budget {
         full
     } else {
         index_lines(&skills, INDEX_SHORT_DESCRIPTION_CHARS)
@@ -116,7 +123,7 @@ pub fn skills_index<'s>(skills: impl IntoIterator<Item = (&'s str, &'s str)>) ->
     let mut index = String::new();
     for (shown, line) in lines.iter().enumerate() {
         // Reserve room for the omission line.
-        if index.len() + line.len() + 1 > SKILLS_INDEX_BYTES - 64 {
+        if index.len() + line.len() + 1 > budget - OMISSION_LINE_BYTES {
             index.push_str(&format!(
                 "- ({} more skills not listed)",
                 lines.len() - shown

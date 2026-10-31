@@ -445,24 +445,63 @@ pub(crate) async fn acquire_inference_lock(
     }
 }
 
+/// Placeholders whose values come from the model rather than from Xylo. As a
+/// whole argument they must follow a `--`, so text such as `--help` or
+/// `--vits-model=/elsewhere` can never be read as a helper option.
+const UNTRUSTED_PLACEHOLDERS: &[&str] = &["text"];
+
+/// Expands a speech helper's argv template in one pass. Placeholders are
+/// found in the template, never in substituted values, so a value may
+/// contain braces or text that looks like another placeholder.
 pub(crate) fn expand_arguments(
     args: &[String],
     values: &BTreeMap<String, String>,
 ) -> Result<Vec<String>> {
     ensure!(args.len() <= 128, "Too many speech helper arguments");
-    args.iter()
-        .map(|arg| {
-            let mut expanded = arg.clone();
-            for (key, value) in values {
-                expanded = expanded.replace(&format!("{{{key}}}"), value);
-            }
+    let mut options_ended = false;
+    let mut expanded = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "--" {
+            options_ended = true;
+        }
+        if let Some(name) = arg
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+            && UNTRUSTED_PLACEHOLDERS.contains(&name)
+        {
             ensure!(
-                !expanded.contains('{') && !expanded.contains('}'),
-                "Unknown speech argv template placeholder"
+                options_ended,
+                "Speech argv template must put `--` before {{{name}}}"
             );
-            Ok(expanded)
-        })
-        .collect()
+        }
+        expanded.push(expand_argument(arg, values)?);
+    }
+    Ok(expanded)
+}
+
+/// One template argument with each `{name}` replaced by its value.
+fn expand_argument(template: &str, values: &BTreeMap<String, String>) -> Result<String> {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find(['{', '}']) {
+        ensure!(
+            rest[open..].starts_with('{'),
+            "Unbalanced brace in speech argv template"
+        );
+        output.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after
+            .find('}')
+            .context("Unbalanced brace in speech argv template")?;
+        let name = &after[..close];
+        let value = values
+            .get(name)
+            .with_context(|| format!("Unknown speech argv template placeholder {{{name}}}"))?;
+        output.push_str(value);
+        rest = &after[close + 1..];
+    }
+    output.push_str(rest);
+    Ok(output)
 }
 
 pub fn definitions() -> Vec<ToolDefinition> {

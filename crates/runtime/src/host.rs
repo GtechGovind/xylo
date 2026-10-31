@@ -21,7 +21,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -465,6 +465,7 @@ impl HostClient {
                     secrets: parking_lot::RwLock::new(secrets),
                     store,
                     settings: Mutex::new(settings.clone()),
+                    latest_project_open: AtomicU64::new(0),
                     workers: Mutex::new(HashMap::new()),
                     sequences: SessionSequences::default(),
                     events: events.clone(),
@@ -525,7 +526,10 @@ impl HostClient {
                     // Project opens are ordered among themselves, not behind
                     // settings commits, so a slow provider save cannot block them.
                     let workspace_opens = settings_control::CommitOrder::default();
+                    let mut received = 0u64;
                     while let Ok(command) = incoming.recv().await {
+                        received += 1;
+                        let receipt = received;
                         if matches!(command,HostCommand::Shutdown) {maintenance_stop.cancel();state.shutdown().await;scheduling.abort();editor_forwarder.abort();project_forwarder.abort();let _=learning_task.await;for task in notification_tasks {let _=task.await;}state.events.send(HostEvent::Stopped).await?;break;}
                         // Reserve at receipt, before any task can race to acquire admission.
                         let settings_commit = matches!(&command, HostCommand::SaveSettings(_) | HostCommand::SaveProvider(..) | HostCommand::RemoveProvider(_)).then(|| settings_commits.reserve());
@@ -548,7 +552,7 @@ impl HostClient {
                                 let state = state.clone();
                                 tokio::spawn(async move {
                                     let _order = order.enter().await;
-                                    if let Err(error) = state.handle(HostCommand::Workspace(path)).await {
+                                    if let Err(error) = settings_control::with_receipt(receipt, state.handle(HostCommand::Workspace(path))).await {
                                         let _ = state.events.send(HostEvent::Error(error.to_string())).await;
                                     }
                                 });
@@ -583,7 +587,7 @@ impl HostClient {
                         let state = state.clone();
                         tokio::spawn(async move {
                             let _commit = match settings_commit { Some(receipt) => Some(receipt.enter().await), None => None };
-                            if let Err(error) = state.handle(command).await {
+                            if let Err(error) = settings_control::with_receipt(receipt, state.handle(command)).await {
                                 if let Some((generation, provider)) = provider_context {
                                     if state.discovery.generation() == generation {
                                         let _ = state.events.send(HostEvent::ModelsFailed { generation, message: provider_control::discovery_error(&provider, error), provider }).await;
@@ -1070,6 +1074,9 @@ struct HostState {
     /// The vault and connector broker, or why the vault could not be opened.
     secrets: parking_lot::RwLock<std::result::Result<Secrets, String>>,
     settings: Mutex<AppSettings>,
+    /// Receipt number of the newest project open applied to `settings`; a
+    /// settings snapshot received before it must not undo that open.
+    latest_project_open: AtomicU64,
     workers: Mutex<HashMap<Uuid, WorkerHandle>>,
     sequences: SessionSequences,
     events: Sender<HostEvent>,
@@ -1658,8 +1665,10 @@ impl HostState {
                 self.events.send(HostEvent::ConversationPage(page)).await?;
             }
             HostCommand::SaveSettings(settings) => {
-                self.commit_settings(settings.clone()).await?;
-                self.events.send(HostEvent::Settings(settings)).await?;
+                let committed = self
+                    .commit_settings(settings, settings_control::ProjectFields::Snapshot)
+                    .await?;
+                self.events.send(HostEvent::Settings(committed)).await?;
             }
             HostCommand::SaveProvider(generation, settings, config, secret) => {
                 let _save = self.provider_save_gate.lock().await;
@@ -1676,8 +1685,9 @@ impl HostState {
                     let vault = self.vault()?;
                     tokio::task::spawn_blocking(move || vault.set(&reference, &secret)).await??;
                 }
-                let settings = *settings;
-                self.commit_settings(settings.clone()).await?;
+                let settings = self
+                    .commit_settings(*settings, settings_control::ProjectFields::Snapshot)
+                    .await?;
                 if self.discovery.generation() != generation {
                     return Ok(());
                 }
@@ -1724,6 +1734,10 @@ impl HostState {
                     let saved = value.clone();
                     tokio::task::spawn_blocking(move || store.save_settings(&saved)).await??;
                     *settings = value;
+                    if let Some(receipt) = settings_control::current_receipt() {
+                        self.latest_project_open
+                            .fetch_max(receipt, Ordering::AcqRel);
+                    }
                 }
                 self.workspace.open(&path).await?;
                 self.events
@@ -1820,7 +1834,10 @@ impl HostState {
                     .await?;
                 self.report_embedding_failure().await;
             }
-            HostCommand::Remember(request_id, record) => {
+            HostCommand::Remember(request_id, mut record) => {
+                // Facts saved through the app are typed by the person; the
+                // origin is set here, never taken from the caller.
+                record.origin = xylo_core::MemoryOrigin::UserTyped;
                 let memory = self.memory.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let receipt = crate::MemoryMutation {
@@ -2900,20 +2917,27 @@ impl HostState {
     /// previous choice is restored, and when the vault turns out to keep its
     /// key elsewhere the setting follows the vault. A changed mode reaches
     /// running tasks.
-    async fn commit_settings(&self, settings: AppSettings) -> Result<()> {
+    /// Commits a full settings snapshot and returns what was saved: the
+    /// snapshot after [`settings_control::merge_project_fields`] and any
+    /// secret-storage correction.
+    async fn commit_settings(
+        &self,
+        settings: AppSettings,
+        fields: settings_control::ProjectFields,
+    ) -> Result<AppSettings> {
         let previous = self.settings.lock().await.clone();
-        self.save_settings_snapshot(&settings).await?;
-        let mut applied = settings.clone();
-        match self.apply_secret_storage(settings.secret_storage).await {
-            Ok(actual) if actual == settings.secret_storage => {}
+        let requested = settings.secret_storage;
+        let mut applied = self.save_settings_snapshot(&settings, fields).await?;
+        match self.apply_secret_storage(requested).await {
+            Ok(actual) if actual == requested => {}
             Ok(actual) => {
                 applied.secret_storage = actual;
-                self.save_settings_snapshot(&applied).await?;
+                applied = self.save_settings_snapshot(&applied, fields).await?;
                 self.events
                     .send(HostEvent::Settings(applied.clone()))
                     .await?;
             }
-            Err(error) if settings.secret_storage == previous.secret_storage => {
+            Err(error) if requested == previous.secret_storage => {
                 // The vault is still unavailable; the rest of the change stands.
                 self.events
                     .send(HostEvent::Error(format!("{error:#}")))
@@ -2922,7 +2946,7 @@ impl HostState {
             Err(error) => {
                 // Never leave the saved choice and the live vault disagreeing.
                 applied.secret_storage = previous.secret_storage;
-                self.save_settings_snapshot(&applied).await?;
+                applied = self.save_settings_snapshot(&applied, fields).await?;
                 if applied.permissions != previous.permissions {
                     self.forward_permissions(applied.permissions).await;
                 }
@@ -2933,18 +2957,31 @@ impl HostState {
         if applied.permissions != previous.permissions {
             self.forward_permissions(applied.permissions).await;
         }
-        Ok(())
+        Ok(applied)
     }
 
     /// Saves a settings snapshot and makes it current; memory and the
-    /// database never disagree.
-    async fn save_settings_snapshot(&self, settings: &AppSettings) -> Result<()> {
+    /// database never disagree. The project fields are merged under the same
+    /// lock that project opens hold, so a snapshot cannot undo a newer open.
+    async fn save_settings_snapshot(
+        &self,
+        settings: &AppSettings,
+        fields: settings_control::ProjectFields,
+    ) -> Result<AppSettings> {
         let mut current = self.settings.lock().await;
+        let mut value = settings.clone();
+        settings_control::merge_project_fields(
+            &mut value,
+            &current,
+            fields,
+            settings_control::current_receipt(),
+            self.latest_project_open.load(Ordering::Acquire),
+        );
         let store = self.store.clone();
-        let value = settings.clone();
-        tokio::task::spawn_blocking(move || store.save_settings(&value)).await??;
-        *current = settings.clone();
-        Ok(())
+        let saved = value.clone();
+        tokio::task::spawn_blocking(move || store.save_settings(&saved)).await??;
+        *current = value.clone();
+        Ok(value)
     }
 
     /// Switches the vault to `storage` (key file or keychain item) after the
@@ -3094,7 +3131,11 @@ impl HostState {
                     .chain([&settings.provider])
                     .any(|other| other.credential_ref.as_deref() == Some(reference.as_str()))
         });
-        self.commit_settings(settings.clone()).await?;
+        // Built from a copy of current settings: a project opened since then is
+        // kept rather than overwritten with the copy's older project fields.
+        let settings = self
+            .commit_settings(settings, settings_control::ProjectFields::Current)
+            .await?;
         self.events.send(HostEvent::Settings(settings)).await?;
         if let Some(reference) = orphaned {
             let vault = self.vault()?;

@@ -99,20 +99,33 @@ async fn open_stream_fixture() -> (String, tokio::task::JoinHandle<()>, Arc<Atom
     let counted = calls.clone();
     let task = tokio::spawn(async move {
         for _ in 0..CANCELLATIONS {
-            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(15), listener.accept())
-                .await
-                .expect("next model request")
-                .unwrap();
-            let mut bytes = Vec::new();
+            // The engine's served-context probe sends GETs first; this
+            // server reports no context, so they get 404.
             let mut buffer = [0; 8192];
-            let header = loop {
-                let n = socket.read(&mut buffer).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buffer[..n]);
-                if let Some(index) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
-                    break index + 4;
+            let (mut socket, mut bytes, header) = loop {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(15), listener.accept())
+                        .await
+                        .expect("next model request")
+                        .unwrap();
+                let mut bytes = Vec::new();
+                let header = loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(index) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                    assert!(bytes.len() < 65536);
+                };
+                if !bytes.starts_with(b"GET ") {
+                    break (socket, bytes, header);
                 }
-                assert!(bytes.len() < 65536);
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
             };
             let length = String::from_utf8_lossy(&bytes[..header])
                 .lines()

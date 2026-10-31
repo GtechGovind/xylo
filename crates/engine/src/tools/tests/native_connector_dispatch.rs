@@ -27,6 +27,7 @@ fn install(
             command: None,
             args: vec![],
             credential_ref: reference.map(str::to_owned),
+            trusted: false,
         })
         .unwrap();
     json!({"connector_id":id,"tool":"gmail_send_draft","arguments":{"draft_id":"existing-draft"}})

@@ -97,3 +97,18 @@ fn reasoning_capability_follows_protocol_model_and_saved_effort() {
     config.family = ApiFamily::Anthropic;
     assert!(config.supported_reasoning_efforts().is_empty());
 }
+
+#[test]
+fn the_served_context_lowers_but_never_raises_the_window() {
+    let mut config = ProviderConfig {
+        context_tokens: 32_768,
+        ..Default::default()
+    };
+    assert_eq!(config.context_window(), 32_768);
+    config.served_context_tokens = Some(4096);
+    assert_eq!(config.context_window(), 4096);
+    config.served_context_tokens = Some(131_072);
+    assert_eq!(config.context_window(), 32_768);
+    config.served_context_tokens = Some(0);
+    assert_eq!(config.context_window(), 32_768);
+}

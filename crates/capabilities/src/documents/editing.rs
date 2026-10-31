@@ -1,14 +1,10 @@
 //! Native parse/edit/copy transaction. All APIs here run on blocking workers.
 use super::{check, docx, package::Package, spreadsheet, transaction};
-use crate::{CapabilityConfig, input_path, observation};
+use crate::{CapabilityConfig, observation, open_input};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{
-    fs::{self, File},
-    io::Read,
-    path::Path,
-};
+use std::{fs, io::Read, path::Path};
 use tokio_util::sync::CancellationToken;
 use xylo_core::*;
 pub fn digest(bytes: &[u8]) -> String {
@@ -59,12 +55,13 @@ fn source(
     path: &str,
     cancel: &CancellationToken,
 ) -> Result<(DocumentSource, Vec<u8>)> {
-    let path = input_path(config, path)?;
+    let input = open_input(config, path)?;
+    let (path, mut file) = (input.path, input.file);
     ensure!(
-        fs::metadata(&path)?.len() <= 64 * 1024 * 1024,
+        file.metadata()?.len() <= 64 * 1024 * 1024,
         "Document exceeds 64 MiB input budget"
     );
-    let bytes = read_bounded(&mut File::open(&path)?, 64 * 1024 * 1024, cancel)?;
+    let bytes = read_bounded(&mut file, 64 * 1024 * 1024, cancel)?;
     let source = DocumentSource {
         kind: kind(&path)?,
         revision: digest(&bytes),
@@ -78,7 +75,7 @@ pub fn verify(
     source: &DocumentSource,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let path = input_path(
+    let input = open_input(
         config,
         source
             .path
@@ -86,10 +83,10 @@ pub fn verify(
             .context("Document path must be UTF-8")?,
     )?;
     ensure!(
-        path == source.path,
+        input.path == source.path,
         "Source path changed; reopen the document"
     );
-    let mut file = File::open(path)?;
+    let mut file = input.file;
     ensure!(
         file.metadata()?.len() == source.bytes,
         "Source revision changed; reopen before saving a copy"

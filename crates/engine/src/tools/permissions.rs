@@ -27,6 +27,14 @@
 //! its agent configuration (see `builtin::write_target`), matching the
 //! command sandbox.
 //!
+//! Once a conversation has read content from outside the project (web
+//! pages, connectors, plugins, files outside it), a memory write asks in
+//! "Ask for approval" and "Approve for me", and no "always allow" rule
+//! covers it: a fact outlives the conversation, so injected text must not
+//! reach later sessions unreviewed. "Full access" still asks for nothing;
+//! the fact then keeps the untrusted origin the broker assigns it, which
+//! keeps it out of automatically recalled context.
+//!
 //! "Always allow" rules are owned by the host and persisted per project. A
 //! turn is seeded with them through `TurnRequest.approved_rules`; a rule the
 //! user remembers during the turn is added to that turn's set, and the host
@@ -226,6 +234,9 @@ pub(crate) struct Call<'a> {
     pub(crate) workspace: &'a Path,
     /// The justification of a command that asked for internet access.
     pub(crate) network: Option<&'a str>,
+    /// The conversation has read content from outside the project. Only
+    /// computed for memory writes; `false` for every other call.
+    pub(crate) untrusted_input: bool,
 }
 
 /// The outcome of a permission check.
@@ -246,6 +257,9 @@ pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
     if let Some(justification) = call.network {
         return network(mode, call, justification);
     }
+    if let Some(verdict) = untrusted_memory_write(mode, call) {
+        return verdict;
+    }
     match mode {
         PermissionMode::FullAccess => Verdict::Allow,
         PermissionMode::ApproveForMe => approve_for_me(call),
@@ -257,10 +271,28 @@ pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
     }
 }
 
+/// Why a memory write after untrusted input asks: the user must review a
+/// fact that content from outside the project may have shaped.
+pub(crate) const UNTRUSTED_MEMORY_WRITE: &str = "This conversation has read content from outside the project, which can carry injected instructions; review this fact before it is saved to project memory";
+
+/// The memory-write rule for a conversation that read untrusted content.
+fn untrusted_memory_write(mode: PermissionMode, call: &Call) -> Option<Verdict> {
+    (call.name == "memory_remember"
+        && call.untrusted_input
+        && matches!(
+            mode,
+            PermissionMode::AskForApproval | PermissionMode::ApproveForMe
+        ))
+    .then(|| Verdict::Ask(UNTRUSTED_MEMORY_WRITE.into()))
+}
+
 /// "Approve for me": writes outside the project and connector traffic that
 /// is not a small, secret-free lookup always ask; everything else, outside
 /// reads included, asks only when the risk assessment flags it. Never
-/// refuses, so "Ask for approval" can build on it.
+/// refuses, so "Ask for approval" can build on it. A connector call arrives
+/// as a read only when its read-only classification is trusted (a native
+/// connector, or an MCP server the user marked trusted); an untrusted
+/// server's `readOnlyHint` arrives as a write and so always asks.
 fn approve_for_me(call: &Call) -> Verdict {
     if let Reach::Outside(path) = call.reach
         && call.writes
@@ -380,6 +412,15 @@ fn ask_for_approval(call: &Call) -> Verdict {
 const RULE_KEY_BYTES: usize = 400;
 /// Longest label shown for a rule.
 const RULE_LABEL_CHARS: usize = 160;
+
+/// The "always allow" rule for `call`, if one may cover it. A memory write
+/// after untrusted input has none: each one is reviewed.
+pub(crate) fn approval_rule_for(call: &Call) -> Option<(String, String)> {
+    if call.name == "memory_remember" && call.untrusted_input {
+        return None;
+    }
+    approval_rule(call.name, call.arguments, call.reach, call.workspace)
+}
 
 /// The rule key and its label for "always allow in this project". Every
 /// label states exactly what the rule covers.

@@ -193,6 +193,46 @@ impl Message {
         }
     }
 
+    /// Sets the arguments of the call at `position` to `arguments`, in the
+    /// call and in the native replay content, so every later request replays
+    /// exactly what ran. The loop uses it for arguments the dispatcher
+    /// repaired (canonical JSON) and for a call the output limit cut off (an
+    /// empty object: its partial JSON is never dispatched, and replaying it
+    /// would make later requests invalid for servers that parse the
+    /// arguments of earlier calls).
+    pub fn set_tool_call_arguments(&mut self, position: usize, arguments: &Value) {
+        let Some(call) = self.tool_calls.get_mut(position) else {
+            return;
+        };
+        call.arguments = arguments.to_string();
+        let id = call.id.clone();
+        let occurrence = self.tool_calls[..position]
+            .iter()
+            .filter(|call| call.id == id)
+            .count();
+        // Responses carries arguments as JSON text; the others as objects.
+        let (pointer, replayed) = match self.native {
+            Some(NativeContent::Anthropic(_)) => ("/input", arguments.clone()),
+            Some(NativeContent::Responses(_)) => {
+                ("/arguments", Value::String(arguments.to_string()))
+            }
+            Some(NativeContent::Gemini(_)) => ("/functionCall/args", arguments.clone()),
+            Some(NativeContent::Bedrock(_)) => ("/toolUse/input", arguments.clone()),
+            None => return,
+        };
+        let Some((items, id_pointer, _)) = self.native_calls() else {
+            return;
+        };
+        if let Some(slot) = items
+            .iter_mut()
+            .filter(|item| item.pointer(id_pointer).and_then(Value::as_str) == Some(id.as_str()))
+            .nth(occurrence)
+            .and_then(|item| item.pointer_mut(pointer))
+        {
+            *slot = replayed;
+        }
+    }
+
     /// The native items that describe tool calls, with the JSON pointers of
     /// a call's identity and name.
     fn native_calls(&mut self) -> Option<(&mut Vec<Value>, &'static str, &'static str)> {
@@ -217,8 +257,26 @@ pub struct ToolSchema {
 /// Token counts a provider reported for one request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelUsage {
+    /// Every prompt token of the request, cached ones included.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt tokens served from the provider's prompt cache; `None` when
+    /// the provider did not report it.
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    /// Prompt tokens written to the provider's prompt cache; `None` when
+    /// the provider did not report it.
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
+}
+
+impl ModelUsage {
+    /// These counts with the cache reads and writes the provider reported.
+    pub fn with_cache(mut self, read: Option<u64>, write: Option<u64>) -> Self {
+        self.cache_read_tokens = read;
+        self.cache_write_tokens = write;
+        self
+    }
 }
 
 /// Why the model stopped generating.
@@ -229,6 +287,9 @@ pub enum FinishReason {
     ToolCalls,
     /// The output token limit was reached.
     Length,
+    /// The model produced a tool call the provider could not parse, so the
+    /// response carries no usable call (Gemini `MALFORMED_FUNCTION_CALL`).
+    MalformedToolCall,
 }
 
 /// One increment of a streamed response, in provider order.
@@ -255,6 +316,20 @@ pub struct ModelResponse {
     pub message: Message,
     pub usage: Option<ModelUsage>,
     pub finish: FinishReason,
+    /// Tool calls the output limit cut off before their arguments were
+    /// complete JSON. Their arguments in `message` are already an empty
+    /// object; they must be answered with an error, never dispatched.
+    pub truncated_calls: Vec<TruncatedCall>,
+}
+
+/// A tool call cut off by the output limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TruncatedCall {
+    /// Position of the call in the response's `tool_calls`. Positions stay
+    /// valid when the loop later renames call ids.
+    pub position: usize,
+    /// Bytes of argument text that arrived before the cut.
+    pub received: usize,
 }
 
 /// What to send to the model.
@@ -304,6 +379,12 @@ pub enum ModelError {
     Interrupted,
     /// A local fault (storage, encoding).
     Io(String),
+    /// The harness stopped a turn whose model kept repeating itself after
+    /// two warnings.
+    Stalled(String),
+    /// The model returned no usable reply, even after being asked once more.
+    /// Repeating the turn may succeed.
+    EmptyResponse(String),
 }
 
 impl ModelError {
@@ -328,13 +409,14 @@ impl ModelError {
     /// Whether repeating the same request may succeed.
     pub fn retryable(&self) -> bool {
         match self {
-            Self::RateLimited { .. } | Self::Timeout(_) => true,
+            Self::RateLimited { .. } | Self::Timeout(_) | Self::EmptyResponse(_) => true,
             Self::Provider { retryable, .. } => *retryable,
             Self::Authentication(_)
             | Self::InvalidRequest(_)
             | Self::ContextOverflow(_)
             | Self::Interrupted
-            | Self::Io(_) => false,
+            | Self::Io(_)
+            | Self::Stalled(_) => false,
         }
     }
 
@@ -357,6 +439,8 @@ impl ModelError {
                 ErrorKind::Provider
             }
             Self::ContextOverflow(_) => ErrorKind::ContextOverflow,
+            Self::Stalled(_) => ErrorKind::Stalled,
+            Self::EmptyResponse(_) => ErrorKind::EmptyResponse,
             Self::Interrupted | Self::Io(_) => ErrorKind::Internal,
         }
     }
@@ -371,7 +455,9 @@ impl fmt::Display for ModelError {
             | Self::InvalidRequest(message)
             | Self::ContextOverflow(message)
             | Self::Timeout(message)
-            | Self::Io(message) => formatter.write_str(message),
+            | Self::Io(message)
+            | Self::Stalled(message)
+            | Self::EmptyResponse(message) => formatter.write_str(message),
             Self::Interrupted => formatter.write_str("The task was cancelled"),
         }
     }
@@ -449,11 +535,17 @@ impl Assembler {
 
     /// The complete response; fails when the provider never finished or sent
     /// a tool call without identity.
+    ///
+    /// When the output limit stopped the response, a call whose arguments
+    /// are not complete JSON (including one that received no arguments at
+    /// all) was cut off mid-generation: it is listed in
+    /// [`ModelResponse::truncated_calls`] and its arguments are cleared.
+    /// Otherwise empty arguments mean a call without parameters.
     pub fn finish(self) -> Result<ModelResponse, ModelError> {
         let finish = self
             .finish
             .ok_or_else(|| ModelError::transient("Provider stream ended before completion"))?;
-        let mut calls = self.calls.into_values().collect::<Vec<_>>();
+        let calls = self.calls.into_values().collect::<Vec<_>>();
         if calls
             .iter()
             .any(|call| call.id.is_empty() || call.name.is_empty())
@@ -462,14 +554,30 @@ impl Assembler {
                 "Provider returned an incomplete function call",
             ));
         }
-        for call in &mut calls {
+        let truncated_calls = if finish == FinishReason::Length {
+            calls
+                .iter()
+                .enumerate()
+                .filter(|(_, call)| serde_json::from_str::<Value>(&call.arguments).is_err())
+                .map(|(position, call)| TruncatedCall {
+                    position,
+                    received: call.arguments.len(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut message = Message::assistant_with_tool_calls(self.text, calls);
+        message.reasoning = (!self.reasoning.is_empty()).then_some(self.reasoning);
+        message.native = self.native;
+        for call in &mut message.tool_calls {
             if call.arguments.trim().is_empty() {
                 call.arguments = "{}".into();
             }
         }
-        let mut message = Message::assistant_with_tool_calls(self.text, calls);
-        message.reasoning = (!self.reasoning.is_empty()).then_some(self.reasoning);
-        message.native = self.native;
+        for truncated in &truncated_calls {
+            message.set_tool_call_arguments(truncated.position, &Value::Object(Default::default()));
+        }
         let finish = if message.tool_calls.is_empty() || finish == FinishReason::Length {
             finish
         } else {
@@ -479,6 +587,7 @@ impl Assembler {
             message,
             usage: self.usage,
             finish,
+            truncated_calls,
         })
     }
 }

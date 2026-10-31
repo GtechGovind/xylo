@@ -1,4 +1,4 @@
-use super::{is_image_path, speakable_text, time_label};
+use super::{is_image_path, reply_status_label, speakable_text, time_label};
 use std::path::Path;
 
 #[test]
@@ -29,4 +29,12 @@ fn only_image_files_attach_as_images() {
     assert!(is_image_path(Path::new("photo.jpeg")));
     assert!(!is_image_path(Path::new("notes.md")));
     assert!(!is_image_path(Path::new("Makefile")));
+}
+
+#[test]
+fn a_reloaded_cut_off_answer_says_it_reached_the_output_limit() {
+    use xylo_core::MessageStatus;
+    assert_eq!(reply_status_label(MessageStatus::Complete), None);
+    let label = reply_status_label(MessageStatus::Truncated).unwrap();
+    assert!(label.contains("output limit"), "{label}");
 }

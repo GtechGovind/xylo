@@ -9,8 +9,8 @@
 use gpui_kit::SharedString;
 use uuid::Uuid;
 use xylo_core::{
-    ChatMessage, ContextUsage, EngineEvent, ErrorKind, MessageStatus, TurnPhase, TurnRequest,
-    Usage, now_ms,
+    ChatMessage, ContextUsage, EngineEvent, ErrorKind, MessageStatus, NoteKind, TurnPhase,
+    TurnRequest, Usage, now_ms,
 };
 #[path = "tool_presentation.rs"]
 pub mod tool_presentation;
@@ -92,6 +92,9 @@ pub enum Segment {
     Tools(Vec<Uuid>),
     /// A helper agent started by an `agent_delegate` call with this id.
     Subagent(Uuid),
+    /// A note from Xylo's harness, such as a stall warning or an answer
+    /// being continued after the output limit.
+    Note { kind: NoteKind, text: SharedString },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +176,22 @@ pub struct TurnState {
     /// The user retried this failed turn; when it reopens, its partial reply
     /// is replaced rather than kept as history.
     pub resend: bool,
+    /// Why the completed answer is incomplete, shown beside it: the
+    /// harness's [`NoteKind::Truncated`] note when the answer still hit the
+    /// output limit. The archived reply then has [`MessageStatus::Truncated`].
+    pub answer_note: Option<SharedString>,
+    /// The text of the segment being streamed, grown in place. The segment's
+    /// shared string is rebuilt from it at most once per frame
+    /// ([`Self::flush_text`]), so streaming stays linear in its length.
+    stream: String,
+    /// `stream` holds the last segment's text and may be ahead of it.
+    stream_open: bool,
+    /// `stream` has text the last segment does not show yet.
+    stream_pending: bool,
+    /// The earliest live row (0 = the work summary, 1 + n = segment n) whose
+    /// content changed since the list last measured it; the footer always
+    /// is. `None` when only the footer changed.
+    changed_rows: Option<usize>,
 }
 
 /// Earlier helpers kept for the Subagents panel.
@@ -204,30 +223,80 @@ impl TurnState {
             (self.finished_at.unwrap_or_else(now_ms) - start).max(0)
         })
     }
+    /// The text of segment `index`, including streamed text not flushed yet.
+    fn segment_text<'a>(&'a self, index: usize, text: &'a SharedString) -> &'a str {
+        if self.stream_pending && index + 1 == self.segments.len() {
+            &self.stream
+        } else {
+            text
+        }
+    }
     /// All streamed text of this turn, in order.
     pub fn transcript_text(&self) -> String {
         self.segments
             .iter()
-            .filter_map(|segment| match segment {
-                Segment::Text(text) => Some(text.as_ref()),
+            .enumerate()
+            .filter_map(|(index, segment)| match segment {
+                Segment::Text(text) => Some(self.segment_text(index, text)),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n\n")
     }
+    /// Shows text streamed since the last frame in the last segment. Called
+    /// once per frame before the transcript renders.
+    pub fn flush_text(&mut self) {
+        if !self.stream_pending {
+            return;
+        }
+        self.stream_pending = false;
+        if let Some(Segment::Text(text)) = self.segments.last_mut() {
+            *text = SharedString::from(self.stream.clone());
+        }
+    }
+    /// The earliest live row that changed since the last call (see
+    /// `changed_rows`), resetting the record.
+    pub fn take_changed_rows(&mut self) -> Option<usize> {
+        self.changed_rows.take()
+    }
+    /// Records that live row `row` and everything after it changed.
+    fn touch(&mut self, row: usize) {
+        self.changed_rows = Some(self.changed_rows.map_or(row, |known| known.min(row)));
+    }
+    /// The live row of the segment showing call `id`: its tool group, or the
+    /// helper row it runs under.
+    fn row_of_call(&self, id: Uuid) -> usize {
+        let parent = self
+            .tools
+            .iter()
+            .find(|tool| tool.id == id)
+            .and_then(|tool| tool.parent_id);
+        self.segments
+            .iter()
+            .position(|segment| match segment {
+                Segment::Tools(ids) => ids.contains(&id),
+                Segment::Subagent(agent) => *agent == id || Some(*agent) == parent,
+                _ => false,
+            })
+            .map_or(0, |index| index + 1)
+    }
     /// The finished turn's reply as a history message would hold it: the last
     /// text it streamed (the final answer once completed) and how it ended.
     pub fn reply(&self) -> Option<(String, MessageStatus)> {
         let status = match self.outcome.as_ref()? {
+            TurnOutcome::Completed if self.answer_note.is_some() => MessageStatus::Truncated,
             TurnOutcome::Completed => MessageStatus::Complete,
             TurnOutcome::Stopped => MessageStatus::Interrupted,
             TurnOutcome::Failed(_) => MessageStatus::Failed,
         };
         self.segments
             .iter()
+            .enumerate()
             .rev()
-            .find_map(|segment| match segment {
-                Segment::Text(text) if !text.trim().is_empty() => Some((text.to_string(), status)),
+            .find_map(|(index, segment)| match segment {
+                Segment::Text(text) => Some(self.segment_text(index, text))
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| (text.to_owned(), status)),
                 _ => None,
             })
     }
@@ -251,6 +320,11 @@ impl TurnState {
         self.started_at = None;
         self.finished_at = None;
         self.resend = false;
+        self.answer_note = None;
+        self.stream.clear();
+        self.stream_open = false;
+        self.stream_pending = false;
+        self.touch(0);
     }
     /// Admission opened this turn (`Phase { Preparing }`) but the host never
     /// started it: the activity line goes away without leaving a turn behind.
@@ -263,10 +337,15 @@ impl TurnState {
             self.running = false;
             self.phase = None;
             self.started_at = None;
+            self.touch(0);
             self.render_revision = self.render_revision.wrapping_add(1);
         }
     }
     pub fn apply(&mut self, event: EngineEvent) {
+        if !matches!(event, EngineEvent::Delta { .. }) {
+            // Every other event reads or reorders segments: show the stream first.
+            self.flush_text();
+        }
         match event {
             EngineEvent::Ready { .. }
             | EngineEvent::TitleUpdated { .. }
@@ -290,6 +369,13 @@ impl TurnState {
             }
             EngineEvent::Delta { text } => self.push_text(&text),
             EngineEvent::Status { text } => self.status = Some(text),
+            EngineEvent::HarnessNote { kind, text } => {
+                self.segments.push(Segment::Note {
+                    kind,
+                    text: text.into(),
+                });
+                self.touch(self.segments.len());
+            }
             EngineEvent::ToolStarted {
                 action_id,
                 name,
@@ -297,6 +383,7 @@ impl TurnState {
                 parent_id,
             } => {
                 self.card(action_id, name, arguments, parent_id);
+                self.touch(self.row_of_call(action_id));
             }
             EngineEvent::ApprovalRequired {
                 action_id,
@@ -315,6 +402,7 @@ impl TurnState {
                 if reason.is_some() {
                     card.reason = reason;
                 }
+                self.touch(self.row_of_call(action_id));
             }
             EngineEvent::ContextUsage { usage } => self.context = Some(usage),
             EngineEvent::ToolFinished {
@@ -322,14 +410,12 @@ impl TurnState {
                 result,
                 success,
                 ..
-            } => self.finish_tool(action_id, result, success),
+            } => {
+                self.finish_tool(action_id, result, success);
+                self.touch(self.row_of_call(action_id));
+            }
             EngineEvent::Completed { text, usage } => {
-                if !text.trim().is_empty() {
-                    match self.segments.last_mut() {
-                        Some(Segment::Text(tail)) => *tail = text.into(),
-                        _ => self.segments.push(Segment::Text(text.into())),
-                    }
-                }
+                self.settle_answer(text);
                 self.usage = usage;
                 self.finish(TurnOutcome::Completed);
             }
@@ -346,6 +432,40 @@ impl TurnState {
         }
         self.render_revision = self.render_revision.wrapping_add(1);
     }
+    /// Puts the completed answer in place once. A continued answer streams
+    /// as several text segments with continuation notes between them, and
+    /// `Completed` carries them joined: every text after the last tool or
+    /// helper row gives way to that one answer, the notes stay before it as
+    /// steps, and a [`NoteKind::Truncated`] note right before `Completed`
+    /// (the answer still hit the limit) becomes the answer's status instead
+    /// of a step.
+    fn settle_answer(&mut self, text: String) {
+        self.stream_open = false;
+        let start = self
+            .segments
+            .iter()
+            .rposition(|segment| matches!(segment, Segment::Tools(_) | Segment::Subagent(_)))
+            .map_or(0, |boundary| boundary + 1);
+        if matches!(
+            self.segments.last(),
+            Some(Segment::Note {
+                kind: NoteKind::Truncated,
+                ..
+            })
+        ) && let Some(Segment::Note { text, .. }) = self.segments.pop()
+        {
+            self.answer_note = Some(text);
+        }
+        if text.trim().is_empty() {
+            return;
+        }
+        let tail = self.segments.split_off(start);
+        self.segments.extend(
+            tail.into_iter()
+                .filter(|segment| !matches!(segment, Segment::Text(_))),
+        );
+        self.segments.push(Segment::Text(text.into()));
+    }
     fn begin(&mut self) {
         self.archive();
         let now = now_ms();
@@ -354,19 +474,27 @@ impl TurnState {
         self.phase = Some(TurnPhase::Preparing);
         self.phase_since = now;
     }
+    /// Appends streamed text to the open text segment in place; the segment
+    /// shows it at the next [`Self::flush_text`].
     fn push_text(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
-        match self.segments.last_mut() {
+        match self.segments.last() {
+            Some(Segment::Text(_)) if self.stream_open => {}
             Some(Segment::Text(text)) => {
-                let mut joined = String::with_capacity(text.len() + delta.len());
-                joined.push_str(text);
-                joined.push_str(delta);
-                *text = joined.into();
+                self.stream = text.to_string();
+                self.stream_open = true;
             }
-            _ => self.segments.push(Segment::Text(delta.to_owned().into())),
+            _ => {
+                self.stream.clear();
+                self.stream_open = true;
+                self.segments.push(Segment::Text(SharedString::default()));
+            }
         }
+        self.stream.push_str(delta);
+        self.stream_pending = true;
+        self.touch(self.segments.len());
     }
     /// The card for `id`, created and placed in the transcript on first sight.
     fn card(
@@ -415,7 +543,9 @@ impl TurnState {
         let index = self.tools.len();
         self.tools.push(ToolCard::new(id, name, input, parent_id));
         if top_level_plan {
+            // An earlier checklist in another group stops showing.
             self.refresh_plan();
+            self.touch(0);
         }
         &mut self.tools[index]
     }
@@ -470,6 +600,7 @@ impl TurnState {
             }
         }
         self.segments.splice(segment..=segment, replacement);
+        self.touch(segment + 1);
         Some(self.subagents.len() - 1)
     }
     fn finish_tool(&mut self, id: Uuid, result: String, success: bool) {
@@ -496,6 +627,7 @@ impl TurnState {
         }
         if plan {
             self.refresh_plan();
+            self.touch(0);
         }
     }
     /// The newest top-level checklist that did not fail.
@@ -510,6 +642,8 @@ impl TurnState {
             .map(|tool| tool.id);
     }
     fn finish(&mut self, outcome: TurnOutcome) {
+        // The work folds and the summary appears: every live row changes.
+        self.touch(0);
         let now = now_ms();
         self.running = false;
         self.finished_at = Some(now);

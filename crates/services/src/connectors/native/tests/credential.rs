@@ -84,6 +84,7 @@ async fn cancelling_a_blocked_credential_read_returns_but_keeps_bounded_admissio
         command: None,
         args: Vec::new(),
         credential_ref: Some("fixture".into()),
+        trusted: false,
     };
     let cancel = CancellationToken::new();
     let mut tasks = tokio::task::JoinSet::new();

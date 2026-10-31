@@ -88,6 +88,7 @@ fn verdict(
             reach: &reach,
             workspace: &workspace,
             network: None,
+            untrusted_input: false,
         },
     )
 }
@@ -309,6 +310,7 @@ fn enabled_hooks_run_in_every_mode() {
                 reach: &Reach::Project,
                 workspace: &workspace,
                 network: None,
+                untrusted_input: false,
             },
         );
         assert_eq!(verdict, Verdict::Allow, "{mode:?}");
@@ -335,6 +337,7 @@ fn network_verdict(mode: PermissionMode, name: &str, arguments: Value) -> Verdic
             reach: &Reach::Project,
             workspace,
             network: Some("Install the project's dependencies"),
+            untrusted_input: false,
         },
     )
 }
@@ -416,6 +419,7 @@ fn project_verdict(mode: PermissionMode, name: &str, arguments: Value, writes: b
             reach: &Reach::Project,
             workspace: workspace.path(),
             network: None,
+            untrusted_input: false,
         },
     )
 }
@@ -572,7 +576,39 @@ fn approve_for_me_asks_for_git_fetches_that_can_run_programs() {
             reach: &Reach::Project,
             workspace: plain.path(),
             network: Some("Fetch"),
+            untrusted_input: false,
         },
     );
     assert!(matches!(verdict, Verdict::Ask(_)), "{verdict:?}");
+}
+
+#[test]
+fn memory_writes_after_untrusted_input_are_reviewed_without_standing_rules() {
+    use PermissionMode::*;
+    let workspace = std::env::temp_dir();
+    let arguments = json!({"content":"Deploys go through staging","source":"user"});
+    let call = |untrusted_input| Call {
+        name: "memory_remember",
+        arguments: &arguments,
+        writes: true,
+        origin: Origin::Model,
+        reach: &Reach::Project,
+        workspace: &workspace,
+        network: None,
+        untrusted_input,
+    };
+    for mode in [AskForApproval, ApproveForMe, FullAccess] {
+        assert_eq!(decide(mode, &call(false)), Verdict::Allow, "{mode:?}");
+    }
+    for mode in [AskForApproval, ApproveForMe] {
+        assert_eq!(
+            decide(mode, &call(true)),
+            Verdict::Ask(UNTRUSTED_MEMORY_WRITE.into()),
+            "{mode:?}"
+        );
+    }
+    assert_eq!(decide(FullAccess, &call(true)), Verdict::Allow);
+    assert!(matches!(decide(ReadOnly, &call(true)), Verdict::Refuse(_)));
+    assert!(approval_rule_for(&call(false)).is_some());
+    assert_eq!(approval_rule_for(&call(true)), None);
 }

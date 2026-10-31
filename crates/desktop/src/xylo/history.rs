@@ -26,6 +26,9 @@ pub(super) struct ChatHistory {
     pending_anchor: Option<(Uuid, PathBuf)>,
     pending_after: Option<(i64, PathBuf)>,
     highlight: Option<Uuid>,
+    /// Each message's text as a shared string, made once: rows hand it to the
+    /// markdown view and their actions without copying it every frame.
+    texts: std::collections::HashMap<Uuid, SharedString>,
 }
 impl ChatHistory {
     fn new() -> Self {
@@ -50,6 +53,7 @@ impl ChatHistory {
             pending_anchor: None,
             pending_after: None,
             highlight: None,
+            texts: Default::default(),
         }
     }
     /// Whether the page in flight is an earlier page of an open conversation.
@@ -286,11 +290,41 @@ impl Xylo {
         // Invalidating during render bumps the list's dependency version and
         // defeats its height cache on every spinner/input frame. Only actual
         // turn changes or explicit action expansion invalidate live rows.
+        // Streamed text shows once per frame, here, rather than per delta.
+        let changed_rows = self.turns.get_mut(&self.session).and_then(|turn| {
+            turn.flush_text();
+            turn.take_changed_rows()
+        });
+        for message in &self.messages {
+            history
+                .texts
+                .entry(message.id)
+                .or_insert_with(|| SharedString::from(message.content.clone()));
+        }
+        if history.texts.len() > self.messages.len() * 2 + 16 {
+            let kept: BTreeSet<Uuid> = self.messages.iter().map(|message| message.id).collect();
+            history.texts.retain(|id, _| kept.contains(id));
+        }
         if history.live_revision != Some(revision) {
-            let previous_messages = history
-                .live_revision
-                .map_or(self.messages.len(), |(_, count, _)| count);
-            let first = (1 + previous_messages.min(self.messages.len())).min(count);
+            let previous = history.live_revision;
+            let previous_messages = previous.map_or(self.messages.len(), |(_, count, _)| count);
+            let live_start = 1 + self.messages.len();
+            // A turn change re-measures only the rows it touched and the
+            // footer; an explicit invalidation (expanding a row, a decision)
+            // or a send starting re-measures the whole live turn.
+            let live_first = match (previous, changed_rows) {
+                (None, _) => live_start,
+                (Some((_, _, sending)), _) if sending != revision.2 => live_start,
+                (Some(_), Some(row)) => live_start + row,
+                (Some(_), None) => count.saturating_sub(1),
+            };
+            // Messages that arrived or left since the last measure, if any.
+            let messages_first = if previous_messages == self.messages.len() {
+                count
+            } else {
+                1 + previous_messages.min(self.messages.len())
+            };
+            let first = messages_first.min(live_first).min(count);
             if first < count {
                 history.list.remeasure_items(first..count);
                 #[cfg(test)]
@@ -533,6 +567,14 @@ impl Xylo {
             history.list.set_follow_mode(FollowMode::Tail);
         }
         self.request_history(false, cx);
+    }
+    /// A message's text as the shared string its row renders.
+    pub(super) fn message_text(&self, message: &ChatMessage) -> SharedString {
+        self.histories
+            .get(&self.session)
+            .and_then(|history| history.texts.get(&message.id))
+            .cloned()
+            .unwrap_or_else(|| SharedString::from(message.content.clone()))
     }
     pub(super) fn history_message_highlight(&self, id: Uuid) -> bool {
         self.histories

@@ -16,6 +16,14 @@ use xylo_core::{ChatMessage, Conversation, now_ms};
 
 const MAX_STEPS: usize = 16;
 const MAX_CASES: usize = 16;
+const IDLE_DELAY: Duration = Duration::from_secs(2);
+const MAX_FAILURE_DELAY: Duration = Duration::from_secs(60);
+/// Exponential backoff after consecutive failed passes: 1s, 2s, 4s ... 60s.
+fn failure_delay(failures: u32) -> Duration {
+    Duration::from_secs(1)
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(6))
+        .min(MAX_FAILURE_DELAY)
+}
 fn digest(value: &impl serde::Serialize) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
 }
@@ -36,25 +44,50 @@ impl LearningService {
     pub async fn run(&self, cancel: CancellationToken) -> Result<()> {
         let mut before = None;
         let mut backfill = true;
+        let mut failures = 0u32;
         loop {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            if backfill {
-                let service = self.clone();
-                let page =
-                    tokio::task::spawn_blocking(move || service.backfill_completed(before, 32))
-                        .await??;
-                before = page.0;
-                backfill = page.1;
-            }
-            let batch = self.process_pending(4, &cancel).await?;
-            if batch.processed == 0 && !backfill {
-                tokio::select! {_ = cancel.cancelled()=>return Ok(()),_ = tokio::time::sleep(Duration::from_secs(2))=>{}}
-            } else {
-                tokio::task::yield_now().await;
-            }
+            let delay = match self.pass(&mut before, &mut backfill, &cancel).await {
+                Ok(false) => {
+                    failures = 0;
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Ok(true) => {
+                    failures = 0;
+                    IDLE_DELAY
+                }
+                // A failed claim, backfill page or worker must not end background
+                // learning for the rest of the session; durable jobs stay queued.
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    let delay = failure_delay(failures);
+                    tracing::warn!(%error,attempt=failures,retry_ms=delay.as_millis() as u64,"Procedural learning pass failed; retrying");
+                    delay
+                }
+            };
+            tokio::select! {_ = cancel.cancelled()=>return Ok(()),_ = tokio::time::sleep(delay)=>{}}
         }
+    }
+    /// One backfill page plus one bounded job batch. Returns true when idle.
+    async fn pass(
+        &self,
+        before: &mut Option<i64>,
+        backfill: &mut bool,
+        cancel: &CancellationToken,
+    ) -> Result<bool> {
+        if *backfill {
+            let service = self.clone();
+            let cursor = *before;
+            let page = tokio::task::spawn_blocking(move || service.backfill_completed(cursor, 32))
+                .await??;
+            *before = page.0;
+            *backfill = page.1;
+        }
+        let batch = self.process_pending(4, cancel).await?;
+        Ok(batch.processed == 0 && !*backfill)
     }
     pub async fn process_pending(
         &self,

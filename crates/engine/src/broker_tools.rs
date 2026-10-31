@@ -1,8 +1,13 @@
 //! The agent loop's view of a [`ToolBroker`].
+//!
+//! Scheduling follows each call's effective classification: a tool's static
+//! `writes` flag, a `call_tool`'s target, and for `connector_call` the target
+//! tool's classification when Xylo can vouch for it
+//! ([`ToolBroker::connector_call_reads`]). Anything unknown is a write.
 use crate::{
     agent_loop::{Access, ToolExecutor},
     model::ToolSchema,
-    tools::ToolBroker,
+    tools::{ToolBroker, lookup::CompiledSchema},
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -77,12 +82,34 @@ impl ToolExecutor for BrokerTools {
             .iter()
             .find(|definition| definition.name == name)
             .map(|definition| {
-                if definition.writes {
-                    Access::Writes
-                } else {
+                let reads = !definition.writes
+                    || (name == "connector_call" && self.broker.connector_call_reads(arguments));
+                if reads {
                     Access::ReadOnly
+                } else {
+                    Access::Writes
                 }
             })
+    }
+
+    fn parameters(&self, name: &str) -> Option<Arc<CompiledSchema>> {
+        if !self.offered(name) {
+            return None;
+        }
+        self.broker.compiled_parameters(name)
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.broker
+            .definitions()
+            .iter()
+            .filter(|definition| self.offered(&definition.name))
+            .map(|definition| definition.name.clone())
+            .collect()
+    }
+
+    fn connector_tools(&self, arguments: &Value) -> Option<Vec<(String, Arc<CompiledSchema>)>> {
+        self.broker.connector_catalog(arguments)
     }
 
     fn execute(&self, call_id: &str, name: &str, arguments: Value) -> anyhow::Result<String> {

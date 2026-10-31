@@ -21,7 +21,7 @@ fn stereo_48khz_is_mixed_resampled_and_duration_preserved() {
     }
     writer.finalize().unwrap();
     let info = normalize(
-        &input,
+        std::fs::File::open(&input).unwrap(),
         &root.path().join("mono.wav"),
         120,
         &CancellationToken::new(),
@@ -45,7 +45,7 @@ fn converter_cancels_without_leaving_an_output() {
     let cancel = CancellationToken::new();
     cancel.cancel();
     let output = root.path().join("out.wav");
-    assert!(normalize(&input, &output, 120, &cancel).is_err());
+    assert!(normalize(std::fs::File::open(&input).unwrap(), &output, 120, &cancel).is_err());
     assert!(!output.exists());
 }
 #[test]

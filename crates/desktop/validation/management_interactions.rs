@@ -183,6 +183,11 @@ for line in sys.stdin:
                         input.set_value("first argument\n--readonly", window, cx)
                     });
                 });
+                window.render_frame(cx);
+                assert_eq!(window.find("connector-trusted").checked(), Some(false));
+                window.click("connector-trusted", cx);
+                window.render_frame(cx);
+                assert_eq!(window.find("connector-trusted").checked(), Some(true));
                 window.click("connector-save", cx);
             })
             .unwrap();
@@ -230,6 +235,10 @@ for line in sys.stdin:
             assert_eq!(saved[0].command.as_deref(), Some(server.as_path()));
             assert!(saved[0].credential_ref.is_none());
             assert_eq!(saved[0].args, vec!["first argument", "--readonly"]);
+            assert!(
+                saved[0].trusted,
+                "the trust switch saves with the connection"
+            );
             cx.update_window(fixture.window, |_, window, cx| {
                 window.render_frame(cx);
                 window.click(("connector-tools", 0usize), cx);

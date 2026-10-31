@@ -85,6 +85,8 @@ fn text_and_tool_batches_stay_in_event_order() {
     delta(&mut state, "Found it.");
     started(&mut state, edit, "file_edit", None);
     delta(&mut state, "Done");
+    // Streamed text reaches its segment at the next frame's flush.
+    state.flush_text();
     assert_eq!(
         state.segments,
         vec![
@@ -94,6 +96,69 @@ fn text_and_tool_batches_stay_in_event_order() {
             Segment::Tools(vec![edit]),
             Segment::Text("Done".into()),
         ]
+    );
+}
+
+#[test]
+fn streaming_appends_in_place_and_shows_once_per_flush() {
+    let mut state = TurnState::default();
+    state.apply(EngineEvent::Started);
+    state.take_changed_rows();
+    for _ in 0..1000 {
+        delta(&mut state, "token ");
+    }
+    assert_eq!(
+        state.segments,
+        vec![Segment::Text("".into())],
+        "Nothing is rebuilt per delta"
+    );
+    assert_eq!(state.transcript_text(), "token ".repeat(1000));
+    state.flush_text();
+    assert_eq!(
+        state.segments,
+        vec![Segment::Text("token ".repeat(1000).into())]
+    );
+    delta(&mut state, "more");
+    state.flush_text();
+    assert_eq!(
+        state.transcript_text(),
+        format!("{}more", "token ".repeat(1000))
+    );
+    assert_eq!(
+        state.take_changed_rows(),
+        Some(1),
+        "Only the streaming segment's row changed"
+    );
+}
+
+#[test]
+fn only_rows_from_the_first_change_onward_are_remeasured() {
+    let mut state = TurnState::default();
+    state.apply(EngineEvent::Started);
+    delta(&mut state, "Looking.");
+    let (read, search) = (Uuid::new_v4(), Uuid::new_v4());
+    started(&mut state, read, "file_read", None);
+    state.take_changed_rows();
+    state.apply(EngineEvent::Phase {
+        phase: TurnPhase::Thinking,
+    });
+    assert_eq!(
+        state.take_changed_rows(),
+        None,
+        "A phase only moves the footer"
+    );
+    started(&mut state, search, "search_project", None);
+    assert_eq!(state.take_changed_rows(), Some(2), "The tool group's row");
+    finished(&mut state, read, "file_read", "{}", true);
+    assert_eq!(state.take_changed_rows(), Some(2));
+    state.apply(EngineEvent::Completed {
+        text: "Done.".into(),
+        usage: Usage::default(),
+    });
+    assert_eq!(
+        state.take_changed_rows(),
+        Some(0),
+        "Finishing folds the work and adds the summary"
     );
 }
 
@@ -131,6 +196,93 @@ fn completion_replaces_the_streamed_answer_in_place() {
             .any(|segment| matches!(segment, Segment::Text(_)))
     );
     assert_eq!(tools_only.reply(), None);
+}
+
+fn note(state: &mut TurnState, kind: NoteKind, text: &str) {
+    state.apply(EngineEvent::HarnessNote {
+        kind,
+        text: text.into(),
+    });
+}
+
+#[test]
+fn a_continued_answer_appears_once_with_its_continuation_note_before_it() {
+    let mut state = TurnState::default();
+    state.apply(EngineEvent::Started);
+    started(&mut state, Uuid::new_v4(), "file_read", None);
+    delta(&mut state, "Part one, ");
+    note(
+        &mut state,
+        NoteKind::Continuation,
+        "Asked the model to continue.",
+    );
+    delta(&mut state, "part two.");
+    state.apply(EngineEvent::Completed {
+        text: "Part one, part two.".into(),
+        usage: Usage::default(),
+    });
+    assert_eq!(state.segments.len(), 3);
+    assert!(matches!(
+        state.segments[1],
+        Segment::Note {
+            kind: NoteKind::Continuation,
+            ..
+        }
+    ));
+    assert_eq!(
+        state.segments[2],
+        Segment::Text("Part one, part two.".into())
+    );
+    assert_eq!(state.transcript_text(), "Part one, part two.");
+    assert_eq!(state.answer_note, None, "The continued answer finished");
+}
+
+#[test]
+fn an_answer_still_cut_off_carries_the_note_as_its_status() {
+    let mut state = TurnState::default();
+    state.apply(EngineEvent::Started);
+    delta(&mut state, "Everything up to the limit");
+    note(
+        &mut state,
+        NoteKind::Truncated,
+        "It is shown as far as it got.",
+    );
+    state.apply(EngineEvent::Completed {
+        text: "Everything up to the limit".into(),
+        usage: Usage::default(),
+    });
+    assert_eq!(
+        state.segments,
+        vec![Segment::Text("Everything up to the limit".into())],
+        "No second copy and no trailing note row"
+    );
+    assert_eq!(
+        state.answer_note.as_deref(),
+        Some("It is shown as far as it got.")
+    );
+    assert_eq!(state.transcript_text(), "Everything up to the limit");
+    assert_eq!(state.reply().unwrap().1, MessageStatus::Truncated);
+}
+
+#[test]
+fn only_a_truncated_note_marks_the_answer_cut_off() {
+    let mut state = TurnState::default();
+    state.apply(EngineEvent::Started);
+    delta(&mut state, "Done");
+    note(&mut state, NoteKind::StepBudget, "Step 300 of at most 400.");
+    state.apply(EngineEvent::Completed {
+        text: "Done".into(),
+        usage: Usage::default(),
+    });
+    assert_eq!(state.answer_note, None);
+    assert!(matches!(
+        state.segments[0],
+        Segment::Note {
+            kind: NoteKind::StepBudget,
+            ..
+        }
+    ));
+    assert_eq!(state.reply().unwrap().1, MessageStatus::Complete);
 }
 
 #[test]

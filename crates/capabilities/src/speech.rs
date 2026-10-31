@@ -1,6 +1,6 @@
 //! Native speech processing; recording and playback are separate user actions.
 use crate::{
-    CapabilityConfig, input_path, observation, output_path,
+    CapabilityConfig, observation, open_input, output_path,
     process::{self, ProcessSpec},
     required_str,
 };
@@ -62,7 +62,7 @@ pub(crate) async fn execute(
     );
     let mut normalized = None;
     if name == "speech_transcribe" {
-        let input = input_path(config, required_str(args, "path")?)?;
+        let input = open_input(config, required_str(args, "path")?)?.file;
         let destination = output_path(
             config,
             &format!("speech-input-{}", uuid::Uuid::new_v4()),
@@ -72,7 +72,7 @@ pub(crate) async fn execute(
         let output = destination.clone();
         let result = tokio::task::spawn_blocking(move || {
             crate::audio::convert::normalize(
-                &input,
+                input,
                 &output,
                 crate::audio::convert::MAX_SECONDS,
                 &token,

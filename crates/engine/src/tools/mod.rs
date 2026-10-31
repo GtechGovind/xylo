@@ -9,13 +9,21 @@
 //! approval shows the change against current content. Child brokers created
 //! for delegated work share the journal, the mode and the turn's approved
 //! rules, and stamp their events with the parent `agent_delegate` action.
+//!
+//! The offered tool list does not depend on the permission mode (calls are
+//! gated at dispatch), so it stays byte-identical for provider caching. A
+//! memory write's origin is assigned here, never by the model: the
+//! least-trusted content any journaled action of the conversation may have
+//! shown it, or the user's authority when they approved the write.
 mod builtin;
+pub(crate) mod catalog;
 mod code;
 mod image_generation;
+pub(crate) mod lookup;
 mod permissions;
 mod portable;
 mod risk;
-use crate::prompts;
+use crate::{prompts, provider_guard::EffectiveWindow};
 use anyhow::{Context, Result, bail, ensure};
 pub(crate) use code::shell_name;
 use parking_lot::Mutex;
@@ -31,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xylo_capabilities::{CapabilityConfig, CapabilityService};
 use xylo_core::{
-    ConnectorConfig, EngineEvent, MemoryRecord, PermissionMode, ToolDefinition, TurnPhase,
+    ConnectorConfig, EngineEvent, MemoryOrigin, PermissionMode, ToolDefinition, TurnPhase,
     TurnRequest,
 };
 use xylo_services::{
@@ -76,6 +84,61 @@ const CORE_TOOLS: [&str; 19] = [
     "call_tool",
 ];
 
+/// The resident set when the model's window is small
+/// ([`EffectiveWindow::small`]): the tools nearly every coding step needs.
+/// Everything else, configured capability families included, stays reachable
+/// through `search_tools` and `call_tool`, so tool schemas do not crowd out
+/// the conversation. The set depends only on the provider configuration, so
+/// it is stable for a whole session and keeps the cached prefix intact.
+const SMALL_WINDOW_CORE_TOOLS: [&str; 8] = [
+    "file_read",
+    "file_edit",
+    "search_project",
+    "shell_command",
+    "todo_write",
+    "memory_search",
+    "search_tools",
+    "call_tool",
+];
+
+/// Most results one `search_tools` call returns.
+const SEARCH_RESULTS: usize = 8;
+/// Room left in a search result's budget for its status and next actions.
+const SEARCH_ENVELOPE_BYTES: usize = 640;
+/// Largest parameter schema a search result carries whole; larger ones are
+/// shown as a compact signature.
+const SEARCH_SCHEMA_BYTES: usize = 1536;
+
+/// Most project facts recalled automatically for one turn.
+const RECALLED_FACTS: usize = 8;
+
+/// Tools whose output comes from the project or the application itself. Any
+/// other tool's output counts as content from outside the project when a
+/// later memory write's origin is decided (see `ToolBroker::exposure`), so a
+/// new tool is untrusted until it is listed here. Commands, skills and
+/// learned procedures are classified per call instead: by what a command
+/// reaches, by whether a skill is built in, and by where a procedure was
+/// learned. `skill_list` lists learned procedure titles and counts as tool
+/// output.
+const PROJECT_LOCAL_TOOLS: &[&str] = &[
+    "file_read",
+    "file_edit",
+    "file_write",
+    "files_list",
+    "find_files",
+    "search_project",
+    "git_status",
+    "git_diff",
+    "run_command",
+    "shell_command",
+    "todo_write",
+    "memory_remember",
+    "skill_propose",
+    "search_tools",
+    "agent_delegate",
+    "connector_list",
+];
+
 /// Largest approval or start presentation; long arguments are excerpted so an
 /// event can never approach the worker's protocol line limit.
 const PRESENTATION_EVENT_BYTES: usize = 256 * 1024;
@@ -105,6 +168,11 @@ pub struct ToolBroker {
     connectors: ConnectorBroker,
     native: NativeConnectors,
     image_generation: image_generation::Configuration,
+    /// The context the local server reported serving, probed after the broker
+    /// was built; shared with child brokers.
+    served_context: Arc<std::sync::OnceLock<u32>>,
+    /// Compiled schemas, the connector snapshot and the search index.
+    lookup: lookup::Lookup,
 }
 impl ToolBroker {
     pub fn new(
@@ -162,6 +230,8 @@ impl ToolBroker {
             connectors: session.connectors(&store).with_local_scope(connector_scope),
             native: NativeConnectors::new(vault)?,
             image_generation,
+            served_context: Default::default(),
+            lookup: lookup::Lookup::default(),
             store,
             capabilities,
             capability_config: config,
@@ -196,6 +266,8 @@ impl ToolBroker {
         child.advertised = self.advertised.clone();
         child.rules = self.rules.clone();
         child.parent_id = Some(parent_action_id);
+        child.served_context = self.served_context.clone();
+        child.lookup = self.lookup.child();
         Ok(child)
     }
     pub(crate) fn restrict_tools(&mut self, requested: &[String]) -> Result<()> {
@@ -240,60 +312,91 @@ impl ToolBroker {
         self.session.permissions().get()
     }
     /// Whether the current mode lets the model use `definition` at all.
+    /// Only tool search filters by it; the offered tool list stays the same
+    /// in every mode so the provider's cached prefix survives a mode change,
+    /// and [`permissions::decide`] refuses what the mode does not allow.
     fn usable(&self, definition: &ToolDefinition) -> bool {
         self.mode().allows_writes() || !definition.writes
     }
-    /// Initial context and memory tools share one lazy resident embedding model.
-    pub(crate) fn project_facts(&self) -> Result<Vec<MemoryRecord>> {
-        self.memory.recall_sync(
+    /// The project facts to recall for this turn's prompt, at most
+    /// [`RECALLED_FACTS`]. Only facts the user stated or approved, or that
+    /// the agent wrote before reading anything from outside the project, are
+    /// recalled automatically; facts derived from tool output or web content
+    /// reach the model only through `memory_search`, whose journaled results
+    /// count toward the conversation's exposure. Initial context and memory
+    /// tools share one lazy resident embedding model.
+    pub(crate) fn project_facts(&self) -> Result<Vec<xylo_services::RecalledFact>> {
+        let mut facts = self.memory.recall_with_history(
             &self.request.workspace.to_string_lossy(),
             &self.request.prompt,
-            8,
-        )
+            RECALLED_FACTS,
+        )?;
+        facts.retain(|fact| !fact.record.origin.untrusted());
+        Ok(facts)
+    }
+    /// Learned procedures relevant to this turn's prompt, as `(name, title)`.
+    /// Their steps load on demand through `skill_read`; retrieval is advisory:
+    /// it never executes a learned step or relaxes action permissions.
+    /// Like facts, only procedures learned in conversations that read
+    /// nothing from outside the project are recalled automatically.
+    pub(crate) fn learned_procedures(&self) -> Result<Vec<(String, String)>> {
+        let learning = LearningService::new(self.store.clone());
+        let mut learned = Vec::new();
+        for procedure in learning.relevant_skills(
+            &self.request.workspace.to_string_lossy(),
+            &self.request.prompt,
+            2,
+        )? {
+            if !self.procedure_exposure(&procedure)?.untrusted() {
+                learned.push(procedure);
+            }
+        }
+        if !learned.is_empty() {
+            learning.record_retrieval(self.request.session_id, self.request.turn_id, &learned)?;
+        }
+        Ok(learned
+            .into_iter()
+            .map(|skill| (skill.skill.name, skill.title))
+            .collect())
+    }
+    /// Installed skills that only the user may start and that this turn's
+    /// prompt invokes by name, as `(id, description)`.
+    pub(crate) fn invoked_skills(&self) -> Result<Vec<(String, String)>> {
+        portable::invoked(self)
     }
     /// The compact skills index for the system prompt: one `name: description`
-    /// line per built-in skill, installed portable skill, local plugin
-    /// component and relevant learned procedure. Bodies, resources and
-    /// procedure steps load on demand through `extension_skill`,
-    /// `extension_resource` and `skill_read`. Retrieval is advisory: it never
-    /// executes a learned step or relaxes action permissions.
+    /// line per built-in skill, installed portable skill and local plugin
+    /// component. It does not depend on the turn's prompt, so the system
+    /// prompt stays byte-identical across turns; relevant learned procedures
+    /// travel in the turn's recalled-context note instead. Bodies and
+    /// resources load on demand through `extension_skill` and
+    /// `extension_resource`.
     pub(crate) fn project_skill_context(&self) -> Result<String> {
         let mut entries: Vec<(String, String)> = prompts::bundled_skills()
             .iter()
             .map(|skill| (skill.name.to_owned(), skill.description.to_owned()))
             .collect();
         entries.extend(portable::index(self)?);
-        let learning = LearningService::new(self.store.clone());
-        let learned = learning.relevant_skills(
-            &self.request.workspace.to_string_lossy(),
-            &self.request.prompt,
-            2,
-        )?;
-        entries.extend(learned.iter().map(|skill| {
-            (
-                skill.skill.name.clone(),
-                format!(
-                    "Learned procedure: {}. Read its steps with skill_read before reusing them",
-                    skill.title
-                ),
-            )
-        }));
-        if !learned.is_empty() {
-            learning.record_retrieval(self.request.session_id, self.request.turn_id, &learned)?;
-        }
-        Ok(prompts::skills_index(entries.iter().map(
-            |(name, description)| (name.as_str(), description.as_str()),
-        )))
+        Ok(prompts::skills_index(
+            entries
+                .iter()
+                .map(|(name, description)| (name.as_str(), description.as_str())),
+            self.window().prompt_budget().skills_index_bytes,
+        ))
     }
     pub fn set_delegate(&self, handler: Delegate) {
         *self.delegate.lock() = Some(handler);
     }
-    /// The tools to offer the model directly under the current permission
-    /// mode: a stable core set plus capabilities the user configured
-    /// (browser, local inference, speech, a saved image provider and existing
-    /// connectors). Call it again before each model request so a mode change
-    /// is reflected; everything else stays discoverable through `search_tools`.
+    /// The tools to offer the model directly: a stable core set plus
+    /// capabilities the user configured (browser, local inference, speech, a
+    /// saved image provider and existing connectors), or only
+    /// [`SMALL_WINDOW_CORE_TOOLS`] when the model's window is small. The list
+    /// does not depend on the permission mode: tools are gated at dispatch,
+    /// not filtered, so the provider's cached tools block (the front of every
+    /// cached prefix) survives a mode change. Everything else stays
+    /// discoverable through `search_tools`.
     pub fn initial_definitions(&self) -> Vec<ToolDefinition> {
+        let small = self.window().small();
         let config = &self.capability_config;
         let has_connectors = self
             .advertised
@@ -310,9 +413,12 @@ impl ToolBroker {
         self.advertised
             .iter()
             .filter(|definition| {
-                self.usable(definition)
-                    && (CORE_TOOLS.contains(&definition.name.as_str())
-                        || configured(&definition.name))
+                let name = definition.name.as_str();
+                if small {
+                    SMALL_WINDOW_CORE_TOOLS.contains(&name)
+                } else {
+                    CORE_TOOLS.contains(&name) || configured(name)
+                }
             })
             .cloned()
             .collect()
@@ -465,6 +571,11 @@ impl ToolBroker {
             None
         };
         let mode = self.mode();
+        // A memory write's origin is the least-trusted content the
+        // conversation has read, recomputed from the journal.
+        let exposure = (name == "memory_remember")
+            .then(|| self.exposure())
+            .transpose()?;
         let call = Call {
             name,
             arguments: &arguments,
@@ -473,9 +584,10 @@ impl ToolBroker {
             reach: &reach,
             workspace: &self.request.workspace,
             network,
+            untrusted_input: exposure.is_some_and(MemoryOrigin::untrusted),
         };
         let verdict = permissions::decide(mode, &call);
-        let rule = permissions::approval_rule(name, &arguments, &reach, &self.request.workspace);
+        let rule = permissions::approval_rule_for(&call);
         let ask = match verdict {
             Verdict::Refuse(message) => bail!(message),
             Verdict::Allow => None,
@@ -584,6 +696,14 @@ impl ToolBroker {
             let _ = self.store.deny_action(id);
             return Err(error);
         }
+        // A write the user reviewed and approved carries their authority.
+        let memory_origin = exposure.map(|exposure| {
+            if ask.is_some() {
+                MemoryOrigin::UserApproved
+            } else {
+                exposure
+            }
+        });
         if let Some(reason) = ask {
             let refusal = if self.await_approval(id, name, presentation, reason, rule)? {
                 // The mode may have changed while the user decided; an
@@ -653,6 +773,8 @@ impl ToolBroker {
                     component_snapshot.as_ref(),
                     skill_snapshot.as_ref(),
                 )?
+            } else if let Some(memory_origin) = memory_origin {
+                builtin::remember(self, &arguments, memory_origin)?
             } else if builtin::handles(name) {
                 builtin::execute(self, name, &arguments, access)?
             } else {
@@ -821,6 +943,121 @@ impl ToolBroker {
             _ => bail!("Invalid action state"),
         }
     }
+    /// The least-trusted origin a fact written now would have: the most
+    /// exposed content any action of this conversation (every turn, every
+    /// child agent) may have shown the model, or
+    /// [`MemoryOrigin::AgentInferred`] when it read only the project.
+    /// Derived from the durable journal, so it survives restarts and needs no
+    /// state of its own. Recalled facts count with their own origins.
+    fn exposure(&self) -> Result<MemoryOrigin> {
+        self.session_exposure(self.request.session_id, true)
+    }
+    /// The most exposed content any journaled action of `session` may have
+    /// shown the model. With `follow_procedures`, reading a learned procedure
+    /// counts with the exposure of the conversations it was learned from (one
+    /// level deep; a procedure read inside those counts as tool output).
+    fn session_exposure(&self, session: Uuid, follow_procedures: bool) -> Result<MemoryOrigin> {
+        let actions = self.store.session_action_provenance(
+            session,
+            &[
+                "file_read",
+                "files_list",
+                "find_files",
+                "search_project",
+                "run_command",
+                "shell_command",
+                "extension_skill",
+                "extension_resource",
+                "skill_read",
+            ],
+            &["memory_search"],
+        )?;
+        actions
+            .iter()
+            .try_fold(MemoryOrigin::AgentInferred, |least, action| {
+                Ok(least.max(self.action_exposure(action, follow_procedures)?))
+            })
+    }
+    /// What one journaled action may have shown the model.
+    fn action_exposure(
+        &self,
+        action: &xylo_services::ActionProvenance,
+        follow_procedures: bool,
+    ) -> Result<MemoryOrigin> {
+        let name = action.name.as_str();
+        let arguments = action.arguments.as_ref().unwrap_or(&Value::Null);
+        if name.starts_with("browser_") {
+            return Ok(MemoryOrigin::WebContent);
+        }
+        Ok(match name {
+            "run_command" | "shell_command"
+                if arguments.get("network").and_then(Value::as_bool) == Some(true) =>
+            {
+                MemoryOrigin::WebContent
+            }
+            "run_command" | "shell_command" => {
+                if command_stays_in_project(name, arguments, &self.request.workspace) {
+                    MemoryOrigin::AgentInferred
+                } else {
+                    MemoryOrigin::ToolOutput
+                }
+            }
+            "file_read" | "files_list" | "find_files" | "search_project"
+                if matches!(self.reach(name, arguments), Reach::Outside(_)) =>
+            {
+                MemoryOrigin::ToolOutput
+            }
+            // Built-in skills are compiled in; installed ones are third-party text.
+            "extension_skill" | "extension_resource" => {
+                let id = arguments.get("id").or_else(|| arguments.get("package"));
+                if id
+                    .and_then(Value::as_str)
+                    .and_then(prompts::bundled_skill)
+                    .is_some()
+                {
+                    MemoryOrigin::AgentInferred
+                } else {
+                    MemoryOrigin::ToolOutput
+                }
+            }
+            "skill_read" if follow_procedures => {
+                let learned = arguments
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(|procedure| {
+                        LearningService::new(self.store.clone())
+                            .active_skill(&self.request.workspace.to_string_lossy(), procedure)
+                    })
+                    .transpose()?
+                    .flatten();
+                match learned {
+                    Some(learned) => self.procedure_exposure(&learned)?,
+                    None => MemoryOrigin::ToolOutput,
+                }
+            }
+            "memory_search" => recalled_exposure(action.result.as_ref()),
+            name if PROJECT_LOCAL_TOOLS.contains(&name) => MemoryOrigin::AgentInferred,
+            _ => MemoryOrigin::ToolOutput,
+        })
+    }
+    /// The least-trusted content the conversations a learned procedure was
+    /// learned from may have read. A procedure without evidence counts as
+    /// tool output.
+    fn procedure_exposure(&self, learned: &xylo_services::LearnedSkill) -> Result<MemoryOrigin> {
+        let sessions: std::collections::BTreeSet<Uuid> = learned
+            .provenance
+            .iter()
+            .map(|evidence| evidence.session_id)
+            .collect();
+        if sessions.is_empty() {
+            return Ok(MemoryOrigin::ToolOutput);
+        }
+        sessions
+            .into_iter()
+            .try_fold(MemoryOrigin::AgentInferred, |least, session| {
+                Ok(least.max(self.session_exposure(session, false)?))
+            })
+    }
     /// Where a file or search call's path points, resolved like execution
     /// will resolve it. Unresolvable paths count as project paths: execution
     /// then reports the real error, and still refuses to leave the project.
@@ -938,26 +1175,211 @@ impl ToolBroker {
         }
         Ok(allowed && !self.cancel.is_cancelled())
     }
+    /// Ranks every tool this agent may use (built-in tools, then the
+    /// discovered tools of configured connectors under `server__tool` names)
+    /// against the query with BM25 and returns the best [`SEARCH_RESULTS`]
+    /// with short descriptions and their arguments. Connector catalogs come
+    /// from the last discovery only; nothing here starts a server. The index
+    /// is built once per broker and rebuilt only when what it covers changes
+    /// (see [`lookup`]).
     fn search_tools(&self, namespace: Option<&str>, arguments: &Value) -> Value {
         let query = arguments
             .get("query")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_lowercase();
-        let words: Vec<_> = query.split_whitespace().collect();
-        let matches: Vec<_> = self
+            .unwrap_or_default();
+        let search = self.search_index(namespace);
+        let mut via_connector = false;
+        let mut found: Vec<Value> = search
+            .index
+            .rank(query, SEARCH_RESULTS)
+            .into_iter()
+            .map(|index| {
+                let entry = &search.entries[index];
+                let mut found =
+                    json!({"description":catalog::short_description(&entry.description)});
+                match &entry.connector {
+                    Some(config) => {
+                        via_connector = true;
+                        found["name"] =
+                            json!(format!("{}__{}", connector_slug(&config.name), entry.name));
+                        found["connector_call"] =
+                            json!({"connector_id":config.id,"tool":entry.name});
+                    }
+                    None => found["name"] = json!(entry.name),
+                }
+                if entry.parameters.to_string().len() <= SEARCH_SCHEMA_BYTES {
+                    found["parameters"] = entry.parameters.clone();
+                } else {
+                    found["arguments"] = json!(catalog::signature(&entry.parameters));
+                }
+                found
+            })
+            .collect();
+        let budget = self
+            .window()
+            .tool_result_bytes()
+            .saturating_sub(SEARCH_ENVELOPE_BYTES);
+        fit_search_results(&mut found, budget);
+        let mut next_actions = vec![if found.is_empty() {
+            "No tool matched. Search again with other words for the action and its object, for example \"create issue\" or \"browser screenshot\""
+        } else {
+            "Run a result with call_tool, giving its name and arguments"
+        }];
+        if via_connector {
+            next_actions.push("Run a connector result with connector_call, giving its connector_id, tool and arguments");
+        }
+        let mut summary = json!({"tools":found});
+        if !search.undiscovered.is_empty() {
+            summary["undiscovered_connectors"] = json!(
+                search
+                    .undiscovered
+                    .iter()
+                    .map(|config| json!({"connector_id":config.id,"name":config.name}))
+                    .collect::<Vec<_>>()
+            );
+            next_actions.push("connector_tools discovers the tools of an undiscovered connector");
+        }
+        json!({"status":"success","summary":summary,"next_actions":next_actions,"artifacts":[]})
+    }
+    /// The search index for what this agent may use right now, reused while
+    /// the usable built-in tools, the write permission and the connector
+    /// snapshot stay the same.
+    fn search_index(&self, namespace: Option<&str>) -> Arc<lookup::SearchIndex> {
+        let builtin: Vec<&ToolDefinition> = self
             .advertised
             .iter()
-            .filter(|d| {
-                self.usable(d)
-                    && (namespace.is_none() || d.name != "agent_delegate")
-                    && words.iter().any(|word| {
-                        d.name.contains(word) || d.description.to_lowercase().contains(word)
-                    })
-            })
-            .take(12)
+            .filter(|d| self.usable(d) && (namespace.is_none() || d.name != "agent_delegate"))
             .collect();
-        json!({"status":"success","summary":matches,"next_actions":["Use call_tool with the selected tool name and documented arguments"],"artifacts":[]})
+        let key = lookup::SearchKey {
+            builtin: builtin.iter().map(|d| d.name.clone()).collect(),
+            writes: self.mode().allows_writes(),
+        };
+        if let Some(index) = self.lookup.search.lock().as_ref()
+            && index.key == key
+        {
+            return index.clone();
+        }
+        let mut entries: Vec<lookup::SearchEntry> = builtin
+            .iter()
+            .map(|definition| lookup::SearchEntry {
+                name: definition.name.clone(),
+                description: definition.description.clone(),
+                parameters: definition.parameters.clone(),
+                connector: None,
+            })
+            .collect();
+        let mut undiscovered = Vec::new();
+        let searchable = self
+            .advertised
+            .iter()
+            .any(|definition| definition.name == "connector_call");
+        if searchable {
+            for connector in self.connector_snapshot().iter() {
+                let Some(tools) = &connector.tools else {
+                    if is_mcp(&connector.config) {
+                        undiscovered.push(connector.config.clone());
+                    }
+                    continue;
+                };
+                entries.extend(
+                    tools
+                        .iter()
+                        .map(|tool| &tool.definition)
+                        .filter(|tool| key.writes || !effective_writes(&connector.config, tool))
+                        .map(|tool| lookup::SearchEntry {
+                            name: tool.name.clone(),
+                            description: tool.description.clone(),
+                            parameters: tool.parameters.clone(),
+                            connector: Some(connector.config.clone()),
+                        }),
+                );
+            }
+        }
+        let index = Arc::new(lookup::SearchIndex::new(key, entries, undiscovered));
+        *self.lookup.search.lock() = Some(index.clone());
+        index
+    }
+    /// Configured connectors with their discovered tools, read from the
+    /// store once per broker and again after a rediscovery. A store failure
+    /// leaves connectors out (and is retried next time) rather than failing.
+    fn connector_snapshot(&self) -> Arc<Vec<lookup::ConnectorEntry>> {
+        if let Some(snapshot) = self.lookup.connectors.lock().as_ref() {
+            return snapshot.clone();
+        }
+        let configs = match self.store.connectors() {
+            Ok(configs) => configs,
+            Err(error) => {
+                tracing::warn!("Connectors left out of tool lookups: {error:#}");
+                return Arc::new(Vec::new());
+            }
+        };
+        let snapshot = Arc::new(
+            configs
+                .into_iter()
+                .map(|config| {
+                    let tools = self.discovered_tools(&config);
+                    lookup::ConnectorEntry::new(config, tools)
+                })
+                .collect::<Vec<_>>(),
+        );
+        *self.lookup.connectors.lock() = Some(snapshot.clone());
+        snapshot
+    }
+    /// A connector's tools from Xylo's own definitions (native connectors) or
+    /// the last discovery (MCP servers), without network or process work;
+    /// `None` when there is nothing to show.
+    fn discovered_tools(&self, config: &ConnectorConfig) -> Option<Vec<ToolDefinition>> {
+        let tools = if is_mcp(config) {
+            self.connectors.cached_tools(config)
+        } else {
+            NativeConnectors::tools(&config.transport)
+        };
+        tools.ok().filter(|tools| !tools.is_empty())
+    }
+    /// The compiled argument schema of the tool `name`, compiled once per
+    /// broker family.
+    pub(crate) fn compiled_parameters(&self, name: &str) -> Option<Arc<lookup::CompiledSchema>> {
+        let definition = self.definitions.iter().find(|d| d.name == name)?;
+        Some(
+            self.lookup
+                .schemas
+                .get(name, || definition.parameters.clone()),
+        )
+    }
+    /// The discovered tools, with compiled schemas, of the connector a
+    /// `connector_call` names, for argument validation before dispatch;
+    /// `None` when the connector is not configured or not yet discovered.
+    pub(crate) fn connector_catalog(
+        &self,
+        arguments: &Value,
+    ) -> Option<Vec<(String, Arc<lookup::CompiledSchema>)>> {
+        let snapshot = self.connector_snapshot();
+        let connector = snapshot_entry(&snapshot, arguments)?;
+        Some(
+            connector
+                .tools
+                .as_ref()?
+                .iter()
+                .map(|tool| (tool.definition.name.clone(), tool.schema.clone()))
+                .collect(),
+        )
+    }
+    /// Whether a `connector_call` may be scheduled alongside other read-only
+    /// calls: only when its target is read-only by a trusted classification
+    /// ([`effective_writes`]). Everything else, including an unknown
+    /// connector or tool, is scheduled as a write.
+    pub(crate) fn connector_call_reads(&self, arguments: &Value) -> bool {
+        let snapshot = self.connector_snapshot();
+        let Some(connector) = snapshot_entry(&snapshot, arguments) else {
+            return false;
+        };
+        let tool = arguments.get("tool").and_then(Value::as_str);
+        connector.tools.as_ref().is_some_and(|tools| {
+            tools.iter().any(|candidate| {
+                Some(candidate.definition.name.as_str()) == tool
+                    && !effective_writes(&connector.config, &candidate.definition)
+            })
+        })
     }
     fn run_event_hooks(
         &self,
@@ -1087,8 +1509,9 @@ impl ToolBroker {
                 )?;
             }
             // MCP servers mark read-only tools with annotations; the
-            // connector layer already treats anything else as a write.
-            definition.writes = target.writes;
+            // connector layer already treats anything else as a write, and
+            // the hint counts only for a server the user trusts.
+            definition.writes = effective_writes(&config, &target);
         } else if name == "connector_tools" {
             definition.writes = self.connector(args)?.transport == "stdio";
         } else if name == "extension_component" {
@@ -1110,6 +1533,8 @@ impl ToolBroker {
             } else {
                 NativeConnectors::tools(&config.transport)?
             };
+            // A rediscovery may change schemas and classifications.
+            self.lookup.invalidate_connectors();
             return Ok(json!({"status":"success","summary":tools,"artifacts":[]}));
         }
         ensure!(name == "connector_call", "Unknown connector operation");
@@ -1229,30 +1654,55 @@ impl ToolBroker {
             .map_err(|error| error.error)?;
         Ok(path)
     }
+    /// Records the context the turn's local server reported serving; set
+    /// once per turn, before the first model call.
+    pub(crate) fn set_served_context(&self, served: Option<u32>) {
+        if let Some(served) = served {
+            let _ = self.served_context.set(served);
+        }
+    }
+    /// The effective context window of this turn's model; every size the
+    /// model sees (tool results, file reads, prompt sections) scales from it.
+    ///
+    /// The broker is built before the turn probes the local server, so the
+    /// probed value arrives through [`ToolBroker::set_served_context`].
+    pub(crate) fn window(&self) -> EffectiveWindow {
+        let provider = &self.request.provider;
+        match self.served_context.get().copied() {
+            Some(served) if provider.served_context_tokens != Some(served) => {
+                let mut provider = provider.clone();
+                provider.served_context_tokens = Some(served);
+                EffectiveWindow::of(&provider)
+            }
+            _ => EffectiveWindow::of(provider),
+        }
+    }
     /// What the model observes. Unlike the small UI presentation it keeps the
-    /// actual content; oversized results keep both ends of every long field and
-    /// point at the saved complete result, which file_read can page through.
+    /// actual content; results over the window's tool-result budget
+    /// ([`EffectiveWindow::tool_result_bytes`]) keep both ends of every long
+    /// field and point at the saved complete result, which file_read can page
+    /// through.
     pub(crate) fn model_result(&self, id: Uuid, result: Value) -> Value {
-        const MODEL_BYTES: usize = 64 * 1024;
+        let model_bytes = self.window().tool_result_bytes();
         let Ok(encoded) = serde_json::to_vec(&result) else {
             return self.bound_result(id, result);
         };
-        if encoded.len() <= MODEL_BYTES {
+        if encoded.len() <= model_bytes {
             return result;
         }
         let mut shortened = result;
         for limit in [16_384, 8192, 4096, 2048, 1024, 512, 256] {
             shorten_strings(&mut shortened, limit);
-            if serde_json::to_vec(&shortened)
-                .map_or(true, |bytes| bytes.len() <= MODEL_BYTES - 1024)
-            {
+            if serde_json::to_vec(&shortened).map_or(true, |bytes| {
+                bytes.len() <= model_bytes.saturating_sub(1024)
+            }) {
                 break;
             }
         }
-        if serde_json::to_vec(&shortened).map_or(true, |bytes| bytes.len() > MODEL_BYTES) {
+        if serde_json::to_vec(&shortened).map_or(true, |bytes| bytes.len() > model_bytes) {
             let status = shortened.get("status").cloned().unwrap_or(json!("success"));
             let text = serde_json::to_string(&shortened).unwrap_or_default();
-            shortened = json!({"status":status,"summary":excerpt(&text, MODEL_BYTES / 2)});
+            shortened = json!({"status":status,"summary":excerpt(&text, model_bytes / 2)});
         }
         if let Some(object) = shortened.as_object_mut() {
             object.insert("truncated".into(), json!(true));
@@ -1282,8 +1732,14 @@ impl ToolBroker {
     }
     /// Stops this turn's capability helpers. MCP connections belong to the
     /// worker's [`ToolSession`] and stay open for later turns.
+    /// Stops what this broker started. A helper agent's broker closes only
+    /// its own sessions; models and environments belong to the parent turn.
     pub async fn shutdown(&self) -> Result<()> {
-        self.capabilities.shutdown().await
+        if self.parent_id.is_some() {
+            self.capabilities.shutdown_helper_sessions().await
+        } else {
+            self.capabilities.shutdown().await
+        }
     }
 }
 /// Keeps start and approval events far below the protocol line limit; the
@@ -1310,6 +1766,75 @@ fn is_mcp(config: &ConnectorConfig) -> bool {
         config.transport.as_str(),
         "stdio" | "http" | "streamable_http"
     )
+}
+/// Shrinks ranked search results until they fit `budget` bytes, so the model
+/// never sees a search result cut in the middle: lower results' full schemas
+/// become signatures first, then the weakest results go, and only then does
+/// the best match lose its full schema.
+fn fit_search_results(found: &mut Vec<Value>, budget: usize) {
+    let size = |found: &[Value]| serde_json::to_vec(found).map_or(0, |bytes| bytes.len());
+    while size(found) > budget {
+        let lower_schema = found
+            .iter()
+            .skip(1)
+            .rposition(|result| result.get("parameters").is_some())
+            .map(|position| position + 1);
+        let target = match lower_schema {
+            Some(index) => index,
+            None if found.len() > 1 => {
+                found.pop();
+                continue;
+            }
+            None if found
+                .first()
+                .is_some_and(|best| best.get("parameters").is_some()) =>
+            {
+                0
+            }
+            None => break,
+        };
+        if let Some(fields) = found[target].as_object_mut()
+            && let Some(parameters) = fields.remove("parameters")
+        {
+            fields.insert("arguments".into(), json!(catalog::signature(&parameters)));
+        }
+    }
+}
+/// The snapshot entry of the connector `arguments` names by `connector_id`.
+fn snapshot_entry<'a>(
+    snapshot: &'a [lookup::ConnectorEntry],
+    arguments: &Value,
+) -> Option<&'a lookup::ConnectorEntry> {
+    let id = arguments
+        .get("connector_id")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())?;
+    snapshot.iter().find(|connector| connector.config.id == id)
+}
+/// Whether a connector's read-only classification counts. Native
+/// connectors' classifications are compiled into Xylo. An MCP server's
+/// `readOnlyHint` is only that server's own claim, honoured when the user
+/// marked the server trusted in Settings.
+fn classification_trusted(config: &ConnectorConfig) -> bool {
+    !is_mcp(config) || config.trusted
+}
+/// Whether a connector tool counts as a write for permissions, scheduling and
+/// search: always, unless it is read-only by a trusted classification.
+fn effective_writes(config: &ConnectorConfig, tool: &ToolDefinition) -> bool {
+    tool.writes || !classification_trusted(config)
+}
+/// A connector's name as a tool-name prefix: lowercase words joined by `_`.
+fn connector_slug(name: &str) -> String {
+    let words: Vec<String> = name
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    if words.is_empty() {
+        "connector".into()
+    } else {
+        words.join("_")
+    }
 }
 /// Flattens a result into labelled sections with long strings written verbatim.
 fn readable_text(value: &Value) -> String {
@@ -1425,6 +1950,106 @@ fn observation_failed(value: &Value) -> bool {
                         | "outcome_unknown"
                 )
             })
+}
+/// Programs whose output comes from outside the machine's project files.
+const FETCHING_PROGRAMS: &[&str] = &[
+    "curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "telnet", "ftp", "http",
+    "https", "aria2c", "gh",
+];
+
+/// Git subcommands that bring in remote content.
+const FETCHING_GIT: &[&str] = &["fetch", "pull", "clone", "ls-remote", "submodule", "remote"];
+
+/// Whether a command's output can come only from the project: no word names
+/// a path outside `workspace` (absolute, `~`, `..` or a URL), nothing is
+/// expanded by the shell, and no program fetches remote content. The check
+/// is lexical and conservative; anything it cannot read counts as leaving
+/// the project.
+fn command_stays_in_project(name: &str, arguments: &Value, workspace: &std::path::Path) -> bool {
+    let words: Vec<String> = if name == "shell_command" {
+        let Some(command) = arguments.get("command").and_then(Value::as_str) else {
+            return false;
+        };
+        if command.contains(['$', '`']) {
+            return false;
+        }
+        match shell_words::split(command) {
+            Ok(words) => words,
+            Err(_) => return false,
+        }
+    } else {
+        let Some(program) = arguments.get("program").and_then(Value::as_str) else {
+            return false;
+        };
+        std::iter::once(program.to_owned())
+            .chain(
+                arguments
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned),
+            )
+            .collect()
+    };
+    let program_name = |word: &str| {
+        std::path::Path::new(word)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(word)
+            .to_owned()
+    };
+    let fetches = words.iter().enumerate().any(|(index, word)| {
+        let program = program_name(word);
+        FETCHING_PROGRAMS.contains(&program.as_str())
+            || (program == "git"
+                && words
+                    .get(index + 1..)
+                    .is_some_and(|rest| rest.iter().any(|w| FETCHING_GIT.contains(&w.as_str()))))
+    });
+    let leaves = words.iter().enumerate().any(|(index, word)| {
+        // A program found on PATH or in a system directory is not data.
+        let program = index == 0 && name == "run_command";
+        let path = word
+            .split_once('=')
+            .map_or(word.as_str(), |(_, value)| value);
+        word.contains("://")
+            || path.starts_with('~')
+            || path.split(['/', '\\']).any(|part| part == "..")
+            || (!program
+                && path.starts_with('/')
+                && path != "/dev/null"
+                && !std::path::Path::new(path).starts_with(workspace))
+    });
+    !fetches && !leaves
+}
+
+/// The least-trusted origin among the facts (and earlier versions) a
+/// `memory_search` returned in its `summary`. No result showed nothing; a
+/// result or fact whose origin cannot be read counts as tool output.
+fn recalled_exposure(result: Option<&Value>) -> MemoryOrigin {
+    let Some(result) = result else {
+        return MemoryOrigin::AgentInferred;
+    };
+    let Some(facts) = result.get("summary").and_then(Value::as_array) else {
+        return MemoryOrigin::ToolOutput;
+    };
+    facts
+        .iter()
+        .flat_map(|fact| {
+            let previous = fact
+                .get("previously")
+                .filter(|previous| !previous.is_null());
+            std::iter::once(fact.get("origin"))
+                .chain(previous.map(|previous| previous.get("origin")))
+        })
+        .map(|origin| {
+            origin
+                .and_then(|origin| serde_json::from_value(origin.clone()).ok())
+                .unwrap_or(MemoryOrigin::ToolOutput)
+        })
+        .fold(MemoryOrigin::AgentInferred, MemoryOrigin::max)
 }
 fn ensure_observation_success(value: &Value) -> Result<()> {
     if observation_failed(value) {

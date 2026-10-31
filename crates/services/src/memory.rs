@@ -1,3 +1,14 @@
+//! Project facts: hybrid lexical (FTS5 BM25) and optional semantic recall,
+//! fused by reciprocal rank.
+//!
+//! Writes are non-destructive and provenance-bound. Every saved record is
+//! redacted of credentials first ([`redaction`]), carries the origin the
+//! application assigned it, and a correction (`supersedes`) deactivates the
+//! version it replaces without deleting it, so recall can show what a fact
+//! said before. A correction may come only from the same or a more trusted
+//! origin tier ([`MemoryOrigin::tier`]).
+mod redaction;
+
 use crate::Store;
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
@@ -15,7 +26,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
-use xylo_core::{MemoryBackend, MemoryRecord};
+use xylo_core::{MemoryBackend, MemoryOrigin, MemoryRecord};
 
 /// Pooling is part of model compatibility, not an interchangeable tuning choice.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -174,6 +185,25 @@ struct EmbeddingFailure {
     message: String,
     at: Instant,
     reported: bool,
+}
+
+/// A recalled fact and the version it corrected, if that still exists.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecalledFact {
+    #[serde(flatten)]
+    pub record: MemoryRecord,
+    pub previously: Option<PreviousVersion>,
+}
+
+/// An inactive earlier version of a fact.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PreviousVersion {
+    pub id: Uuid,
+    pub content: String,
+    pub origin: MemoryOrigin,
+    pub created_at: i64,
+    /// When the correction replaced it: the correction's `created_at`.
+    pub until: i64,
 }
 
 #[derive(Clone)]
@@ -402,7 +432,12 @@ impl SqliteMemory {
         }
         result
     }
-    pub fn remember_sync(&self, record: MemoryRecord) -> Result<()> {
+    /// Saves `record` with its content and source redacted of credentials
+    /// and returns the record as stored. Saving the same record again is a
+    /// no-op; reusing its id for different content is an error.
+    pub fn remember_sync(&self, mut record: MemoryRecord) -> Result<MemoryRecord> {
+        record.content = redaction::redact_secrets(&record.content);
+        record.source = redaction::redact_secrets(&record.source);
         ensure!(
             !record.scope.trim().is_empty()
                 && !record.content.trim().is_empty()
@@ -427,16 +462,24 @@ impl SqliteMemory {
             ))
         })?;
         if exists {
-            return Ok(());
+            return Ok(record);
         }
         // Failures are recorded (and logged once) by `vector`; the memory is
         // still saved for lexical recall.
         let vector = self.vector(&record.content).unwrap_or(None);
+        let stored = record.clone();
         self.store.call(move|conn|{let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             crate::memory_facts::reject_deleted(&tx,record.id)?;
             if same_record(&tx, &record)? { tx.commit()?; return Ok(()); }
             ensure!(crate::memory_facts::generation(&tx,&record.scope)?==generation,"Project facts changed during this save; refresh and retry");
-            if let Some(previous)=record.supersedes {let previous_state:Option<(String,bool)>=tx.query_row("SELECT scope,active FROM memories WHERE id=?1",[previous.to_string()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;ensure!(previous_state.as_ref().is_some_and(|(scope,active)|scope==&record.scope&&*active),"Correct the current memory in the same project");tx.execute("UPDATE memories SET active=0 WHERE id=?1",[previous.to_string()])?; delete_vectors(&tx, &previous.to_string())?;}
+            if let Some(previous)=record.supersedes {
+                let previous_state:Option<(String,bool,String)>=tx.query_row("SELECT scope,active,json FROM memories WHERE id=?1",[previous.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                let Some((scope,active,json))=previous_state else { anyhow::bail!("Correct the current memory in the same project") };
+                ensure!(scope==record.scope&&active,"Correct the current memory in the same project");
+                let replaced:MemoryRecord=serde_json::from_str(&json)?;
+                ensure!(record.origin.tier()<=replaced.origin.tier(),"This fact was {}; replacing it needs a correction the user approves",replaced.origin.label());
+                tx.execute("UPDATE memories SET active=0 WHERE id=?1",[previous.to_string()])?; delete_vectors(&tx, &previous.to_string())?;
+            }
             // The vector lives only in its model's vec0 table; `embedding_model`
             // records which index holds it so reindexing can find stale rows.
             let mut model=None;
@@ -448,7 +491,45 @@ impl SqliteMemory {
             }
             tx.execute("INSERT INTO memories(id,scope,content,json,embedding_model) VALUES(?1,?2,?3,?4,?5)",params![record.id.to_string(),record.scope,record.content,serde_json::to_string(&record)?,model])?;
             tx.execute("INSERT INTO memories_fts(id,scope,content) VALUES(?1,?2,?3)",params![record.id.to_string(),record.scope,record.content])?;
-            crate::memory_facts::inserted(&tx,&record)?;tx.commit()?;Ok(())})
+            crate::memory_facts::inserted(&tx,&record)?;tx.commit()?;Ok(())})?;
+        Ok(stored)
+    }
+    /// Like [`Self::recall_sync`], with the version each recalled fact
+    /// corrected, so a reader sees what changed and since when.
+    pub fn recall_with_history(
+        &self,
+        scope: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RecalledFact>> {
+        let records = self.recall_sync(scope, query, limit)?;
+        self.store.call(move |conn| {
+            let mut previous = conn.prepare("SELECT json FROM memories WHERE id=?1")?;
+            records
+                .into_iter()
+                .map(|record| {
+                    let replaced = match record.supersedes {
+                        Some(id) => previous
+                            .query_row([id.to_string()], |row| row.get::<_, String>(0))
+                            .optional()?
+                            .map(|json| serde_json::from_str::<MemoryRecord>(&json))
+                            .transpose()?
+                            .map(|old| PreviousVersion {
+                                id: old.id,
+                                content: old.content,
+                                origin: old.origin,
+                                created_at: old.created_at,
+                                until: record.created_at,
+                            }),
+                        None => None,
+                    };
+                    Ok(RecalledFact {
+                        record,
+                        previously: replaced,
+                    })
+                })
+                .collect()
+        })
     }
     pub fn recall_sync(&self, scope: &str, query: &str, limit: usize) -> Result<Vec<MemoryRecord>> {
         if limit == 0 || query.trim().is_empty() {
@@ -523,40 +604,61 @@ impl SqliteMemory {
         let scope = scope.to_owned();
         let model_query = model.clone();
         let records:Vec<(String,String)>=self.store.call(move|conn|{let mut stmt=conn.prepare("SELECT id,content FROM memories WHERE scope=?1 AND active=1 AND (embedding_model IS NULL OR embedding_model<>?2) LIMIT ?3")?;let rows=stmt.query_map(params![scope,model_query,limit.min(1000) as i64],|r|Ok((r.get(0)?,r.get(1)?)))?;Ok(rows.collect::<rusqlite::Result<_>>()?)})?;
-        let count = records.len();
+        let mut count = 0;
         for (id, content) in records {
             let (model, vector) = self
                 .vector(&content)?
                 .context("Embedding configuration was disabled during reindex")?;
-            self.store.call(move |conn| {
+            let indexed = self.store.call(move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let scope: String =
-                    tx.query_row("SELECT scope FROM memories WHERE id=?1", [&id], |r| {
-                        r.get(0)
-                    })?;
-                delete_vectors(&tx, &id)?;
-                let table = ensure_vector_table(&tx, &model, vector.len() / 4)?;
-                tx.execute(
-                    &format!("INSERT INTO {table}(id,scope,embedding) VALUES(?1,?2,?3)"),
-                    params![id, scope, vector],
-                )?;
-                tx.execute(
-                    "UPDATE memories SET embedding_model=?1 WHERE id=?2",
-                    params![model, id],
-                )?;
+                let indexed = store_reindexed_vector(&tx, &id, &model, &vector)?;
                 tx.commit()?;
-                Ok(())
+                Ok(indexed)
             })?;
+            count += usize::from(indexed);
         }
         Ok(count)
     }
+}
+
+/// Stores one reindexed vector. Embedding runs outside the transaction, so the
+/// memory may have been forgotten or superseded meanwhile: such a memory is
+/// skipped (false) rather than failing the whole reindex or giving a superseded
+/// version a vector that semantic recall could return.
+fn store_reindexed_vector(
+    tx: &rusqlite::Connection,
+    id: &str,
+    model: &str,
+    vector: &[u8],
+) -> Result<bool> {
+    let scope: Option<String> = tx
+        .query_row(
+            "SELECT scope FROM memories WHERE id=?1 AND active=1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(scope) = scope else {
+        return Ok(false);
+    };
+    delete_vectors(tx, id)?;
+    let table = ensure_vector_table(tx, model, vector.len() / 4)?;
+    tx.execute(
+        &format!("INSERT INTO {table}(id,scope,embedding) VALUES(?1,?2,?3)"),
+        params![id, scope, vector],
+    )?;
+    tx.execute(
+        "UPDATE memories SET embedding_model=?1 WHERE id=?2",
+        params![model, id],
+    )?;
+    Ok(true)
 }
 #[async_trait]
 impl MemoryBackend for SqliteMemory {
     async fn remember(&self, record: MemoryRecord) -> Result<()> {
         let this = self.clone();
-        tokio::task::spawn_blocking(move || this.remember_sync(record)).await?
+        tokio::task::spawn_blocking(move || this.remember_sync(record).map(drop)).await?
     }
     async fn recall(&self, scope: &str, query: &str, limit: usize) -> Result<Vec<MemoryRecord>> {
         let this = self.clone();

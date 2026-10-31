@@ -22,6 +22,7 @@ fn decide(mode: PermissionMode, name: &str, arguments: Value, writes: bool) -> V
                 .and_then(Value::as_bool)
                 .filter(|network| *network)
                 .map(|_| "Fetch dependencies"),
+            untrusted_input: false,
         },
     )
 }
@@ -367,6 +368,7 @@ async fn approve_for_me_reads_outside_unasked_unless_risky_and_always_asks_to_wr
                 reach: &Reach::Outside(std::path::PathBuf::from(path)),
                 workspace: &workspace,
                 network: None,
+                untrusted_input: false,
             },
         )
     };
@@ -406,6 +408,7 @@ async fn approve_for_me_reads_outside_unasked_unless_risky_and_always_asks_to_wr
             reach: &Reach::Outside(outside.path().join("notes.txt")),
             workspace: &workspace,
             network: None,
+            untrusted_input: false,
         },
     )));
 }

@@ -33,6 +33,16 @@ pub struct MemoryMutation {
     pub id: Uuid,
     pub deleted: bool,
 }
+/// One journaled action of a conversation, reduced to what decides the
+/// origin of a fact written later in that conversation.
+#[derive(Clone, Debug)]
+pub struct ActionProvenance {
+    pub name: String,
+    /// The intent's arguments, for the names the caller asked for.
+    pub arguments: Option<serde_json::Value>,
+    /// The recorded result, for the names the caller asked for.
+    pub result: Option<serde_json::Value>,
+}
 #[derive(Clone, Debug)]
 pub struct MemoryExport {
     pub scope: String,
@@ -40,6 +50,47 @@ pub struct MemoryExport {
     pub records: usize,
 }
 impl Store {
+    /// Every action of `session` that may have run (pending and denied
+    /// actions never did), in the order they were journaled (insertion
+    /// order, which a millisecond timestamp cannot break ties in), with arguments only for the names in
+    /// `with_arguments` and results only for those in `with_results`, so
+    /// large file contents and outputs are not loaded.
+    pub fn session_action_provenance(
+        &self,
+        session: Uuid,
+        with_arguments: &[&str],
+        with_results: &[&str],
+    ) -> Result<Vec<ActionProvenance>> {
+        let arguments = serde_json::to_string(with_arguments)?;
+        let results = serde_json::to_string(with_results)?;
+        self.call(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT json_extract(intent,'$.name'),
+                    CASE WHEN json_extract(intent,'$.name') IN(SELECT value FROM json_each(?2)) THEN json_extract(intent,'$.arguments') END,
+                    CASE WHEN json_extract(intent,'$.name') IN(SELECT value FROM json_each(?3)) THEN result END
+                 FROM actions WHERE session_id=?1 AND state NOT IN('pending','denied') ORDER BY rowid",
+            )?;
+            let rows = statement.query_map(
+                params![session.to_string(), arguments, results],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?;
+            rows.map(|row| {
+                let (name, arguments, result) = row?;
+                Ok(ActionProvenance {
+                    name,
+                    arguments: arguments.map(|json| serde_json::from_str(&json)).transpose()?,
+                    result: result.map(|json| serde_json::from_str(&json)).transpose()?,
+                })
+            })
+            .collect()
+        })
+    }
     pub fn memory_page(
         &self,
         scope: &str,

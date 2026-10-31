@@ -35,6 +35,7 @@ fn usage(input: u64) -> Step {
     Step::Event(StreamEvent::Usage(crate::model::ModelUsage {
         input_tokens: input,
         output_tokens: 1,
+        ..Default::default()
     }))
 }
 
@@ -177,12 +178,7 @@ fn harness(scripts: Vec<Vec<Step>>) -> Harness {
         max_tokens: 256,
         max_model_calls: MAX_MODEL_CALLS,
         events: sender,
-        journal: Some(Journal {
-            store: store.clone(),
-            session,
-            turn,
-            steering: None,
-        }),
+        journal: Some(Journal::new(store.clone(), session, turn, None)),
         permissions: None,
         cancel: CancellationToken::new(),
     };
@@ -232,6 +228,10 @@ async fn text_only_answer_finishes_in_one_call_with_ordered_events() {
     assert_eq!(outcome.text, "Hello there");
     assert!(!outcome.stopped_early);
     assert_eq!(outcome.usage.context_tokens, 42);
+    assert_eq!(
+        outcome.usage.cache_read_tokens, None,
+        "not reported, not zero"
+    );
     assert_eq!(outcome.messages.len(), 2);
     let events = drain(&mut h.events);
     assert_eq!(deltas(&events), "Hello there");
@@ -780,14 +780,15 @@ async fn a_call_id_compacted_out_of_the_conversation_is_never_reused() {
         output_tokens: 512,
         ..Default::default()
     });
+    // Many small results: too small to mask, so the history is summarised.
     let mut history = vec![Message::user("Read the files")];
-    for index in 0..12 {
+    for index in 0..24 {
         let id = format!("call-{index}");
         history.push(Message::assistant_with_tool_calls(
             "",
             vec![ToolCall::new(&id, "read_a", "{}")],
         ));
-        history.push(Message::tool_result(id, noise(300)));
+        history.push(Message::tool_result(id, noise(150)));
     }
     let outcome = h.agent.run(history).await.unwrap();
     assert!(outcome.messages[0].summary, "the history was compacted");
@@ -832,4 +833,464 @@ async fn a_resumed_turn_never_reuses_an_id_only_its_journal_remembers() {
     }
     h.agent.run(vec![Message::user("go")]).await.unwrap();
     assert_eq!(started_calls(&h), ["call_0#3"]);
+}
+
+fn notes(events: &[EngineEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::HarnessNote { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn note_kinds(events: &[EngineEvent]) -> Vec<NoteKind> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::HarnessNote { kind, .. } => Some(*kind),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_cut_off_by_the_output_limit_is_continued_into_one_answer() {
+    let mut h = harness(vec![
+        vec![text("Part one, "), finish(FinishReason::Length)],
+        vec![text("part two."), finish(FinishReason::Stop)],
+    ]);
+    let outcome = h.agent.run(vec![Message::user("Explain")]).await.unwrap();
+    assert_eq!(outcome.text, "Part one, part two.");
+    assert!(!outcome.cut_off);
+    let events = drain(&mut h.events);
+    assert_eq!(deltas(&events), "Part one, part two.");
+    assert!(notes(&events)[0].contains("output limit"));
+    assert_eq!(note_kinds(&events), [NoteKind::Continuation]);
+    let requests = h.provider.requests.lock();
+    let continued = &requests[1].messages;
+    assert_eq!(
+        continued.last().unwrap(),
+        &application_note(crate::prompts::continue_answer())
+    );
+    assert_eq!(continued[continued.len() - 2].content, "Part one, ");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continuations_are_bounded_and_the_partial_answer_is_kept() {
+    let scripts = (0..=recovery::MAX_CONTINUATIONS)
+        .map(|part| vec![text(&format!("{part}")), finish(FinishReason::Length)])
+        .collect();
+    let mut h = harness(scripts);
+    let outcome = h.agent.run(vec![Message::user("Long")]).await.unwrap();
+    assert_eq!(outcome.text, "0123");
+    assert!(outcome.cut_off, "the answer is stored as truncated");
+    let kinds = note_kinds(&drain(&mut h.events));
+    assert_eq!(kinds.last(), Some(&NoteKind::Truncated));
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == NoteKind::Continuation)
+            .count() as u32,
+        recovery::MAX_CONTINUATIONS
+    );
+    assert_eq!(
+        h.provider.requests.lock().len() as u32,
+        recovery::MAX_CONTINUATIONS + 1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_call_cut_off_by_the_output_limit_is_answered_never_run() {
+    let mut h = harness(vec![
+        vec![
+            call(0, "c1", "read_a", "{}"),
+            call(1, "c2", "write_a", "{\"path\":\"a\",\"content\":\"lo"),
+            finish(FinishReason::Length),
+        ],
+        vec![text("Resent."), finish(FinishReason::Stop)],
+    ]);
+    let outcome = h.agent.run(vec![Message::user("Write")]).await.unwrap();
+    assert_eq!(outcome.text, "Resent.");
+    let log = h.tools.log.lock().clone();
+    assert_eq!(log, ["start c1", "end c1"], "only the complete call ran");
+    let saved = checkpoint(&h);
+    let assistant = saved.iter().find(|m| !m.tool_calls.is_empty()).unwrap();
+    assert_eq!(assistant.tool_calls[1].arguments, "{}");
+    let result = saved
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("c2"))
+        .unwrap();
+    assert!(result.content.contains("cut off by the output token limit"));
+    assert!(result.content.contains("\"status\":\"error\""));
+    assert!(
+        notes(&drain(&mut h.events))
+            .iter()
+            .any(|n| n.contains("`write_a`"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_reply_is_asked_for_once_more() {
+    let h = harness(vec![
+        vec![finish(FinishReason::Stop)],
+        vec![text("Here it is."), finish(FinishReason::Stop)],
+    ]);
+    let outcome = h.agent.run(vec![Message::user("Hi")]).await.unwrap();
+    assert_eq!(outcome.text, "Here it is.");
+    // The empty reply is not kept; the note asks again.
+    assert!(
+        outcome
+            .messages
+            .iter()
+            .all(|m| m.role != Role::Assistant || !m.content.is_empty())
+    );
+    let requests = h.provider.requests.lock();
+    assert_eq!(
+        requests[1].messages.last().unwrap(),
+        &application_note(crate::prompts::empty_answer())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_empty_replies_in_a_row_fail_the_turn_as_an_empty_response() {
+    let h = harness(vec![
+        vec![finish(FinishReason::Stop)],
+        vec![finish(FinishReason::Stop)],
+    ]);
+    let failure = h.agent.run(vec![Message::user("Hi")]).await.unwrap_err();
+    let error = failure.error.downcast_ref::<ModelError>().unwrap();
+    assert!(matches!(error, ModelError::EmptyResponse(_)));
+    assert_eq!(error.kind(), xylo_core::ErrorKind::EmptyResponse);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_tool_call_keeps_its_text_and_is_asked_for_again() {
+    let h = harness(vec![
+        vec![text("Editing."), finish(FinishReason::MalformedToolCall)],
+        vec![text("Fixed."), finish(FinishReason::Stop)],
+    ]);
+    let outcome = h.agent.run(vec![Message::user("Edit")]).await.unwrap();
+    assert_eq!(outcome.text, "Fixed.");
+    let requests = h.provider.requests.lock();
+    let retry = &requests[1].messages;
+    assert_eq!(retry[retry.len() - 2].content, "Editing.");
+    assert_eq!(
+        retry.last().unwrap(),
+        &application_note(crate::prompts::malformed_tool_call())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeated_identical_call_escalates_to_a_stalled_stop() {
+    let round = |index: usize| {
+        vec![
+            call(0, &format!("c{index}"), "read_a", "{\"path\":\"x\"}"),
+            finish(FinishReason::ToolCalls),
+        ]
+    };
+    let mut h = harness((0..7).map(round).collect());
+    let failure = h.agent.run(vec![Message::user("Loop")]).await.unwrap_err();
+    let error = failure.error.downcast_ref::<ModelError>().unwrap();
+    assert!(matches!(error, ModelError::Stalled(_)), "{error}");
+    assert_eq!(error.kind(), xylo_core::ErrorKind::Stalled);
+    assert!(error.to_string().contains("`read_a`"));
+    let requests = h.provider.requests.lock();
+    assert_eq!(requests.len(), 7);
+    let is_note = |message: &Message, prefix: &str| {
+        message.role == Role::User && message.content.contains(prefix)
+    };
+    // The note follows the third identical round, the warning the fifth.
+    let note = &requests[3].messages;
+    assert!(is_note(
+        note.last().unwrap(),
+        "Repeating it will not change"
+    ));
+    let warning = &requests[5].messages;
+    assert!(is_note(warning.last().unwrap(), "Xylo will stop this task"));
+    assert!(
+        requests[2]
+            .messages
+            .iter()
+            .all(|m| !is_note(m, "Repeating it"))
+    );
+    let events = drain(&mut h.events);
+    assert_eq!(
+        note_kinds(&events),
+        [NoteKind::StallNotice, NoteKind::StallWarning]
+    );
+    let shown = notes(&events);
+    assert!(shown[0].contains("change approach") && shown[1].contains("warned"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_step_budget_note_comes_before_the_step_limit() {
+    let mut h = harness(vec![
+        vec![
+            call(0, "c1", "read_a", "{\"n\":1}"),
+            finish(FinishReason::ToolCalls),
+        ],
+        vec![
+            call(0, "c2", "read_a", "{\"n\":2}"),
+            finish(FinishReason::ToolCalls),
+        ],
+        vec![text("Wrapping up."), finish(FinishReason::Stop)],
+    ]);
+    h.agent.max_model_calls = 4;
+    let outcome = h.agent.run(vec![Message::user("go")]).await.unwrap();
+    assert_eq!(outcome.text, "Wrapping up.");
+    assert_eq!(note_kinds(&drain(&mut h.events)), [NoteKind::StepBudget]);
+    let requests = h.provider.requests.lock();
+    let note = application_note(&crate::prompts::step_budget(3, 4));
+    assert_eq!(requests[2].messages.last().unwrap(), &note);
+    assert!(requests[..2].iter().all(|r| !r.messages.contains(&note)));
+}
+
+#[test]
+fn step_budget_warnings_fire_at_75_and_90_percent_only() {
+    let fired = |limit| {
+        (1..=limit)
+            .filter(|&call| step_budget_warning(call, limit))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(fired(MAX_MODEL_CALLS), [300, 360]);
+    assert_eq!(fired(10), [8, 9]);
+    assert_eq!(fired(4), [3]);
+    assert!(fired(2).is_empty() && fired(1).is_empty());
+}
+
+fn budget(context_tokens: u32) -> ContextBudget {
+    ContextBudget::new(&ProviderConfig {
+        model: "unrecognized-custom-model".into(),
+        context_tokens,
+        output_tokens: 512,
+        ..Default::default()
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_provider_overflow_is_compacted_harder_and_sent_once_more() {
+    let mut h = harness(vec![
+        vec![Step::Fail(ModelError::ContextOverflow(
+            "the request exceeds the available context size".into(),
+        ))],
+        // The forced summary.
+        vec![
+            text("User requests: read the files. Work done: read them all. Next: answer."),
+            finish(FinishReason::Stop),
+        ],
+        vec![text("done"), finish(FinishReason::Stop)],
+    ]);
+    h.agent.budget = budget(32_768);
+    // Under every normal threshold, but too long for the server.
+    let mut history = vec![Message::user("Read the files")];
+    for index in 0..30 {
+        let id = format!("call-{index}");
+        history.push(Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall::new(&id, "read_a", "{}")],
+        ));
+        history.push(Message::tool_result(id, noise(150)));
+    }
+    let outcome = h.agent.run(history.clone()).await.unwrap();
+    assert_eq!(outcome.text, "done");
+    let requests = h.provider.requests.lock();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0].messages.len(),
+        history.len() + 1,
+        "sent whole first"
+    );
+    assert!(requests[2].messages.len() < requests[0].messages.len());
+    assert!(outcome.messages[0].summary);
+    assert!(checkpoint(&h)[0].summary, "the compaction is durable");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_overflow_fails_the_turn() {
+    let overflow = || {
+        vec![Step::Fail(ModelError::ContextOverflow(
+            "prompt is too long".into(),
+        ))]
+    };
+    let mut h = harness(vec![overflow(), overflow()]);
+    h.agent.budget = budget(32_768);
+    let failure = h.agent.run(vec![Message::user("Hello")]).await.unwrap_err();
+    assert!(matches!(
+        failure.error.downcast_ref::<ModelError>(),
+        Some(ModelError::ContextOverflow(_))
+    ));
+    assert_eq!(h.provider.requests.lock().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_tool_results_are_masked_durably_before_any_summary() {
+    let mut h = harness(vec![vec![text("done"), finish(FinishReason::Stop)]]);
+    h.agent.budget = budget(8192);
+    let mut history = vec![Message::user("Read the files")];
+    for index in 0..10 {
+        let id = format!("call-{index}");
+        history.push(Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall::new(&id, "read_a", "{}")],
+        ));
+        history.push(Message::tool_result(id, noise(300)));
+    }
+    let outcome = h.agent.run(history.clone()).await.unwrap();
+    // Masking alone made room: one model call, no summary.
+    assert_eq!(h.provider.requests.lock().len(), 1);
+    assert!(!outcome.messages[0].summary);
+    let masked = |messages: &[Message]| {
+        messages
+            .iter()
+            .filter(|m| crate::prompts::is_masked_observation(&m.content))
+            .count()
+    };
+    assert!(masked(&outcome.messages) > 0);
+    assert_eq!(masked(&checkpoint(&h)), masked(&outcome.messages));
+    // The newest results and every call stay as they were.
+    assert_eq!(outcome.messages[20].content, history[20].content);
+    assert_eq!(
+        outcome.messages[..history.len()]
+            .iter()
+            .map(|m| &m.tool_calls)
+            .collect::<Vec<_>>(),
+        history.iter().map(|m| &m.tool_calls).collect::<Vec<_>>()
+    );
+    // The request carried the stubs, so later calls replay the same bytes.
+    let request = &h.provider.requests.lock()[0];
+    assert_eq!(masked(&request.messages), masked(&outcome.messages));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_cache_reads_reach_the_turn_usage_and_the_context_meter() {
+    let cached = Step::Event(StreamEvent::Usage(crate::model::ModelUsage {
+        input_tokens: 100,
+        output_tokens: 1,
+        cache_read_tokens: Some(80),
+        cache_write_tokens: Some(12),
+    }));
+    let mut h = harness(vec![vec![text("Done"), cached, finish(FinishReason::Stop)]]);
+    let outcome = h.agent.run(vec![Message::user("Hi")]).await.unwrap();
+    assert_eq!(outcome.usage.input_tokens, 100);
+    assert_eq!(outcome.usage.cache_read_tokens, Some(80));
+    assert_eq!(outcome.usage.cache_write_tokens, Some(12));
+    let reported = drain(&mut h.events)
+        .into_iter()
+        .filter_map(|event| match event {
+            EngineEvent::ContextUsage { usage } => usage.provider_cache_read,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reported, [80]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_never_runs_a_cut_off_call_with_its_cleared_arguments() {
+    let h = harness(vec![
+        vec![
+            call(0, "c1", "write_a", "{\"n\":1}"),
+            call(1, "c2", "read_a", "{\"path\":\"a"),
+            finish(FinishReason::Length),
+        ],
+        vec![text("Done."), finish(FinishReason::Stop)],
+    ]);
+    // The checkpoint as it stood while the batch ran: a crash here resumes
+    // from it.
+    let during = Arc::new(Mutex::new(None));
+    let (store, session, seen) = (h.store.clone(), h.session, during.clone());
+    *h.tools.on_execute.lock() = Some(Box::new(move || {
+        let saved: Vec<Message> =
+            serde_json::from_value(store.checkpoint(session).unwrap().unwrap().messages).unwrap();
+        seen.lock().get_or_insert(saved);
+    }));
+    let outcome = h.agent.run(vec![Message::user("go")]).await.unwrap();
+    // After the batch the results are in call order.
+    let ids = outcome
+        .messages
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["c1", "c2"]);
+    let crashed = during.lock().take().unwrap();
+    let refusal = crashed
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("c2"))
+        .expect("the refusal is durable before dispatch");
+    assert!(
+        refusal
+            .content
+            .contains("cut off by the output token limit")
+    );
+    assert!(
+        crashed
+            .iter()
+            .all(|m| m.tool_call_id.as_deref() != Some("c1"))
+    );
+    // Resuming runs only the complete call; the cut-off one, whose schema
+    // accepts `{}`, never runs.
+    let resumed = harness(vec![vec![text("Resumed."), finish(FinishReason::Stop)]]);
+    let outcome = resumed.agent.run(crashed).await.unwrap();
+    assert_eq!(outcome.text, "Resumed.");
+    assert_eq!(started_calls(&resumed), ["c1"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_message_is_tokenized_once_however_often_it_is_measured() {
+    let h = harness(vec![
+        vec![
+            call(0, "call-new", "read_a", "{\"n\":1}"),
+            finish(FinishReason::ToolCalls),
+        ],
+        vec![text("done"), usage(4000), finish(FinishReason::Stop)],
+    ]);
+    let mut history = vec![Message::user("Read the files")];
+    for index in 0..20 {
+        let id = format!("call-{index}");
+        history.push(Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall::new(&id, "read_a", format!("{{\"n\":{index}}}"))],
+        ));
+        history.push(Message::tool_result(id, noise(120 + index)));
+    }
+    h.agent.run(history.clone()).await.unwrap();
+    // Two model calls each measure the request several times (threshold,
+    // fit, usage, calibration). Every message is still encoded once: the
+    // history, the system prompt and the tool schemas, then the new tool
+    // call and its result for the second call.
+    assert_eq!(h.agent.budget.encodes(), history.len() + 2 + 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_checkpoints_store_exactly_the_latest_messages() {
+    let h = harness(Vec::new());
+    let journal = h.agent.journal.as_ref().unwrap();
+    let mut messages = vec![Message::user("go"), Message::assistant("one")];
+    journal.checkpoint(&messages).await.unwrap();
+    // An append, then a rewrite of an earlier message (as masking does).
+    messages.push(Message::user("more"));
+    journal.checkpoint(&messages).await.unwrap();
+    messages[1] = Message::assistant("one, masked");
+    journal.checkpoint(&messages).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(checkpoint(&h)).unwrap(),
+        serde_json::to_value(&messages).unwrap()
+    );
+    // Another writer (guidance) changes the checkpoint in between; the next
+    // write still leaves exactly the loop's messages.
+    h.store
+        .save_checkpoint(
+            h.session,
+            h.turn,
+            &json!([{"role":"user","content":"other"}]),
+        )
+        .unwrap();
+    messages.truncate(1);
+    messages.push(Message::assistant("compacted"));
+    journal.checkpoint(&messages).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(checkpoint(&h)).unwrap(),
+        serde_json::to_value(&messages).unwrap()
+    );
 }

@@ -20,6 +20,9 @@ pub struct ProviderModel {
 
 /// Account-specific catalog, bounded to eight pages / 2,000 models. Discovery is
 /// read-only and never starts a model process or falls back to invented choices.
+/// A local server's catalog context is lowered to the context it reports
+/// serving (see [`super::served_context_limits`]), since that is what a
+/// request must fit.
 pub async fn discover_provider_models(
     config: &ProviderConfig,
     vault: &CredentialVault,
@@ -37,7 +40,31 @@ pub async fn discover_provider_models(
         None
     };
     let credential = ProviderCredential::parse(secret)?;
-    discover_with_credential(config, &credential, cancel).await
+    let mut models = discover_with_credential(config, &credential, cancel).await?;
+    apply_served_context(config, &mut models, cancel).await;
+    Ok(models)
+}
+
+/// Lowers (or fills in) each model's context to what a local server serves.
+pub(crate) async fn apply_served_context(
+    config: &ProviderConfig,
+    models: &mut [ProviderModel],
+    cancel: &CancellationToken,
+) {
+    let ids = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let served = super::served_context_limits(config, &ids, cancel).await;
+    for model in models {
+        if let Some(served) = served.get(&model.id).copied() {
+            model.context_tokens = Some(
+                model
+                    .context_tokens
+                    .map_or(served, |advertised| advertised.min(served)),
+            );
+        }
+    }
 }
 
 pub(crate) async fn bounded_json(
@@ -192,6 +219,8 @@ pub(crate) async fn discover_with_credential(
                     "/context_length",
                     "/inputTokenLimit",
                     "/metadata/context_length",
+                    // vLLM: the length the server was started with.
+                    "/max_model_len",
                 ]
                 .iter()
                 .find_map(|path| row.pointer(path).and_then(Value::as_u64))

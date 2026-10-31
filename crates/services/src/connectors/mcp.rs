@@ -14,22 +14,35 @@
 //! stderr are kept and attached to connection errors.
 use crate::{CredentialVault, Store};
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use futures_util::{Stream, StreamExt};
+use reqwest::{
+    StatusCode,
+    header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue, RETRY_AFTER},
+};
 use rmcp::{
     RoleClient, ServiceExt,
     model::{
-        CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest,
-        PaginatedRequestParams, ServerResult, ToolAnnotations,
+        CallToolRequest, CallToolRequestParams, CallToolResult, ClientJsonRpcMessage,
+        ClientRequest, JsonRpcMessage, PaginatedRequestParams, ServerJsonRpcMessage, ServerResult,
+        ToolAnnotations,
     },
     service::{PeerRequestOptions, RunningService},
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
-        streamable_http_client::StreamableHttpClientTransportConfig,
+        common::{
+            client_side_sse::BoxedSseResponse,
+            http_header::{EVENT_STREAM_MIME_TYPE, HEADER_SESSION_ID, JSON_MIME_TYPE},
+        },
+        streamable_http_client::{
+            HttpStatusError, SseError, StreamableHttpClient, StreamableHttpClientTransportConfig,
+            StreamableHttpError, StreamableHttpPostResponse,
+        },
     },
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Weak,
@@ -298,8 +311,14 @@ impl ConnectorBroker {
         } else {
             None
         };
+        // Trust changes how Xylo treats the server's hints, not the server:
+        // toggling it keeps the connection and the discovered catalog.
+        let launch = ConnectorConfig {
+            trusted: false,
+            ..config.clone()
+        };
         Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
-            config, scope,
+            launch, scope,
         ))?)))
     }
     /// Serializes configuration changes for one connector.
@@ -432,7 +451,7 @@ impl ConnectorBroker {
                         StreamableHttpClientTransportConfig::with_uri(config.endpoint.clone())
                             .max_concurrent_requests(4);
                     transport.reinit_on_expired_session = false; // never implicitly replay a write
-                    transport.max_sse_event_size = 8 * 1024 * 1024;
+                    transport.max_sse_event_size = HTTP_BODY_LIMIT;
                     if let Some(secret) = secret.clone() {
                         transport = transport.auth_header(secret);
                     }
@@ -441,10 +460,13 @@ impl ConnectorBroker {
                         .retry(reqwest::retry::never())
                         .redirect(reqwest::redirect::Policy::none())
                         .build()?;
-                    let client =
-                        ().serve(StreamableHttpClientTransport::with_client(http, transport))
-                            .await
-                            .context("Initialize remote MCP server")?;
+                    let client = ()
+                        .serve(StreamableHttpClientTransport::with_client(
+                            BoundedHttpClient(http),
+                            transport,
+                        ))
+                        .await
+                        .context("Initialize remote MCP server")?;
                     Ok((client, None))
                 }
                 other => bail!("Unsupported MCP transport {other}"),
@@ -543,8 +565,24 @@ impl ConnectorBroker {
         let id = config.id;
         let json = serde_json::to_string(&result)?;
         let fingerprint = Self::fingerprint(config, local_scope)?;
-        tokio::task::spawn_blocking(move||store.call(move|conn|{conn.execute("INSERT INTO connector_tools(id,fingerprint,json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,json=excluded.json,updated_at=excluded.updated_at",rusqlite::params![id.to_string(),fingerprint,json,xylo_core::now_ms()])?;Ok(())})).await??;
+        tokio::task::spawn_blocking(move || save_catalog(&store, id, fingerprint, json)).await??;
         Ok(result)
+    }
+    /// Records `tools` as `config`'s discovered catalog for this broker's
+    /// launch scope, as a live discovery would, without starting a server.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cache_tools_for_tests(
+        &self,
+        config: &ConnectorConfig,
+        tools: &[ToolDefinition],
+    ) -> Result<()> {
+        let fingerprint = Self::fingerprint(config, self.local_scope.as_ref())?;
+        save_catalog(
+            &self.pool.store,
+            config.id,
+            fingerprint,
+            serde_json::to_string(tools)?,
+        )
     }
     /// The catalog from the last discovery with the same configuration and scope.
     pub fn cached_tools(&self, config: &ConnectorConfig) -> Result<Vec<ToolDefinition>> {
@@ -697,6 +735,17 @@ impl ConnectorBroker {
     }
 }
 
+/// Persists one connector's discovered catalog under its fingerprint.
+fn save_catalog(store: &Store, id: Uuid, fingerprint: String, json: String) -> Result<()> {
+    store.call(move |conn| {
+        conn.execute(
+            "INSERT INTO connector_tools(id,fingerprint,json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,json=excluded.json,updated_at=excluded.updated_at",
+            rusqlite::params![id.to_string(), fingerprint, json, xylo_core::now_ms()],
+        )?;
+        Ok(())
+    })
+}
+
 /// MCP tool annotations are hints from the server. A tool counts as read-only
 /// only when it says so and does not also claim to be destructive; anything
 /// unannotated is treated as a write and goes through the mutation gate.
@@ -708,6 +757,380 @@ fn tool_writes(annotations: Option<&ToolAnnotations>) -> bool {
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Most bytes of one remote MCP response body, or of one SSE event, that are
+/// ever held in memory.
+const HTTP_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+type HttpError = StreamableHttpError<reqwest::Error>;
+/// rmcp's SSE event type. `sse_stream` is not re-exported, so the type is
+/// named through rmcp's public stream alias.
+type SseEvent = <<BoxedSseResponse as Stream>::Item as OkType>::Ok;
+
+/// Names the success type of a `Result`; only used to spell [`SseEvent`].
+trait OkType {
+    type Ok;
+}
+
+impl<T, E> OkType for Result<T, E> {
+    type Ok = T;
+}
+
+/// The streamable-HTTP backend for remote MCP servers, built on `reqwest`.
+///
+/// rmcp's own `reqwest::Client` backend reads JSON replies and error bodies
+/// with `Response::bytes`/`text`, which buffer whatever the server sends; its
+/// `max_sse_event_size` only bounds SSE events. A hostile server could
+/// therefore exhaust memory with one response. POSTs are handled here so every
+/// body goes through [`HTTP_BODY_LIMIT`]. GET streams (already parsed by rmcp's
+/// bounded SSE parser) and DELETE (whose body is never read) are delegated.
+#[derive(Clone)]
+struct BoundedHttpClient(reqwest::Client);
+
+impl StreamableHttpClient for BoundedHttpClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, HttpError> {
+        self.post_message_with_max_sse_event_size(
+            uri,
+            message,
+            session_id,
+            auth_header,
+            custom_headers,
+            HTTP_BODY_LIMIT,
+        )
+        .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, HttpError> {
+        let mut request = self.0.post(uri.as_ref()).header(
+            ACCEPT,
+            format!("{EVENT_STREAM_MIME_TYPE}, {JSON_MIME_TYPE}"),
+        );
+        if let Some(token) = auth_header {
+            request = request.bearer_auth(token);
+        }
+        if let Some(session) = &session_id {
+            request = request.header(HEADER_SESSION_ID, session.as_ref());
+        }
+        for (name, value) in custom_headers {
+            request = request.header(name, value);
+        }
+        let response = request.json(&message).send().await?;
+        let status = response.status();
+        if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        if status == StatusCode::NOT_FOUND && session_id.is_some() {
+            return Err(StreamableHttpError::SessionExpired);
+        }
+        let headers = response.headers();
+        let new_session = headers
+            .get(HEADER_SESSION_ID)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+        let is_json = content_type
+            .as_deref()
+            .is_some_and(|value| value.starts_with(JSON_MIME_TYPE));
+        // Only requests wait for a reply; other messages tolerate an empty or
+        // unusable body, as rmcp's backend does.
+        let awaits_reply = matches!(message, ClientJsonRpcMessage::Request(_));
+
+        if !status.is_success() {
+            let mut status_error =
+                (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()).then(|| {
+                    let retry_after = headers
+                        .get(RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    HttpStatusError::new(status.as_u16(), retry_after)
+                });
+            // Rate limits and non-JSON failures carry nothing worth reading.
+            if let Some(error) =
+                status_error.take_if(|_| !is_json || status == StatusCode::TOO_MANY_REQUESTS)
+            {
+                return Err(error.into());
+            }
+            let body = read_bounded(response, HTTP_BODY_LIMIT).await?;
+            // A JSON-RPC error body is the server's real answer; 401/403 keep
+            // their status so they are never mistaken for an ordinary error.
+            let auth_failure = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
+            if is_json
+                && !auth_failure
+                && let Ok(error @ JsonRpcMessage::Error(_)) =
+                    serde_json::from_slice::<ServerJsonRpcMessage>(&body)
+            {
+                return Ok(StreamableHttpPostResponse::Json(error, new_session));
+            }
+            if let Some(error) = status_error {
+                return Err(error.into());
+            }
+            return Err(StreamableHttpError::UnexpectedServerResponse(
+                format!("HTTP {status}: {}", body_preview(&body)).into(),
+            ));
+        }
+        // Some servers answer notifications with an empty 200 instead of 202.
+        if !awaits_reply && response.content_length() == Some(0) {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        match content_type.as_deref() {
+            Some(value) if value.starts_with(EVENT_STREAM_MIME_TYPE) => {
+                Ok(StreamableHttpPostResponse::Sse(
+                    bounded_sse(response, max_sse_event_size),
+                    new_session,
+                ))
+            }
+            Some(_) if is_json => {
+                let body = read_bounded(response, HTTP_BODY_LIMIT).await?;
+                match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
+                    Ok(reply) => Ok(StreamableHttpPostResponse::Json(reply, new_session)),
+                    Err(_) if !awaits_reply => Ok(StreamableHttpPostResponse::Accepted),
+                    Err(error) => Err(StreamableHttpError::UnexpectedServerResponse(
+                        format!(
+                            "could not parse JSON-RPC response: {error}: {}",
+                            body_preview(&body)
+                        )
+                        .into(),
+                    )),
+                }
+            }
+            _ => Err(StreamableHttpError::UnexpectedContentType(content_type)),
+        }
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), HttpError> {
+        self.0
+            .delete_session(uri, session_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<BoxedSseResponse, HttpError> {
+        self.get_stream_with_max_sse_event_size(
+            uri,
+            session_id,
+            last_event_id,
+            auth_header,
+            custom_headers,
+            HTTP_BODY_LIMIT,
+        )
+        .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxedSseResponse, HttpError> {
+        self.0
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+    }
+}
+
+fn body_too_large(limit: usize) -> String {
+    format!(
+        "MCP server response exceeds the {} MiB size limit",
+        limit / (1024 * 1024)
+    )
+}
+
+/// Reads a whole response body, failing once it would exceed `limit` bytes.
+///
+/// `Content-Length` rejects an honest oversized body before any of it is read;
+/// the running total catches chunked bodies that declare no length.
+async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, HttpError> {
+    let too_large = || StreamableHttpError::UnexpectedServerResponse(body_too_large(limit).into());
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// A short, lossy view of a body for error messages.
+fn body_preview(body: &[u8]) -> String {
+    const PREVIEW: usize = 256;
+    let mut preview = String::from_utf8_lossy(&body[..body.len().min(PREVIEW)]).into_owned();
+    if body.len() > PREVIEW {
+        preview.push('…');
+    }
+    preview
+}
+
+/// Parses an SSE response body while holding at most `limit` bytes of any one
+/// event. rmcp's bounded parser is crate-private, so POST streams need this.
+fn bounded_sse(response: reqwest::Response, limit: usize) -> BoxedSseResponse {
+    let state = (
+        response.bytes_stream().boxed(),
+        SseParser::new(limit),
+        false,
+    );
+    futures_util::stream::unfold(state, |(mut body, mut parser, failed)| async move {
+        if failed {
+            return None;
+        }
+        loop {
+            if let Some(event) = parser.ready.pop_front() {
+                return Some((Ok(event), (body, parser, false)));
+            }
+            let error = match body.next().await? {
+                Ok(chunk) => match parser.feed(&chunk) {
+                    Ok(()) => continue,
+                    Err(error) => error,
+                },
+                Err(error) => SseError::Body(Box::new(error)),
+            };
+            // Stop after the first error; an incomplete event is never emitted.
+            return Some((Err(error), (body, parser, true)));
+        }
+    })
+    .boxed()
+}
+
+/// Incremental parser for the `text/event-stream` format.
+struct SseParser {
+    limit: usize,
+    /// Bytes of the line not yet terminated.
+    line: Vec<u8>,
+    /// The event being assembled and the bytes it retains.
+    event: Option<SseEvent>,
+    retained: usize,
+    /// A chunk ended in `\r`, so a leading `\n` in the next one is its pair.
+    skip_lf: bool,
+    first_line: bool,
+    ready: VecDeque<SseEvent>,
+}
+
+impl SseParser {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            line: Vec::new(),
+            event: None,
+            retained: 0,
+            skip_lf: false,
+            first_line: true,
+            ready: VecDeque::new(),
+        }
+    }
+
+    fn feed(&mut self, mut chunk: &[u8]) -> Result<(), SseError> {
+        if std::mem::take(&mut self.skip_lf) && chunk.first() == Some(&b'\n') {
+            chunk = &chunk[1..];
+        }
+        while !chunk.is_empty() {
+            let end = chunk.iter().position(|byte| matches!(byte, b'\r' | b'\n'));
+            let (part, rest) = chunk.split_at(end.unwrap_or(chunk.len()));
+            // Checked before buffering so a line without a terminator is
+            // never held past the limit.
+            if self.retained + self.line.len() + part.len() > self.limit {
+                return Err(SseError::Body(body_too_large(self.limit).into()));
+            }
+            self.line.extend_from_slice(part);
+            let Some((&delimiter, mut rest)) = rest.split_first() else {
+                return Ok(());
+            };
+            if delimiter == b'\r' {
+                match rest.first() {
+                    Some(b'\n') => rest = &rest[1..],
+                    None => self.skip_lf = true,
+                    Some(_) => {}
+                }
+            }
+            let line = std::mem::take(&mut self.line);
+            self.finish_line(&line)?;
+            self.line = line;
+            self.line.clear();
+            chunk = rest;
+        }
+        Ok(())
+    }
+
+    fn finish_line(&mut self, mut line: &[u8]) -> Result<(), SseError> {
+        if std::mem::take(&mut self.first_line) {
+            line = line.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(line);
+        }
+        if line.is_empty() {
+            self.ready.extend(self.event.take());
+            self.retained = 0;
+            return Ok(());
+        }
+        let (name, value) = match line.iter().position(|byte| *byte == b':') {
+            Some(0) => return Ok(()), // comment
+            Some(colon) => (&line[..colon], &line[colon + 1..]),
+            None => (line, &[][..]),
+        };
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+        let value = std::str::from_utf8(value).map_err(SseError::Utf8Parse)?;
+        let event = self.event.get_or_insert_default();
+        match name {
+            b"data" => match &mut event.data {
+                Some(data) => {
+                    data.push('\n');
+                    data.push_str(value);
+                }
+                None => event.data = Some(value.to_owned()),
+            },
+            b"event" => event.event = Some(value.to_owned()),
+            b"id" if !value.contains('\0') => event.id = Some(value.to_owned()),
+            b"retry" => event.retry = value.parse().ok().or(event.retry),
+            _ => return Ok(()), // unknown fields are ignored per the SSE spec
+        }
+        self.retained += value.len() + 1;
+        Ok(())
+    }
 }
 
 pub(crate) fn validate_endpoint(endpoint: &str) -> Result<url::Url> {

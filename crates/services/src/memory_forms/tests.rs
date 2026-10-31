@@ -10,6 +10,7 @@ fn escaped_maximum_entry_fits_the_encoded_row_bound() {
         source: "explicit".into(),
         created_at: 1,
         supersedes: None,
+        origin: xylo_core::MemoryOrigin::UserTyped,
     };
     let mut request = write("a", &text, 0);
     request.form.retry = Some(record);
@@ -25,6 +26,7 @@ fn restart_does_not_clear_new_whitespace_after_a_committed_save() {
         source: "explicit".into(),
         created_at: 1,
         supersedes: None,
+        origin: xylo_core::MemoryOrigin::UserTyped,
     };
     let mut request = write("a", "saved ", 0);
     request.form.retry = Some(record.clone());
@@ -127,6 +129,7 @@ fn restart_reconciles_fact_commit_without_losing_newer_typing() {
         source: "explicit".into(),
         created_at: 1,
         supersedes: None,
+        origin: xylo_core::MemoryOrigin::UserTyped,
     };
     memory.remember_sync(original.clone()).unwrap();
     let correction = MemoryRecord {
@@ -136,6 +139,7 @@ fn restart_reconciles_fact_commit_without_losing_newer_typing() {
         source: "explicit".into(),
         created_at: 2,
         supersedes: Some(original.id),
+        origin: xylo_core::MemoryOrigin::UserTyped,
     };
     let mut form = write("a", "corrected", 0);
     form.form.editing = Some(original.id);
@@ -156,6 +160,7 @@ fn restart_reconciles_fact_commit_without_losing_newer_typing() {
         source: "explicit".into(),
         created_at: 3,
         supersedes: Some(correction.id),
+        origin: xylo_core::MemoryOrigin::UserTyped,
     };
     let mut form = write("a", "newer typing after clicking Save", recovered.revision);
     form.form.editing = Some(correction.id);
@@ -179,6 +184,7 @@ fn forms_keep_unconfirmed_retry_and_support_worst_case_valid_json_escaping() {
         source: "explicit".into(),
         created_at: 1,
         supersedes: None,
+        origin: xylo_core::MemoryOrigin::UserTyped,
     };
     let mut form = write("a", &content, 0);
     form.form.retry = Some(retry.clone());
@@ -206,6 +212,7 @@ fn fact_purge_never_erases_unsaved_forms_or_composer_tables() {
         source: "explicit".into(),
         created_at: 1,
         supersedes: None,
+        origin: xylo_core::MemoryOrigin::UserTyped,
     };
     memory.remember_sync(record).unwrap();
     saved(

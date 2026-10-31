@@ -142,3 +142,28 @@ fn the_activity_line_names_a_helper_agents_call_on_one_line() {
     });
     assert_eq!(latest_step(&turn).as_deref(), Some("Search first second"));
 }
+
+#[test]
+fn harness_notes_alone_are_not_work_to_fold() {
+    let mut turn = TurnState::default();
+    turn.apply(EngineEvent::Started);
+    turn.apply(EngineEvent::Delta {
+        text: "Part one".into(),
+    });
+    turn.apply(EngineEvent::HarnessNote {
+        kind: xylo_core::NoteKind::Continuation,
+        text: "Asked the model to continue.".into(),
+    });
+    turn.apply(EngineEvent::Delta {
+        text: " and two".into(),
+    });
+    turn.apply(EngineEvent::Completed {
+        text: "Part one and two".into(),
+        usage: Default::default(),
+    });
+    assert_eq!(answer_segment(&turn), Some(1));
+    assert!(
+        !has_work(&turn),
+        "A plain answer gets no 'Worked for' header for a note"
+    );
+}

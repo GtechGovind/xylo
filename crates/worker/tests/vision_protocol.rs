@@ -109,7 +109,7 @@ async fn fixture() -> (String, tokio::task::JoinHandle<Vec<Value>>) {
         // answered too but not recorded. The title follows Completed, so the
         // restart between the turns may abandon it mid-response.
         while requests.len() < 2 {
-            let (socket, _) = listener.accept().await.unwrap();
+            let socket = accept_model_request(&listener).await;
             let mut socket = BufReader::new(socket);
             let mut line = String::new();
             socket.read_line(&mut line).await.unwrap();
@@ -243,4 +243,28 @@ async fn actual_worker_sends_managed_image_and_rehydrates_it_after_process_resta
             .count(),
         1
     );
+}
+
+/// The next connection carrying a model request. The engine's served-context
+/// probe (a GET this fixture does not serve) gets 404, as from a server that
+/// reports no context.
+async fn accept_model_request(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    loop {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut start = [0; 4];
+        if socket.peek(&mut start).await.unwrap_or(0) < 4 || &start != b"GET " {
+            return socket;
+        }
+        let (mut bytes, mut buffer) = (Vec::new(), [0; 1024]);
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            match socket.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+            }
+        }
+        let _ = socket
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    }
 }

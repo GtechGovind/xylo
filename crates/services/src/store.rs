@@ -606,30 +606,6 @@ impl Store {
             Ok(())
         })
     }
-    pub fn save_checkpoint(&self, session_id: Uuid, turn_id: Uuid, messages: &Value) -> Result<()> {
-        let json = serde_json::to_string(messages)?;
-        self.call(move |conn| { conn.execute("INSERT INTO checkpoints(session_id,turn_id,messages,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET turn_id=excluded.turn_id,messages=excluded.messages,updated_at=excluded.updated_at",params![session_id.to_string(),turn_id.to_string(),json,now_ms()])?; Ok(()) })
-    }
-    pub fn checkpoint(&self, session_id: Uuid) -> Result<Option<Checkpoint>> {
-        self.call(move |conn| {
-            let row: Option<(String, String, i64)> = conn
-                .query_row(
-                    "SELECT turn_id,messages,updated_at FROM checkpoints WHERE session_id=?1",
-                    [session_id.to_string()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            row.map(|(turn_id, json, updated_at)| {
-                Ok(Checkpoint {
-                    session_id,
-                    turn_id: Uuid::parse_str(&turn_id)?,
-                    messages: serde_json::from_str(&json)?,
-                    updated_at,
-                })
-            })
-            .transpose()
-        })
-    }
     pub fn completed_turn(&self, session_id: Uuid, turn_id: Uuid) -> Result<Option<CompletedTurn>> {
         self.call(move |conn| {
             let json: Option<String> = conn
@@ -653,7 +629,29 @@ impl Store {
         text: &str,
         usage: &Usage,
     ) -> Result<()> {
-        let messages = serde_json::to_string(messages)?;
+        self.complete_turn_as(
+            session_id,
+            turn_id,
+            messages,
+            text,
+            usage,
+            MessageStatus::Complete,
+        )
+    }
+
+    /// [`Store::complete_turn`], storing the assistant reply with `status`:
+    /// [`MessageStatus::Truncated`] for an answer that reached the output
+    /// limit and is kept as far as it got.
+    pub fn complete_turn_as(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        messages: &Value,
+        text: &str,
+        usage: &Usage,
+        status: MessageStatus,
+    ) -> Result<()> {
+        let messages = crate::checkpoint::message_rows(messages)?;
         let receipt = CompletedTurn {
             text: text.into(),
             usage: usage.clone(),
@@ -663,8 +661,8 @@ impl Store {
             let existing:Option<String>=tx.query_row("SELECT json FROM completed_turns WHERE session_id=?1 AND turn_id=?2",params![session_id.to_string(),turn_id.to_string()],|r|r.get(0)).optional()?;
             if let Some(existing)=existing{ensure!(serde_json::from_str::<Value>(&existing)?==serde_json::from_str::<Value>(&receipt_json)?,"Turn was already completed with a different result");return Ok(())}
             let timestamp=now_ms();
-            tx.execute("INSERT INTO checkpoints(session_id,turn_id,messages,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET turn_id=excluded.turn_id,messages=excluded.messages,updated_at=excluded.updated_at",params![session_id.to_string(),turn_id.to_string(),messages,timestamp])?;
-            let message=ChatMessage{id:assistant_reply_id(turn_id),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new(), status: Default::default(),};
+            crate::checkpoint::write_rows(&tx,session_id,turn_id,&messages,None,timestamp)?;
+            let message=ChatMessage{id:assistant_reply_id(turn_id),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new(), status,};
             tx.execute("INSERT INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4)",params![message.id.to_string(),session_id.to_string(),serde_json::to_string(&message)?,timestamp])?;
             tx.execute("DELETE FROM messages WHERE id=?1",[interrupted_reply_id(turn_id).to_string()])?;
             tx.execute("INSERT INTO completed_turns(session_id,turn_id,json,completed_at) VALUES(?1,?2,?3,?4)",params![session_id.to_string(),turn_id.to_string(),receipt_json,timestamp])?;

@@ -33,6 +33,8 @@ use std::{
 pub const DIRECTORY_TTL_SECONDS: i64 = 6 * 60 * 60;
 const MAX_INDEX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+/// GitHub truncates a recursive tree near 7 MB; anything larger is not a tree.
+const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 2000;
 const MANIFEST_CONCURRENCY: usize = 8;
 const RATE_LIMITED: &str = "Showing cached results; GitHub rate limit reached";
@@ -248,12 +250,19 @@ impl ExtensionService {
         let Some(content) = &item.content else {
             return Ok(());
         };
+        // Read-modify-write under the catalog lock so concurrent installs
+        // cannot drop each other's records; replace atomically and durably.
+        let _lock = self.lock()?;
         let mut map = self.installed_content();
         map.insert(provenance(item), content.clone());
-        std::fs::create_dir_all(self.directory_root())?;
-        let mut file = tempfile::NamedTempFile::new_in(self.directory_root())?;
+        let root = self.directory_root();
+        std::fs::create_dir_all(&root)?;
+        let mut file = tempfile::NamedTempFile::new_in(&root)?;
         file.write_all(&serde_json::to_vec(&map)?)?;
+        file.as_file().sync_all()?;
         file.persist(self.installed_content_path())?;
+        #[cfg(unix)]
+        std::fs::File::open(&root)?.sync_all()?;
         Ok(())
     }
 
@@ -474,19 +483,25 @@ async fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
     Ok(response.error_for_status()?)
 }
 
-async fn bounded_text(response: reqwest::Response, maximum: usize) -> Result<Vec<u8>> {
+/// Reads at most `maximum` bytes. The body is streamed and counted, so a
+/// response without a Content-Length (chunked or close-delimited) is cut off
+/// at the limit instead of being buffered whole.
+async fn bounded_text(mut response: reqwest::Response, maximum: usize) -> Result<Vec<u8>> {
     ensure!(
         response
             .content_length()
             .is_none_or(|length| length <= maximum as u64),
         "Directory file exceeds its size limit"
     );
-    let bytes = response.bytes().await?;
-    ensure!(
-        bytes.len() <= maximum,
-        "Directory file exceeds its size limit"
-    );
-    Ok(bytes.to_vec())
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            bytes.len() + chunk.len() <= maximum,
+            "Directory file exceeds its size limit"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 async fn fetch(
@@ -522,19 +537,22 @@ async fn fetch(
     if cached.revision.as_deref() == Some(revision.as_str()) {
         return Ok(Fetched::Unchanged { etag });
     }
-    let tree: Value = checked(
-        client
-            .get(format!(
-                "{}/repos/{}/git/trees/{revision}",
-                endpoints.api, source.repository
-            ))
-            .query(&[("recursive", "1")])
-            .send()
-            .await?,
+    let tree = bounded_text(
+        checked(
+            client
+                .get(format!(
+                    "{}/repos/{}/git/trees/{revision}",
+                    endpoints.api, source.repository
+                ))
+                .query(&[("recursive", "1")])
+                .send()
+                .await?,
+        )
+        .await?,
+        MAX_TREE_BYTES,
     )
-    .await?
-    .json()
     .await?;
+    let tree: Value = serde_json::from_slice(&tree).context("Source tree is not JSON")?;
     let tree = Tree::new(&tree)?;
     let raw = |path: &str| format!("{}/{}/{revision}/{path}", endpoints.raw, source.repository);
     let index = [

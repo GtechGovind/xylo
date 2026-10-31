@@ -1,0 +1,1 @@
+{{pattern}} Xylo has already pointed out that you are repeating yourself. If the pattern continues, Xylo will stop this task. Do something different now, or stop calling tools and explain to the user what is blocking you.

@@ -332,7 +332,7 @@ async fn chat_and_azure_use_correct_paths_headers_images_and_tool_fragments() {
             json!({"choices":[{"delta":{"content":"हैलो 🦀"},"finish_reason":null}]}),
             json!({"choices":[{"delta":{"tool_calls":[{"index":4,"id":"call-fixture","function":{"name":"lookup","arguments":"{\"q\":"}}]},"finish_reason":null}]}),
             json!({"choices":[{"delta":{"tool_calls":[{"index":4,"function":{"arguments":"\"done\"}"}}]},"finish_reason":"tool_calls"}]}),
-            json!({"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4}}),
+            json!({"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":6}}}),
         ]);
         payload.extend_from_slice(b"data: [DONE]\r\n\r\n");
         let (endpoint, server) = fixture(payload, 200, "text/event-stream").await;
@@ -342,6 +342,7 @@ async fn chat_and_azure_use_correct_paths_headers_images_and_tool_fragments() {
         assert_eq!(response.message.tool_calls.len(), 1);
         assert_eq!(response.message.tool_calls[0].arguments, "{\"q\":\"done\"}");
         assert_eq!(response.usage.unwrap().input_tokens, 9);
+        assert_eq!(response.usage.unwrap().cache_read_tokens, Some(6));
         let sent = server.await.unwrap();
         assert!(sent.line.contains(if family == ApiFamily::Azure {
             "/openai/v1/chat/completions"
@@ -366,7 +367,7 @@ async fn chat_and_azure_use_correct_paths_headers_images_and_tool_fragments() {
 async fn gemini_native_stream_retains_tool_signature_for_the_next_turn() {
     let payload = sse(&[
         json!({"candidates":[{"content":{"parts":[{"text":"हैलो"}]}}]}),
-        json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"gemini-call","name":"lookup","args":{"q":"done"}},"thoughtSignature":"opaque-signature"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":2,"thoughtsTokenCount":3}}),
+        json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"gemini-call","name":"lookup","args":{"q":"done"}},"thoughtSignature":"opaque-signature"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":2,"thoughtsTokenCount":3,"cachedContentTokenCount":4}}),
     ]);
     let (endpoint, server) = fixture(payload, 200, "text/event-stream").await;
     let native = provider(ApiFamily::Gemini, endpoint);
@@ -375,6 +376,7 @@ async fn gemini_native_stream_retains_tool_signature_for_the_next_turn() {
         .unwrap();
     assert_eq!(response.finish, FinishReason::ToolCalls);
     assert_eq!(response.usage.unwrap().output_tokens, 5);
+    assert_eq!(response.usage.unwrap().cache_read_tokens, Some(4));
     let replay = request::body(
         &native,
         &[
@@ -459,6 +461,7 @@ async fn anthropic_stream_preserves_interleaved_thinking_signature_and_compact_t
     };
     assert_eq!(blocks[0]["signature"], "signed-thinking");
     assert_eq!(response.usage.unwrap().input_tokens, 10);
+    assert_eq!(response.usage.unwrap().cache_read_tokens, Some(2));
     let replay = request::body(
         &native,
         &[Message::user("query"), response.message],
@@ -481,6 +484,46 @@ async fn anthropic_stream_preserves_interleaved_thinking_signature_and_compact_t
     );
     assert_eq!(sent.body["system"][0]["cache_control"]["type"], "ephemeral");
     assert_eq!(sent.body["tools"][0]["cache_control"]["type"], "ephemeral");
+}
+
+#[tokio::test]
+async fn a_long_anthropic_thinking_block_streams_to_identical_content() {
+    let pieces: Vec<String> = (0..4000).map(|i| format!("step {i}; ")).collect();
+    let mut events = vec![
+        json!({"type":"message_start","message":{"usage":{"input_tokens":8}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"Begin: ","signature":""}}),
+    ];
+    events.extend(pieces.iter().map(|piece| {
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":piece}})
+    }));
+    events.extend([
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"nature"}}),
+        json!({"type":"content_block_stop","index":0}),
+        // A text block the stream never stops is still settled at message_stop.
+        json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":"Hi"}}),
+        json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" there"}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6}}),
+        json!({"type":"message_stop"}),
+    ]);
+    let (endpoint, _server) = fixture(sse(&events), 200, "text/event-stream").await;
+    let native = provider(ApiFamily::Anthropic, endpoint);
+    let response = collect(&native, &[Message::user("think")]).await.unwrap();
+    let thinking = format!("Begin: {}", pieces.concat());
+    let Some(NativeContent::Anthropic(blocks)) = &response.message.native else {
+        panic!("native blocks missing");
+    };
+    assert_eq!(
+        blocks,
+        &vec![
+            json!({"type":"thinking","thinking":thinking,"signature":"sig-nature"}),
+            json!({"type":"text","text":"Hi there"}),
+        ]
+    );
+    assert_eq!(
+        response.message.reasoning.as_deref(),
+        Some(pieces.concat().as_str())
+    );
 }
 
 #[test]
@@ -509,7 +552,7 @@ async fn responses_stream_uses_public_api_and_preserves_encrypted_history() {
         json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc-1","call_id":"responses-call","name":"lookup","arguments":""}}),
         json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"q\":\"done\"}"}),
         json!({"type":"response.output_item.done","output_index":1,"item":output[1]}),
-        json!({"type":"response.completed","response":{"status":"completed","model":"fixture-model","output":output,"usage":{"input_tokens":8,"output_tokens":3}}}),
+        json!({"type":"response.completed","response":{"status":"completed","model":"fixture-model","output":output,"usage":{"input_tokens":8,"output_tokens":3,"input_tokens_details":{"cached_tokens":5}}}}),
     ]);
     let (endpoint, server) = fixture(payload, 200, "text/event-stream").await;
     let native = provider(ApiFamily::OpenAiResponses, endpoint);
@@ -517,6 +560,7 @@ async fn responses_stream_uses_public_api_and_preserves_encrypted_history() {
         .await
         .unwrap();
     assert_eq!(response.message.tool_calls.len(), 1);
+    assert_eq!(response.usage.unwrap().cache_read_tokens, Some(5));
     let replay = request::body(
         &native,
         &[Message::user("query"), response.message],
@@ -742,7 +786,7 @@ async fn bedrock_native_binary_stream_retains_signed_reasoning_tools_images_and_
         aws_frame("messageStop", json!({"stopReason":"tool_use"})),
         aws_frame(
             "metadata",
-            json!({"usage":{"inputTokens":8,"outputTokens":4,"totalTokens":12}}),
+            json!({"usage":{"inputTokens":8,"outputTokens":4,"totalTokens":12,"cacheReadInputTokens":20,"cacheWriteInputTokens":2}}),
         ),
     ]
     .concat();
@@ -756,7 +800,15 @@ async fn bedrock_native_binary_stream_retains_signed_reasoning_tools_images_and_
     assert_eq!(response.message.content, "Hello 🦀");
     assert_eq!(response.message.tool_calls.len(), 1);
     assert_eq!(response.message.tool_calls[0].arguments, "{\"q\":\"done\"}");
-    assert_eq!(response.usage.unwrap().input_tokens, 8);
+    let usage = response.usage.unwrap();
+    assert_eq!(
+        usage.input_tokens, 30,
+        "cached tokens count as prompt tokens"
+    );
+    assert_eq!(
+        (usage.cache_read_tokens, usage.cache_write_tokens),
+        (Some(20), Some(2))
+    );
     let Some(NativeContent::Bedrock(blocks)) = &response.message.native else {
         panic!("native blocks missing");
     };
@@ -1228,7 +1280,10 @@ async fn anthropic_tool_input_cut_by_the_output_limit_finishes_with_length() {
     .await
     .unwrap();
     assert_eq!(response.finish, FinishReason::Length);
-    assert_eq!(response.message.tool_calls[0].arguments, "{\"path\":\"a");
+    // The cut-off call is reported and its partial JSON cleared, so it is
+    // never dispatched and later requests replay valid arguments.
+    assert_eq!(response.truncated_calls.len(), 1);
+    assert_eq!(response.message.tool_calls[0].arguments, "{}");
     server.await.unwrap();
     // The same cut-off input without the output limit is a provider fault.
     let mut events = events.to_vec();
@@ -1249,12 +1304,7 @@ async fn anthropic_tool_input_cut_by_the_output_limit_finishes_with_length() {
 async fn bedrock_tool_without_arguments_and_cut_off_arguments_are_not_turn_failures() {
     for (input, stop, arguments, finish) in [
         ("", "tool_use", "{}", FinishReason::ToolCalls),
-        (
-            "{\"path\":\"a",
-            "max_tokens",
-            "{\"path\":\"a",
-            FinishReason::Length,
-        ),
+        ("{\"path\":\"a", "max_tokens", "{}", FinishReason::Length),
     ] {
         let payload = [
             aws_frame(
@@ -1275,6 +1325,10 @@ async fn bedrock_tool_without_arguments_and_cut_off_arguments_are_not_turn_failu
             .unwrap();
         assert_eq!(response.message.tool_calls[0].arguments, arguments);
         assert_eq!(response.finish, finish);
+        assert_eq!(
+            response.truncated_calls.len(),
+            usize::from(finish == FinishReason::Length)
+        );
         let Some(NativeContent::Bedrock(blocks)) = &response.message.native else {
             panic!("native blocks missing");
         };
@@ -1332,4 +1386,224 @@ fn lowest_reasoning_picks_the_smallest_supported_effort() {
         assert_eq!(effort(crate::model::Reasoning::Configured), "high");
         assert_eq!(effort(crate::model::Reasoning::Lowest), "low");
     }
+}
+
+/// Finish reasons that mean "out of room" keep the partial reply as a
+/// `Length` finish, and a plain end-of-sequence is a stop.
+#[tokio::test]
+async fn output_room_finish_reasons_map_to_length_and_eos_to_stop() {
+    for (reason, expected) in [
+        ("model_length", FinishReason::Length),
+        ("eos_token", FinishReason::Stop),
+        ("eos", FinishReason::Stop),
+    ] {
+        let mut payload = sse(&[
+            json!({"choices":[{"delta":{"content":"Partial"},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":reason}]}),
+        ]);
+        payload.extend_from_slice(b"data: [DONE]\r\n\r\n");
+        let (endpoint, server) = fixture(payload, 200, "text/event-stream").await;
+        let response = collect(
+            &provider(ApiFamily::OpenAiChat, endpoint),
+            &[Message::user("q")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.finish, expected, "{reason}");
+        assert_eq!(response.message.content, "Partial");
+        server.await.unwrap();
+    }
+    let events = [
+        json!({"type":"message_start","message":{"usage":{"input_tokens":3}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Cut"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"},"usage":{"output_tokens":9}}),
+        json!({"type":"message_stop"}),
+    ];
+    let (endpoint, server) = fixture(sse(&events), 200, "text/event-stream").await;
+    let response = collect(
+        &provider(ApiFamily::Anthropic, endpoint),
+        &[Message::user("q")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.finish, FinishReason::Length);
+    assert_eq!(response.message.content, "Cut");
+    server.await.unwrap();
+}
+
+/// Gemini's malformed function call is a recoverable finish, not a failure.
+#[tokio::test]
+async fn gemini_malformed_function_call_is_a_recoverable_finish() {
+    let payload = sse(&[
+        json!({"candidates":[{"content":{"parts":[{"text":"Calling"}]},"finishReason":"MALFORMED_FUNCTION_CALL"}]}),
+    ]);
+    let (endpoint, server) = fixture(payload, 200, "text/event-stream").await;
+    let response = collect(
+        &provider(ApiFamily::Gemini, endpoint),
+        &[Message::user("q")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.finish, FinishReason::MalformedToolCall);
+    assert!(response.message.tool_calls.is_empty());
+    assert_eq!(response.message.content, "Calling");
+    server.await.unwrap();
+}
+
+fn body_for(provider: &NativeProvider, messages: &[Message], tools: &[ToolSchema]) -> Value {
+    request::body(
+        provider,
+        messages,
+        tools,
+        100,
+        crate::model::Reasoning::Configured,
+    )
+    .unwrap()
+}
+
+#[test]
+fn anthropic_keeps_the_static_system_prompt_cached_beside_a_summary() {
+    let native = provider(ApiFamily::Anthropic, "http://127.0.0.1:1".into());
+    let mut summary = Message::system("Summary of earlier work");
+    summary.summary = true;
+    let body = body_for(
+        &native,
+        &[Message::system("Policy"), summary, Message::user("Next")],
+        &[tool_schema()],
+    );
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(body["system"][1]["cache_control"]["type"], "ephemeral");
+    assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(body.to_string().matches("cache_control").count(), 4);
+}
+
+#[test]
+fn openai_cache_key_is_stable_for_a_conversation_and_omitted_for_other_servers() {
+    let responses = provider(ApiFamily::OpenAiResponses, "http://127.0.0.1:1".into());
+    let first = [Message::system("Policy"), Message::user("Fix the build")];
+    let mut later = first.to_vec();
+    later.push(Message::assistant("Done"));
+    later.push(Message::user("Now run the tests"));
+    let key = body_for(&responses, &first, &[])["prompt_cache_key"].clone();
+    assert!(key.as_str().unwrap().starts_with("xylo-"));
+    assert_eq!(body_for(&responses, &later, &[])["prompt_cache_key"], key);
+    let other = [Message::system("Policy"), Message::user("Another task")];
+    assert_ne!(body_for(&responses, &other, &[])["prompt_cache_key"], key);
+    assert!(!key.as_str().unwrap().contains("Policy"));
+    let local = provider(ApiFamily::OpenAiChat, "http://127.0.0.1:1".into());
+    assert!(
+        body_for(&local, &first, &[])
+            .get("prompt_cache_key")
+            .is_none()
+    );
+    let openai = provider(ApiFamily::OpenAiChat, "https://api.openai.com/v1".into());
+    assert!(body_for(&openai, &first, &[])["prompt_cache_key"].is_string());
+    let anthropic = provider(ApiFamily::Anthropic, "http://127.0.0.1:1".into());
+    assert!(
+        body_for(&anthropic, &first, &[])
+            .get("prompt_cache_key")
+            .is_none()
+    );
+}
+
+#[test]
+fn openai_functions_are_strict_only_when_the_schema_already_complies() {
+    let native = provider(ApiFamily::OpenAiResponses, "http://127.0.0.1:1".into());
+    let schema = |parameters: Value| ToolSchema {
+        name: "tool".into(),
+        description: "A tool.".into(),
+        parameters,
+    };
+    let strict = [
+        tool_schema(),
+        schema(json!({"type":"object","properties":{},"required":[],"additionalProperties":false})),
+        schema(
+            json!({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"status":{"type":"string","enum":["a","b"]}},"required":["status"],"additionalProperties":false}}},"required":["todos"],"additionalProperties":false}),
+        ),
+    ];
+    let loose = [
+        schema(
+            json!({"type":"object","properties":{"q":{"type":"string"},"limit":{"type":"integer"}},"required":["q"],"additionalProperties":false}),
+        ),
+        schema(json!({"type":"object","properties":{"q":{"type":"string"}},"required":["q"]})),
+        schema(
+            json!({"type":"object","properties":{"n":{"type":"integer","minimum":1}},"required":["n"],"additionalProperties":false}),
+        ),
+        schema(
+            json!({"type":"object","properties":{"o":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}},"required":["o"],"additionalProperties":false}),
+        ),
+        schema(json!({})),
+    ];
+    for (tools, expected) in [(&strict[..], true), (&loose[..], false)] {
+        let body = body_for(&native, &[Message::user("q")], tools);
+        for (index, function) in body["tools"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(function["strict"], expected, "{index}: {function}");
+        }
+    }
+}
+
+/// The request prefix a provider caches (tools, then system) must be
+/// byte-identical between two turns of one conversation, whatever the new
+/// messages say.
+#[test]
+fn cached_prefix_is_byte_identical_across_turns() {
+    for family in [ApiFamily::Anthropic, ApiFamily::OpenAiResponses] {
+        let native = provider(family.clone(), "http://127.0.0.1:1".into());
+        let tools = [tool_schema()];
+        let turn_one = [Message::system("Policy"), Message::user("First prompt")];
+        let mut turn_two = turn_one.to_vec();
+        turn_two.push(Message::assistant("First answer"));
+        turn_two.push(Message::user("A different second prompt"));
+        let one = body_for(&native, &turn_one, &tools);
+        let two = body_for(&native, &turn_two, &tools);
+        for field in ["tools", "system", "instructions", "prompt_cache_key"] {
+            assert_eq!(
+                serde_json::to_string(&one[field]).unwrap(),
+                serde_json::to_string(&two[field]).unwrap(),
+                "{family:?} {field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn context_overflow_is_recognised_from_codes_and_messages() {
+    let native = provider(ApiFamily::OpenAiChat, "http://127.0.0.1:1".into());
+    let overflow = |status, code, reason: Option<&str>| {
+        matches!(
+            native.http_error(status, code, reason, None, &json!({})),
+            ModelError::ContextOverflow(_)
+        )
+    };
+    assert!(overflow(400, "context_length_exceeded", None));
+    // llama.cpp reports a numeric code and says it in the message.
+    assert!(overflow(
+        400,
+        "request_failed",
+        Some("the request exceeds the available context size, try increasing it")
+    ));
+    assert!(overflow(
+        400,
+        "invalid_request_error",
+        Some("prompt is too long: 210000 tokens > 200000 maximum")
+    ));
+    assert!(overflow(
+        400,
+        "request_failed",
+        Some(
+            "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens."
+        )
+    ));
+    assert!(!overflow(
+        400,
+        "invalid_request_error",
+        Some("messages: field required")
+    ));
+    assert!(!overflow(500, "request_failed", Some("prompt is too long")));
 }

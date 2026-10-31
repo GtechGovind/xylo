@@ -121,7 +121,10 @@ fn provider(count: usize) -> (String, tokio::sync::mpsc::UnboundedReceiver<Reque
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let (send, recv) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
-        for connection in listener.incoming().take(count) {
+        let requests = listener
+            .incoming()
+            .filter(|connection| connection.as_ref().map_or(true, |c| !answer_probe(c)));
+        for connection in requests.take(count) {
             let mut connection = connection.unwrap();
             connection
                 .set_read_timeout(Some(Duration::from_secs(30)))
@@ -458,5 +461,63 @@ async fn cancellation_before_application_reports_cancelled_and_preserves_draft()
             .iter()
             .any(|message| message.id == Uuid::new_v5(&guidance.id, b"steering-message"))
     );
+    worker.shutdown().await;
+}
+
+/// Answers the engine's served-context probe (a GET this fixture does not
+/// serve) with 404, as a server that reports no context; true when
+/// `connection` was such a probe.
+fn answer_probe(connection: &std::net::TcpStream) -> bool {
+    use std::io::{Read as _, Write as _};
+    let mut start = [0; 4];
+    if connection.peek(&mut start).unwrap_or(0) < 4 || &start != b"GET " {
+        return false;
+    }
+    let (mut reader, mut bytes, mut buffer) = (connection, Vec::new(), [0; 1024]);
+    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+        }
+    }
+    let _ = (&mut reader)
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    true
+}
+#[tokio::test]
+async fn a_guidance_journal_failure_is_answered_and_the_worker_keeps_serving() {
+    let profile = tempfile::tempdir().unwrap();
+    let paths = xylo_runtime::AppPaths::at(profile.path().into()).unwrap();
+    let mut worker = Worker::start(profile.path()).await;
+    // The worker's next journal read fails, as an I/O fault would.
+    rusqlite::Connection::open(&paths.database)
+        .unwrap()
+        .execute_batch("DROP TABLE user_guidance")
+        .unwrap();
+    let session = Uuid::new_v4();
+    let guidance = SteeringRequest {
+        id: Uuid::new_v4(),
+        session_id: session,
+        turn_id: Uuid::new_v4(),
+        text: "Use the other option".into(),
+    };
+    worker
+        .send(session, WorkerCommand::SteerDurable { guidance })
+        .await;
+    match worker.event().await {
+        EngineEvent::Error {
+            message, retryable, ..
+        } => {
+            assert!(
+                message.starts_with("Guidance could not be checked"),
+                "{message}"
+            );
+            assert!(retryable);
+        }
+        other => panic!("expected an error reply, got {other:?}"),
+    }
+    // Still alive: the next command is answered.
+    worker.send(Uuid::nil(), WorkerCommand::Hello).await;
+    assert!(matches!(worker.event().await, EngineEvent::Ready { .. }));
     worker.shutdown().await;
 }

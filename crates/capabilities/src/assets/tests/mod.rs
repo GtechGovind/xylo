@@ -155,6 +155,19 @@ async fn installation_is_durable_verified_and_rejects_changed_bytes_on_activatio
         .verified_exports("fixture", &CancellationToken::new())
         .await
         .unwrap();
+    // The damaged copy was moved aside and removed, never left half-deleted.
+    assert_eq!(
+        std::fs::read_dir(manager.root.join("staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_dir(manager.root.join("installed/fixture"))
+            .unwrap()
+            .count(),
+        1
+    );
     manager.shutdown().await;
     server.abort();
 }

@@ -60,6 +60,12 @@ impl Drop for LearningTurnGuard {
     }
 }
 
+/// Wraps the model provider a turn would otherwise use, beneath the engine's
+/// own attachment and context guards. Evaluation harnesses use it to record
+/// requests or to substitute a scripted model; the worker never sets one.
+pub type ProviderLayer =
+    Arc<dyn Fn(Arc<dyn ModelProvider>) -> Arc<dyn ModelProvider> + Send + Sync>;
+
 /// Xylo's native agent engine.
 pub struct AgentEngine {
     store: Store,
@@ -68,6 +74,12 @@ pub struct AgentEngine {
     steering: SteeringControl,
     provider_credential: Option<WorkerCredential>,
     credential_resolver: Option<Arc<dyn ProviderCredentialResolver>>,
+    provider_layer: Option<ProviderLayer>,
+    /// Contexts local servers reported serving, so a session probes each
+    /// endpoint and model once. The worker shares one cache across its
+    /// engines ([`AgentEngine::with_served_contexts`]), so the window, and
+    /// with it the tool set and cached prefix, stays stable across turns.
+    served_contexts: xylo_services::providers::ServedContextCache,
 }
 
 impl AgentEngine {
@@ -78,6 +90,8 @@ impl AgentEngine {
             steering: SteeringControl::new(store.clone()),
             provider_credential: None,
             credential_resolver: None,
+            provider_layer: None,
+            served_contexts: Default::default(),
             store,
             paths,
             session,
@@ -105,7 +119,34 @@ impl AgentEngine {
         self
     }
 
+    /// Remembers served contexts in `cache`, shared with the session's other
+    /// engines: once a local server reported its window, every later turn
+    /// of the session uses that value without probing again.
+    pub fn with_served_contexts(
+        mut self,
+        cache: xylo_services::providers::ServedContextCache,
+    ) -> Self {
+        self.served_contexts = cache;
+        self
+    }
+
+    /// Wraps every provider this engine builds (turns and titles) in
+    /// `layer`. The layer sits under the context guard, so it sees exactly
+    /// the requests that would reach the wire.
+    pub fn with_provider_layer(mut self, layer: ProviderLayer) -> Self {
+        self.provider_layer = Some(layer);
+        self
+    }
+
     fn provider(&self, config: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
+        let provider = self.configured_provider(config)?;
+        Ok(match &self.provider_layer {
+            Some(layer) => layer(provider),
+            None => provider,
+        })
+    }
+
+    fn configured_provider(&self, config: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
         if let Some(credential) = &self.provider_credential {
             ensure!(
                 config.credential_ref.is_none() || credential.0.is_some(),
@@ -155,7 +196,8 @@ impl AgentEngine {
         events: mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
     ) -> Result<Vec<Message>> {
-        let checkpoint = self.store.checkpoint(request.session_id)?;
+        let (store, session) = (self.store.clone(), request.session_id);
+        let checkpoint = blocking(move || store.checkpoint(session)).await?;
         let Some(checkpoint) = checkpoint else {
             return Ok(vec![user_message(request)]);
         };
@@ -164,19 +206,23 @@ impl AgentEngine {
         let resuming = checkpoint.turn_id == request.turn_id;
         let mut previous = request.clone();
         previous.turn_id = checkpoint.turn_id;
-        let broker = self.broker(&previous, events, cancel)?;
-        let settled = settle_pending_tools(&mut messages, &broker, resuming);
+        let broker = Arc::new(self.broker(&previous, events, cancel)?);
+        let settling = broker.clone();
+        let (mut messages, settled) = tokio::task::spawn_blocking(move || {
+            let settled = settle_pending_tools(&mut messages, &settling, resuming);
+            (messages, settled)
+        })
+        .await
+        .context("Settling task stopped")?;
         let shutdown = broker.shutdown().await;
         settled?;
         shutdown?;
         if !resuming {
             // Keep the earlier turn's key namespace until its settled results
             // have a durable checkpoint of their own.
-            self.store.save_checkpoint(
-                request.session_id,
-                checkpoint.turn_id,
-                &serde_json::to_value(&messages)?,
-            )?;
+            let (store, turn) = (self.store.clone(), checkpoint.turn_id);
+            let value = serde_json::to_value(&messages)?;
+            blocking(move || store.save_checkpoint(session, turn, &value)).await?;
             messages.push(user_message(request));
         }
         Ok(messages)
@@ -197,26 +243,53 @@ impl AgentEngine {
     }
 
     /// The system prompt for this turn: environment, permission policy,
-    /// project instructions and the skill and fact indexes.
-    fn system_prompt(
-        &self,
-        request: &TurnRequest,
-        broker: &ToolBroker,
-        mode: PermissionMode,
-    ) -> Result<String> {
-        let mut context =
-            crate::prompts::PromptContext::detect(&request.workspace, mode, xylo_core::now_ms());
+    /// project instructions and the skills index. Nothing in it depends on
+    /// the user's prompt, so it is byte-identical across the turns of a
+    /// conversation (until the day, branch, mode, instructions or installed
+    /// skills change) and the provider's cached prefix survives each new
+    /// message. What is retrieved for the prompt goes in [`Self::recalled_context`].
+    fn system_prompt(request: &TurnRequest, broker: &ToolBroker, mode: PermissionMode) -> String {
+        let mut context = crate::prompts::PromptContext::detect(
+            &request.workspace,
+            mode,
+            xylo_core::now_ms(),
+            broker.window().prompt_budget(),
+        );
         context.skills_index = broker.project_skill_context().unwrap_or_else(|error| {
             tracing::warn!(error=%error, "Skill index unavailable");
             String::new()
         });
-        let facts = broker.project_facts()?;
-        context.facts_index = crate::prompts::facts_index(
-            facts
-                .iter()
-                .map(|fact| fact.content.lines().next().unwrap_or_default()),
-        );
-        Ok(crate::prompts::system(&context))
+        crate::prompts::system(&context)
+    }
+
+    /// The application note that follows a new user message with the
+    /// project facts and learned procedures retrieved for its prompt, quoted
+    /// and dated as data, and the installed skills the prompt invokes. It is appended once, becomes part of the durable
+    /// history, and is never rebuilt, so later calls replay identical bytes.
+    /// Retrieval is advisory: a failure is logged and the turn goes on.
+    fn recalled_context(broker: &ToolBroker) -> Option<Message> {
+        let facts = broker.project_facts().unwrap_or_else(|error| {
+            tracing::warn!(error=%error, "Project facts unavailable");
+            Vec::new()
+        });
+        let procedures = broker.learned_procedures().unwrap_or_else(|error| {
+            tracing::warn!(error=%error, "Learned procedures unavailable");
+            Vec::new()
+        });
+        let facts: Vec<_> = facts
+            .iter()
+            .map(|fact| crate::prompts::RecalledFact {
+                text: &fact.record.content,
+                origin: fact.record.origin,
+                created_at: fact.record.created_at,
+            })
+            .collect();
+        let skills = broker.invoked_skills().unwrap_or_else(|error| {
+            tracing::warn!(error=%error, "Invoked skills unavailable");
+            Vec::new()
+        });
+        crate::prompts::recalled_context(&facts, &procedures, &skills)
+            .map(|note| crate::agent_loop::application_note(&note))
     }
 
     /// Generates, stores and announces a title after the first completed
@@ -313,10 +386,8 @@ impl AgentEngine {
         events: &mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        if let Some(completed) = self
-            .store
-            .completed_turn(request.session_id, request.turn_id)?
-        {
+        let (store, session, turn) = (self.store.clone(), request.session_id, request.turn_id);
+        if let Some(completed) = blocking(move || store.completed_turn(session, turn)).await? {
             events
                 .send(EngineEvent::Completed {
                     text: completed.text,
@@ -361,19 +432,31 @@ impl AgentEngine {
         }
         // Inspect exact native receipts before blocking resume on the journal.
         // This pass never dispatches a tool or probes its target.
-        for action in self.store.unresolved_actions(request.session_id)? {
+        let (store, session) = (self.store.clone(), request.session_id);
+        for action in blocking(move || store.unresolved_actions(session)).await? {
             if action.state == "outcome_unknown" && action.intent.name == "environment_execute" {
                 let broker = broker.clone();
                 tokio::task::spawn_blocking(move || broker.recover_native_action(action)).await??;
             }
         }
-        let unresolved = self.store.unresolved_actions(request.session_id)?;
+        let store = self.store.clone();
+        let unresolved = blocking(move || store.unresolved_actions(session)).await?;
         ensure!(
             !unresolved
                 .iter()
                 .any(|a| matches!(a.state.as_str(), "outcome_unknown" | "running")),
             "This task has an outcome-unknown action. Reconcile it before resuming"
         );
+        // Budgets follow the context a local server actually serves. The
+        // probe runs only past the gate above, so a blocked turn never
+        // contacts the provider; the session's cache remembers each answer,
+        // so a session probes an endpoint and model once.
+        let mut request = request;
+        request.provider.served_context_tokens = self
+            .served_contexts
+            .served_context_tokens(&request.provider, &cancel)
+            .await;
+        broker.set_served_context(request.provider.served_context_tokens);
         let guarded = GuardedProvider::new(
             Arc::new(AttachmentProvider::new(
                 self.provider(&request.provider)?,
@@ -387,11 +470,22 @@ impl AgentEngine {
         let summary_deadline = guarded.timeout();
         let provider: Arc<dyn ModelProvider> = Arc::new(guarded);
         let budget = ContextBudget::new(&request.provider);
-        let messages = self
+        let mut messages = self
             .restored_messages(&request, events.clone(), cancel.clone())
             .await?;
+        // A new prompt (or a resumed turn that never got past it) is followed
+        // by what was recalled for it; a resumed turn keeps the note it has.
+        // Recall (embedding inference and SQLite) and the system prompt (files,
+        // Git, the skills index) block, so they run off the async workers.
+        if messages.last() == Some(&user_message(&request)) {
+            let recalling = broker.clone();
+            if let Some(note) = blocking(move || Ok(Self::recalled_context(&recalling))).await? {
+                messages.push(note);
+            }
+        }
         let mode = self.session.permissions().get();
-        let system = self.system_prompt(&request, &broker, mode)?;
+        let (prompting, prompted) = (broker.clone(), request.clone());
+        let system = blocking(move || Ok(Self::system_prompt(&prompted, &prompting, mode))).await?;
         // Model calls admit their own memory when the model runs locally;
         // a child holds no lease of its own while it waits on tools.
         let resources = xylo_resources::ResourceManager::new();
@@ -414,11 +508,8 @@ impl AgentEngine {
             permissions: self.session.permissions().clone(),
         });
         broker.set_delegate(delegation.handler());
-        self.store.save_checkpoint(
-            request.session_id,
-            request.turn_id,
-            &serde_json::to_value(&messages)?,
-        )?;
+        let (store, value) = (self.store.clone(), serde_json::to_value(&messages)?);
+        blocking(move || store.save_checkpoint(session, turn, &value)).await?;
         events.send(EngineEvent::Started).await?;
         let agent = AgentLoop {
             provider: provider.clone(),
@@ -430,12 +521,12 @@ impl AgentEngine {
             max_model_calls: MAX_MODEL_CALLS,
             events: events.clone(),
             permissions: Some((self.session.permissions().clone(), mode)),
-            journal: Some(Journal {
-                store: self.store.clone(),
-                session: request.session_id,
-                turn: request.turn_id,
-                steering: Some(self.steering.clone()),
-            }),
+            journal: Some(Journal::new(
+                self.store.clone(),
+                request.session_id,
+                request.turn_id,
+                Some(self.steering.clone()),
+            )),
             cancel: cancel.clone(),
         };
         let outcome = agent.run(messages).await;
@@ -446,13 +537,19 @@ impl AgentEngine {
                 if outcome.stopped_early {
                     tracing::warn!(session_id=%request.session_id, "Turn reached its step limit");
                 }
-                self.store.complete_turn(
-                    request.session_id,
-                    request.turn_id,
-                    &serde_json::to_value(&outcome.messages)?,
-                    &outcome.text,
-                    &outcome.usage,
-                )?;
+                let (store, value) = (self.store.clone(), serde_json::to_value(&outcome.messages)?);
+                let (text, usage) = (outcome.text.clone(), outcome.usage.clone());
+                // An answer the output limit still cut off is kept as far as
+                // it got, and history says so.
+                let status = if outcome.cut_off {
+                    MessageStatus::Truncated
+                } else {
+                    MessageStatus::Complete
+                };
+                blocking(move || {
+                    store.complete_turn_as(session, turn, &value, &text, &usage, status)
+                })
+                .await?;
                 learning_turn.completed = true; // Receipt and evidence job committed atomically.
                 events
                     .send(EngineEvent::Completed {
@@ -526,6 +623,16 @@ impl EngineBackend for AgentEngine {
             .map_err(|_| error)
             .context("Task event consumer disconnected")
     }
+}
+
+/// Runs blocking store, file or inference work on the blocking pool, so the
+/// worker's small async runtime keeps serving events and streams meanwhile.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .context("Blocking task stopped")?
 }
 
 /// The product classification of a turn failure.

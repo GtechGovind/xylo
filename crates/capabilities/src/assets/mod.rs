@@ -725,22 +725,44 @@ impl AssetManager {
                 write_json(&stage.join("receipt.json"), &receipt)?;
                 write_json(&stage.join("ORIGIN.json"), &asset)?;
                 let destination = self.location(&asset)?;
-                std::fs::create_dir_all(
-                    destination
-                        .parent()
-                        .context("Invalid installed asset root")?,
-                )?;
+                let parent = destination
+                    .parent()
+                    .context("Invalid installed asset root")?;
+                std::fs::create_dir_all(parent)?;
+                let mut backup = None;
                 if destination.exists() {
                     if self.verified_exports(&asset.id, &cancel).await.is_ok() {
                         tokio::fs::remove_dir_all(&stage).await?;
                         return Ok(());
                     }
                     // A damaged or outdated installation is replaced, not kept.
-                    tokio::fs::remove_dir_all(&destination)
+                    // Move it aside whole (atomic) rather than delete it in place,
+                    // so the destination is never a half-deleted folder. The
+                    // backup is named as a stage of this asset: the held asset
+                    // lock protects it now, and startup reclaims it after a crash.
+                    let aside =
+                        self.root
+                            .join("staging")
+                            .join(format!("{}-{}", asset.id, Uuid::new_v4()));
+                    tokio::fs::rename(&destination, &aside)
                         .await
                         .context("Stop active native tasks before repairing this installation")?;
+                    backup = Some(aside);
                 }
-                tokio::fs::rename(&stage, &destination).await?;
+                if let Err(error) = tokio::fs::rename(&stage, &destination).await {
+                    // Put the previous installation back rather than leave none.
+                    if let Some(backup) = &backup {
+                        let _ = tokio::fs::rename(backup, &destination).await;
+                    }
+                    return Err(error.into());
+                }
+                #[cfg(unix)]
+                std::fs::File::open(parent)?.sync_all()?;
+                if let Some(backup) = backup
+                    && let Err(error) = tokio::fs::remove_dir_all(&backup).await
+                {
+                    tracing::debug!(%error, "Replaced native asset is removed at the next start");
+                }
                 Ok::<_, anyhow::Error>(())
             }
             .await;
