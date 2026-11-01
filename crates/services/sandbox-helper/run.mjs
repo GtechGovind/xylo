@@ -36,15 +36,29 @@ const singleLine = value => String(value?.message ?? value).replace(/\s+/g, ' ')
 // The owning worker holds this pipe for a coding job's lifetime. It is not
 // inherited by the program, so no descendant can keep the worker alive.
 const guardParent = process.env.XYLO_SANDBOX_PARENT_GUARD === '1';
-if (guardParent) {
-  process.stdin.on('end', () => { try { process.kill(-process.pid, 'SIGKILL'); } catch {} });
-  process.stdin.resume();
-}
 let manager;
 let child;
 let statusFile;
 let unavailableReported = false;
 const reported = new Set();
+
+async function guardOwner() {
+  const watcher = spawn(process.execPath, [fileURLToPath(new URL('./owner-guard.mjs', import.meta.url)), String(process.pid), `${statusFile}.cleanup`], {
+    detached: true, stdio: [process.stdin, 'ignore', 'ignore', 'ipc'], env: { PATH: '/usr/bin:/bin' },
+  });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { watcher.kill(); reject(new Error('Owner watchdog did not become ready')); }, 3000);
+    watcher.once('error', error => { clearTimeout(timer); reject(error); });
+    watcher.once('exit', () => { clearTimeout(timer); reject(new Error('Owner watchdog exited before dispatch')); });
+    watcher.once('message', message => {
+      if (message?.ready !== true) return;
+      clearTimeout(timer);
+      watcher.disconnect();
+      watcher.unref();
+      resolve();
+    });
+  });
+}
 
 function record(entry) {
   if (statusFile) appendFileSync(statusFile, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
@@ -98,6 +112,8 @@ try {
   if (typeof spec.status_file === 'string' && spec.status_file) statusFile = spec.status_file;
   const [major, minor] = process.versions.node.split('.').map(Number);
   if (major < 22 || (major === 22 && minor < 12)) throw new Error('Node.js 22.12 or later is required');
+  if (!statusFile) throw new Error('Missing status file');
+  if (guardParent) await guardOwner();
   // Imported here so a missing or broken runtime package is recorded as
   // unavailable instead of an uncaught module error.
   ({ SandboxManager: manager } = await import('@anthropic-ai/sandbox-runtime'));

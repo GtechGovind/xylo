@@ -314,6 +314,10 @@ fn prepare_internal(
         .arg(serde_json::to_string(&spec)?)
         .current_dir(&workspace)
         .env_clear()
+        .env(
+            "XYLO_SANDBOX_CLEANUP_STATUS",
+            status_file.with_extension("cleanup"),
+        )
         .kill_on_drop(true);
     if let Some(root) = write_root {
         command.env("XYLO_SANDBOX_WRITE_ROOT", root);

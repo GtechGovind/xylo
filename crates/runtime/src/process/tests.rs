@@ -151,50 +151,248 @@ async fn cancellation_terminates_child() {
     assert!(result.is_err());
 }
 
+/// Last-resort cleanup for a failing fixture; never targets an unrelated group.
+struct FixtureGroup(u32);
+impl Drop for FixtureGroup {
+    fn drop(&mut self) {
+        for _ in 0..8 {
+            // SAFETY: this group was created by this test's child spawn.
+            unsafe {
+                libc::kill(-(self.0 as i32), libc::SIGSTOP);
+                libc::kill(-(self.0 as i32), libc::SIGKILL);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+/// Covers startup/assertion failures before a fixture can read its owned IDs.
+struct FixtureOwner(std::path::PathBuf);
+impl Drop for FixtureOwner {
+    fn drop(&mut self) {
+        if let Ok(bytes) = std::fs::read(&self.0)
+            && let Ok(status) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            for key in ["group", "watchdog"] {
+                if let Some(id) = status[key]
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                    .filter(|id| *id > 1)
+                {
+                    drop(FixtureGroup(id));
+                }
+            }
+        }
+    }
+}
+
+async fn watchdog_exited(status: &serde_json::Value) {
+    let watchdog = status["watchdog"].as_u64().unwrap() as u32;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !live_group(watchdog).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watchdog did not retire after its cleanup fence");
+}
+
+fn live_group(group: u32) -> Vec<u32> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,pgid=,stat="])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let pgid = fields.next()?.parse::<u32>().ok()?;
+            let state = fields.next()?;
+            (pgid == group && !state.starts_with('Z')).then_some(pid)
+        })
+        .collect()
+}
+
+const FORK_BOUNDARY: &str =
+    "echo ready; i=0; while [ $i -lt 16 ]; do sleep 300 & i=$((i+1)); done; wait";
+
 #[tokio::test]
 async fn guarded_sandbox_kills_descendants_when_its_owner_pipe_closes() {
     use tokio::io::{AsyncBufReadExt, BufReader};
-    let dir = tempfile::tempdir().unwrap();
-    let prepared = xylo_services::sandbox::prepare_coding(
-        "/bin/sh",
-        &["-c".into(), "echo ready; sleep 300".into()],
-        dir.path(),
-        &[],
-        &[],
-    )
-    .unwrap();
-    let xylo_services::sandbox::PreparedSandbox {
-        mut command,
-        temporary,
-        ..
-    } = prepared;
-    command
-        .env("XYLO_SANDBOX_PARENT_GUARD", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let mut child = command.spawn().unwrap();
-    let owner = child.stdin.take().unwrap();
-    let mut output = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(20), output.read_line(&mut line))
-        .await
-        .unwrap()
+    for iteration in 0..24 {
+        let dir = tempfile::tempdir().unwrap();
+        let script = if iteration % 2 == 0 {
+            "echo ready; sleep 300"
+        } else {
+            FORK_BOUNDARY
+        };
+        let prepared = xylo_services::sandbox::prepare_coding(
+            "/bin/sh",
+            &["-c".into(), script.into()],
+            dir.path(),
+            &[],
+            &[],
+        )
         .unwrap();
-    assert_eq!(line.trim(), "ready");
-    drop(owner);
-    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
-        .await
-        .unwrap()
+        let xylo_services::sandbox::PreparedSandbox {
+            mut command,
+            temporary,
+            status_file,
+        } = prepared;
+        let _owner_cleanup = FixtureOwner(status_file.with_extension("cleanup"));
+        command
+            .env("XYLO_SANDBOX_PARENT_GUARD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let cleanup = FixtureGroup(child.id().unwrap());
+        let owner = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(20), output.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.trim(), "ready", "iteration {iteration}");
+        drop(owner);
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.success());
+        wait_for_guard_cleanup(&status_file.with_extension("cleanup"))
+            .await
+            .unwrap();
+        let mut remaining = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), output.read_to_end(&mut remaining))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            live_group(cleanup.0).is_empty(),
+            "orphan at fork boundary {iteration}"
+        );
+        let guard: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(status_file.with_extension("cleanup")).unwrap())
+                .unwrap();
+        watchdog_exited(&guard).await;
+        drop(temporary);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guarded_cancellation_and_future_drop_fence_forking_descendants() {
+    for iteration in 0..12 {
+        let dir = tempfile::tempdir().unwrap();
+        let prepared = xylo_services::sandbox::prepare_coding(
+            "/bin/sh",
+            &["-c".into(), FORK_BOUNDARY.into()],
+            dir.path(),
+            &[],
+            &[],
+        )
         .unwrap();
-    assert!(!status.success());
-    let mut remaining = Vec::new();
-    tokio::time::timeout(Duration::from_secs(2), output.read_to_end(&mut remaining))
+        let status = prepared.status_file.with_extension("cleanup");
+        let _temporary = prepared.temporary;
+        let _owner_cleanup = FixtureOwner(status.clone());
+        let (ready, mut output) = tokio::sync::mpsc::unbounded_channel();
+        let observer: OutputObserver = Arc::new(move |_, bytes| {
+            let _ = ready.send(bytes.to_vec());
+        });
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let cwd = dir.path().to_owned();
+        let task = tokio::spawn(async move {
+            run_prepared_observed(
+                prepared.command,
+                &cwd,
+                Some(Duration::from_secs(20)),
+                token,
+                Some(observer),
+                true,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(bytes) = output.recv().await {
+                if bytes.windows(5).any(|part| part == b"ready") {
+                    return;
+                }
+            }
+            panic!("fixture did not start");
+        })
         .await
-        .unwrap()
         .unwrap();
-    drop(temporary);
+        let guard: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&status).unwrap()).unwrap();
+        let cleanup = FixtureGroup(guard["group"].as_u64().unwrap() as u32);
+        if iteration % 2 == 0 {
+            cancel.cancel();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(
+                live_group(cleanup.0).is_empty(),
+                "cancellation returned before its fork fence"
+            );
+        } else {
+            task.abort();
+            let _ = task.await;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !live_group(cleanup.0).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        watchdog_exited(&guard).await;
+    }
+}
+
+#[tokio::test]
+async fn guarded_normal_exit_drains_output_and_cleans_background_descendants() {
+    for _ in 0..8 {
+        let dir = tempfile::tempdir().unwrap();
+        let prepared = xylo_services::sandbox::prepare_coding(
+            "/bin/sh",
+            &["-c".into(), "sleep 300 & echo complete; exit 7".into()],
+            dir.path(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let status = prepared.status_file.with_extension("cleanup");
+        let _owner_cleanup = FixtureOwner(status.clone());
+        let result = run_prepared_observed(
+            prepared.command,
+            dir.path(),
+            Some(Duration::from_secs(20)),
+            CancellationToken::new(),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let guard: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(status).unwrap()).unwrap();
+        let cleanup = FixtureGroup(guard["group"].as_u64().unwrap() as u32);
+        assert_eq!(result.code, Some(7));
+        assert_eq!(result.stdout, "complete\n");
+        assert_eq!(guard["state"], "done");
+        assert!(live_group(cleanup.0).is_empty());
+        watchdog_exited(&guard).await;
+    }
 }
 
 #[tokio::test]
@@ -303,4 +501,56 @@ async fn managed_sandbox_refuses_a_replaced_approved_cwd() {
     .unwrap();
     assert!(!other.path().join("forbidden").exists());
     assert!(xylo_services::sandbox::read_start_status(&prepared.status_file).is_some());
+}
+
+#[tokio::test]
+async fn guarded_start_failure_and_early_owner_loss_retire_the_watchdog() {
+    for early_owner_loss in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let prepared = xylo_services::sandbox::prepare_coding(
+            "/xylo-fixture-missing-program",
+            &[],
+            dir.path(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let cleanup_status = prepared.status_file.with_extension("cleanup");
+        let _fixture_cleanup = FixtureOwner(cleanup_status.clone());
+        if early_owner_loss {
+            let mut command = prepared.command;
+            command
+                .env("XYLO_SANDBOX_PARENT_GUARD", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .kill_on_drop(true);
+            let mut child = command.spawn().unwrap();
+            let _group = FixtureGroup(child.id().unwrap());
+            drop(child.stdin.take());
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            wait_for_guard_cleanup(&cleanup_status).await.unwrap();
+        } else {
+            let result = run_prepared_observed(
+                prepared.command,
+                dir.path(),
+                Some(Duration::from_secs(10)),
+                CancellationToken::new(),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.code, Some(127));
+        }
+        let guard: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cleanup_status).unwrap()).unwrap();
+        assert_eq!(guard["state"], "done");
+        assert!(live_group(guard["group"].as_u64().unwrap() as u32).is_empty());
+        watchdog_exited(&guard).await;
+    }
 }
