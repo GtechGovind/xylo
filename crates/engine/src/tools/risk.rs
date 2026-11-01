@@ -29,7 +29,11 @@ use std::path::{Component, Path, PathBuf};
 pub(crate) fn assess(name: &str, arguments: &Value, workspace: &Path) -> Option<String> {
     let text = |key: &str| arguments.get(key).and_then(Value::as_str);
     match name {
-        "file_write" | "file_edit" => {
+        "worktree_enter" | "worktree_exit" => {
+            Some("Changes the chat checkout using native Git".into())
+        }
+        "web_fetch" | "web_search" => None,
+        "file_write" | "file_edit" | "notebook_edit" => {
             let path = resolve(workspace, text("path")?);
             if !inside(workspace, &path) {
                 return Some(format!(
@@ -41,6 +45,13 @@ pub(crate) fn assess(name: &str, arguments: &Value, workspace: &Path) -> Option<
                 .map(|kind| format!("Changes {kind}"))
                 .or_else(|| auto_run_config(workspace, &path))
         }
+        "connector_resources"
+        | "connector_resource_read"
+        | "connector_prompts"
+        | "connector_prompt_get" => {
+            Some("Contacts an MCP server and may send the requested URI or prompt arguments".into())
+        }
+        "lsp" => Some(super::permissions::NATIVE_LSP_REASON.into()),
         "file_read" | "files_list" | "find_files" | "search_project" => {
             let path = resolve(workspace, text("path").unwrap_or("."));
             secret_path(&path).map(|kind| format!("Reads {kind}"))
@@ -62,6 +73,7 @@ pub(crate) fn assess(name: &str, arguments: &Value, workspace: &Path) -> Option<
             command_words(&words, workspace, 0)
         }
         "shell_command" => command(text("command")?, workspace),
+        "shell_output" | "shell_jobs" | "shell_kill" => None,
         _ => tool_risk(name).map(str::to_owned),
     }
 }
@@ -146,6 +158,8 @@ const TOOL_RISKS: &[(Tools, Option<&str>)] = {
             Family("environment_"),
             Some("Runs in a remote or container environment outside the sandbox"),
         ),
+        (Named("ask_user"), None),
+        (Named("exit_plan_mode"), None),
         (Named("schedule_list"), None),
         (
             Named("schedule_create"),
@@ -170,8 +184,7 @@ fn tool_risk(name: &str) -> Option<&'static str> {
 /// Whether a command that asked for internet access only downloads
 /// dependencies or repository history with a well-known tool. Every simple
 /// command of a shell line must qualify or be a harmless local step; changing
-/// directory is not one, since a fetch must read the project root's own
-/// configuration.
+/// directory is not one: configuration is reviewed for the captured cwd.
 pub(crate) fn routine_fetch(name: &str, arguments: &Value, workspace: &Path) -> Fetch {
     let Some(commands) = fetch_commands(name, arguments) else {
         return Fetch::Other;
@@ -238,9 +251,10 @@ fn fetch_commands(name: &str, arguments: &Value) -> Option<Vec<Vec<String>>> {
 
 /// Project files each fetch tool reads that can run code or redirect where
 /// it downloads from: cargo credential providers and source replacement,
-/// npm's `git` and registry settings, yarn and pnpm hooks. Fetches run at
-/// the project root (no `cd`, `--prefix` or `-C` qualifies), so the root is
-/// the only project directory these tools consult.
+/// npm's `git` and registry settings, yarn and pnpm hooks. Ancestors are
+/// checked too: these tools discover project/workspace configuration above
+/// their working directory. Conservatively reviewing extra ancestor files
+/// avoids interpreting package-manager-specific workspace boundaries.
 const FETCH_CONFIGURATION: &[(&str, &[&str])] = &[
     ("cargo", &[".cargo/config", ".cargo/config.toml"]),
     (
@@ -276,9 +290,12 @@ const GIT_RISKY_SETTINGS: &[&str] = &[
 /// routine, if it does.
 fn project_configuration(program: &str, workspace: &Path) -> Option<String> {
     match program {
-        "git" => git_configuration(workspace),
+        "git" => git_configuration(repository_directory(workspace).unwrap_or(workspace)),
         "go" => {
-            let work = std::fs::read_to_string(workspace.join("go.work")).ok()?;
+            let directory = workspace
+                .ancestors()
+                .find(|directory| directory.join("go.work").exists())?;
+            let work = std::fs::read_to_string(directory.join("go.work")).ok()?;
             work.lines()
                 .any(|line| line.trim_start().starts_with("replace"))
                 .then(|| "go.work replaces modules, so the download is redirected".into())
@@ -288,7 +305,11 @@ fn project_configuration(program: &str, workspace: &Path) -> Option<String> {
             .find(|(tool, _)| *tool == program)?
             .1
             .iter()
-            .find(|file| workspace.join(file).exists())
+            .find(|file| {
+                workspace
+                    .ancestors()
+                    .any(|directory| directory.join(file).exists())
+            })
             .map(|file| {
                 format!("{file} can run code or redirect downloads for {program}; review it first")
             }),
@@ -491,6 +512,12 @@ const GIT_FETCH: Options = Options {
     ],
 };
 
+/// Finds the closest repository Git discovers from a command directory.
+fn repository_directory(cwd: &Path) -> Option<&Path> {
+    cwd.ancestors()
+        .find(|directory| directory.join(".git").exists())
+}
+
 /// Whether one simple command only downloads, without running project or
 /// dependency code or any program the command names: build scripts, tests,
 /// install scripts, source builds and plugins all ask even when they would
@@ -522,12 +549,14 @@ fn fetches(words: &[String], workspace: &Path) -> bool {
         // select another configuration or program, so none qualify.
         "git" => {
             matches!(first, Some("fetch" | "pull" | "clone"))
-                && workspace.join(".git").exists()
+                && repository_directory(workspace).is_some()
                 && after(1).is_some_and(|words| match words.split_first() {
                     // The rest are refspecs or the clone's directory.
                     Some((repository, rest)) => {
-                        remote(repository, workspace)
-                            && rest.iter().all(|word| !word.contains("::"))
+                        remote(
+                            repository,
+                            repository_directory(workspace).unwrap_or(workspace),
+                        ) && rest.iter().all(|word| !word.contains("::"))
                     }
                     None => true,
                 })

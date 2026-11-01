@@ -1,5 +1,8 @@
 //! Application-owned contracts. Community engine types must not cross this boundary.
+mod review_prompts;
+pub use review_prompts::{ReviewKind, review_prompt};
 mod branding;
+pub mod pricing;
 pub use branding::{APPLICATION_ID, APPLICATION_NAME, CREDENTIAL_SERVICE};
 mod documents;
 pub use documents::*;
@@ -11,6 +14,7 @@ mod attachments;
 pub use attachments::*;
 mod image_generation;
 pub use image_generation::*;
+mod provider_controls;
 mod steering;
 pub use steering::*;
 
@@ -87,6 +91,9 @@ pub struct ProviderConfig {
     pub managed_local: bool,
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
+    /// An alternative model on this same authorized connection.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -107,6 +114,7 @@ impl Default for ProviderConfig {
             discovery_url: None,
             managed_local: false,
             headers: Default::default(),
+            fallback_model: None,
         }
     }
 }
@@ -129,7 +137,8 @@ impl ProviderConfig {
         if !matches!(
             self.family,
             ApiFamily::OpenAiChat | ApiFamily::OpenAiResponses | ApiFamily::Azure
-        ) {
+        ) && self.native_reasoning_efforts().is_empty()
+        {
             return Vec::new();
         }
         if let Some(options) = &self.reasoning_options {
@@ -140,6 +149,12 @@ impl ProviderConfig {
                 }
             }
             return supported;
+        }
+        if !matches!(
+            self.family,
+            ApiFamily::OpenAiChat | ApiFamily::OpenAiResponses | ApiFamily::Azure
+        ) {
+            return self.native_reasoning_efforts();
         }
         let model = self.model.to_ascii_lowercase();
         let is = |name: &str| {
@@ -244,15 +259,18 @@ pub enum PermissionMode {
     FullAccess,
     /// Read and search only; any write is refused.
     ReadOnly,
+    /// Inspect the project and propose a plan without changing it.
+    Plan,
 }
 
 impl PermissionMode {
     /// Presentation order for menus and settings.
-    pub const ALL: [PermissionMode; 4] = [
+    pub const ALL: [PermissionMode; 5] = [
         PermissionMode::AskForApproval,
         PermissionMode::ApproveForMe,
         PermissionMode::FullAccess,
         PermissionMode::ReadOnly,
+        PermissionMode::Plan,
     ];
 
     /// The one product label for this mode.
@@ -262,6 +280,7 @@ impl PermissionMode {
             PermissionMode::ApproveForMe => "Approve for me",
             PermissionMode::FullAccess => "Full access",
             PermissionMode::ReadOnly => "Read only",
+            PermissionMode::Plan => "Plan",
         }
     }
 
@@ -276,12 +295,13 @@ impl PermissionMode {
                 "Unrestricted access to the internet and any file on your computer"
             }
             PermissionMode::ReadOnly => "Read and search only; nothing is changed",
+            PermissionMode::Plan => "Explore and propose a plan before making changes",
         }
     }
 
     /// Whether the agent may change anything at all.
     pub fn allows_writes(self) -> bool {
-        self != PermissionMode::ReadOnly
+        !matches!(self, PermissionMode::ReadOnly | PermissionMode::Plan)
     }
 
     /// Whether commands run inside the OS sandbox.
@@ -303,17 +323,6 @@ pub enum SecretStorage {
     OsKeychain,
 }
 
-/// A user's standing approval for one kind of action in one project.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ApprovalRule {
-    /// Stable rule key emitted by the engine (`ApprovalRequired.rule_key`).
-    pub key: String,
-    /// What the rule allows, in product words.
-    pub label: String,
-    pub workspace: PathBuf,
-    pub created_at: i64,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
     pub provider: ProviderConfig,
@@ -327,6 +336,21 @@ pub struct AppSettings {
     pub ui: UiPreferences,
     #[serde(default)]
     pub secret_storage: SecretStorage,
+    #[serde(default)]
+    pub pricing_overrides: std::collections::BTreeMap<String, pricing::ModelPrice>,
+    #[serde(default = "default_output_style")]
+    pub output_style: String,
+    #[serde(default)]
+    pub status_line_command: Option<String>,
+    /// Default alternative model ID, used on the active authorized connection.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
+    /// Optional search service for connections without native search.
+    #[serde(default)]
+    pub web_search: WebSearchSettings,
+    /// Save new permission rules in the shared project file instead of local settings.
+    #[serde(default)]
+    pub permission_rules_project: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -427,8 +451,38 @@ impl Default for AppSettings {
             telemetry_export: false,
             ui: UiPreferences::default(),
             secret_storage: SecretStorage::default(),
+            pricing_overrides: Default::default(),
+            output_style: default_output_style(),
+            status_line_command: None,
+            fallback_model: None,
+            web_search: WebSearchSettings::default(),
+            permission_rules_project: false,
         }
     }
+}
+
+fn default_output_style() -> String {
+    "default".into()
+}
+
+/// Saved web search configuration contains references, never credential values.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WebSearchSettings {
+    pub backend: WebSearchBackend,
+    pub endpoint: String,
+    pub credential_ref: Option<String>,
+}
+
+/// The fallback search service explicitly chosen by the user.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchBackend {
+    #[default]
+    Disabled,
+    Brave,
+    Tavily,
+    Searxng,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -441,9 +495,6 @@ pub struct TurnRequest {
     pub permissions: PermissionMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ImageAttachment>,
-    /// Keys of the project's standing approvals ("always allow" rules).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub approved_rules: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -531,6 +582,20 @@ pub enum WorkerCommand {
         key: WorkerCredential,
     },
     Shutdown,
+    /// Stops one shell job owned by this conversation.
+    KillJob {
+        job_id: Uuid,
+    },
+    RespondMcpElicitation {
+        request_id: Uuid,
+        action: McpFormAction,
+        content: Option<Value>,
+    },
+    /// Answers one pending conversation interaction.
+    Answer {
+        action_id: Uuid,
+        answer: InteractionAnswer,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -551,6 +616,12 @@ pub struct Usage {
     /// `cache_read_tokens`. Part of `input_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
+    /// Successful request counts retain model identity and per-request context tiers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<pricing::UsageCall>,
+    /// Token-only estimate captured using the rates selected for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<pricing::CostEstimate>,
 }
 
 /// What a running turn is doing right now, for the activity line.
@@ -659,6 +730,14 @@ pub enum NoteKind {
     StallWarning,
     /// The turn crossed 75% or 90% of its step limit.
     StepBudget,
+    /// The turn continued on its configured alternative model.
+    Fallback,
+    /// A background shell job finished.
+    ShellJob,
+    /// A shell working directory was reset to its project.
+    WorkingDirectory,
+    /// Context supplied by a configured lifecycle hook.
+    Hook,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -747,6 +826,70 @@ pub enum EngineEvent {
         #[serde(default)]
         kind: ErrorKind,
     },
+    ModelMetadata {
+        model: String,
+        rate_limits: Option<RateLimits>,
+    },
+    /// Visible provider reasoning, separate from the answer.
+    ThinkingDelta {
+        text: String,
+    },
+    /// A registered SDK tool is authorized and ready for client execution.
+    CustomToolRequested {
+        action_id: Uuid,
+        name: String,
+        arguments: Value,
+    },
+    /// An update from a shell job, including after the turn has ended.
+    ShellJobUpdated {
+        job: ShellJob,
+    },
+    /// The conversation selected a different managed checkout.
+    WorkspaceChanged {
+        workspace: PathBuf,
+        branch: Option<String>,
+    },
+    McpElicitation {
+        request: McpFormRequest,
+    },
+    McpElicitationClosed {
+        request_id: Uuid,
+    },
+    /// A bounded set of questions awaiting the user.
+    QuestionRequired {
+        action_id: Uuid,
+        questions: Vec<UserQuestion>,
+    },
+    /// A proposed plan awaiting an explicit continuation choice.
+    PlanRequired {
+        action_id: Uuid,
+        plan: String,
+    },
+}
+
+/// Numeric remaining quota reported by a provider, never inferred from usage.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimits {
+    pub requests: Option<u64>,
+    pub tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub observed_at_ms: i64,
+}
+
+/// Live state of a conversation-owned shell job. The output is a bounded tail;
+/// the complete log is kept on disk at `log_path`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShellJob {
+    pub id: Uuid,
+    pub turn_id: Uuid,
+    pub command: String,
+    pub cwd: PathBuf,
+    pub log_path: PathBuf,
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    pub output: String,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -794,6 +937,7 @@ pub enum MessageStatus {
 }
 
 /// Stable keyset pagination in most-recently-updated order; IDs break timestamp ties.
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConversationCursor {
     pub updated_at: i64,
@@ -818,6 +962,9 @@ pub struct ChatMessage {
     pub attachments: Vec<ImageAttachment>,
     #[serde(default, skip_serializing_if = "is_complete")]
     pub status: MessageStatus,
+    /// Provider reasoning shown only when the reader opens Thinking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 fn is_complete(status: &MessageStatus) -> bool {
@@ -970,3 +1117,11 @@ pub struct TeamTask {
 
 #[cfg(test)]
 mod tests;
+
+/// Public headless CLI and SDK protocol.
+pub mod stdio;
+
+mod mcp;
+pub use mcp::*;
+mod interaction;
+pub use interaction::{InteractionAnswer, QuestionAnswer, QuestionOption, UserQuestion};

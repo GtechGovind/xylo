@@ -6,7 +6,7 @@ use uuid::Uuid;
 use xylo_core::{ApiFamily, Conversation, PermissionMode, Usage, now_ms};
 use xylo_services::ActionIntent;
 
-fn fixture() -> (tempfile::TempDir, AgentEngine, TurnRequest) {
+pub(super) fn fixture() -> (tempfile::TempDir, AgentEngine, TurnRequest) {
     let directory = tempfile::tempdir().unwrap();
     let paths = AppPaths::at(directory.path().join("profile")).unwrap();
     let store = Store::open(&paths.database).unwrap();
@@ -30,7 +30,6 @@ fn fixture() -> (tempfile::TempDir, AgentEngine, TurnRequest) {
         provider: ProviderConfig::default(),
         permissions: PermissionMode::ReadOnly,
         attachments: Vec::new(),
-        approved_rules: Vec::new(),
     };
     let engine = AgentEngine::new(
         store,
@@ -214,6 +213,7 @@ async fn lost_completed_event_replays_receipt_without_model_or_duplicate_history
         context_tokens: 5,
         cache_read_tokens: Some(3),
         cache_write_tokens: None,
+        ..Usage::default()
     };
     engine
         .store
@@ -479,11 +479,16 @@ async fn serve(
                         (status, "application/json", body.to_string(), false)
                     }
                 };
+                let retry = if status == 529 {
+                    "Retry-After: 0\r\n"
+                } else {
+                    ""
+                };
                 let head = if hold {
                     format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\n\r\n")
                 } else {
                     format!(
-                        "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\n{retry}Content-Length: {}\r\nConnection: close\r\n\r\n",
                         payload.len()
                     )
                 };
@@ -881,7 +886,6 @@ async fn child_timeout_cancels_its_stalled_process_without_cancelling_the_parent
         cancel: parent_cancel.clone(),
         timeout: Duration::from_millis(1500),
         runtime: tokio::runtime::Handle::current(),
-        workspace: request.workspace.clone(),
         permissions: crate::tools::PermissionCell::new(PermissionMode::FullAccess),
     });
     let handler = delegation.handler();
@@ -1210,7 +1214,8 @@ async fn system_prompt_is_identical_across_turns_and_recall_follows_each_prompt(
         let broker = engine
             .broker(&request, events.clone(), CancellationToken::new())
             .unwrap();
-        let system = AgentEngine::system_prompt(&request, &broker, PermissionMode::ReadOnly);
+        let system =
+            AgentEngine::system_prompt(&request, &broker, PermissionMode::ReadOnly).unwrap();
         let recalled = AgentEngine::recalled_context(&broker);
         broker.shutdown().await.unwrap();
         prompts.push((system, recalled));
@@ -1521,3 +1526,10 @@ async fn a_4k_window_sends_identical_prompt_and_tool_bytes_across_turns() {
     );
     assert_eq!(first["max_tokens"], second["max_tokens"]);
 }
+
+mod headless;
+mod interaction;
+mod provider_fallback;
+
+#[path = "child_instruction_provenance_tests.rs"]
+mod child_instruction_provenance_tests;

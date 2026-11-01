@@ -36,11 +36,44 @@ impl BrokerTools {
 
     /// Children cannot delegate further.
     fn offered(&self, name: &str) -> bool {
-        self.namespace.is_none() || name != "agent_delegate"
+        self.namespace.is_none()
+            || !matches!(name, "agent_delegate" | "worktree_enter" | "worktree_exit")
     }
 }
 
 impl ToolExecutor for BrokerTools {
+    fn pending_stop(&self) -> Option<String> {
+        self.broker.hook_stop.lock().clone()
+    }
+    fn lifecycle(
+        &self,
+        event: &str,
+        input: Value,
+    ) -> anyhow::Result<xylo_services::hooks::HookOutput> {
+        self.broker
+            .lifecycle(self.namespace.as_deref(), event, input)
+    }
+
+    fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
+        if self.namespace.is_none() {
+            self.broker.take_notes()
+        } else {
+            self.broker.take_hook_notes()
+        }
+    }
+    fn active_provider(&self, provider: Arc<dyn crate::model::ModelProvider>) {
+        self.broker.set_web_provider(provider);
+    }
+
+    fn refreshed_system_prompt(&self) -> Option<String> {
+        self.namespace
+            .is_none()
+            .then(|| self.broker.refreshed_system_prompt())
+            .flatten()
+    }
+    fn take_instruction_notes(&self) -> Vec<String> {
+        self.broker.take_instruction_notes()
+    }
     fn schemas(&self) -> Vec<ToolSchema> {
         self.broker
             .initial_definitions()
@@ -60,6 +93,7 @@ impl ToolExecutor for BrokerTools {
     }
 
     fn access(&self, name: &str, arguments: &Value) -> Option<Access> {
+        self.broker.observe_excluded(name);
         if !self.offered(name) {
             return None;
         }

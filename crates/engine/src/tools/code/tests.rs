@@ -75,7 +75,7 @@ fn edits_require_a_unique_exact_match() {
     let error = plan_edit(
         &file,
         "a.rs",
-        &json!({"old_string":"fn a() {}","new_string":"x"}),
+        &json!({"edits":[{"old_string":"fn a() {}","new_string":"x"}]}),
     )
     .err()
     .unwrap();
@@ -84,7 +84,7 @@ fn edits_require_a_unique_exact_match() {
     let all = plan_edit(
         &file,
         "a.rs",
-        &json!({"old_string":"fn a() {}","new_string":"fn c() {}","replace_all":true}),
+        &json!({"edits":[{"old_string":"fn a() {}","new_string":"fn c() {}","replace_all":true}]}),
     )
     .unwrap();
     assert_eq!(all.replacements, 2);
@@ -92,7 +92,7 @@ fn edits_require_a_unique_exact_match() {
     let missing = plan_edit(
         &file,
         "a.rs",
-        &json!({"old_string":"nope","new_string":"x"}),
+        &json!({"edits":[{"old_string":"nope","new_string":"x"}]}),
     );
     assert!(missing.err().unwrap().downcast_ref::<Unapplied>().is_some());
 }
@@ -105,14 +105,14 @@ fn edits_keep_crlf_line_endings() {
     let plan = plan_edit(
         &file,
         "w.txt",
-        &json!({"old_string":"one\ntwo","new_string":"uno\ndos"}),
+        &json!({"edits":[{"old_string":"one\ntwo","new_string":"uno\ndos"}]}),
     )
     .unwrap();
     assert_eq!(plan.updated, "uno\r\ndos\r\nthree\r\n");
     let single = plan_edit(
         &file,
         "w.txt",
-        &json!({"old_string":"two","new_string":"two\nand a half"}),
+        &json!({"edits":[{"old_string":"two","new_string":"two\nand a half"}]}),
     )
     .unwrap();
     assert_eq!(single.updated, "one\r\ntwo\r\nand a half\r\nthree\r\n");

@@ -39,11 +39,41 @@ pub(crate) enum Access {
 /// The tools a loop may call. Execution is blocking and exactly-once per
 /// call id: the implementation journals every dispatch.
 pub(crate) trait ToolExecutor: Send + Sync {
+    /// Pending harness notes from work that outlives a tool call.
+    fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
+        Vec::new()
+    }
+    /// Updates utility requests to the provider that completed this model call.
+    fn active_provider(&self, _provider: Arc<dyn crate::model::ModelProvider>) {}
+
+    /// A refreshed project prompt after an approved checkout change.
+    fn refreshed_system_prompt(&self) -> Option<String> {
+        None
+    }
+    /// A retained terminal hook stop prevents further dispatch and model steps.
+    /// Reading this value must not consume it; each scheduling boundary checks it.
+    fn pending_stop(&self) -> Option<String> {
+        None
+    }
+
+    /// Delivers a lifecycle event outside provider streaming and tool batches.
+    fn lifecycle(
+        &self,
+        _event: &str,
+        _input: Value,
+    ) -> anyhow::Result<xylo_services::hooks::HookOutput> {
+        Ok(Default::default())
+    }
+
     /// Tools offered directly to the model right now. Re-read before every
     /// model call, because the permission mode can change mid-task.
     fn schemas(&self) -> Vec<ToolSchema>;
     /// Registered tools that are not offered directly (found via search).
     fn deferred_count(&self) -> usize;
+    /// Newly applicable path-scoped project instructions.
+    fn take_instruction_notes(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// `None` when `name` is not a tool this loop may call.
     fn access(&self, name: &str, arguments: &Value) -> Option<Access>;
     /// Runs one call and returns the model-facing result text.
@@ -70,16 +100,31 @@ pub(crate) trait ToolExecutor: Send + Sync {
 }
 
 /// Exact names other agents use for Xylo's tools.
-const ALIASES: [(&str, &str); 9] = [
+const ALIASES: [(&str, &str); 24] = [
+    ("WebFetch", "web_fetch"),
+    ("WebSearch", "web_search"),
+    ("webfetch", "web_fetch"),
+    ("websearch", "web_search"),
+    ("enterworktree", "worktree_enter"),
+    ("exitworktree", "worktree_exit"),
+    ("readmcpresource", "connector_resource_read"),
+    ("listmcpresources", "connector_resources"),
+    ("askuserquestion", "ask_user"),
+    ("exitplanmode", "exit_plan_mode"),
     ("read", "file_read"),
     ("write", "file_write"),
     ("edit", "file_edit"),
+    ("notebookedit", "notebook_edit"),
+    ("lsp", "lsp"),
     ("bash", "shell_command"),
     ("shell", "shell_command"),
     ("grep", "search_project"),
     ("glob", "find_files"),
     ("ls", "files_list"),
     ("todo", "todo_write"),
+    ("bashoutput", "shell_output"),
+    ("killshell", "shell_kill"),
+    ("taskoutput", "shell_output"),
 ];
 
 /// A call ready to run, or the error result the model receives instead.
@@ -298,8 +343,17 @@ pub(crate) async fn run_batch(
                 results[slot] = Some(joined(handle).await);
             }
         }
+        if let Some(reason) = tools.pending_stop() {
+            results[index] = Some(error_result(format!("Not run: {reason}")));
+            continue;
+        }
         let executor = tools.clone();
         let handle = tokio::task::spawn_blocking(move || {
+            // A previously queued read may have stopped while this worker
+            // waited for a blocking-thread slot.
+            if let Some(reason) = executor.pending_stop() {
+                return error_result(format!("Not run: {reason}"));
+            }
             executor
                 .execute(&id, &name, arguments)
                 .unwrap_or_else(|error| error_result(format!("{error:#}")))
@@ -327,3 +381,17 @@ async fn joined(handle: JoinHandle<String>) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// Hook edits must satisfy the same schema as model-authored tool input.
+pub(crate) fn validate_hook_input(
+    name: &str,
+    input: &Value,
+    schema: &CompiledSchema,
+) -> anyhow::Result<()> {
+    arguments::validate(input, schema).map_err(|problems| {
+        anyhow::anyhow!(
+            "Hook updatedInput for {name} is invalid: {}",
+            problems.join("; ")
+        )
+    })
+}

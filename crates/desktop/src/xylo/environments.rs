@@ -200,6 +200,7 @@ enum Asset {
 }
 pub(super) struct EnvironmentUi {
     records: Vec<EnvironmentRecord>,
+    devcontainer: Option<Value>,
     loaded: bool,
     selected: Option<Uuid>,
     statuses: BTreeMap<Uuid, EnvironmentStatus>,
@@ -246,6 +247,7 @@ impl EnvironmentUi {
     pub fn new(window: &mut Window, cx: &mut Context<Xylo>) -> Self {
         Self {
             records: Vec::new(),
+            devcontainer: None,
             loaded: false,
             selected: None,
             statuses: BTreeMap::new(),
@@ -1214,6 +1216,14 @@ impl Xylo {
         let parsed: Result<(), String> = (|| {
             match request.kind {
                 RequestKind::List => {
+                    self.environments.devcontainer = summary
+                        .get("devcontainer")
+                        .filter(|offer| !offer.is_null())
+                        .cloned();
+                    if let Some(error) = summary["devcontainer_error"].as_str() {
+                        self.environments.notice = error.to_owned();
+                    }
+
                     let records: Vec<EnvironmentRecord> = serde_json::from_value(
                         summary
                             .get("environments")

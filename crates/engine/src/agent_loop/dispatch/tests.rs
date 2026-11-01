@@ -25,8 +25,8 @@ impl Fake {
                 (
                     "file_edit",
                     object(
-                        json!({"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}}),
-                        &["path", "old_string", "new_string"],
+                        json!({"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["old_string","new_string"],"additionalProperties":false}}}),
+                        &["path", "edits"],
                     ),
                     Access::Writes,
                 ),
@@ -179,11 +179,11 @@ fn unambiguous_type_slips_are_repaired_before_dispatch() {
     assert_eq!(arguments, json!({"path":"a.rs","offset":5,"limit":20}));
     let (_, arguments) = ran(prepared(
         "file_edit",
-        r#"{"path":"a","oldString":"x","new_string":12,"replace_all":"TRUE"}"#,
+        r#"{"path":"a","edits":[{"oldString":"x","new_string":12,"replace_all":"TRUE"}]}"#,
     ));
     assert_eq!(
         arguments,
-        json!({"path":"a","old_string":"x","new_string":"12","replace_all":true})
+        json!({"path":"a","edits":[{"old_string":"x","new_string":"12","replace_all":true}]})
     );
 }
 
@@ -246,16 +246,20 @@ fn schema_violations_name_the_field_and_what_was_expected() {
 async fn invalid_calls_never_reach_the_executor_where_approval_happens() {
     let fake = Arc::new(Fake::new());
     let calls = [
-        ("w1", "file_edit", r#"{"path":"a","old_string":"x"}"#),
+        (
+            "w1",
+            "file_edit",
+            r#"{"path":"a","edits":[{"old_string":"x"}]}"#,
+        ),
         (
             "w2",
             "file_edit",
-            r#"{"path":"a","old_string":"x","new_string":"y","mode":"fast"}"#,
+            r#"{"path":"a","edits":[{"old_string":"x","new_string":"y","mode":"fast"}]}"#,
         ),
         (
             "w3",
             "file_edit",
-            r#"{"path":"a","old_string":"x","new_string":"y"}"#,
+            r#"{"path":"a","edits":[{"old_string":"x","new_string":"y"}]}"#,
         ),
     ];
     let prepared = calls
@@ -385,5 +389,54 @@ fn record_replays_repaired_arguments_in_the_native_content() {
     assert_eq!(
         serde_json::from_str::<Value>(&assistant.tool_calls[0].arguments).unwrap(),
         items[0]["input"]
+    );
+}
+
+#[derive(Default)]
+struct TerminalTools {
+    ran: Mutex<Vec<String>>,
+}
+impl ToolExecutor for TerminalTools {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        Vec::new()
+    }
+    fn deferred_count(&self) -> usize {
+        0
+    }
+    fn access(&self, _: &str, _: &Value) -> Option<Access> {
+        Some(Access::Writes)
+    }
+    fn execute(&self, id: &str, _: &str, _: Value) -> anyhow::Result<String> {
+        self.ran.lock().push(id.into());
+        anyhow::bail!("terminal hook")
+    }
+    fn pending_stop(&self) -> Option<String> {
+        (!self.ran.lock().is_empty()).then(|| "terminal hook".into())
+    }
+}
+
+#[tokio::test]
+async fn review_f_dispatch_stops_sequential_calls_and_keeps_all_results() {
+    let tools = Arc::new(TerminalTools::default());
+    let calls = ["first", "second"]
+        .into_iter()
+        .map(|id| {
+            (
+                id.into(),
+                Prepared::Run {
+                    name: "write".into(),
+                    arguments: json!({}),
+                    access: Access::Writes,
+                },
+            )
+        })
+        .collect();
+    let results = run_batch(tools.clone(), calls).await;
+    assert_eq!(*tools.ran.lock(), ["first"]);
+    assert_eq!(results.len(), 2);
+    assert!(results[1].content.contains("terminal hook"));
+    assert!(
+        tools.pending_stop().is_some(),
+        "Batch must preserve stop for model loop"
     );
 }

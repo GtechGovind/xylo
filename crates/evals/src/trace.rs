@@ -364,6 +364,7 @@ impl From<&ModelError> for RecordedError {
             ModelError::Authentication(_) => ErrorKind::Authentication,
             ModelError::RateLimited { .. } => ErrorKind::RateLimited,
             ModelError::Provider { retryable, .. } if *retryable => ErrorKind::Transient,
+            ModelError::Unavailable { .. } => ErrorKind::Transient,
             ModelError::Provider { .. } => ErrorKind::Permanent,
             ModelError::InvalidRequest(_) => ErrorKind::InvalidRequest,
             ModelError::ContextOverflow(_) => ErrorKind::ContextOverflow,

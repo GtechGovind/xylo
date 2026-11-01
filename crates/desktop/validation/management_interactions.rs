@@ -232,7 +232,7 @@ for line in sys.stdin:
                     archived: false,
                 })
                 .unwrap();
-            let source = xylo_core::ChatMessage {
+            let source = xylo_core::ChatMessage { reasoning: None,
                 id: Uuid::new_v4(),
                 session_id: session,
                 role: "user".into(),

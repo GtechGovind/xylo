@@ -13,6 +13,12 @@ use crate::icons::{self, AppIcon};
 use gpui_kit::base::Disableable;
 use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+#[path = "chat/plan_card.rs"]
+mod plan_card;
+#[path = "chat/question_card.rs"]
+mod question_card;
+#[path = "chat/thinking.rs"]
+mod thinking;
 #[path = "tool_result_view.rs"]
 mod tool_result_view;
 #[path = "chat/tools.rs"]
@@ -289,6 +295,7 @@ impl Xylo {
             .child(self.recovery_banner(cx))
             .child(pane)
             .child(self.history_later_footer(cx))
+            .child(self.mcp_form_cards(cx))
             .child(
                 div()
                     .w_full()
@@ -310,12 +317,33 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let EngineEvent::WorkspaceChanged { workspace, .. } = &event {
+            self.chat_worktree_changed(session, workspace.clone(), window, cx);
+        }
+        match &event {
+            EngineEvent::McpElicitation { request } => {
+                self.mcp_form_open(session, request.clone(), window, cx)
+            }
+            EngineEvent::McpElicitationClosed { request_id } => {
+                self.mcp_forms.remove(request_id);
+            }
+            _ => {}
+        }
         self.log(match &event {
-            EngineEvent::Delta { .. } => String::new(),
+            EngineEvent::McpElicitation { .. }
+            | EngineEvent::McpElicitationClosed { .. }
+            | EngineEvent::Delta { .. }
+            | EngineEvent::ThinkingDelta { .. }
+            | EngineEvent::ShellJobUpdated { .. } => String::new(),
+            EngineEvent::CustomToolRequested {
+                name, action_id, ..
+            } => format!("Custom tool requested: {name} ({action_id})"),
             EngineEvent::ToolStarted { name, .. } => format!("Tool started: {name}"),
             EngineEvent::ToolFinished { name, success, .. } => {
                 format!("Tool finished: {name}, success={success}")
             }
+            EngineEvent::QuestionRequired { .. } => "Questions need answers".into(),
+            EngineEvent::PlanRequired { .. } => "Plan needs a decision".into(),
             EngineEvent::ApprovalRequired { name, .. } => format!("Approval required: {name}"),
             other => format!("{other:?}"),
         });
@@ -379,6 +407,7 @@ impl Xylo {
             }
         }
         if completed {
+            self.invalidate_usage();
             if session != self.session
                 && let Some(history) = self.histories.get_mut(&session)
             {
@@ -427,6 +456,16 @@ impl Xylo {
         }
         // A retried turn resumes under the same id; its partial reply is not history.
         let reply = turn.reply().filter(|_| !turn.resend);
+        let thinking = turn
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                crate::state::Segment::Thinking(text) => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let reasoning = (!thinking.is_empty()).then_some(thinking);
         let finished_at = turn.finished_at;
         let answer = live_answer_key(session, turn);
         turn.archive();
@@ -437,6 +476,7 @@ impl Xylo {
                 // still belongs to it.
                 reply.id = answer;
                 reply.status = status;
+                reply.reasoning = reasoning;
                 if let Some(at) = finished_at {
                     reply.created_at = at;
                 }
@@ -479,7 +519,6 @@ impl Xylo {
         // The same prompt and images, with the connection fixed since the failure.
         request.provider = self.settings.provider.clone();
         request.permissions = self.settings.permissions;
-        request.approved_rules = Vec::new();
         self.engine_command(WorkerCommand::Run { turn: request }, cx);
         self.invalidate_live_history();
         self.sync_history_list(cx);
@@ -749,6 +788,13 @@ impl Xylo {
             .when(self.history_message_highlight(message.id), |row| {
                 row.border_1().border_color(rgb(brand()))
             })
+            .when_some(message.reasoning.clone(), |row, reasoning| {
+                row.child(self.thinking_block(
+                    Uuid::new_v5(&message.id, b"thinking"),
+                    reasoning.into(),
+                    cx,
+                ))
+            })
             .when(!message.content.is_empty(), |row| {
                 row.child(
                     TextView::markdown(
@@ -840,6 +886,7 @@ impl Xylo {
                     }),
                 show_time,
             ))
+            .children(self.answer_usage(answer, index))
             .into_any_element()
     }
     /// Records the decision immediately so the card responds before the worker
@@ -851,6 +898,17 @@ impl Xylo {
         remember: bool,
         cx: &mut Context<Self>,
     ) {
+        let interaction = self
+            .turns
+            .get(&self.session)
+            .and_then(|turn| turn.tools.iter().find(|t| t.id == id))
+            .is_some_and(|card| matches!(card.name.as_str(), "ask_user" | "exit_plan_mode"));
+        if interaction {
+            if !allow {
+                self.answer_interaction(id, xylo_core::InteractionAnswer::Reject, cx);
+            }
+            return;
+        }
         if let Some(card) = self
             .turns
             .get_mut(&self.session)
@@ -1002,6 +1060,24 @@ impl Xylo {
                     .child(name.clone())
                     .when(!ready, |context| context.child("· loading project…"));
             }
+        }
+        if self.workspace.is_some()
+            && !self
+                .conversations
+                .iter()
+                .any(|chat| chat.id == self.session)
+        {
+            context = context.child(
+                secondary(
+                    "new-worktree-chat",
+                    if self.worktree_pending == Some(self.session) {
+                        "Creating worktree…"
+                    } else {
+                        "Work in a new worktree"
+                    },
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.start_worktree_chat(cx))),
+            );
         }
         if !configured {
             context = context.child("·").child("No model set up");
@@ -1355,6 +1431,7 @@ impl Xylo {
                             .min_h(px(32.))
                             .child(self.composer_context_actions(cx))
                             .child(self.composer_permissions(cx))
+                            .when(self.schedules.iter().any(|task| task.enabled && task.wakeup.as_ref().is_some_and(|wakeup| wakeup.session_id == self.session)), |row| row.child(secondary("stop-conversation-wakeups", "Stop wakeups").on_click(cx.listener(|this, _, _, cx| { let session = this.session; this.host_call(cx, |host| host.stop_wakeups(session)); }))))
                             .child(div().flex_1().min_w_0())
                             .children(self.composer_context(cx))
                             .child(self.unified_model_control(model, cx))
@@ -1420,6 +1497,7 @@ impl Xylo {
                             ),
                     ),
             )
+            .child(self.composer_status(cx))
             .when_some(self.composer_hint(), |surface, hint| {
                 surface.child(
                     div()

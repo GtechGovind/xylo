@@ -1294,3 +1294,7 @@ async fn incremental_checkpoints_store_exactly_the_latest_messages() {
         serde_json::to_value(&messages).unwrap()
     );
 }
+
+mod provider_fallback;
+
+mod hooks;

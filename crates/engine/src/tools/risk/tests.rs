@@ -114,7 +114,7 @@ fn argv_commands_and_files_are_assessed() {
     ));
     assert!(flagged(
         "file_edit",
-        json!({"path":".env","old_string":"a","new_string":"b"})
+        json!({"path":".env","edits":[{"old_string":"a","new_string":"b"}]})
     ));
     assert!(!flagged(
         "file_write",
@@ -410,4 +410,47 @@ fn linked_worktrees_are_checked_through_the_shared_configuration() {
             .unwrap()
             .contains("could not be checked")
     );
+}
+
+#[test]
+fn routine_fetch_checks_configuration_above_the_current_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().join("nested/child");
+    std::fs::create_dir_all(&cwd).unwrap();
+    for (program, args, file) in [
+        ("cargo", vec!["fetch"], ".cargo/config.toml"),
+        ("npm", vec!["ci", "--ignore-scripts"], ".npmrc"),
+        ("pnpm", vec!["install", "--ignore-scripts"], ".pnpmfile.cjs"),
+        ("go", vec!["mod", "download"], "go.work"),
+    ] {
+        let path = root.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "replace example.test/a => example.test/b v1.0.0").unwrap();
+        assert!(
+            matches!(
+                routine_fetch(
+                    "run_command",
+                    &serde_json::json!({"program":program,"args":args}),
+                    &cwd
+                ),
+                Fetch::Configured(_)
+            ),
+            "{program} bypassed ancestor config"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    std::fs::write(
+        root.path().join(".git/config"),
+        "[core]\nsshCommand = dangerous\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        routine_fetch(
+            "shell_command",
+            &serde_json::json!({"command":"git fetch origin"}),
+            &cwd
+        ),
+        Fetch::Configured(_)
+    ));
 }

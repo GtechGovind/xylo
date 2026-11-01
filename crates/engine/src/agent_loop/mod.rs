@@ -43,11 +43,13 @@
 //!   prompt, and a root loop shows each recovery note to the user as it is
 //!   added.
 mod dispatch;
+mod fallback;
+mod hooks;
 mod recovery;
 mod retry;
 mod stall;
 
-pub(crate) use dispatch::{Access, ToolExecutor, error_result};
+pub(crate) use dispatch::{Access, ToolExecutor, error_result, validate_hook_input};
 
 use crate::{
     model::{
@@ -199,9 +201,11 @@ impl LoopFailure {
 
 /// Per-run bookkeeping.
 struct Run {
+    fallback: Option<Arc<dyn ModelProvider>>,
     started: Instant,
     usage: Usage,
     streamed: String,
+    active_model: String,
     /// The final answer reached the output limit.
     cut_off: bool,
 }
@@ -266,14 +270,35 @@ impl AgentLoop {
     /// Runs the loop from `messages` (the conversation without the system
     /// prompt) until the model answers without tools.
     pub(crate) async fn run(&self, messages: Vec<Message>) -> Result<LoopOutcome, LoopFailure> {
+        let fallback = self
+            .restored_fallback()
+            .await
+            .map_err(|error| LoopFailure {
+                error,
+                streamed: String::new(),
+            })?;
         let mut run = Run {
+            fallback,
             started: Instant::now(),
             usage: Usage::default(),
+            active_model: String::new(),
             streamed: String::new(),
             cut_off: false,
         };
         let mut messages = messages;
-        match self.steps(&mut messages, &mut run).await {
+        let result = self.steps(&mut messages, &mut run).await;
+        let ending = self
+            .hook(
+                "SessionEnd",
+                serde_json::json!({"reason":if result.is_ok(){"completed"}else{"failed"}}),
+            )
+            .await;
+        let ending = match ending {
+            Ok(output) => self.hook_context(&mut messages, &output).await,
+            Err(error) => Err(error),
+        };
+        let result = result.and_then(|value| ending.map(|_| value));
+        match result {
             Ok((text, stopped_early)) => {
                 run.usage.elapsed_ms = run.started.elapsed().as_millis() as u64;
                 Ok(LoopOutcome {
@@ -300,6 +325,21 @@ impl AgentLoop {
         messages: &mut Vec<Message>,
         run: &mut Run,
     ) -> anyhow::Result<(String, bool)> {
+        let prompt = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        let start = self
+            .hook("SessionStart", serde_json::json!({"source":"startup"}))
+            .await?;
+        self.hook_context(messages, &start).await?;
+        let submitted = self
+            .hook("UserPromptSubmit", serde_json::json!({"prompt":prompt}))
+            .await?;
+        self.hook_context(messages, &submitted).await?;
+        let mut stop_continuations = 0;
         // A resumed turn may end with calls that never produced a result.
         if let Some(index) = messages.iter().rposition(|m| m.role == Role::Assistant)
             && unanswered(&messages[index..]).next().is_some()
@@ -313,10 +353,17 @@ impl AgentLoop {
         let mut answer = recovery::AnswerRecovery::default();
         let mut stall = stall::StallDetector::default();
         loop {
+            if let Some(reason) = self.tools.pending_stop() {
+                anyhow::bail!("{reason}");
+            }
             if self.cancel.is_cancelled() {
                 return Err(ModelError::Interrupted.into());
             }
             self.apply_guidance(messages).await?;
+            for (kind, text) in self.tools.take_notes() {
+                messages.push(application_note(&text));
+                self.show_note(kind, text).await?;
+            }
             if let Some((cell, _)) = &self.permissions {
                 let mode = cell.get();
                 if announced != Some(mode) {
@@ -363,6 +410,28 @@ impl AgentLoop {
                         // Guidance that arrived while the answer streamed
                         // continues the task instead of being left unread.
                         if !final_call && self.apply_guidance(messages).await? > 0 {
+                            continue;
+                        }
+                        let stopped=self.hook(if self.root(){"Stop"}else{"SubagentStop"},serde_json::json!({"response":text,"stop_hook_active":stop_continuations>0,"continuations":stop_continuations})).await?;
+                        if let Some(reason) = &stopped.stop_reason {
+                            anyhow::bail!("{reason}");
+                        }
+                        for context in &stopped.context {
+                            messages.push(application_note(context));
+                            self.show_note(NoteKind::Hook, context.clone()).await?;
+                        }
+                        let reason = stopped.block_reason.or_else(|| {
+                            (stopped.decision
+                                == Some(xylo_services::settings_files::PermissionDecision::Deny))
+                            .then(|| "The stop hook requested further work".into())
+                        });
+                        if let Some(reason) = reason
+                            && stop_continuations < 3
+                            && !final_call
+                        {
+                            stop_continuations += 1;
+                            messages.push(application_note(&reason));
+                            self.show_note(NoteKind::Hook, reason).await?;
                             continue;
                         }
                         run.cut_off = cut_off;
@@ -516,6 +585,22 @@ impl AgentLoop {
     /// itself travels in the conversation as an application note.
     async fn show_note(&self, kind: NoteKind, text: String) -> anyhow::Result<()> {
         if self.root() {
+            if kind != NoteKind::Hook {
+                let output = self
+                    .hook(
+                        "Notification",
+                        serde_json::json!({"message":text,"notification_type":kind}),
+                    )
+                    .await?;
+                if let Some(reason) = output.stop_reason {
+                    anyhow::bail!("{reason}");
+                }
+                anyhow::ensure!(
+                    output.decision
+                        != Some(xylo_services::settings_files::PermissionDecision::Deny),
+                    "Notification hook denied continuation"
+                );
+            }
             self.emit(EngineEvent::HarnessNote { kind, text }).await?;
         }
         Ok(())
@@ -576,7 +661,17 @@ impl AgentLoop {
         .await?;
         let results = dispatch::run_batch(self.tools.clone(), prepared).await;
         messages.extend(results);
-        self.checkpoint(messages).await
+        messages.extend(
+            self.tools
+                .take_instruction_notes()
+                .iter()
+                .map(|text| application_note(text)),
+        );
+        self.checkpoint(messages).await?;
+        if let Some(reason) = self.tools.pending_stop() {
+            anyhow::bail!("{reason}");
+        }
+        Ok(())
     }
 
     /// Fits, sends and (when transient failures allow) retries one model
@@ -619,6 +714,13 @@ impl AgentLoop {
                 let error = match self.stream_once(request.clone(), &mut shown, run).await {
                     Ok(response) => {
                         if let Some(usage) = response.usage {
+                            run.usage.calls.push(xylo_core::pricing::UsageCall {
+                                model: run.active_model.clone(),
+                                input_tokens: usage.input_tokens,
+                                output_tokens: usage.output_tokens,
+                                cache_read_tokens: usage.cache_read_tokens.unwrap_or_default(),
+                                cache_write_tokens: usage.cache_write_tokens.unwrap_or_default(),
+                            });
                             run.usage.input_tokens += usage.input_tokens;
                             run.usage.output_tokens += usage.output_tokens;
                             run.usage.context_tokens = usage.input_tokens;
@@ -641,6 +743,11 @@ impl AgentLoop {
                                 usage.input_tokens,
                             );
                         }
+                        self.tools.active_provider(
+                            run.fallback
+                                .clone()
+                                .unwrap_or_else(|| self.provider.clone()),
+                        );
                         return Ok(response);
                     }
                     Err(StreamFailure::Fatal(error)) => return Err(error),
@@ -656,6 +763,26 @@ impl AgentLoop {
                 };
                 attempt += 1;
                 let Some(delay) = retry::delay(&error, attempt) else {
+                    if run.fallback.is_none()
+                        && retry::permits_fallback(&error)
+                        && let Some((model, provider)) = self.provider.fallback()
+                    {
+                        run.fallback = Some(provider);
+                        let note = retry::fallback_note(&model);
+                        messages.push(application_note(&note));
+                        self.checkpoint(messages).await?;
+                        self.persist_fallback(&model).await?;
+                        if self.root() {
+                            self.emit(EngineEvent::HarnessNote {
+                                kind: NoteKind::Fallback,
+                                text: format!(
+                                    "Primary model unavailable. Continuing with {model}."
+                                ),
+                            })
+                            .await?;
+                        }
+                        continue 'fitting;
+                    }
                     return Err(error.into());
                 };
                 tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, %error, "Retrying model request");
@@ -683,7 +810,10 @@ impl AgentLoop {
         tools: &[ToolSchema],
         pressure: Pressure,
     ) -> anyhow::Result<(Vec<Message>, ContextUsage)> {
-        let system = vec![Message::system(&self.system)];
+        let refreshed = self.tools.refreshed_system_prompt();
+        let system = vec![Message::system(
+            refreshed.as_deref().unwrap_or(&self.system),
+        )];
         let assemble = |history: &[Message]| {
             let mut view = system.clone();
             view.extend_from_slice(history);
@@ -704,6 +834,10 @@ impl AgentLoop {
                 self.budget
                     .summary_plan(&system, messages, tools, self.max_tokens, pressure)
         {
+            let compact = self
+                .hook("PreCompact", serde_json::json!({"trigger":"auto"}))
+                .await?;
+            self.hook_context(messages, &compact).await?;
             self.phase(TurnPhase::Compacting).await?;
             match self
                 .budget
@@ -748,8 +882,13 @@ impl AgentLoop {
         shown: &mut String,
         run: &mut Run,
     ) -> Result<ModelResponse, StreamFailure> {
-        let mut stream = self.provider.stream(request, self.cancel.clone());
+        let mut stream = run
+            .fallback
+            .as_ref()
+            .unwrap_or(&self.provider)
+            .stream(request, self.cancel.clone());
         let mut response = Assembler::default();
+        run.active_model.clear();
         let mut attempt_text = String::new();
         let mut matching = true;
         let mut pending = String::new();
@@ -771,6 +910,17 @@ impl AgentLoop {
                 Some(Err(error)) => break Err(error),
                 Some(Ok(event)) => event,
             };
+            if let StreamEvent::Metadata { model, rate_limits } = &event {
+                run.active_model.clone_from(model);
+                if self.root() {
+                    self.emit(EngineEvent::ModelMetadata {
+                        model: model.clone(),
+                        rate_limits: rate_limits.clone(),
+                    })
+                    .await
+                    .map_err(StreamFailure::Fatal)?;
+                }
+            }
             if let StreamEvent::Text(text) = &event
                 && self.root()
             {
@@ -801,6 +951,13 @@ impl AgentLoop {
                         last_flush = Instant::now();
                     }
                 }
+            }
+            if let StreamEvent::Reasoning(text) = &event
+                && self.root()
+            {
+                self.emit(EngineEvent::ThinkingDelta { text: text.clone() })
+                    .await
+                    .map_err(StreamFailure::Fatal)?;
             }
             saw_calls |= matches!(event, StreamEvent::ToolCall { .. });
             response.push(event);

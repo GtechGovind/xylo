@@ -19,6 +19,7 @@ fn sample(workspace: &Path) -> PromptContext<'_> {
         date: "2026-10-31".to_owned(),
         permission_mode: PermissionMode::AskForApproval,
         project_instructions: String::new(),
+        instruction_sources: Vec::new(),
         skills_index: String::new(),
         compact: false,
         skills_index_bytes: SKILLS_INDEX_BYTES,
@@ -838,3 +839,5 @@ fn small_budgets_shrink_instructions_and_the_skills_index() {
     assert!(index.ends_with("more skills not listed)"));
     assert!(skills_index(skills(), usize::MAX).len() <= SKILLS_INDEX_BYTES);
 }
+
+mod project_discovery;

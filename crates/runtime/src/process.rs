@@ -10,12 +10,14 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
+pub use xylo_services::sandbox::CleanupUnknown;
+use xylo_services::sandbox::wait_for_guard_cleanup;
 
 const OUTPUT_LIMIT: usize = 512 * 1024;
 
@@ -26,6 +28,13 @@ struct ProcessGroup {
     pid: Option<u32>,
 }
 impl ProcessGroup {
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pid = None;
+        }
+    }
+
     fn terminate(&self) {
         #[cfg(unix)]
         if let Some(pid) = self.pid {
@@ -68,7 +77,14 @@ pub struct ProcessResult {
     pub truncated: bool,
 }
 
-async fn drain(mut stream: impl AsyncRead + Unpin) -> Result<(Vec<u8>, bool)> {
+/// Receives each output chunk; `true` identifies stderr. Callbacks must stay bounded.
+pub type OutputObserver = Arc<dyn Fn(bool, &[u8]) + Send + Sync>;
+
+async fn drain(
+    mut stream: impl AsyncRead + Unpin,
+    stderr: bool,
+    observer: Option<OutputObserver>,
+) -> Result<(Vec<u8>, bool)> {
     let mut saved = Vec::new();
     let mut buffer = [0_u8; 8192];
     let mut truncated = false;
@@ -76,6 +92,9 @@ async fn drain(mut stream: impl AsyncRead + Unpin) -> Result<(Vec<u8>, bool)> {
         let count = stream.read(&mut buffer).await?;
         if count == 0 {
             break;
+        }
+        if let Some(observer) = &observer {
+            observer(stderr, &buffer[..count]);
         }
         let retain = (OUTPUT_LIMIT - saved.len()).min(count);
         saved.extend_from_slice(&buffer[..retain]);
@@ -144,7 +163,10 @@ pub async fn run_prepared_sandboxed(
         temporary,
         status_file,
     } = prepared;
-    let result = run_prepared(command, cwd, timeout, cancel).await;
+    let guarded = command.as_std().get_envs().any(|(name, value)| {
+        name == "XYLO_SANDBOX_PARENT_GUARD" && value.is_some_and(|value| value == "1")
+    });
+    let result = run_prepared_observed(command, cwd, Some(timeout), cancel, None, guarded).await;
     if let Some(failure) = xylo_services::sandbox::read_start_status(&status_file) {
         return Err(NotStarted(failure.to_string()).into());
     }
@@ -156,14 +178,44 @@ pub async fn run_prepared_sandboxed(
     })
 }
 
+/// Supplies bounded input to the child while retaining the helper's owner pipe.
+pub async fn run_prepared_sandboxed_input(
+    mut prepared: xylo_services::sandbox::PreparedSandbox,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: CancellationToken,
+    input: &[u8],
+) -> Result<SandboxedResult> {
+    anyhow::ensure!(input.len() <= 32 * 1024, "Process input exceeds 32 KiB");
+    xylo_services::sandbox::set_child_input(&mut prepared, input)?;
+    run_prepared_sandboxed(prepared, cwd, timeout, cancel).await
+}
+
 /// Runs a prepared command without a sandbox, draining output and owning its
 /// process group until it ends.
 pub async fn run_prepared(
-    mut command: Command,
+    command: Command,
     cwd: &Path,
     timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<ProcessResult> {
+    run_prepared_observed(command, cwd, Some(timeout), cancel, None, false).await
+}
+
+/// Runs a process with live output and an optional deadline. A guarded sandbox
+/// keeps a private stdin pipe open; its detached watchdog fences and kills
+/// the process group if the owner exits, including abrupt worker termination.
+pub async fn run_prepared_observed(
+    mut command: Command,
+    cwd: &Path,
+    timeout: Option<Duration>,
+    cancel: CancellationToken,
+    observer: Option<OutputObserver>,
+    guard_parent: bool,
+) -> Result<ProcessResult> {
+    if guard_parent {
+        command.env("XYLO_SANDBOX_PARENT_GUARD", "1");
+    }
     if cancel.is_cancelled() {
         return Err(NotStarted("Cancelled before process start".into()).into());
     }
@@ -172,42 +224,83 @@ pub async fn run_prepared(
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if guard_parent {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(!guard_parent);
     #[cfg(unix)]
     command.process_group(0);
+    let cleanup_status = guard_parent
+        .then(|| {
+            command.as_std().get_envs().find_map(|(name, value)| {
+                (name == "XYLO_SANDBOX_CLEANUP_STATUS")
+                    .then(|| value.map(std::path::PathBuf::from))
+                    .flatten()
+            })
+        })
+        .flatten();
     let mut child = command
         .spawn()
         .map_err(|error| anyhow::Error::new(NotStarted(format!("Start process: {error}"))))?;
-    let group = ProcessGroup {
+    let mut group = ProcessGroup {
         #[cfg(unix)]
-        pid: child.id(),
+        // The helper is the watchdog's live identity anchor. Only the watchdog
+        // may kill guarded groups, including when this execution future drops.
+        pid: if guard_parent { None } else { child.id() },
     };
-    let stdout = child.stdout.take().context("Missing stdout pipe")?;
-    let stderr = child.stderr.take().context("Missing stderr pipe")?;
-    let output = tokio::spawn(drain(stdout));
-    let errors = tokio::spawn(drain(stderr));
+    let parent_guard = child.stdin.take();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CleanupUnknown("missing stdout pipe after spawn".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CleanupUnknown("missing stderr pipe after spawn".into()))?;
+    let output = tokio::spawn(drain(stdout, false, observer.clone()));
+    let errors = tokio::spawn(drain(stderr, true, observer));
     let _output_guard = AbortDrain(output.abort_handle());
     let _error_guard = AbortDrain(errors.abort_handle());
     let result = tokio::select! {
         result = child.wait() => result.context("Wait for native process"),
-        _ = cancel.cancelled() => { group.terminate(); let _ = child.kill().await; Err(anyhow::anyhow!("Process cancelled; side effects may have occurred")) },
-        _ = tokio::time::sleep(timeout) => { group.terminate(); let _ = child.kill().await; Err(anyhow::anyhow!("Process timed out; side effects may have occurred")) },
+        _ = cancel.cancelled() => { if !guard_parent { group.terminate(); let _ = child.kill().await; } Err(anyhow::anyhow!("Process cancelled; side effects may have occurred")) },
+        _ = async { match timeout { Some(timeout) => tokio::time::sleep(timeout).await, None => std::future::pending().await } } => { if !guard_parent { group.terminate(); let _ = child.kill().await; } Err(anyhow::anyhow!("Process timed out; side effects may have occurred")) },
     };
     group.terminate();
-    let _ = child.wait().await;
+    // Owner EOF requests the fence; the helper must stay alive until its
+    // watchdog has frozen all descendants and releases the identity anchor.
+    drop(parent_guard);
+    let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    let cleanup = match &cleanup_status {
+        Some(path) => wait_for_guard_cleanup(path).await,
+        None if guard_parent => {
+            Err(CleanupUnknown("guarded command has no acknowledgment path".into()).into())
+        }
+        None => Ok(()),
+    };
+    if guard_parent && cleanup.is_ok() {
+        // The watchdog fenced this group; never signal a potentially reused ID.
+        group.disarm();
+    }
     // Descendant processes can retain pipes after the direct child exits. Bound cleanup too.
     let captured = tokio::time::timeout(Duration::from_secs(2), async {
         Ok::<_, anyhow::Error>((output.await??, errors.await??))
     })
     .await;
+    cleanup?;
+    reaped.context("Native process did not retire")??;
     let status = result?;
     let ((out, out_truncated), (err, err_truncated)) =
         captured.context("Process output pipes did not close")??;
     Ok(ProcessResult {
-        code: status.code(),
+        code: cleanup_status
+            .as_deref()
+            .and_then(xylo_services::sandbox::read_guard_exit_code)
+            .or_else(|| status.code()),
         stdout: String::from_utf8_lossy(&out).into_owned(),
         stderr: String::from_utf8_lossy(&err).into_owned(),
         truncated: out_truncated || err_truncated,
@@ -224,3 +317,6 @@ pub fn require_success(result: ProcessResult) -> Result<ProcessResult> {
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod cleanup_tests;

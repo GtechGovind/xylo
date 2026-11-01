@@ -12,14 +12,24 @@ use serde_json::Value;
 /// The icon for a kind of call, so a run of calls scans at a glance.
 pub(super) fn tool_icon(name: &str) -> AppIcon {
     match name {
-        "file_read" | "read_file" | "extension_resource" => AppIcon::ToolRead,
-        "file_write" | "file_edit" | "write_file" | "edit_file" => AppIcon::ToolEdit,
-        "run_command" | "shell_command" | "terminal" => AppIcon::Terminal,
+        "file_read" | "lsp" | "read_file" | "extension_resource" => AppIcon::ToolRead,
+        "file_write" | "file_edit" | "notebook_edit" | "write_file" | "edit_file" => {
+            AppIcon::ToolEdit
+        }
+        "run_command" | "shell_command" | "shell_output" | "shell_kill" | "shell_jobs"
+        | "terminal" => AppIcon::Terminal,
         "search_project" | "grep" | "glob" | "find" => AppIcon::Search,
         "files_list" | "find_files" => AppIcon::Folder,
+        "worktree_enter" | "worktree_exit" => AppIcon::Branch,
         "git_status" | "git_diff" | "git_log" | "git_commit" => AppIcon::Branch,
         "web_fetch" | "web_search" | "browser" => AppIcon::Web,
+        "ask_user" => AppIcon::Tool,
+        "exit_plan_mode" | "schedule_wakeup" => AppIcon::Plan,
         crate::state::PLAN_TOOL => AppIcon::Plan,
+        "connector_resources"
+        | "connector_resource_read"
+        | "connector_prompts"
+        | "connector_prompt_get" => AppIcon::Connectors,
         "image_generate" => AppIcon::Image,
         "memory_search" | "memory_remember" => AppIcon::Memory,
         "extension_skill" => AppIcon::Skills,
@@ -420,6 +430,12 @@ impl Xylo {
     /// The decision card: what the agent wants to do, a preview of it, and
     /// Allow / Deny with their shortcuts.
     fn approval_panel(&self, i: usize, tool: &ToolCard, cx: &mut Context<Self>) -> AnyElement {
+        if tool.name == "ask_user" {
+            return self.question_card(i, tool, cx);
+        }
+        if tool.name == "exit_plan_mode" {
+            return self.plan_decision_card(i, tool, cx);
+        }
         let id = tool.id;
         let incomplete = tool.input.get("diff_truncated").and_then(Value::as_bool) == Some(true);
         let shortcut = if cfg!(target_os = "macos") {
@@ -694,7 +710,7 @@ fn full_code_block(id: impl Into<ElementId>, text: &str) -> AnyElement {
 
 fn approval_preview(i: usize, tool: &ToolCard) -> AnyElement {
     match tool.name.as_str() {
-        "file_write" | "file_edit" => {
+        "file_write" | "file_edit" | "notebook_edit" => {
             let diff = text_arg(&tool.input, "diff");
             if diff.trim().is_empty() {
                 subtitle("No textual change.").into_any_element()

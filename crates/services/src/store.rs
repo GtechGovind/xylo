@@ -10,8 +10,8 @@ use std::{
 };
 use uuid::Uuid;
 use xylo_core::{
-    AppSettings, ApprovalRule, ChatMessage, ConnectorConfig, Conversation, ConversationCursor,
-    ConversationPage, HistoryPage, MessageStatus, TitleSource, TurnRequest, Usage, now_ms,
+    AppSettings, ChatMessage, ConnectorConfig, Conversation, ConversationCursor, ConversationPage,
+    HistoryPage, MessageStatus, TitleSource, TurnRequest, Usage, now_ms,
 };
 
 type JournalRow = (String, String, Option<String>, Option<String>, i64);
@@ -95,6 +95,7 @@ pub(crate) fn register_user_turn_in_transaction(
     conversation.updated_at = timestamp;
     conn.execute("INSERT INTO conversations(id,json,updated_at) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET json=excluded.json,updated_at=excluded.updated_at",params![turn.session_id.to_string(),serde_json::to_string(&conversation)?,timestamp])?;
     let message = ChatMessage {
+        reasoning: None,
         id: message_id,
         session_id: turn.session_id,
         role: "user".into(),
@@ -180,9 +181,13 @@ pub struct Checkpoint {
     pub turn_id: Uuid,
     pub messages: Value,
     pub updated_at: i64,
+    /// The harness-selected alternative for this checkpoint's turn only.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletedTurn {
+    pub reply_id: Uuid,
     pub text: String,
     pub usage: Usage,
 }
@@ -313,6 +318,23 @@ impl Store {
         })
     }
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
+        ensure!(
+            settings.pricing_overrides.len() <= 512
+                && settings
+                    .pricing_overrides
+                    .iter()
+                    .all(|(model, price)| !model.trim().is_empty()
+                        && model.len() <= 200
+                        && price.valid()),
+            "Enter valid model prices"
+        );
+        ensure!(
+            settings
+                .status_line_command
+                .as_ref()
+                .is_none_or(|command| command.len() <= 8192),
+            "Status command exceeds 8 KiB"
+        );
         // Settings are plain JSON on disk: refuse secrets in custom headers.
         for provider in std::iter::once(&settings.provider).chain(&settings.providers) {
             crate::providers::validate_custom_headers(&provider.headers)?;
@@ -320,49 +342,23 @@ impl Store {
         let json = serde_json::to_string(settings)?;
         self.call(move |conn| { conn.execute("INSERT INTO settings(key,value) VALUES('app',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [json])?; Ok(()) })
     }
-    /// Standing approvals ("always allow" rules) recorded for one project.
-    pub fn approval_rules(&self, workspace: &std::path::Path) -> Result<Vec<ApprovalRule>> {
+    /// Native execution is separate from ordinary tool rules and remains scope-bound.
+    pub fn native_execution_granted(&self, workspace: &std::path::Path, key: &str) -> Result<bool> {
         let workspace = workspace.to_string_lossy().into_owned();
-        self.call(move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT key,label,workspace,created_at FROM approval_rules WHERE workspace=?1 ORDER BY created_at,key",
-            )?;
-            let rows = statement.query_map([workspace], |row| {
-                Ok(ApprovalRule {
-                    key: row.get(0)?,
-                    label: row.get(1)?,
-                    workspace: PathBuf::from(row.get::<_, String>(2)?),
-                    created_at: row.get(3)?,
-                })
-            })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })
+        let key = key.to_owned();
+        self.call(move |conn| Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM native_execution_grants WHERE workspace=?1 AND key=?2)",params![workspace,key],|row|row.get(0))?))
     }
-
-    /// Records a standing approval for one project. Saving the same key again
-    /// updates its label and keeps the original creation time.
-    pub fn save_approval_rule(&self, rule: &ApprovalRule) -> Result<()> {
+    /// Records a user-reviewed native language-server grant, never a general allow rule.
+    pub fn grant_native_execution(&self, workspace: &std::path::Path, key: &str) -> Result<()> {
         ensure!(
-            !rule.key.trim().is_empty() && rule.key.len() <= 512 && rule.label.len() <= 512,
-            "Invalid approval rule"
+            key.starts_with("native-lsp:"),
+            "Only explicit native LSP grants may be recorded"
         );
-        let rule = rule.clone();
-        self.call(move |conn| {
-            conn.execute(
-                "INSERT INTO approval_rules(workspace,key,label,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(workspace,key) DO UPDATE SET label=excluded.label",
-                params![rule.workspace.to_string_lossy(), rule.key, rule.label, rule.created_at],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Revokes a standing approval. Removing an absent rule is not an error.
-    pub fn remove_approval_rule(&self, workspace: &std::path::Path, key: &str) -> Result<()> {
         let workspace = workspace.to_string_lossy().into_owned();
         let key = key.to_owned();
         self.call(move |conn| {
             conn.execute(
-                "DELETE FROM approval_rules WHERE workspace=?1 AND key=?2",
+                "INSERT OR IGNORE INTO native_execution_grants(workspace,key) VALUES(?1,?2)",
                 params![workspace, key],
             )?;
             Ok(())
@@ -431,6 +427,15 @@ impl Store {
         })
     }
 
+    /// Updates the selected checkout after a conversation changes worktrees.
+    pub fn set_conversation_workspace(
+        &self,
+        id: Uuid,
+        workspace: std::path::PathBuf,
+    ) -> Result<Option<Conversation>> {
+        self.update_conversation(id, move |conversation| conversation.workspace = workspace)
+    }
+
     /// Applies `change` to one stored conversation inside a write transaction.
     fn update_conversation(
         &self,
@@ -478,6 +483,7 @@ impl Store {
             return Ok(());
         }
         let message = ChatMessage {
+            reasoning: None,
             id: interrupted_reply_id(turn_id),
             session_id,
             role: "assistant".into(),
@@ -516,6 +522,22 @@ impl Store {
             json.map(|json| Ok(serde_json::from_str(&json)?))
                 .transpose()
         })
+    }
+    /// Distinct chat roots, including archives, for retained checkout discovery.
+    pub fn conversation_workspaces(&self) -> Result<Vec<std::path::PathBuf>> {
+        self.call(move |conn| {
+            let mut statement = conn
+                .prepare("SELECT DISTINCT json_extract(json,'$.workspace') FROM conversations")?;
+            let rows = statement.query_map([], |row| {
+                row.get::<_, String>(0).map(std::path::PathBuf::from)
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+    /// Managed-worktree chats, including archives, for host lifecycle checks.
+    pub fn worktree_conversations(&self) -> Result<Vec<Conversation>> {
+        self.call(move |conn| json_rows(conn,
+            "SELECT json FROM conversations WHERE json_extract(json,'$.workspace') LIKE '%/.xylo/worktrees/%'", []))
     }
     pub fn conversations(&self, limit: usize) -> Result<Vec<Conversation>> {
         self.call(move |conn| {
@@ -651,8 +673,27 @@ impl Store {
         usage: &Usage,
         status: MessageStatus,
     ) -> Result<()> {
+        self.complete_turn_with_reasoning(session_id, turn_id, messages, text, usage, status, None)
+    }
+
+    /// Completes a reply with its separately disclosed provider reasoning.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The reply fields share one atomic transaction."
+    )]
+    pub fn complete_turn_with_reasoning(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        messages: &Value,
+        text: &str,
+        usage: &Usage,
+        status: MessageStatus,
+        reasoning: Option<String>,
+    ) -> Result<()> {
         let messages = crate::checkpoint::message_rows(messages)?;
         let receipt = CompletedTurn {
+            reply_id: assistant_reply_id(turn_id),
             text: text.into(),
             usage: usage.clone(),
         };
@@ -662,10 +703,11 @@ impl Store {
             if let Some(existing)=existing{ensure!(serde_json::from_str::<Value>(&existing)?==serde_json::from_str::<Value>(&receipt_json)?,"Turn was already completed with a different result");return Ok(())}
             let timestamp=now_ms();
             crate::checkpoint::write_rows(&tx,session_id,turn_id,&messages,None,timestamp)?;
-            let message=ChatMessage{id:assistant_reply_id(turn_id),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new(), status,};
+            let message=ChatMessage{ reasoning,id:assistant_reply_id(turn_id),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new(), status,};
             tx.execute("INSERT INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4)",params![message.id.to_string(),session_id.to_string(),serde_json::to_string(&message)?,timestamp])?;
             tx.execute("DELETE FROM messages WHERE id=?1",[interrupted_reply_id(turn_id).to_string()])?;
             tx.execute("INSERT INTO completed_turns(session_id,turn_id,json,completed_at) VALUES(?1,?2,?3,?4)",params![session_id.to_string(),turn_id.to_string(),receipt_json,timestamp])?;
+            tx.execute("DELETE FROM turn_usage WHERE session_id=?1 AND turn_id=?2",params![session_id.to_string(),turn_id.to_string()])?;
             tx.execute("UPDATE conversations SET updated_at=?1,json=json_set(json,'$.updated_at',?1) WHERE id=?2",params![timestamp,session_id.to_string()])?;
             tx.execute("INSERT OR IGNORE INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) VALUES(?1,?2,'pending',?3,?3)",params![session_id.to_string(),turn_id.to_string(),timestamp])?;
             tx.commit()?;Ok(())})

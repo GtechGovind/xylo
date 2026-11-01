@@ -46,7 +46,6 @@ fn fixture(
         provider: ProviderConfig::default(),
         permissions: mode,
         attachments: Vec::new(),
-        approved_rules: Vec::new(),
     };
     let (events, receiver) = tokio::sync::mpsc::channel(256);
     let broker = ToolBroker::new(

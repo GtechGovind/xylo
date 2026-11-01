@@ -204,7 +204,27 @@ fn admission_error(error: anyhow::Error) -> ModelError {
     }
 }
 
+#[async_trait::async_trait]
 impl ModelProvider for GuardedProvider {
+    fn supports_search(&self) -> bool {
+        self.inner.supports_search()
+    }
+    async fn search(
+        &self,
+        arguments: serde_json::Value,
+        addresses: Vec<std::net::SocketAddr>,
+        cancel: CancellationToken,
+    ) -> Result<serde_json::Value, ModelError> {
+        self.inner.search(arguments, addresses, cancel).await
+    }
+
+    fn fallback(&self) -> Option<(String, Arc<dyn ModelProvider>)> {
+        let (name, inner) = self.inner.fallback()?;
+        let mut guard = self.clone();
+        guard.inner = inner;
+        Some((name, Arc::new(guard)))
+    }
+
     fn stream(&self, mut request: ModelRequest, cancel: CancellationToken) -> EventStream {
         request.max_tokens = request.max_tokens.min(self.output_tokens).max(1);
         let this = self.clone();

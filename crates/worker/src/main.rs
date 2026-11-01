@@ -6,6 +6,7 @@
 //! updates the live permission mode every broker reads at each tool call.
 
 mod credentials;
+mod shell_events;
 mod steering;
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -221,7 +222,11 @@ async fn main() -> Result<()> {
                 // later changes arrive as SetPermissions.
                 permissions.set(turn.permissions);
                 let engine = AgentEngine::new(store.clone(), paths.clone(), tools)
-                    .with_served_contexts(served_contexts.clone());
+                    .with_served_contexts(served_contexts.clone())
+                    .with_run_options(xylo_engine::RunOptions {
+                        interactive: true,
+                        ..Default::default()
+                    });
                 let engine = Arc::new(match credential {
                     Some(credential) => engine
                         .with_provider_credential(credential)
@@ -330,34 +335,47 @@ async fn main() -> Result<()> {
                 .await?;
             }
             WorkerCommand::SetPermissions { mode } => permissions.set(mode),
-            WorkerCommand::Unlock { key } => match unlock(&paths, &key) {
-                Ok(vault) => {
-                    // A repeated Unlock replaces the vault; close the old
-                    // session's connections, which hold the old secrets.
-                    if let Some(previous) = session.take() {
-                        previous.shutdown().await;
+            WorkerCommand::Unlock { key } => {
+                match unlock(&paths, &key) {
+                    Ok(vault) => {
+                        // A repeated Unlock replaces the vault; close the old
+                        // session's connections, which hold the old secrets.
+                        if let Some(previous) = session.take() {
+                            previous.shutdown().await;
+                        }
+                        let tools = ToolSession::new(permissions.clone(), vault);
+                        tools.set_job_events(shell_events::sink(output.clone(), sequence.clone()));
+                        session = Some(tools);
                     }
-                    session = Some(ToolSession::new(permissions.clone(), vault));
+                    Err(error) => {
+                        send(
+                            &output,
+                            &sequence,
+                            request_id,
+                            session_id,
+                            EngineEvent::Error {
+                                message: format!("Could not unlock the secret vault: {error:#}"),
+                                retryable: false,
+                                kind: ErrorKind::Authentication,
+                            },
+                        )
+                        .await?
+                    }
                 }
-                Err(error) => {
-                    send(
-                        &output,
-                        &sequence,
-                        request_id,
-                        session_id,
-                        EngineEvent::Error {
-                            message: format!("Could not unlock the secret vault: {error:#}"),
-                            retryable: false,
-                            kind: ErrorKind::Authentication,
-                        },
-                    )
-                    .await?
-                }
-            },
+            }
             WorkerCommand::SteerDurable { guidance } => {
                 let session = guidance.session_id;
                 let reply = steering::answer(store.clone(), active.as_ref(), guidance).await;
                 send(&output, &sequence, request_id, Some(session), reply).await?;
+            }
+            WorkerCommand::RespondMcpElicitation {
+                request_id: form,
+                action,
+                content,
+            } => {
+                if let Some(session) = &session {
+                    let _ = session.answer_mcp_form(form, action, content);
+                }
             }
             WorkerCommand::Approve {
                 action_id,
@@ -379,6 +397,47 @@ async fn main() -> Result<()> {
                         session_id,
                         EngineEvent::Error {
                             message: format!("Approval for action {action_id} failed: {error:#}"),
+                            retryable: false,
+                            kind: ErrorKind::Internal,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            WorkerCommand::Answer { action_id, answer } => {
+                let result = session
+                    .as_ref()
+                    .context("This task is no longer running")
+                    .and_then(|tools| tools.answer(action_id, answer));
+                let event = match result {
+                    Ok(()) => EngineEvent::Status {
+                        text: "Answer accepted".into(),
+                    },
+                    Err(error) => EngineEvent::Error {
+                        message: format!("Answer could not be applied: {error:#}"),
+                        retryable: false,
+                        kind: ErrorKind::Internal,
+                    },
+                };
+                send(&output, &sequence, request_id, session_id, event).await?;
+            }
+            WorkerCommand::KillJob { job_id } => {
+                let stopped = session_id
+                    .context("Select a conversation to stop its job")
+                    .and_then(|id| {
+                        session
+                            .as_ref()
+                            .context("Worker is locked")?
+                            .kill_job(id, job_id)
+                    });
+                if let Err(error) = stopped {
+                    send(
+                        &output,
+                        &sequence,
+                        request_id,
+                        session_id,
+                        EngineEvent::Error {
+                            message: format!("Could not stop shell job: {error:#}"),
                             retryable: false,
                             kind: ErrorKind::Internal,
                         },

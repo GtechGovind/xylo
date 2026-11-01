@@ -367,17 +367,13 @@ impl ExtensionService {
                 }
                 _ => unreachable!(),
             };
-            let mut result = result
-                .map_err(|error| anyhow::anyhow!(redacted(&format!("{error:#}"), &secrets)))?;
+            let mut result = result.map_err(|error| redact_execution_error(error, &secrets))?;
             // Policy control is extracted before data redaction. Credentials
             // that equal a policy word/key must never erase a hook denial.
             let hook_control = if plan.component.kind == ComponentKind::Hooks {
-                let decision = result
-                    .pointer("/hookSpecificOutput/permissionDecision")
-                    .or_else(|| result.get("decision"))
-                    .and_then(Value::as_str);
+                let control = crate::hooks::HookOutput::parse(&result)?;
                 Some(
-                    json!({"blocked":result.get("continue").and_then(Value::as_bool)==Some(false)||decision.is_some_and(|decision|!matches!(decision,"allow"|"approve"))}),
+                    json!({"decision": control.decision, "stop_reason": control.stop_reason, "block_reason": control.block_reason}),
                 )
             } else {
                 None
@@ -535,11 +531,9 @@ impl ExtensionService {
         Ok(output)
     }
 }
-/// Hook events Xylo delivers. Entries for any other event (for example
-/// `SessionStart`) are reported as unsupported individually and never run;
-/// they do not make the rest of the component unsupported.
+/// Hook events delivered by the harness.
 fn supported_event(event: &str) -> bool {
-    matches!(event, "PreToolUse" | "PostToolUse")
+    crate::hooks::EVENTS.contains(&event)
 }
 /// Whether an entry can ever run: non-hook entries always, hook entries only
 /// for a delivered event.
@@ -599,7 +593,7 @@ fn validate_env_name(name: &str) -> Result<()> {
         !name.is_empty()
             && name.len() <= 128
             && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            && name != "XYLO_SANDBOX_CHILD_ENV",
+            && !name.starts_with("XYLO_SANDBOX_"),
         "Unsupported environment variable name"
     );
     Ok(())
@@ -675,7 +669,10 @@ fn entries(kind: &ComponentKind, declaration: Value) -> Result<Vec<Entry>> {
                             event: Some(event.clone()),
                             matcher: group
                                 .get("matcher")
-                                .and_then(Value::as_str)
+                                .map(|value| {
+                                    value.as_str().context("Hook matcher must be a string")
+                                })
+                                .transpose()?
                                 .map(str::to_owned),
                             declaration: command.clone(),
                         });
@@ -705,16 +702,12 @@ fn entry_requirements(plan: &Plan, entry: &Entry) -> Vec<String> {
     {
         required.push("Install the pinned managed sandbox runtime dependencies".into());
     }
-    if let Some(event) = entry.event.as_deref().filter(|e| !supported_event(e)) {
-        required.push(format!(
-            "Unsupported hook event {event}; Xylo delivers only PreToolUse and PostToolUse"
-        ));
-    }
-    if entry.matcher.as_deref().is_some_and(|m| {
-        m.chars()
-            .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '_' | '|' | '*'))
-    }) {
-        required.push("Unsupported hook matcher; use exact tool names separated by | or *".into());
+    if entry
+        .matcher
+        .as_deref()
+        .is_some_and(|matcher| crate::hooks::matches(Some(matcher), "").is_err())
+    {
+        required.push("Invalid hook matcher regular expression".into());
     }
     if plan.component.kind == ComponentKind::Hooks
         && entry
@@ -927,28 +920,17 @@ async fn resolve_environment(
     Ok(env)
 }
 fn hook_matches(matcher: Option<&str>, input: &Value) -> bool {
-    let Some(matcher) = matcher else { return true };
-    if matcher == "*" || matcher.is_empty() {
-        return true;
-    }
     let name = input
         .get("tool_name")
         .or_else(|| input.get("source"))
         .or_else(|| input.get("reason"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    matcher.split('|').any(|m| {
-        m == name
-            || matches!(
-                (m, name),
-                ("Bash", "shell_command" | "run_command")
-                    | ("Read", "file_read")
-                    | ("Write", "file_write")
-                    | ("Edit", "file_edit")
-                    | ("Glob", "find_files" | "files_list")
-                    | ("Grep", "search_project")
-            )
-    })
+    crate::hooks::matches(matcher, name).unwrap_or(false)
+        || input
+            .get("tool_alias")
+            .and_then(Value::as_str)
+            .is_some_and(|alias| crate::hooks::matches(matcher, alias).unwrap_or(false))
 }
 fn duration(plan: &Plan) -> Duration {
     Duration::from_secs(if plan.setup.timeout_seconds == 0 {
@@ -1116,52 +1098,41 @@ async fn run_hook(
         !cancel.is_cancelled(),
         "Component execution cancelled before process start"
     );
-    let mut process = spawn_component(plan, entry, environment)?;
-    let mut stdin = process.child.stdin.take().context("Hook stdin missing")?;
-    let stdout = process.child.stdout.take().context("Hook stdout missing")?;
-    let work = async {
-        // Feed stdin while draining stdout: a hook that writes before it has read
-        // all of its input would otherwise fill the stdout pipe and deadlock both
-        // sides until the deadline. A hook may exit without reading all input.
-        let feed = async move {
-            match stdin.write_all(&bytes).await {
-                Ok(()) => stdin.shutdown().await,
-                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-                Err(error) => Err(error),
-            }
-        };
-        let mut output = Vec::new();
-        let mut limited = stdout.take(1024 * 1024 + 1);
-        let (fed, drained) = tokio::join!(feed, limited.read_to_end(&mut output));
-        drained?;
-        ensure!(output.len() <= 1024 * 1024, "Hook output exceeds 1 MiB");
-        fed?;
-        let status = process.child.wait().await?;
-        if status.code() == Some(2) {
-            return Ok(json!({"hookSpecificOutput":{"permissionDecision":"deny"},"exit_code":2}));
-        }
-        ensure!(
-            status.success(),
-            "Hook command failed (exit {:?}); inspect component dependencies and setup",
-            status.code()
-        );
-        let text = String::from_utf8(output).context("Hook output is not UTF-8")?;
-        let output: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"text":text}));
-        ensure!(
-            output.pointer("/hookSpecificOutput/updatedInput").is_none()
-                && output.get("updatedInput").is_none()
-                && output
-                    .pointer("/hookSpecificOutput/updatedToolInput")
-                    .is_none()
-                && output
-                    .pointer("/hookSpecificOutput/updatedMCPToolOutput")
-                    .is_none(),
-            "Unsupported hook execution-changing directive; updatedInput/output replacement requires host validation and renewed approval"
-        );
-        Ok::<Value, anyhow::Error>(output)
-    };
-    tokio::select! {_=cancel.cancelled()=>bail!("Hook execution cancelled; effects may be incomplete"),result=tokio::time::timeout(duration(plan),work)=>result.context("Hook execution timed out; effects may be incomplete")?}
+    let (program, args) = command(plan, entry)?;
+    let mut prepared = crate::sandbox::prepare_with_policy(
+        &program.to_string_lossy(),
+        &args,
+        &plan.setup.workspace,
+        std::slice::from_ref(&plan.root),
+        &plan.protected_paths,
+        &plan.setup.allowed_domains,
+    )?;
+    crate::sandbox::set_child_environment(&mut prepared, &environment)?;
+    crate::sandbox::set_child_input(&mut prepared, &bytes)?;
+    let (code, output) = crate::hooks::run_prepared(prepared, duration(plan), cancel).await?;
+    if code == Some(2) {
+        return Ok(json!({"hookSpecificOutput":{"permissionDecision":"deny"},"exit_code":2}));
+    }
+    ensure!(
+        code == Some(0),
+        "Hook command failed (exit {code:?}); inspect component dependencies and setup"
+    );
+    let text = String::from_utf8(output).context("Hook output is not UTF-8")?;
+    let output: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"text":text}));
+    crate::hooks::HookOutput::parse(&output)?;
+    Ok(output)
 }
+
+/// Redaction must not turn unknown process ownership into a releasable error.
+fn redact_execution_error(error: anyhow::Error, secrets: &[String]) -> anyhow::Error {
+    let message = redacted(&format!("{error:#}"), secrets);
+    if error.is::<crate::sandbox::CleanupUnknown>() {
+        crate::sandbox::CleanupUnknown(message).into()
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
 async fn write_lsp(stdin: &mut tokio::process::ChildStdin, message: Value) -> Result<()> {
     let bytes = serde_json::to_vec(&message)?;
     ensure!(bytes.len() <= 1024 * 1024, "LSP request exceeds 1 MiB");
@@ -1368,3 +1339,6 @@ fn redact_value(value: &mut Value, secrets: &[String]) {
         _ => {}
     }
 }
+
+#[cfg(all(test, unix))]
+mod cleanup_tests;

@@ -16,6 +16,8 @@ mod drafts;
 use drafts::{DraftFlushAction, DraftUi};
 #[path = "xylo/turn_queue.rs"]
 mod turn_queue;
+#[path = "xylo/worktrees.rs"]
+mod worktrees;
 use turn_queue::TurnQueueUi;
 #[path = "xylo/attachments.rs"]
 mod attachments;
@@ -63,6 +65,10 @@ mod chat;
 use app_status::{HostHealth, StatusLine, product_error};
 #[path = "xylo/context_panel.rs"]
 mod context_panel;
+#[path = "xylo/git_review.rs"]
+mod git_review;
+#[path = "xylo/mcp_forms.rs"]
+mod mcp_forms;
 #[path = "xylo/memory.rs"]
 mod memory;
 #[path = "xylo/memory_form.rs"]
@@ -81,6 +87,10 @@ mod quit;
 mod settings;
 #[path = "xylo/settings_ui.rs"]
 mod settings_ui;
+#[path = "xylo/shell_jobs.rs"]
+mod shell_jobs;
+#[path = "xylo/usage.rs"]
+mod usage;
 #[path = "xylo/work_panel.rs"]
 mod work_panel;
 use native_tools::NativeUi;
@@ -210,6 +220,7 @@ pub struct Xylo {
     #[cfg(test)]
     validation_worker_commands: Option<std::sync::mpsc::SyncSender<(Uuid, WorkerCommand)>>,
     settings: AppSettings,
+    effective_permissions: std::collections::HashMap<Uuid, (u64, PermissionMode)>,
     page: Page,
     workspace: Option<PathBuf>,
     workspace_ready: bool,
@@ -224,6 +235,8 @@ pub struct Xylo {
     sidebar_state: sidebar::SidebarUi,
     messages: Vec<ChatMessage>,
     turns: BTreeMap<Uuid, TurnState>,
+    mcp_forms: BTreeMap<Uuid, mcp_forms::Form>,
+    mcp_commands: Vec<xylo_runtime::host::McpPromptCommand>,
     composer: Entity<TextareaState>,
     editor: Entity<EditorState>,
     editor_path: Option<PathBuf>,
@@ -262,12 +275,17 @@ pub struct Xylo {
     memory_content: Entity<TextareaState>,
     memories: Vec<MemoryRecord>,
     facts: memory::MemoryUi,
+    web_search_backend: Option<xylo_core::WebSearchBackend>,
+    web_search_endpoint: Entity<InputState>,
+    web_search_secret: Entity<InputState>,
+    permission_pattern: Entity<InputState>,
     connector_name: Entity<InputState>,
     connector_endpoint: Entity<InputState>,
     connector_command: Entity<InputState>,
     connector_args: Entity<TextareaState>,
     connector_pending: Option<Uuid>,
     connector_pending_save: bool,
+    connector_signing_in: bool,
     connector_editing: Option<Uuid>,
     connector_credential: Entity<InputState>,
     connector_transport: String,
@@ -316,6 +334,7 @@ pub struct Xylo {
     quit_tasks_confirmed: bool,
     /// Quitting waits for pending saves; the banner offers Quit anyway.
     quit_waiting_for_saves: bool,
+    usage_ui: usage::UsageUi,
     model_picker: model_picker::ModelPickerUi,
     /// When context accounting last arrived, per chat.
     context_updated_at: BTreeMap<Uuid, i64>,
@@ -323,6 +342,8 @@ pub struct Xylo {
     /// while the composer or the transcript has focus.
     transcript_focus: FocusHandle,
     native: NativeUi,
+    worktrees: Vec<xylo_runtime::workspace::worktree::Worktree>,
+    worktree_pending: Option<Uuid>,
     documents: documents::DocumentUi,
     assets: AssetsUi,
     account: AccountUi,
@@ -487,6 +508,7 @@ impl Xylo {
             #[cfg(test)]
             validation_worker_commands: None,
             settings: AppSettings::default(),
+            effective_permissions: std::collections::HashMap::new(),
             page: Page::Chat,
             workspace: None,
             workspace_ready: false,
@@ -499,6 +521,8 @@ impl Xylo {
             sidebar_state: Default::default(),
             messages: vec![],
             turns: BTreeMap::new(),
+            mcp_forms: BTreeMap::new(),
+            mcp_commands: Vec::new(),
             composer,
             editor,
             editor_path: None,
@@ -539,6 +563,14 @@ impl Xylo {
             memory_content,
             memories: vec![],
             facts: memory::MemoryUi::default(),
+            web_search_backend: None,
+            web_search_endpoint: input("https://search.example", window, cx),
+            web_search_secret: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("API key (leave blank to keep saved key)")
+                    .masked(true)
+            }),
+            permission_pattern: input("Bash(npm test:*) or Edit(src/**)", window, cx),
             connector_name: input("Connector name", window, cx),
             connector_endpoint: input("https://…/mcp", window, cx),
             connector_command: input("Executable path", window, cx),
@@ -549,6 +581,7 @@ impl Xylo {
             }),
             connector_pending: None,
             connector_pending_save: false,
+            connector_signing_in: false,
             connector_editing: None,
             connector_credential: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -596,10 +629,13 @@ impl Xylo {
             quit_after_save: None,
             quit_tasks_confirmed: false,
             quit_waiting_for_saves: false,
+            usage_ui: usage::UsageUi::new(window, cx),
             model_picker: model_picker::ModelPickerUi::new(window, cx),
             context_updated_at: BTreeMap::new(),
             transcript_focus: cx.focus_handle(),
             native: NativeUi::new(),
+            worktrees: Vec::new(),
+            worktree_pending: None,
             documents: documents::DocumentUi::new(window, cx),
             assets: AssetsUi::default(),
             account: AccountUi::default(),
@@ -792,6 +828,56 @@ impl Xylo {
             self.note_context_usage(envelope);
         }
         match event {
+            HostEvent::Permissions {
+                session,
+                mode,
+                revision,
+            } => {
+                if self
+                    .effective_permissions
+                    .get(&session)
+                    .is_none_or(|(previous, _)| revision >= *previous)
+                {
+                    self.effective_permissions.insert(session, (revision, mode));
+                }
+            }
+            HostEvent::PlanModes {
+                session,
+                action_id,
+                modes,
+                scheduled,
+            } => {
+                if let Some(card) = self
+                    .turns
+                    .get_mut(&session)
+                    .and_then(|turn| turn.tools.iter_mut().find(|card| card.id == action_id))
+                {
+                    card.input["allowed_modes"] = serde_json::json!(modes);
+                    card.input["scheduled"] = serde_json::json!(scheduled);
+                }
+                self.invalidate_live_history();
+                self.sync_history_list(cx);
+            }
+            HostEvent::InteractionReply {
+                session,
+                action_id,
+                result,
+            } => {
+                if let Some(card) = self
+                    .turns
+                    .get_mut(&session)
+                    .and_then(|turn| turn.tools.iter_mut().find(|card| card.id == action_id))
+                    && result.is_ok()
+                {
+                    card.approval = false;
+                }
+                // Rejected replies leave the draft and pending controls untouched.
+                if let Err(error) = result {
+                    self.error = Some(error);
+                }
+                self.invalidate_live_history();
+                self.sync_history_list(cx);
+            }
             HostEvent::ActionReviews { request_id, result } => {
                 self.action_reviews_received(request_id, result, cx)
             }
@@ -995,6 +1081,7 @@ impl Xylo {
                     self.provider_form(&settings.provider, window, cx);
                 }
                 self.settings = settings;
+                self.sync_usage_forms(window, cx);
                 if let Some(mut ui) = local_ui {
                     for root in &self.settings.ui.open_projects {
                         if !ui.open_projects.contains(root) {
@@ -1032,6 +1119,17 @@ impl Xylo {
                 }
             }
             HostEvent::ConversationPage(page) => self.conversation_page(page, cx),
+            HostEvent::Usage {
+                request_id,
+                session_id,
+                result,
+            } => self.usage_received(request_id, session_id, result, cx),
+            HostEvent::OutputStyles { request_id, result } => {
+                self.output_styles_received(request_id, result, cx)
+            }
+            HostEvent::StatusLine { request_id, result } => {
+                self.status_line_received(request_id, result, cx)
+            }
             HostEvent::HistoryPage(page) => self.history_page(page, cx),
             HostEvent::ModelsFailed {
                 generation,
@@ -1128,6 +1226,13 @@ impl Xylo {
                     }
                 }
             }
+            HostEvent::GitHunkApplied {
+                request_id,
+                root,
+                result,
+            } => {
+                self.git_hunk_applied(request_id, root, result, cx);
+            }
             HostEvent::GitStatus {
                 request_id,
                 root,
@@ -1161,6 +1266,25 @@ impl Xylo {
             }
             HostEvent::MemoryExport { request_id, result } => {
                 self.memory_exported(request_id, result, cx)
+            }
+            HostEvent::McpCommands {
+                request_id,
+                workspace,
+                connector_id,
+                commands,
+            } => {
+                if self.connector_inspection_request == Some(request_id)
+                    && self.workspace == workspace
+                {
+                    self.mcp_commands
+                        .retain(|command| command.connector_id != connector_id);
+                    self.mcp_commands.extend(commands);
+                }
+            }
+            HostEvent::ConnectorAuthorization { request_id, url } => {
+                if self.connector_pending == Some(request_id) {
+                    cx.open_url(&url);
+                }
             }
             HostEvent::Connectors(connectors) => self.connectors = connectors,
             HostEvent::ConnectorMutation { request_id, result } => {
@@ -1199,6 +1323,7 @@ impl Xylo {
                 }
             }
             HostEvent::Error(error) => {
+                self.worktree_pending = None;
                 self.quit_after_save = None;
                 self.error = Some(error.clone());
                 self.log(format!("ERROR {error}"));
@@ -1209,6 +1334,12 @@ impl Xylo {
             HostEvent::ApprovalRules { workspace, result } => {
                 self.approval_rules_received(workspace, result, cx)
             }
+            HostEvent::Worktrees(trees) => self.worktrees = trees,
+            HostEvent::ChatWorktree {
+                session,
+                workspace,
+                branch: _,
+            } => self.chat_worktree_changed(session, workspace, window, cx),
             HostEvent::ConversationRenamed(conversation) => self.conversation_renamed(conversation),
             HostEvent::Engine(envelope) => {
                 // Engine events always name their chat; one without a session
@@ -1261,6 +1392,28 @@ impl Xylo {
         };
         if let Some(reason) = blocked {
             self.show_composer_hint(reason, cx);
+            return;
+        }
+        let command = self.composer.read(cx).value().trim().to_owned();
+        if command == "/loop stop" {
+            let session = self.session;
+            self.host_call(cx, |host| host.stop_wakeups(session));
+            return;
+        }
+        if command.starts_with("/loop ") {
+            let Some(workspace) = self.workspace.clone() else {
+                return;
+            };
+            if let Err(error) = xylo_runtime::scheduler::parse_loop(&command) {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+            let session = self.session;
+            self.host_call(cx, |host| host.start_loop(session, workspace, command));
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.draft_changed(cx);
             return;
         }
         self.submit_persisted_draft(window, cx);
@@ -1703,6 +1856,9 @@ impl Xylo {
 }
 impl Render for Xylo {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.page == Page::Chat && !self.settings_open && !self.updates.installing {
+            self.refresh_usage(cx);
+        }
         if self.updates.installing {
             return div()
                 .size_full()
@@ -1873,6 +2029,25 @@ impl Render for Xylo {
             .on_action(
                 cx.listener(|view, _: &EscapePressed, window, cx| view.escape_pressed(window, cx)),
             )
+            .on_action(cx.listener(|view, _: &CyclePermissions, window, cx| {
+                if view
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+                {
+                    let index = PermissionMode::ALL
+                        .iter()
+                        .position(|mode| *mode == view.current_permission_mode())
+                        .unwrap_or(0);
+                    view.set_permission_mode(
+                        PermissionMode::ALL[(index + 1) % PermissionMode::ALL.len()],
+                        cx,
+                    );
+                } else {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|view, _: &FocusComposer, window, cx| {
                 view.navigate(Page::Chat, cx);
                 view.composer

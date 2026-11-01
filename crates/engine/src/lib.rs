@@ -11,6 +11,8 @@ mod attachments;
 mod broker_tools;
 mod credentials;
 mod engine;
+mod run_options;
+pub use run_options::{CustomToolHandler, RefusalObserver, RunOptions};
 mod model;
 mod prompts;
 mod provider_guard;
@@ -18,6 +20,7 @@ mod providers;
 mod steering;
 mod subagent;
 pub mod tools;
+mod usage_meter;
 
 pub use credentials::ProviderCredentialResolver;
 pub use engine::{AgentEngine, ProviderLayer};

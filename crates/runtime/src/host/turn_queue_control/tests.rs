@@ -35,7 +35,6 @@ fn queued(host: &HostState) -> (TurnRequest, crate::drafts::DraftSubmission) {
         },
         permissions: PermissionMode::ReadOnly,
         attachments: vec![],
-        approved_rules: Vec::new(),
     };
     (turn, sub)
 }

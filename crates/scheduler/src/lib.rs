@@ -36,6 +36,9 @@ const MAX_MISSED_SCAN: usize = 100_000;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduledTask {
+    /// Conversation wakeups retain identity, reason and the original authority limit.
+    #[serde(default)]
+    pub wakeup: Option<ConversationWakeup>,
     pub id: Uuid,
     pub prompt: String,
     pub workspace: PathBuf,
@@ -50,6 +53,30 @@ pub struct ScheduledTask {
     /// The most recent occurrence whose host stopped renewing its lease
     /// before acknowledging it. It was not dispatched again.
     pub interrupted: Option<Uuid>,
+}
+
+/// The conversation and authority retained by a one-shot or repeating wakeup.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationWakeup {
+    pub session_id: Uuid,
+    pub permissions: xylo_core::PermissionMode,
+    pub reason: String,
+    pub interval_seconds: Option<u64>,
+}
+
+/// The tighter of the original wakeup mode and the current setting.
+pub fn wakeup_mode(
+    original: xylo_core::PermissionMode,
+    current: xylo_core::PermissionMode,
+) -> xylo_core::PermissionMode {
+    use xylo_core::PermissionMode::*;
+    match (original, current) {
+        (Plan, _) | (_, Plan) => Plan,
+        (ReadOnly, _) | (_, ReadOnly) => ReadOnly,
+        (AskForApproval, _) | (_, AskForApproval) => AskForApproval,
+        _ => ApproveForMe,
+    }
 }
 
 /// One claimed occurrence of a task.
@@ -127,7 +154,20 @@ impl Scheduler {
             "Schedule must retain an absolute workspace"
         );
         ensure!(task.cron.len() <= 512, "Cron expression exceeds limit");
-        cron::Schedule::from_str(&task.cron).context("Invalid UTC cron expression")?;
+        if let Some(wakeup) = &task.wakeup {
+            ensure!(
+                !wakeup.reason.trim().is_empty() && wakeup.reason.len() <= 1024,
+                "Wakeup reason must contain 1..1024 bytes"
+            );
+            ensure!(
+                wakeup
+                    .interval_seconds
+                    .is_none_or(|interval| (60..=3600).contains(&interval)),
+                "Loop interval must be 60..3600 seconds"
+            );
+        } else {
+            cron::Schedule::from_str(&task.cron).context("Invalid UTC cron expression")?;
+        }
         Ok(())
     }
 
@@ -258,6 +298,10 @@ impl Scheduler {
         );
         self.transact(true, move |tasks| {
             if let Some(stored) = tasks.iter_mut().find(|t| t.id == task.id) {
+                ensure!(
+                    stored.wakeup == task.wakeup,
+                    "Wakeup conversation and permission limit cannot be changed"
+                );
                 if stored.cron != task.cron {
                     stored.next_run = first_occurrence(&task.cron)?;
                 }
@@ -280,6 +324,7 @@ impl Scheduler {
     /// Create an enabled task in this scheduler's workspace.
     pub async fn create(&self, prompt: String, expression: String) -> Result<ScheduledTask> {
         let task = ScheduledTask {
+            wakeup: None,
             id: Uuid::new_v4(),
             prompt,
             workspace: self.workspace.clone(),
@@ -290,6 +335,39 @@ impl Scheduler {
             interrupted: None,
         };
         self.save(task).await
+    }
+
+    /// Create a conversation-bound wakeup with its original permission limit.
+    pub async fn create_wakeup(
+        &self,
+        session_id: Uuid,
+        permissions: xylo_core::PermissionMode,
+        delay_seconds: u64,
+        prompt: String,
+        reason: String,
+        interval_seconds: Option<u64>,
+    ) -> Result<ScheduledTask> {
+        ensure!(
+            (60..=3600).contains(&delay_seconds),
+            "Wakeup delay must be 60..3600 seconds"
+        );
+        self.save(ScheduledTask {
+            id: Uuid::new_v4(),
+            prompt,
+            workspace: self.workspace.clone(),
+            cron: String::new(),
+            next_run: Utc::now() + Duration::seconds(delay_seconds as i64),
+            enabled: true,
+            claim: None,
+            interrupted: None,
+            wakeup: Some(ConversationWakeup {
+                session_id,
+                permissions,
+                reason,
+                interval_seconds,
+            }),
+        })
+        .await
     }
 
     /// Delete a task.
@@ -449,6 +527,17 @@ fn first_occurrence(expression: &str) -> Result<DateTime<Utc>> {
 }
 
 fn advance(task: &mut ScheduledTask, due: DateTime<Utc>, now: DateTime<Utc>) -> Result<()> {
+    if let Some(wakeup) = &task.wakeup {
+        match wakeup.interval_seconds {
+            Some(interval) => {
+                let interval = interval as i64;
+                let skipped = ((now - due).num_seconds().max(0) / interval) + 1;
+                task.next_run = due + Duration::seconds(skipped * interval);
+            }
+            None => task.enabled = false,
+        }
+        return Ok(());
+    }
     task.next_run = following(&cron::Schedule::from_str(&task.cron)?, due, now)
         .context("Schedule has no future occurrence")?;
     Ok(())
@@ -488,6 +577,44 @@ pub fn definitions() -> Vec<ToolDefinition> {
             true,
         ),
     ]
+}
+
+/// Parse `/loop [60s|5m|1h] prompt`; the default interval is five minutes.
+pub fn parse_loop(input: &str) -> Result<(u64, String)> {
+    let body = input.strip_prefix("/loop").context("Expected /loop")?;
+    ensure!(
+        body.is_empty() || body.starts_with(char::is_whitespace),
+        "Expected /loop followed by a prompt"
+    );
+    let body = body.trim();
+    let (first, rest) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+    let parsed = first
+        .strip_suffix('s')
+        .map(|s| (s, 1))
+        .or_else(|| first.strip_suffix('m').map(|s| (s, 60)))
+        .or_else(|| first.strip_suffix('h').map(|s| (s, 3600)));
+    let (interval, prompt) = if let Some((digits, scale)) = parsed
+        .filter(|(digits, _)| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+    {
+        (
+            digits
+                .parse::<u64>()?
+                .checked_mul(scale)
+                .context("Interval is too large")?,
+            rest.trim(),
+        )
+    } else {
+        (300, body)
+    };
+    ensure!(
+        (60..=3600).contains(&interval),
+        "Loop interval must be 60 seconds to one hour"
+    );
+    ensure!(
+        !prompt.is_empty() && prompt.len() <= MAX_PROMPT_BYTES,
+        "Provide a loop prompt of 1..8192 bytes"
+    );
+    Ok((interval, prompt.to_owned()))
 }
 
 #[cfg(test)]

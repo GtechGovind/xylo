@@ -52,6 +52,15 @@ pub(super) fn group_summary<'a>(tools: impl IntoIterator<Item = &'a ToolCard>) -
 }
 fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
     match name {
+        "connector_resources" | "connector_resource_read" => {
+            ("Read", "MCP resource", "MCP resources")
+        }
+        "connector_prompts" | "connector_prompt_get" => ("Loaded", "MCP prompt", "MCP prompts"),
+        "ask_user" => ("Asked", "question", "questions"),
+        "exit_plan_mode" => ("Reviewed", "plan", "plans"),
+        "schedule_wakeup" => ("Scheduled", "wakeup", "wakeups"),
+        "lsp" => ("Inspected", "code location", "code locations"),
+        "worktree_enter" | "worktree_exit" => ("Changed", "worktree", "worktrees"),
         "file_read" | "read_file" => ("Read", "file", "files"),
         "extension_resource" => ("Read", "skill file", "skill files"),
         "search_project" | "find_files" | "grep" | "glob" | "find" => {
@@ -59,8 +68,14 @@ fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
         }
         "files_list" => ("Listed", "folder", "folders"),
         "run_command" | "shell_command" | "terminal" => ("Ran", "command", "commands"),
-        "file_write" | "file_edit" | "write_file" | "edit_file" => ("Edited", "file", "files"),
-        "web_fetch" | "web_search" | "browser" => ("Fetched", "page", "pages"),
+        "file_write" | "file_edit" | "notebook_edit" | "write_file" | "edit_file" => {
+            ("Edited", "file", "files")
+        }
+        "shell_output" => ("Read", "job output", "job outputs"),
+        "shell_kill" => ("Stopped", "shell job", "shell jobs"),
+        "shell_jobs" => ("Listed", "shell job", "shell jobs"),
+        "web_fetch" | "browser" => ("Fetched", "page", "pages"),
+        "web_search" => ("Searched", "query", "queries"),
         "memory_search" | "memory_remember" => ("Used memory", "time", "times"),
         "extension_skill" => ("Used", "skill", "skills"),
         name if name.starts_with("git_") => ("Checked git", "time", "times"),
@@ -80,8 +95,13 @@ pub(super) fn duration_label(ms: i64) -> String {
 
 /// The live activity of a running turn, in plain words.
 pub(super) fn phase_label(turn: &TurnState) -> String {
-    if turn.pending_approvals().next().is_some() {
-        return "Waiting for your approval".into();
+    if let Some(tool) = turn.pending_approvals().next() {
+        return match tool.name.as_str() {
+            "ask_user" => "Waiting for your answers",
+            "exit_plan_mode" => "Waiting for your plan decision",
+            _ => "Waiting for your approval",
+        }
+        .into();
     }
     match turn.phase {
         Some(TurnPhase::Preparing) => "Preparing…".into(),
@@ -221,6 +241,14 @@ impl Xylo {
             Segment::Tools(ids) => self.tool_group_row(turn, ids, window, cx),
             Segment::Subagent(id) => self.subagent_row(turn, *id, window, cx),
             Segment::Note { text, .. } => note_row(text.clone()),
+            Segment::Thinking(text) => self.thinking_block(
+                Uuid::new_v5(
+                    &self.session,
+                    format!("thinking-{}-{index}", turn.started_at.unwrap_or_default()).as_bytes(),
+                ),
+                text.clone(),
+                cx,
+            ),
         };
         motion::fade_slide_in(
             ElementId::NamedInteger(format!("live-row-{}", self.session).into(), index as u64),

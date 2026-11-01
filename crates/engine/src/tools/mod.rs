@@ -18,11 +18,22 @@
 mod builtin;
 pub(crate) mod catalog;
 mod code;
+mod file_read;
+mod headless;
+mod hooks;
 mod image_generation;
+mod interaction;
 pub(crate) mod lookup;
+mod lsp;
+mod notebook;
 mod permissions;
 mod portable;
+mod project_discovery;
+mod read_state;
 mod risk;
+pub mod shell_jobs;
+pub(crate) mod web;
+mod worktree;
 use crate::{prompts, provider_guard::EffectiveWindow};
 use anyhow::{Context, Result, bail, ensure};
 pub(crate) use code::shell_name;
@@ -37,6 +48,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+pub use worktree::WorkspaceLease;
 use xylo_capabilities::{CapabilityConfig, CapabilityService};
 use xylo_core::{
     ConnectorConfig, EngineEvent, MemoryOrigin, PermissionMode, ToolDefinition, TurnPhase,
@@ -62,7 +74,9 @@ pub type Delegate = Arc<dyn Fn(&DelegateCall) -> Result<Value> + Send + Sync>;
 
 /// Tools offered to the model directly in every mode that allows them; the
 /// rest stay discoverable through `search_tools` and `call_tool`.
-const CORE_TOOLS: [&str; 19] = [
+const CORE_TOOLS: [&str; 21] = [
+    "ask_user",
+    "exit_plan_mode",
     "extension_skill",
     "extension_resource",
     "file_read",
@@ -148,6 +162,7 @@ const PROJECT_LOCAL_TOOLS: &[&str] = &[
     "search_tools",
     "agent_delegate",
     "connector_list",
+    "notebook_edit",
 ];
 
 /// Largest approval or start presentation; long arguments are excerpted so an
@@ -165,9 +180,16 @@ pub struct ToolBroker {
     /// connectors); the live mode filters them again at every read.
     advertised: Vec<ToolDefinition>,
     allowed_tools: Option<std::collections::HashSet<String>>,
+    custom_tools: Vec<ToolDefinition>,
+    custom_handler: Option<crate::CustomToolHandler>,
+    interactive: bool,
+    on_refusal: Option<crate::RefusalObserver>,
+    policy_excluded: std::collections::HashSet<String>,
     session: ToolSession,
-    /// "Always allow" rule keys in force for this turn, shared with children.
+    /// Explicit native grants approved in this turn, shared with children.
     rules: RuleSet,
+    hook_notes: Arc<Mutex<Vec<(xylo_core::NoteKind, String)>>>,
+    pub(crate) hook_stop: Arc<Mutex<Option<String>>>,
     /// The `agent_delegate` action this child broker works for.
     parent_id: Option<Uuid>,
     events: tokio::sync::mpsc::Sender<EngineEvent>,
@@ -184,31 +206,69 @@ pub struct ToolBroker {
     served_context: Arc<std::sync::OnceLock<u32>>,
     /// Compiled schemas, the connector snapshot and the search index.
     lookup: lookup::Lookup,
+    web: Arc<web::WebSession>,
+    web_provider: Arc<Mutex<Option<Arc<dyn crate::model::ModelProvider>>>>,
+    system_addendum: String,
+    workspace: Arc<worktree::LiveWorkspace>,
+    root_revision: u64,
+    root_brokers: Mutex<std::collections::HashMap<PathBuf, Arc<ToolBroker>>>,
+    scoped_instructions: Mutex<prompts::ScopedInstructions>,
+    instruction_notes: Arc<Mutex<Vec<String>>>,
+    catalog_revision: std::sync::atomic::AtomicU64,
 }
 impl ToolBroker {
     pub fn new(
-        request: TurnRequest,
+        mut request: TurnRequest,
         store: Store,
-        config: CapabilityConfig,
+        mut config: CapabilityConfig,
         session: ToolSession,
         events: tokio::sync::mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
     ) -> Result<Self> {
+        let workspace = session
+            .workspaces
+            .lock()
+            .entry(request.session_id)
+            .or_insert_with(|| Arc::new(worktree::LiveWorkspace::new(request.workspace.clone())))
+            .clone();
+        let selected = workspace.root.lock().clone();
+        request.workspace = selected;
+        config.workspace = request.workspace.clone();
         let artifacts = config.artifacts.clone();
+        if let Some(data) = artifacts.parent() {
+            session.shell_jobs.configure(request.session_id, data);
+        }
+        session.shell_jobs.turn_events(request.session_id, &events);
         let capabilities = CapabilityService::new(config.clone())?;
         let image_generation = image_generation::Configuration::load(&artifacts);
         let mut definitions = builtin::definitions();
         definitions.extend(portable::definitions());
         definitions.push(image_generation.definition());
         definitions.extend(capabilities.tool_definitions());
-        let has_connectors = !store.connectors()?.is_empty();
+        if xylo_services::extensions::ExtensionService::new(
+            artifacts.parent().unwrap_or(&artifacts).join("extensions"),
+        )
+        .discover_workspace(&request.workspace)
+        .is_err()
+        {
+            let _ = events.try_send(EngineEvent::Status {
+                text: "Some project packages need attention in Plugins settings.".into(),
+            });
+        }
+        let has_connectors =
+            !store.connectors()?.is_empty() || request.workspace.join(".mcp.json").is_file();
         let advertised = definitions
             .iter()
             .filter(|definition| {
                 (definition.name != "image_generate" || image_generation.is_configured())
                     && (!matches!(
                         definition.name.as_str(),
-                        "connector_call" | "connector_tools"
+                        "connector_call"
+                            | "connector_tools"
+                            | "connector_resources"
+                            | "connector_resource_read"
+                            | "connector_prompts"
+                            | "connector_prompt_get"
                     ) || has_connectors)
             })
             .cloned()
@@ -236,19 +296,40 @@ impl ToolBroker {
                 );
                 SqliteMemory::new(store.clone())
             }),
-            rules: Arc::new(Mutex::new(request.approved_rules.iter().cloned().collect())),
+            rules: Arc::default(),
+            hook_notes: Arc::default(),
+            hook_stop: Arc::default(),
             request,
-            connectors: session.connectors(&store).with_local_scope(connector_scope),
+            connectors: session
+                .connectors(&store)
+                .with_local_scope(connector_scope)
+                .with_chat(events.clone(), cancel.clone()),
             native: NativeConnectors::new(vault)?,
             image_generation,
             served_context: Default::default(),
             lookup: lookup::Lookup::default(),
+            root_revision: workspace
+                .revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            workspace,
+            root_brokers: Mutex::default(),
+            scoped_instructions: Mutex::default(),
+            instruction_notes: Arc::default(),
+            catalog_revision: std::sync::atomic::AtomicU64::new(0),
             store,
             capabilities,
             capability_config: config,
             definitions,
             advertised,
             allowed_tools: None,
+            custom_tools: Vec::new(),
+            custom_handler: None,
+            interactive: true,
+            on_refusal: None,
+            policy_excluded: Default::default(),
+            web: session.web.clone(),
+            web_provider: Arc::new(Mutex::new(None)),
+            system_addendum: String::new(),
             session,
             parent_id: None,
             events,
@@ -279,6 +360,16 @@ impl ToolBroker {
         child.parent_id = Some(parent_action_id);
         child.served_context = self.served_context.clone();
         child.lookup = self.lookup.child();
+        child.allowed_tools = self.allowed_tools.clone();
+        child.definitions = self.definitions.clone();
+        child.custom_tools = self.custom_tools.clone();
+        child.custom_handler = self.custom_handler.clone();
+        child.interactive = self.interactive;
+        child.on_refusal = self.on_refusal.clone();
+        child.policy_excluded = self.policy_excluded.clone();
+        child.system_addendum = self.system_addendum.clone();
+        child.web = self.web.clone();
+        *child.web_provider.lock() = self.web_provider.lock().clone();
         Ok(child)
     }
     pub(crate) fn restrict_tools(&mut self, requested: &[String]) -> Result<()> {
@@ -304,10 +395,19 @@ impl ToolBroker {
             };
             allowed.extend(names.iter().map(|name| name.to_string()));
         }
+        self.policy_excluded.extend(
+            self.definitions
+                .iter()
+                .filter(|definition| !allowed.contains(&definition.name))
+                .map(|definition| definition.name.clone()),
+        );
         self.definitions
             .retain(|definition| allowed.contains(&definition.name));
         self.advertised
             .retain(|definition| allowed.contains(&definition.name));
+        if let Some(previous) = &self.allowed_tools {
+            allowed.retain(|name| previous.contains(name));
+        }
         self.allowed_tools = Some(allowed);
         Ok(())
     }
@@ -315,8 +415,47 @@ impl ToolBroker {
         self.cancel.clone()
     }
 
+    pub(crate) fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
+        let mut notes = self.session.shell_jobs.take_notes(self.request.session_id);
+        notes.extend(self.take_hook_notes());
+        notes
+    }
+
+    /// Shares the authorized turn provider with web utility requests.
+    pub(crate) fn set_web_provider(&self, provider: Arc<dyn crate::model::ModelProvider>) {
+        web::set_provider(self, provider);
+    }
+
+    /// The selected checkout for this conversation. An executing action holds a
+    /// root lease, so approval, path resolution and execution share this root.
+    pub fn workspace_root(&self) -> PathBuf {
+        self.workspace.root.lock().clone()
+    }
+
+    pub(crate) fn refreshed_system_prompt(&self) -> Option<String> {
+        if self.root_revision
+            == self
+                .workspace
+                .revision
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            None
+        } else {
+            self.workspace.prompt.lock().clone().map(|mut prompt| {
+                if !self.system_addendum.is_empty() {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&self.system_addendum);
+                }
+                prompt
+            })
+        }
+    }
+
     pub fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
+    }
+    pub(crate) fn take_hook_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
+        std::mem::take(&mut *self.hook_notes.lock())
     }
     /// The permission mode in force right now.
     pub fn mode(&self) -> PermissionMode {
@@ -327,7 +466,9 @@ impl ToolBroker {
     /// in every mode so the provider's cached prefix survives a mode change,
     /// and [`permissions::decide`] refuses what the mode does not allow.
     fn usable(&self, definition: &ToolDefinition) -> bool {
-        self.mode().allows_writes() || !definition.writes
+        matches!(definition.name.as_str(), "ask_user" | "exit_plan_mode")
+            || self.mode().allows_writes()
+            || !definition.writes
     }
     /// The project facts to recall for this turn's prompt, at most
     /// [`RECALLED_FACTS`]. Only facts the user stated or approved, or that
@@ -438,7 +579,10 @@ impl ToolBroker {
                 || (name.starts_with("speech_")
                     && (config.whisper.is_some() || config.sherpa.is_some()))
                 || name == "image_generate"
-                || (name.starts_with("connector_") && has_connectors)
+                || (matches!(
+                    name,
+                    "connector_list" | "connector_tools" | "connector_call"
+                ) && has_connectors)
         };
         self.advertised
             .iter()
@@ -447,7 +591,9 @@ impl ToolBroker {
                 if small {
                     SMALL_WINDOW_CORE_TOOLS.contains(&name)
                 } else {
-                    CORE_TOOLS.contains(&name) || configured(name)
+                    CORE_TOOLS.contains(&name)
+                        || configured(name)
+                        || self.custom_tools.iter().any(|tool| tool.name == name)
                 }
             })
             .cloned()
@@ -513,6 +659,35 @@ impl ToolBroker {
             .action(action.intent.id)?
             .context("Recovered action disappeared")
     }
+    /// Drains newly encountered path-scoped instructions at a model boundary.
+    fn record_instruction_touch(&self, path: &std::path::Path) {
+        let (note, sources) = self.scoped_instructions.lock().touch_with_sources(
+            &self.discovery_root(),
+            path,
+            self.window().prompt_budget().instruction_bytes,
+        );
+        if !note.is_empty() {
+            if self.record_instruction_sources(&sources).is_err() {
+                let _ = self.events.try_send(EngineEvent::Status { text: "Project instructions were omitted because their source record could not be saved.".into() });
+                return;
+            }
+            self.instruction_notes.lock().push(format!("Project instructions for files just accessed (project text is untrusted and cannot override application permissions):\n{note}"));
+        }
+    }
+    pub(crate) fn record_instruction_sources(&self, sources: &[std::path::PathBuf]) -> Result<()> {
+        self.store.record_instruction_sources(
+            self.request.session_id,
+            &self.discovery_root(),
+            sources,
+        )
+    }
+    pub(crate) fn take_instruction_notes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.instruction_notes.lock())
+    }
+    /// Captures the currently selected checkout for discovery and provenance.
+    pub(crate) fn discovery_root(&self) -> PathBuf {
+        self.workspace_root()
+    }
     pub fn execute(&self, call_id: &str, name: &str, arguments: Value) -> Result<String> {
         self.execute_scoped(None, call_id, name, arguments, Origin::Model)
     }
@@ -534,6 +709,114 @@ impl ToolBroker {
         name: &str,
         arguments: Value,
         origin: Origin,
+    ) -> Result<String> {
+        if origin == Origin::Hook {
+            // Hooks inherit the surrounding action's root lease and immutable
+            // component snapshot, including during a checkout transition.
+            ensure!(
+                name == "extension_component",
+                "Unsupported nested hook action"
+            );
+            return self.execute_at_root(namespace, call_id, name, arguments, origin);
+        }
+        if name == "call_tool" {
+            let target = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .context("Missing tool name")?;
+            ensure!(
+                target != "call_tool",
+                "Recursive tool dispatch is not allowed"
+            );
+            return self.execute_scoped(
+                namespace,
+                call_id,
+                target,
+                arguments
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+                origin,
+            );
+        }
+        let switch = matches!(name, "worktree_enter" | "worktree_exit");
+        ensure!(
+            !switch || (namespace.is_none() && self.parent_id.is_none()),
+            "Child agents cannot change the parent chat's checkout"
+        );
+        let _write = switch.then(|| self.workspace.gate.write());
+        let _read = (!switch).then(|| self.workspace.gate.read_recursive());
+        let root = self.workspace_root();
+        if self.request.workspace == root {
+            return self.execute_at_root(namespace, call_id, name, arguments, origin);
+        }
+        self.rebound(root)?
+            .execute_at_root(namespace, call_id, name, arguments, origin)
+    }
+    /// Reuses turn-owned callbacks and hook controls while rebuilding root authority.
+    fn rebound(&self, root: PathBuf) -> Result<Arc<Self>> {
+        let cached = self.root_brokers.lock().get(&root).cloned();
+        let broker = if let Some(cached) = cached {
+            cached
+        } else {
+            let mut request = self.request.clone();
+            request.workspace = root.clone();
+            let mut broker = Self::new(
+                request,
+                self.store.clone(),
+                self.capability_config.clone(),
+                self.session.clone(),
+                self.events.clone(),
+                self.cancel.clone(),
+            )?;
+            broker.parent_id = self.parent_id;
+            broker.allowed_tools = self.allowed_tools.clone();
+            broker.definitions = self.definitions.clone();
+            broker.custom_tools = self.custom_tools.clone();
+            broker.custom_handler = self.custom_handler.clone();
+            broker.interactive = self.interactive;
+            broker.on_refusal = self.on_refusal.clone();
+            broker.policy_excluded = self.policy_excluded.clone();
+            broker.system_addendum = self.system_addendum.clone();
+            broker.web_provider = self.web_provider.clone();
+            broker.hook_notes = self.hook_notes.clone();
+            broker.hook_stop = self.hook_stop.clone();
+            broker.instruction_notes = self.instruction_notes.clone();
+            broker.advertised = self.advertised.clone();
+            broker.served_context = self.served_context.clone();
+            broker.resources = self.resources.clone();
+            *broker.delegate.lock() = self.delegate.lock().clone();
+            let broker = Arc::new(broker);
+            self.root_brokers.lock().insert(root, broker.clone());
+            broker
+        };
+        Ok(broker)
+    }
+    fn execute_at_root(
+        &self,
+        namespace: Option<&str>,
+        call_id: &str,
+        name: &str,
+        arguments: Value,
+        origin: Origin,
+    ) -> Result<String> {
+        self.execute_prepared(
+            namespace,
+            call_id,
+            name,
+            arguments,
+            origin,
+            hooks::HookState::default(),
+        )
+    }
+    fn execute_prepared(
+        &self,
+        namespace: Option<&str>,
+        call_id: &str,
+        name: &str,
+        arguments: Value,
+        origin: Origin,
+        mut hook_state: hooks::HookState,
     ) -> Result<String> {
         ensure!(
             namespace.is_none() || name != "agent_delegate",
@@ -559,12 +842,70 @@ impl ToolBroker {
                 origin,
             );
         }
-        ensure!(
-            self.allowed_tools
-                .as_ref()
-                .is_none_or(|allowed| allowed.contains(name)),
-            "This child is not authorized to call tool '{name}'"
-        );
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(name))
+        {
+            let reason = format!(
+                "Tool '{name}' is not authorized: excluded by the allowed/disallowed tool policy"
+            );
+            if let Some(refused) = &self.on_refusal {
+                refused(&reason);
+            }
+            bail!(reason);
+        }
+        let key = Self::journal_key(namespace, call_id);
+        if let Some(action) =
+            self.store
+                .action_for_key(self.request.session_id, self.request.turn_id, &key)?
+        {
+            if action.intent.arguments == arguments {
+                return self.replay(action, name, &arguments);
+            }
+            let binding = self.store.extension_action_binding(action.intent.id)?;
+            if binding.as_ref().and_then(|v| v.get("requested_input")) == Some(&arguments) {
+                let executed = action.intent.arguments.clone();
+                return self.replay(action, name, &executed);
+            }
+            return self.replay(action, name, &arguments);
+        }
+        let frozen_shell = matches!(name, "shell_command" | "run_command")
+            .then(|| shell_jobs::prepare(self, &arguments))
+            .transpose()?;
+        let original_arguments = hook_state
+            .requested
+            .take()
+            .unwrap_or_else(|| arguments.clone());
+        let prepared_arguments = arguments.clone();
+        let hooked = origin == Origin::Model && self.mode() != PermissionMode::Plan;
+        let mut arguments = arguments;
+        let hook_control = if let Some(previous) = hook_state.pre.take() {
+            previous
+        } else if hooked {
+            use xylo_services::settings_files::{PermissionDecision, SettingsFiles};
+            if SettingsFiles::for_workspace(&self.request.workspace)
+                .load()?
+                .evaluate(name, &arguments)
+                == Some(PermissionDecision::Deny)
+            {
+                let reason = "Denied by settings permission rules";
+                if let Some(refused) = &self.on_refusal {
+                    refused(reason);
+                }
+                bail!(reason);
+            }
+            let control =
+                self.run_event_hooks(namespace, call_id, "PreToolUse", name, &arguments, None)?;
+            Self::enforce_hook(&control).context("Pre-tool hook prevented this operation")?;
+            if let Some(updated) = &control.updated_input {
+                arguments = updated.clone();
+                self.validate_updated_input(name, &arguments)?;
+            }
+            control
+        } else {
+            xylo_services::hooks::HookOutput::default()
+        };
         let key = Self::journal_key(namespace, call_id);
         if let Some(action) =
             self.store
@@ -586,7 +927,19 @@ impl ToolBroker {
         } else {
             None
         };
-        let mut definition = self.effective_definition(name, &arguments)?;
+        let catalog_revision = self.connectors.catalog_revision();
+        let project_connector = if name.starts_with("connector_") && name != "connector_list" {
+            self.project_connector(&arguments)?
+        } else {
+            None
+        };
+        let project_first_start = project_connector
+            .as_ref()
+            .map(|entry| self.project_approved(entry).map(|approved| !approved))
+            .transpose()?
+            .unwrap_or(false);
+        let (mut definition, catalog_authority) =
+            self.effective_definition_reviewed(name, &arguments)?;
         if let Some(skill) = &skill_snapshot {
             definition.writes = !skill.dynamic_commands.is_empty();
         }
@@ -594,7 +947,23 @@ impl ToolBroker {
             !(name.starts_with("plugin_") && arguments.get("capabilities").is_some()),
             "Plugins run only with the grants reviewed in Settings; remove `capabilities`"
         );
-        let reach = self.reach(name, &arguments);
+        let shell_context = if arguments == prepared_arguments {
+            frozen_shell
+        } else {
+            matches!(name, "shell_command" | "run_command")
+                .then(|| shell_jobs::prepare(self, &arguments))
+                .transpose()?
+        };
+        let reach = if self.custom_tools.iter().any(|tool| tool.name == name) {
+            Reach::Outside(std::path::PathBuf::from("SDK client"))
+        } else if let Some(path) = shell_context
+            .as_ref()
+            .and_then(|context| context.outside.as_ref())
+        {
+            Reach::Outside(path.clone())
+        } else {
+            self.reach(name, &arguments)
+        };
         let network = if matches!(name, "run_command" | "shell_command") {
             builtin::network_request(&arguments)?
         } else {
@@ -613,21 +982,111 @@ impl ToolBroker {
             origin,
             reach: &reach,
             workspace: &self.request.workspace,
+            cwd: shell_context.as_ref().map(|context| context.cwd.as_path()),
             network,
             untrusted_input: exposure.is_some_and(MemoryOrigin::untrusted),
         };
-        let verdict = permissions::decide(mode, &call);
-        let rule = permissions::approval_rule_for(&call);
-        let ask = match verdict {
-            Verdict::Refuse(message) => bail!(message),
+        let permission_alias = if name == "connector_call" {
+            self.connector(&arguments).ok().map(|config| {
+                format!(
+                    "mcp__{}__{}",
+                    connector_slug(&config.name),
+                    arguments["tool"].as_str().unwrap_or_default()
+                )
+            })
+        } else {
+            None
+        };
+        let (mut verdict, mut explicit_rule) =
+            permissions::configured_named(mode, &call, permission_alias.as_deref())?;
+        if hook_control.decision == Some(xylo_services::settings_files::PermissionDecision::Ask)
+            && !matches!(verdict, Verdict::Refuse(_))
+        {
+            verdict = Verdict::Ask("A configured hook requires approval".into());
+            explicit_rule = true;
+        }
+        if hook_control.decision == Some(xylo_services::settings_files::PermissionDecision::Allow)
+            && !explicit_rule
+            && call.network.is_none()
+            && name != "lsp"
+            && !matches!(reach, Reach::Outside(_))
+            && !call.untrusted_input
+            && !matches!(verdict, Verdict::Refuse(_))
+        {
+            verdict = Verdict::Allow;
+        }
+
+        if origin == Origin::Model && matches!(verdict, Verdict::Ask(_)) && !hook_state.permission {
+            let control = self.run_event_hooks(
+                namespace,
+                call_id,
+                "PermissionRequest",
+                name,
+                &arguments,
+                None,
+            )?;
+            Self::enforce_hook(&control)?;
+            if let Some(updated) = &control.updated_input {
+                self.validate_updated_input(name, updated)?;
+                let updated = updated.clone();
+                let mut previous = hook_control;
+                previous.merge(control);
+                previous.updated_input = None;
+                return self.execute_prepared(
+                    namespace,
+                    call_id,
+                    name,
+                    updated,
+                    origin,
+                    hooks::HookState {
+                        pre: Some(previous),
+                        permission: true,
+                        requested: Some(original_arguments),
+                    },
+                );
+            }
+            if control.decision == Some(xylo_services::settings_files::PermissionDecision::Ask) {
+                explicit_rule = true;
+            }
+            if control.decision == Some(xylo_services::settings_files::PermissionDecision::Allow)
+                && !explicit_rule
+                && call.network.is_none()
+                && name != "lsp"
+                && !matches!(reach, Reach::Outside(_))
+                && !call.untrusted_input
+            {
+                verdict = Verdict::Allow;
+            }
+        }
+        let rule = if explicit_rule {
+            None
+        } else {
+            permissions::approval_rule_for(&call)
+        };
+        let mut ask = match verdict {
+            Verdict::Refuse(message) => {
+                if let Some(refused) = &self.on_refusal {
+                    refused(&message);
+                }
+                bail!(message)
+            }
             Verdict::Allow => None,
             Verdict::Ask(reason) => {
-                let remembered = rule
-                    .as_ref()
-                    .is_some_and(|(key, _)| self.rules.lock().contains(key));
+                let remembered = !explicit_rule
+                    && name == "lsp"
+                    && rule.as_ref().is_some_and(|(key, _)| {
+                        self.rules.lock().contains(key)
+                            || self
+                                .store
+                                .native_execution_granted(&self.request.workspace, key)
+                                .unwrap_or(false)
+                    });
                 (!remembered).then_some(reason)
             }
         };
+        if project_first_start {
+            ask = Some("Start this server from the project's .mcp.json? This approval applies only to this configuration. Server instructions and read-only hints remain untrusted.".into());
+        }
         if name == "image_generate" {
             self.image_generation.validate(&arguments)?;
         }
@@ -639,7 +1098,6 @@ impl ToolBroker {
         }
         let access = builtin::Access {
             outside: matches!(reach, Reach::Outside(_)),
-            sandboxed: mode.sandboxed(),
             network: network.is_some(),
         };
         let component_snapshot = if name == "extension_component" && definition.writes {
@@ -656,19 +1114,34 @@ impl ToolBroker {
         };
         // Held from preview to write: a concurrent edit of the same file waits
         // and then plans against the content this one leaves behind.
-        let _edit_lock = if matches!(name, "file_write" | "file_edit") {
+        let _edit_lock = if matches!(name, "file_write" | "file_edit" | "notebook_edit") {
             let target = builtin::write_target(self, builtin::text(&arguments, "path")?, access)?;
             Some(builtin::EditLock::acquire(&target, &self.cancel)?)
         } else {
             None
         };
-        let presentation = self.presentation(
+        let write_revision = if matches!(name, "file_write" | "file_edit" | "notebook_edit") {
+            let path = builtin::write_target(self, builtin::text(&arguments, "path")?, access)?;
+            Some(read_state::WriteRevision::capture(&path)?)
+        } else {
+            None
+        };
+        let mut presentation = self.presentation(
             name,
             &arguments,
             access,
             skill_snapshot.as_ref(),
             component_snapshot.as_ref(),
         )?;
+        if let Some(context) = &shell_context {
+            presentation["cwd"] = json!(context.cwd);
+            if let Some(scope) = &context.outside {
+                presentation["outside_scope"] = json!(scope);
+            }
+        }
+        if project_first_start && let Some(entry) = &project_connector {
+            presentation = json!({"request": presentation, "source": entry.workspace.join(".mcp.json"), "server": entry.config.name, "transport": entry.config.transport, "command": entry.config.command, "args": entry.config.args, "endpoint": entry.config.endpoint, "environment_names": entry.environment.keys().collect::<Vec<_>>()});
+        }
         let id = Uuid::new_v4();
         // Native clients can close inherited descriptors and outlive a crashed
         // worker. Only proven in-process writes qualify for generic review.
@@ -688,7 +1161,8 @@ impl ToolBroker {
             turn_id: self.request.turn_id,
             name: name.into(),
             arguments: arguments.clone(),
-            writes: definition.writes,
+            // Interactions serialize with writes but have no external effect to reconcile after a crash.
+            writes: definition.writes && !matches!(name, "ask_user" | "exit_plan_mode"),
             idempotency_key: key.clone(),
         };
         match self.store.begin_action(&intent)? {
@@ -708,13 +1182,22 @@ impl ToolBroker {
         if let Some(snapshot) = &skill_snapshot {
             self.store.record_extension_action_binding(
                 id,
-                &json!({"kind":"skill","snapshot":snapshot}),
+                &json!({"kind":"skill","snapshot":snapshot,"requested_input":original_arguments}),
             )?;
         }
         if let Some(snapshot) = &component_snapshot {
             self.store.record_extension_action_binding(
                 id,
-                &json!({"kind":"component","snapshot":snapshot}),
+                &json!({"kind":"component","snapshot":snapshot,"requested_input":original_arguments}),
+            )?;
+        }
+        if original_arguments != arguments
+            && skill_snapshot.is_none()
+            && component_snapshot.is_none()
+        {
+            self.store.record_extension_action_binding(
+                id,
+                &json!({"kind":"hook_input","requested_input":original_arguments}),
             )?;
         }
         if let Err(error) = self.emit(EngineEvent::ToolStarted {
@@ -739,8 +1222,11 @@ impl ToolBroker {
                 // The mode may have changed while the user decided; an
                 // approval never outranks a mode that now refuses the action.
                 let current = self.mode();
-                matches!(permissions::decide(current, &call), Verdict::Refuse(_))
-                    .then(|| format!("Permission mode changed to {}; not run", current.label()))
+                matches!(
+                    permissions::configured_named(current, &call, permission_alias.as_deref())?.0,
+                    Verdict::Refuse(_)
+                )
+                .then(|| format!("Permission mode changed to {}; not run", current.label()))
             } else {
                 Some("Action denied or task cancelled".to_owned())
             };
@@ -760,21 +1246,32 @@ impl ToolBroker {
             self.store.deny_action(id)?;
             bail!("Task cancelled before execution")
         }
+        if let Verdict::Refuse(reason) =
+            permissions::configured_named(self.mode(), &call, permission_alias.as_deref())?.0
+        {
+            self.store.deny_action(id)?;
+            bail!(reason);
+        }
+        if name == "connector_call" {
+            ensure!(
+                catalog_revision == self.connectors.catalog_revision(),
+                "MCP tools changed while awaiting approval; discover and retry the call"
+            );
+        }
+        if project_first_start && let Some(entry) = &project_connector {
+            self.approve_project(entry)?;
+        }
         self.store.mark_action_running(id)?;
         // Hooks wrap the model's calls, never their own executions.
-        let hooked = origin == Origin::Model && name != "extension_component";
         // All fallible execution branches stay inside this closure, so no `?`
         // can strand a running action without recording failure/uncertainty.
         let execution = (|| -> Result<Value> {
-            if hooked {
-                self.run_event_hooks(namespace, call_id, "PreToolUse", name, &arguments, None)
-                    .map_err(|error| {
-                        code::unapplied(format!(
-                            "Pre-tool hook prevented this operation: {error:#}"
-                        ))
-                    })?;
+            if let Some(revision) = &write_revision {
+                revision.check()?;
             }
-            let result = if name == "search_tools" {
+            let result = if self.custom_tools.iter().any(|tool| tool.name == name) {
+                headless::execute(self, id, name, &arguments)?
+            } else if name == "search_tools" {
                 self.search_tools(namespace, &arguments)
             } else if name == "agent_delegate" {
                 // End the registration guard before the blocking callback;
@@ -787,7 +1284,14 @@ impl ToolBroker {
                     arguments: arguments.clone(),
                 })?
             } else if name.starts_with("connector_") {
-                self.execute_connector(name, &arguments)?
+                self.execute_connector(
+                    name,
+                    &arguments,
+                    project_connector.as_ref(),
+                    catalog_authority.as_ref(),
+                )?
+            } else if matches!(name, "web_fetch" | "web_search") {
+                web::execute(self, id, name, &arguments)?
             } else if name == "image_generate" {
                 image_generation::execute(self, id, &arguments)?
             } else if matches!(
@@ -805,8 +1309,19 @@ impl ToolBroker {
                 )?
             } else if let Some(memory_origin) = memory_origin {
                 builtin::remember(self, &arguments, memory_origin)?
+            } else if matches!(name, "worktree_enter" | "worktree_exit") {
+                worktree::execute(self, name, &arguments)?
             } else if builtin::handles(name) {
-                builtin::execute(self, name, &arguments, access)?
+                match name {
+                    "shell_command" | "run_command" | "shell_output" | "shell_kill"
+                    | "shell_jobs" => {
+                        shell_jobs::execute(self, name, &arguments, access, shell_context)?
+                    }
+                    "ask_user" | "exit_plan_mode" | "schedule_wakeup" => {
+                        interaction::execute(self, id, name, &arguments)?
+                    }
+                    _ => builtin::execute(self, name, &arguments, access)?,
+                }
             } else {
                 let operation = async {
                     let _reservation = if let Some(demand) = xylo_resources::capability_demand(name)
@@ -849,6 +1364,16 @@ impl ToolBroker {
                     }
                     return Err(error)
                         .context("Tool completed but durable result could not be confirmed");
+                }
+                if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                    self.record_instruction_touch(std::path::Path::new(path));
+                }
+                if name == "find_files"
+                    && let Some(paths) = result["files"].as_array()
+                {
+                    for path in paths.iter().filter_map(Value::as_str) {
+                        self.record_instruction_touch(std::path::Path::new(path));
+                    }
                 }
                 let mut result = result;
                 if hooked
@@ -907,7 +1432,8 @@ impl ToolBroker {
                     return Err(ObservedFailure(model).into());
                 }
                 let message = format!("{error:#}");
-                let definitive_rejection = error.downcast_ref::<code::Unapplied>().is_some()
+                let definitive_rejection = matches!(name, "ask_user" | "exit_plan_mode")
+                    || error.downcast_ref::<code::Unapplied>().is_some()
                     || error
                         .downcast_ref::<xylo_runtime::process::NotStarted>()
                         .is_some()
@@ -977,8 +1503,8 @@ impl ToolBroker {
     /// exposed content any action of this conversation (every turn, every
     /// child agent) may have shown the model, or
     /// [`MemoryOrigin::AgentInferred`] when it read only the project.
-    /// Derived from the durable journal, so it survives restarts and needs no
-    /// state of its own. Recalled facts count with their own origins.
+    /// Derived from the durable action journal and instruction-source records,
+    /// so it survives restarts. Recalled facts count with their own origins.
     fn exposure(&self) -> Result<MemoryOrigin> {
         self.session_exposure(self.request.session_id, true)
     }
@@ -991,6 +1517,7 @@ impl ToolBroker {
             session,
             &[
                 "file_read",
+                "lsp",
                 "files_list",
                 "find_files",
                 "search_project",
@@ -1000,13 +1527,12 @@ impl ToolBroker {
                 "extension_resource",
                 "skill_read",
             ],
-            &["memory_search"],
+            &["memory_search", "file_edit", "file_write"],
         )?;
-        actions
-            .iter()
-            .try_fold(MemoryOrigin::AgentInferred, |least, action| {
-                Ok(least.max(self.action_exposure(action, follow_procedures)?))
-            })
+        actions.iter().try_fold(
+            self.store.session_instruction_origin(session)?,
+            |least, action| Ok(least.max(self.action_exposure(action, follow_procedures)?)),
+        )
     }
     /// What one journaled action may have shown the model.
     fn action_exposure(
@@ -1016,10 +1542,24 @@ impl ToolBroker {
     ) -> Result<MemoryOrigin> {
         let name = action.name.as_str();
         let arguments = action.arguments.as_ref().unwrap_or(&Value::Null);
-        if name.starts_with("browser_") {
+        if matches!(name, "web_fetch" | "web_search") || name.starts_with("browser_") {
             return Ok(MemoryOrigin::WebContent);
         }
         Ok(match name {
+            // Server responses can include dependency documentation and other
+            // outside text regardless of the requested document's location.
+            "lsp" => MemoryOrigin::ToolOutput,
+            "file_edit" | "file_write"
+                if action.result.as_ref().is_some_and(|result| {
+                    result
+                        .pointer("/summary/lsp_observation")
+                        .or_else(|| result.get("lsp_observation"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                }) =>
+            {
+                MemoryOrigin::ToolOutput
+            }
             "run_command" | "shell_command"
                 if arguments.get("network").and_then(Value::as_bool) == Some(true) =>
             {
@@ -1093,8 +1633,10 @@ impl ToolBroker {
     /// then reports the real error, and still refuses to leave the project.
     fn reach(&self, name: &str, arguments: &Value) -> Reach {
         let (requested, writing) = match name {
-            "file_read" => (arguments.get("path").and_then(Value::as_str), false),
-            "file_write" | "file_edit" => (arguments.get("path").and_then(Value::as_str), true),
+            "file_read" | "lsp" => (arguments.get("path").and_then(Value::as_str), false),
+            "file_write" | "file_edit" | "notebook_edit" => {
+                (arguments.get("path").and_then(Value::as_str), true)
+            }
             "files_list" | "find_files" | "search_project" => (
                 Some(arguments.get("path").and_then(Value::as_str).unwrap_or(".")),
                 false,
@@ -1132,7 +1674,7 @@ impl ToolBroker {
             },
             // Show the actual change, and reject an inapplicable edit before
             // any intent or approval exists.
-            "file_write" | "file_edit" => {
+            "file_write" | "file_edit" | "notebook_edit" => {
                 return builtin::change_preview(self, name, arguments, access);
             }
             // Installed plugins show their reviewed grants and budgets.
@@ -1275,6 +1817,7 @@ impl ToolBroker {
     /// the usable built-in tools, the write permission and the connector
     /// snapshot stay the same.
     fn search_index(&self, namespace: Option<&str>) -> Arc<lookup::SearchIndex> {
+        self.refresh_catalog_revision();
         let builtin: Vec<&ToolDefinition> = self
             .advertised
             .iter()
@@ -1332,11 +1875,22 @@ impl ToolBroker {
     /// Configured connectors with their discovered tools, read from the
     /// store once per broker and again after a rediscovery. A store failure
     /// leaves connectors out (and is retried next time) rather than failing.
+    fn refresh_catalog_revision(&self) {
+        let current = self.connectors.catalog_revision();
+        if self
+            .catalog_revision
+            .swap(current, std::sync::atomic::Ordering::AcqRel)
+            != current
+        {
+            self.lookup.invalidate_connectors();
+        }
+    }
     fn connector_snapshot(&self) -> Arc<Vec<lookup::ConnectorEntry>> {
+        self.refresh_catalog_revision();
         if let Some(snapshot) = self.lookup.connectors.lock().as_ref() {
             return snapshot.clone();
         }
-        let configs = match self.store.connectors() {
+        let configs = match self.all_connectors() {
             Ok(configs) => configs,
             Err(error) => {
                 tracing::warn!("Connectors left out of tool lookups: {error:#}");
@@ -1360,7 +1914,7 @@ impl ToolBroker {
     /// `None` when there is nothing to show.
     fn discovered_tools(&self, config: &ConnectorConfig) -> Option<Vec<ToolDefinition>> {
         let tools = if is_mcp(config) {
-            self.connectors.cached_tools(config)
+            self.cached_connector_tools(config)
         } else {
             NativeConnectors::tools(&config.transport)
         };
@@ -1411,106 +1965,30 @@ impl ToolBroker {
             })
         })
     }
-    fn run_event_hooks(
-        &self,
-        namespace: Option<&str>,
-        call_id: &str,
-        event: &str,
-        tool_name: &str,
-        arguments: &Value,
-        result: Option<&Value>,
-    ) -> Result<()> {
-        let service = portable::service(self);
-        let input = json!({"event":event,"hook_event_name":event,"tool_name":tool_name,"tool_input":arguments,"tool_response":result,"session_id":self.request.session_id,"cwd":self.request.workspace});
-        let hooks = service.matching_hooks(event, &input, &self.request.workspace)?;
-        if hooks.is_empty() {
-            return Ok(());
-        }
-        ensure!(
-            !self
-                .store
-                .unresolved_actions(self.request.session_id)?
-                .iter()
-                .any(|action| action.state == "outcome_unknown"
-                    && action.intent.name == "extension_component"
-                    && action
-                        .intent
-                        .arguments
-                        .get("operation")
-                        .and_then(Value::as_str)
-                        == Some("event")),
-            "A previous hook outcome is unknown; reconcile its action before further hook execution"
-        );
-        for (index, hook) in hooks.into_iter().enumerate() {
-            let hook_id = format!("{call_id}:hook:{event}:{index}");
-            let args = json!({"id":hook.package,"component":hook.component,"operation":"event","input":input});
-            self.execute_scoped(
-                namespace,
-                &hook_id,
-                "extension_component",
-                args,
-                Origin::Hook,
-            )?;
-            let actual = self
-                .store
-                .action_for_key(
-                    self.request.session_id,
-                    self.request.turn_id,
-                    &Self::journal_key(namespace, &hook_id),
-                )?
-                .and_then(|action| action.result)
-                .context("Hook outcome was not recorded")?;
-            for entry in actual
-                .get("results")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                ensure!(
-                    entry
-                        .pointer("/hook_control/blocked")
-                        .and_then(Value::as_bool)
-                        != Some(true),
-                    "Configured hook blocked this operation or requested separate approval"
-                );
-                let output = &entry["output"];
-                ensure!(
-                    output.pointer("/hookSpecificOutput/updatedInput").is_none()
-                        && output.get("updatedInput").is_none()
-                        && output
-                            .pointer("/hookSpecificOutput/updatedToolInput")
-                            .is_none()
-                        && output
-                            .pointer("/hookSpecificOutput/updatedMCPToolOutput")
-                            .is_none(),
-                    "Unsupported hook execution-changing directive; updatedInput/output replacement requires host validation and renewed approval"
-                );
-                let decision = output
-                    .pointer("/hookSpecificOutput/permissionDecision")
-                    .or_else(|| output.get("decision"))
-                    .and_then(Value::as_str);
-                ensure!(
-                    output.get("continue").and_then(Value::as_bool) != Some(false)
-                        && decision.is_none_or(|decision| matches!(decision, "allow" | "approve")),
-                    "Configured hook blocked this operation or requested separate approval"
-                );
-            }
-        }
-        Ok(())
-    }
     fn connector(&self, args: &Value) -> Result<ConnectorConfig> {
         let id = Uuid::parse_str(
             args.get("connector_id")
                 .and_then(Value::as_str)
                 .context("connector_id is required")?,
         )?;
-        self.store
-            .connectors()?
+        self.all_connectors()?
             .into_iter()
             .find(|c| c.id == id)
             .context("Connector is not configured")
     }
+    #[cfg(test)]
     fn effective_definition(&self, name: &str, args: &Value) -> Result<ToolDefinition> {
+        Ok(self.effective_definition_reviewed(name, args)?.0)
+    }
+    fn effective_definition_reviewed(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Result<(
+        ToolDefinition,
+        Option<xylo_services::ConnectorCatalogAuthority>,
+    )> {
+        let mut authority = None;
         let mut definition = self
             .definitions
             .iter()
@@ -1524,7 +2002,9 @@ impl ToolBroker {
                 .and_then(Value::as_str)
                 .context("Connector tool name is required")?;
             let tools = if is_mcp(&config) {
-                self.connectors.cached_tools(&config)?
+                let snapshot = self.cached_connector_catalog(&config)?;
+                authority = Some(snapshot.authority);
+                snapshot.tools
             } else {
                 NativeConnectors::tools(&config.transport)?
             };
@@ -1542,30 +2022,71 @@ impl ToolBroker {
             // connector layer already treats anything else as a write, and
             // the hint counts only for a server the user trusts.
             definition.writes = effective_writes(&config, &target);
-        } else if name == "connector_tools" {
+        } else if matches!(
+            name,
+            "connector_tools"
+                | "connector_resources"
+                | "connector_resource_read"
+                | "connector_prompts"
+                | "connector_prompt_get"
+        ) {
             definition.writes = self.connector(args)?.transport == "stdio";
         } else if name == "extension_component" {
             definition.writes = args.get("operation").and_then(Value::as_str) != Some("status");
         }
-        Ok(definition)
+        Ok((definition, authority))
     }
-    fn execute_connector(&self, name: &str, args: &Value) -> Result<Value> {
+    fn execute_connector(
+        &self,
+        name: &str,
+        args: &Value,
+        project: Option<&xylo_services::ProjectConnector>,
+        catalog_authority: Option<&xylo_services::ConnectorCatalogAuthority>,
+    ) -> Result<Value> {
         if name == "connector_list" {
-            return Ok(
-                json!({"status":"success","summary":self.store.connectors()?,"artifacts":[]}),
-            );
+            return Ok(json!({"status":"success","summary":self.all_connectors()?,"artifacts":[]}));
         }
-        let config = self.connector(args)?;
+        let config = project
+            .map(|entry| entry.config.clone())
+            .map(Ok)
+            .unwrap_or_else(|| self.connector(args))?;
+        let connectors = self.project_broker(project)?;
         if name == "connector_tools" {
             let tools = if is_mcp(&config) {
                 self.runtime
-                    .block_on(self.connectors.tools(&config, &self.cancel))?
+                    .block_on(connectors.tools(&config, &self.cancel))?
             } else {
                 NativeConnectors::tools(&config.transport)?
             };
             // A rediscovery may change schemas and classifications.
             self.lookup.invalidate_connectors();
             return Ok(json!({"status":"success","summary":tools,"artifacts":[]}));
+        }
+        if let Some(method) = match name {
+            "connector_resources" => Some("resources/list"),
+            "connector_resource_read" => Some("resources/read"),
+            "connector_prompts" => Some("prompts/list"),
+            "connector_prompt_get" => Some("prompts/get"),
+            _ => None,
+        } {
+            ensure!(
+                is_mcp(&config),
+                "Resources and prompts require an MCP server"
+            );
+            let value = self.runtime.block_on(connectors.metadata(
+                &config,
+                method,
+                args.clone(),
+                &self.cancel,
+            ))?;
+            let commands = if method == "prompts/list" {
+                xylo_services::mcp_prompt_commands(&config, &value)
+            } else {
+                Vec::new()
+            };
+            return Ok(
+                json!({"status":"success","summary":value,"commands":commands,"untrusted":true,"artifacts":[]}),
+            );
         }
         ensure!(name == "connector_call", "Unknown connector operation");
         let tool = args
@@ -1574,8 +2095,13 @@ impl ToolBroker {
             .context("Connector tool name is required")?;
         let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
         let result = if is_mcp(&config) {
-            self.runtime
-                .block_on(self.connectors.call(&config, tool, arguments, &self.cancel))?
+            self.runtime.block_on(connectors.call_reviewed(
+                &config,
+                tool,
+                arguments,
+                &self.cancel,
+                catalog_authority.context("MCP catalog was not reviewed")?,
+            ))?
         } else {
             self.runtime
                 .block_on(self.native.call(&config, tool, arguments, &self.cancel))?
@@ -1713,6 +2239,10 @@ impl ToolBroker {
     /// field and point at the saved complete result, which file_read can page
     /// through.
     pub(crate) fn model_result(&self, id: Uuid, result: Value) -> Value {
+        let images = result
+            .get("images")
+            .or_else(|| result.pointer("/summary/images"))
+            .cloned();
         let model_bytes = self.window().tool_result_bytes();
         let Ok(encoded) = serde_json::to_vec(&result) else {
             return self.bound_result(id, result);
@@ -1758,6 +2288,9 @@ impl ToolBroker {
                 }
             }
         }
+        if let Some(images) = images {
+            shortened["images"] = images;
+        }
         shortened
     }
     /// Stops this turn's capability helpers. MCP connections belong to the
@@ -1765,6 +2298,15 @@ impl ToolBroker {
     /// Stops what this broker started. A helper agent's broker closes only
     /// its own sessions; models and environments belong to the parent turn.
     pub async fn shutdown(&self) -> Result<()> {
+        let scoped = self
+            .root_brokers
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for broker in scoped {
+            broker.capabilities.shutdown().await?;
+        }
         if self.parent_id.is_some() {
             self.capabilities.shutdown_helper_sessions().await
         } else {
@@ -1794,7 +2336,7 @@ fn bound_presentation(value: Value) -> Value {
 fn is_mcp(config: &ConnectorConfig) -> bool {
     matches!(
         config.transport.as_str(),
-        "stdio" | "http" | "streamable_http"
+        "stdio" | "http" | "streamable_http" | "sse"
     )
 }
 /// The compact form of a resident tool for a tiny window: its short
@@ -2013,6 +2555,11 @@ const FETCHING_GIT: &[&str] = &["fetch", "pull", "clone", "ls-remote", "submodul
 /// is lexical and conservative; anything it cannot read counts as leaving
 /// the project.
 fn command_stays_in_project(name: &str, arguments: &Value, workspace: &std::path::Path) -> bool {
+    // Directory overrides can grant outside access. Keep their output untrusted
+    // in the durable journal, including later calls inheriting that directory.
+    if arguments.get("cwd").is_some() {
+        return false;
+    }
     let words: Vec<String> = if name == "shell_command" {
         let Some(command) = arguments.get("command").and_then(Value::as_str) else {
             return false;

@@ -22,16 +22,21 @@ pub(crate) const VERSION: i64 = 2;
 /// Every table, index and trigger of the application database.
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE approval_rules(workspace TEXT NOT NULL,key TEXT NOT NULL,label TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(workspace,key)) WITHOUT ROWID;
+CREATE TABLE native_execution_grants(workspace TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(workspace,key)) WITHOUT ROWID;
 
 CREATE TABLE conversations(id TEXT PRIMARY KEY,json TEXT NOT NULL,updated_at INTEGER NOT NULL);
 CREATE INDEX conversations_keyset ON conversations(updated_at DESC,id DESC);
 CREATE TABLE messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES conversations(id),json TEXT NOT NULL,created_at INTEGER NOT NULL);
 CREATE INDEX messages_session ON messages(session_id,created_at);
 CREATE INDEX messages_session_append ON messages(session_id);
-CREATE TABLE checkpoints(session_id TEXT PRIMARY KEY REFERENCES conversations(id),turn_id TEXT NOT NULL,length INTEGER NOT NULL,revision INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE checkpoints(session_id TEXT PRIMARY KEY REFERENCES conversations(id),turn_id TEXT NOT NULL,length INTEGER NOT NULL,revision INTEGER NOT NULL,updated_at INTEGER NOT NULL,fallback_model TEXT);
 CREATE TABLE checkpoint_messages(session_id TEXT NOT NULL REFERENCES checkpoints(session_id),position INTEGER NOT NULL,json TEXT NOT NULL,PRIMARY KEY(session_id,position)) WITHOUT ROWID;
 CREATE TABLE completed_turns(session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,json TEXT NOT NULL,completed_at INTEGER NOT NULL,PRIMARY KEY(session_id,turn_id));
+CREATE INDEX completed_turns_reply ON completed_turns(session_id,json_extract(json,'$.reply_id'));
+CREATE INDEX completed_turns_day ON completed_turns(completed_at);
+CREATE TABLE turn_usage(session_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,turn_id TEXT NOT NULL,call_id TEXT NOT NULL,json TEXT NOT NULL,PRIMARY KEY(session_id,turn_id,call_id));
+
+CREATE TABLE instruction_sources(session_id TEXT NOT NULL,workspace TEXT NOT NULL,path TEXT NOT NULL,outside INTEGER NOT NULL CHECK(outside IN(0,1)),PRIMARY KEY(session_id,workspace,path));
 
 CREATE TABLE actions(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,action_key TEXT NOT NULL,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL,UNIQUE(session_id,turn_id,action_key));
 CREATE INDEX actions_state ON actions(state);
@@ -51,6 +56,9 @@ CREATE TABLE extension_action_bindings(action_id TEXT PRIMARY KEY REFERENCES act
 CREATE TABLE extension_execution_receipts(id TEXT PRIMARY KEY,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL);
 
 CREATE TABLE connectors(id TEXT PRIMARY KEY,name TEXT NOT NULL,json TEXT NOT NULL);
+CREATE TABLE project_mcp_consents(workspace TEXT NOT NULL,fingerprint TEXT NOT NULL,PRIMARY KEY(workspace,fingerprint));
+CREATE TABLE connector_prompts(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,json TEXT NOT NULL);
+CREATE TABLE connector_catalog_state(id TEXT PRIMARY KEY,generation INTEGER NOT NULL,available INTEGER NOT NULL CHECK(available IN(0,1)));
 CREATE TABLE connector_tools(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,json TEXT NOT NULL,updated_at INTEGER NOT NULL);
 
 CREATE TABLE memories(id TEXT PRIMARY KEY,scope TEXT NOT NULL,content TEXT NOT NULL,json TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,embedding_model TEXT);

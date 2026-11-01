@@ -87,6 +87,7 @@ fn verdict(
             origin: Origin::Model,
             reach: &reach,
             workspace: &workspace,
+            cwd: None,
             network: None,
             untrusted_input: false,
         },
@@ -96,7 +97,7 @@ fn verdict(
 #[test]
 fn presets_follow_the_codex_table() {
     use PermissionMode::*;
-    let edit = json!({"path":"src/lib.rs","old_string":"a","new_string":"b"});
+    let edit = json!({"path":"src/lib.rs","edits":[{"old_string":"a","new_string":"b"}]});
     let outside = Reach::Outside(PathBuf::from("/etc/hosts"));
     let cases = [
         (
@@ -297,7 +298,7 @@ fn presets_follow_the_codex_table() {
 }
 
 #[test]
-fn enabled_hooks_run_in_every_mode() {
+fn enabled_hooks_run_except_in_plan_mode() {
     for mode in PermissionMode::ALL {
         let workspace = std::env::temp_dir();
         let verdict = decide(
@@ -309,11 +310,16 @@ fn enabled_hooks_run_in_every_mode() {
                 origin: Origin::Hook,
                 reach: &Reach::Project,
                 workspace: &workspace,
+                cwd: None,
                 network: None,
                 untrusted_input: false,
             },
         );
-        assert_eq!(verdict, Verdict::Allow, "{mode:?}");
+        if mode == PermissionMode::Plan {
+            assert!(matches!(verdict, Verdict::Refuse(_)));
+        } else {
+            assert_eq!(verdict, Verdict::Allow, "{mode:?}");
+        }
     }
 }
 
@@ -336,6 +342,7 @@ fn network_verdict(mode: PermissionMode, name: &str, arguments: Value) -> Verdic
             origin: Origin::Model,
             reach: &Reach::Project,
             workspace,
+            cwd: None,
             network: Some("Install the project's dependencies"),
             untrusted_input: false,
         },
@@ -418,6 +425,7 @@ fn project_verdict(mode: PermissionMode, name: &str, arguments: Value, writes: b
             origin: Origin::Model,
             reach: &Reach::Project,
             workspace: workspace.path(),
+            cwd: None,
             network: None,
             untrusted_input: false,
         },
@@ -438,7 +446,8 @@ fn ask_for_approval_asks_before_editing_files_that_run_code() {
         ".env",
     ] {
         for name in ["file_write", "file_edit"] {
-            let arguments = json!({"path":path,"content":"x","old_string":"a","new_string":"b"});
+            let arguments =
+                json!({"path":path,"content":"x","edits":[{"old_string":"a","new_string":"b"}]});
             assert!(
                 matches!(
                     project_verdict(AskForApproval, name, arguments, true),
@@ -575,6 +584,7 @@ fn approve_for_me_asks_for_git_fetches_that_can_run_programs() {
             origin: Origin::Model,
             reach: &Reach::Project,
             workspace: plain.path(),
+            cwd: None,
             network: Some("Fetch"),
             untrusted_input: false,
         },
@@ -594,6 +604,7 @@ fn memory_writes_after_untrusted_input_are_reviewed_without_standing_rules() {
         origin: Origin::Model,
         reach: &Reach::Project,
         workspace: &workspace,
+        cwd: None,
         network: None,
         untrusted_input,
     };
@@ -611,4 +622,142 @@ fn memory_writes_after_untrusted_input_are_reviewed_without_standing_rules() {
     assert!(matches!(decide(ReadOnly, &call(true)), Verdict::Refuse(_)));
     assert!(approval_rule_for(&call(false)).is_some());
     assert_eq!(approval_rule_for(&call(true)), None);
+}
+
+#[test]
+fn review_h1_native_lsp_has_separate_execution_and_network_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let args = json!({"path":"a.py","operation":"hover"});
+    let call = Call {
+        name: "lsp",
+        arguments: &args,
+        writes: false,
+        origin: Origin::Model,
+        reach: &Reach::Project,
+        workspace: dir.path(),
+        cwd: None,
+        network: None,
+        untrusted_input: false,
+    };
+    assert!(matches!(
+        decide(PermissionMode::ReadOnly, &call),
+        Verdict::Refuse(_)
+    ));
+    for mode in [PermissionMode::AskForApproval, PermissionMode::ApproveForMe] {
+        assert_eq!(decide(mode, &call), Verdict::Ask(NATIVE_LSP_REASON.into()));
+    }
+    let native = approval_rule_for(&call).unwrap().0;
+    assert!(native.starts_with("native-lsp:"));
+    assert_ne!(
+        native,
+        approval_rule("file_read", &args, &Reach::Project, dir.path())
+            .map(|rule| rule.0)
+            .unwrap_or_default()
+    );
+    let outside_reach = Reach::Outside(outside.path().join("a.py"));
+    let native_outside = approval_rule("lsp", &args, &outside_reach, dir.path())
+        .unwrap()
+        .0;
+    assert_ne!(native, native_outside);
+    assert_ne!(
+        native_outside,
+        approval_rule("file_read", &args, &outside_reach, dir.path())
+            .unwrap()
+            .0
+    );
+}
+
+#[test]
+fn local_listening_always_asks_even_for_a_routine_download() {
+    let args = json!({"command":"cargo fetch", "network":true,"allow_local_binding":true,"justification":"Run a local server"});
+    let call = Call {
+        name: "shell_command",
+        arguments: &args,
+        writes: true,
+        origin: Origin::Model,
+        reach: &Reach::Project,
+        workspace: Path::new("/tmp"),
+        cwd: None,
+        network: Some("Run a local server"),
+        untrusted_input: false,
+    };
+    assert!(matches!(
+        decide(PermissionMode::ApproveForMe, &call),
+        Verdict::Ask(_)
+    ));
+    assert!(matches!(
+        decide(PermissionMode::AskForApproval, &call),
+        Verdict::Ask(_)
+    ));
+    assert!(matches!(
+        decide(PermissionMode::ReadOnly, &call),
+        Verdict::Refuse(_)
+    ));
+    assert_eq!(decide(PermissionMode::FullAccess, &call), Verdict::Allow);
+    assert!(
+        approval_rule_for(&call).is_none(),
+        "An ordinary remembered network rule must not authorize local access"
+    );
+}
+
+#[test]
+fn outside_shell_scope_never_inherits_network_or_generic_rules() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let arguments = json!({"command":"cargo fetch","cwd":outside.path(),"network":true,"justification":"Download dependencies"});
+    let reach = Reach::Outside(outside.path().into());
+    let call = Call {
+        name: "shell_command",
+        arguments: &arguments,
+        writes: true,
+        origin: Origin::Model,
+        reach: &reach,
+        workspace: root.path(),
+        cwd: Some(outside.path()),
+        network: Some("Download dependencies"),
+        untrusted_input: false,
+    };
+    for mode in [PermissionMode::AskForApproval, PermissionMode::ApproveForMe] {
+        let Verdict::Ask(reason) = decide(mode, &call) else {
+            panic!("outside network command did not ask");
+        };
+        assert!(reason.contains(outside.path().to_str().unwrap()));
+        assert!(reason.contains("network"));
+        assert!(approval_rule_for(&call).is_none());
+    }
+    assert!(matches!(
+        decide(PermissionMode::ReadOnly, &call),
+        Verdict::Refuse(_)
+    ));
+}
+
+#[test]
+fn ancestor_configuration_disables_remembered_routine_network_rule() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().join("sub");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::create_dir(root.path().join(".cargo")).unwrap();
+    std::fs::write(
+        root.path().join(".cargo/config.toml"),
+        "[net]\noffline = true\n",
+    )
+    .unwrap();
+    let arguments = json!({"command":"cargo fetch","network":true});
+    let call = Call {
+        name: "shell_command",
+        arguments: &arguments,
+        writes: true,
+        origin: Origin::Model,
+        reach: &Reach::Project,
+        workspace: root.path(),
+        cwd: Some(&cwd),
+        network: Some("Download dependencies"),
+        untrusted_input: false,
+    };
+    assert!(matches!(
+        decide(PermissionMode::ApproveForMe, &call),
+        Verdict::Ask(_)
+    ));
+    assert!(approval_rule_for(&call).is_none());
 }

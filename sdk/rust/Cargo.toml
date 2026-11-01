@@ -1,0 +1,17 @@
+[package]
+name = "xylo-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stable Rust sessions over the Xylo CLI stdio protocol"
+
+[dependencies]
+xylo-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

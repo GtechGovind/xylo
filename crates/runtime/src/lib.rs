@@ -3,11 +3,15 @@
 pub mod drafts;
 pub mod extensions;
 pub use xylo_services::action_review::*;
+pub mod conversation_export;
+pub mod headless;
 pub mod history;
 pub mod host;
 pub mod learning;
 pub mod lsp;
+pub mod observability;
 pub mod process;
+pub mod status_line;
 pub mod steering;
 pub mod terminal;
 pub mod turn_queue;
@@ -22,7 +26,7 @@ pub use xylo_services::{
     ExportSelection, FactCursor, FactDeleteKind, FactDeletePreview, FactDeleteRequest,
     FactDeletion, FactPage, FactVersion, MAX_DOCUMENT_DRAFT_BYTES, MemoryCursor, MemoryExport,
     MemoryFormSave, MemoryFormSnapshot, MemoryFormState, MemoryFormWrite, MemoryMutation,
-    MemoryPage, SteeringOutcome, verify_document_relink_source,
+    MemoryPage, SteeringOutcome, UsageReport, UsageTotals, verify_document_relink_source,
 };
 
 use anyhow::{Context, Result};
@@ -60,3 +64,6 @@ impl AppPaths {
 
 #[cfg(test)]
 mod tests;
+
+/// File-backed permission settings shared with the desktop editor.
+pub use xylo_services::settings_files;

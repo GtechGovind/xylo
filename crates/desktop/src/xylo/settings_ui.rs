@@ -1532,3 +1532,78 @@ pub(super) fn form_actions(children: impl IntoIterator<Item = AnyElement>) -> Di
 #[cfg(test)]
 #[path = "settings_ui/tests.rs"]
 mod tests;
+
+impl Xylo {
+    /// Search connections live beside the other external tool connections.
+    pub(super) fn web_search_settings_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        use xylo_core::WebSearchBackend;
+        let selected = self
+            .web_search_backend
+            .unwrap_or(self.settings.web_search.backend);
+        let options = [
+            (WebSearchBackend::Disabled, "Disabled"),
+            (WebSearchBackend::Brave, "Brave Search"),
+            (WebSearchBackend::Tavily, "Tavily"),
+            (WebSearchBackend::Searxng, "SearXNG"),
+        ]
+        .into_iter()
+        .map(|(backend, label)| {
+            let view = cx.entity().downgrade();
+            SelectOption::new(label, selected == backend, move |_, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.web_search_backend = Some(backend);
+                    cx.notify();
+                });
+            })
+        })
+        .collect();
+        let mut content = div().flex().flex_col().gap(px(12.)).child(setting_row(
+            "Search service",
+            Some("Used when the selected model connection has no native web search.".into()),
+            Some(select("web-search-backend", "Search service", options)),
+        ));
+        if selected == WebSearchBackend::Searxng {
+            let saved = &self.settings.web_search.endpoint;
+            content = content.child(field(
+                "SearXNG URL",
+                Input::new(&self.web_search_endpoint).aria_label("SearXNG HTTPS URL"),
+                Some(if saved.is_empty() {
+                    "Enter an HTTPS URL. Private addresses require approval for every search."
+                        .into()
+                } else {
+                    format!("Saved: {saved}. Leave blank to keep it.").into()
+                }),
+            ));
+        }
+        if selected != WebSearchBackend::Disabled {
+            content = content.child(field(
+                "API key",
+                Input::new(&self.web_search_secret).aria_label("Search API key"),
+                Some("Stored in your credential vault. Leave blank to keep the saved key.".into()),
+            ));
+        }
+        content = content.child(
+            text_button("web-search-save", "Save search service").on_click(cx.listener(
+                move |view, _, window, cx| {
+                    let endpoint = view.web_search_endpoint.read(cx).value().to_string();
+                    let secret = view.web_search_secret.read(cx).value().to_string();
+                    let config = xylo_core::WebSearchSettings {
+                        backend: selected,
+                        endpoint: if endpoint.trim().is_empty() {
+                            view.settings.web_search.endpoint.clone()
+                        } else {
+                            endpoint.trim().into()
+                        },
+                        credential_ref: None,
+                    };
+                    view.host_call(cx, |host| {
+                        host.save_web_search(config, (!secret.is_empty()).then_some(secret))
+                    });
+                    Self::set_input(&view.web_search_secret, "", window, cx);
+                    cx.notify();
+                },
+            )),
+        );
+        section("Web search",Some("Native provider search is used automatically when available. Search results and pages are untrusted content.".into()),content).into_any_element()
+    }
+}

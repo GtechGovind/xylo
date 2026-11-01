@@ -262,10 +262,16 @@ pub(crate) async fn run_trial_with(
     // Canonical paths keep the engine's project-boundary checks honest on
     // systems whose temporary directory is behind a symlink.
     let root = directory.path().canonicalize()?;
+    let fixture = if let Some(page) = task.web_fixture {
+        Some(crate::web_fixture::Server::start(page).await?)
+    } else {
+        None
+    };
     let places = TrialPaths {
         workspace: root.join("workspace"),
         outside: root.join("outside"),
         profile: root.join("profile"),
+        web_fixture: fixture.as_ref().map(|server| server.url.clone()),
     };
     places.write_fixtures(&places.workspace, &task.files)?;
     places.write_fixtures(&places.outside, &task.outside_files)?;
@@ -295,7 +301,6 @@ pub(crate) async fn run_trial_with(
         },
         permissions: task.mode,
         attachments: Vec::new(),
-        approved_rules: Vec::new(),
     };
     store.register_user_turn(&request)?;
 
@@ -303,6 +308,9 @@ pub(crate) async fn run_trial_with(
         PermissionCell::new(task.mode),
         CredentialVault::unlocked(&paths.data, VaultKey::from_bytes(random_key()))?,
     );
+    if let Some(fixture) = &fixture {
+        tools.register_web_fixture(&fixture.url)?;
+    }
     let log = ExchangeLog::default();
     let script = places.resolve_json(
         replay
@@ -547,6 +555,7 @@ struct TrialPaths {
     workspace: PathBuf,
     outside: PathBuf,
     profile: PathBuf,
+    web_fixture: Option<String>,
 }
 
 impl TrialPaths {
@@ -565,6 +574,10 @@ impl TrialPaths {
             .fold(text.to_owned(), |text, (placeholder, path)| {
                 text.replace(placeholder, &path.to_string_lossy())
             })
+            .replace(
+                "{web_fixture}",
+                self.web_fixture.as_deref().unwrap_or("{web_fixture}"),
+            )
     }
 
     /// `value` with placeholders in its strings replaced by this trial's
@@ -574,6 +587,10 @@ impl TrialPaths {
             serde_json::to_string(value)?,
             |text, (placeholder, path)| text.replace(placeholder, &json_escaped(path)),
         );
+        let text = text.replace(
+            "{web_fixture}",
+            self.web_fixture.as_deref().unwrap_or("{web_fixture}"),
+        );
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -581,6 +598,9 @@ impl TrialPaths {
     /// and in JSON-escaped form (tool results are JSON inside strings).
     fn portable_json<T: Serialize + DeserializeOwned>(&self, value: &T) -> Result<T> {
         let mut text = serde_json::to_string(value)?;
+        if let Some(url) = &self.web_fixture {
+            text = text.replace(url, "{web_fixture}");
+        }
         for (placeholder, path) in self.places() {
             let plain = path.to_string_lossy();
             let escaped = json_escaped(path);

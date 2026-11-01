@@ -34,19 +34,27 @@ use uuid::Uuid;
 use xylo_core::*;
 use xylo_helper_client::HelperClient;
 use xylo_resources::{ResourceLease, ResourceManager, TaskDemand};
+pub use xylo_services::McpPromptCommand;
+use xylo_services::settings_files::{PermissionDecision, PermissionRule, SettingsFiles};
 use xylo_services::{ConnectorBroker, CredentialVault, SqliteMemory, Store};
 mod action_control;
 mod credential_control;
 mod document_control;
+mod export_control;
 mod fact_control;
+mod git_review_control;
 mod image_control;
+mod mcp_control;
 mod notice_control;
 mod provider_control;
 mod settings_control;
 mod steering_control;
 mod turn_queue_control;
 mod update_control;
+mod usage_control;
+mod web_search_control;
 mod worker_control;
+mod worktree_control;
 use worker_control::{SessionSequences, WorkerHandle, effective_mode, retire_idle_workers};
 
 #[derive(Clone)]
@@ -57,6 +65,35 @@ pub struct ConnectorMutationReceipt {
 
 #[derive(Clone)]
 pub enum HostEvent {
+    Usage {
+        request_id: Uuid,
+        session_id: Uuid,
+        result: std::result::Result<(xylo_services::UsageReport, Option<String>), String>,
+    },
+    OutputStyles {
+        request_id: Uuid,
+        result: std::result::Result<Vec<crate::workspace::output_styles::OutputStyle>, String>,
+    },
+    StatusLine {
+        request_id: Uuid,
+        result: std::result::Result<Option<String>, String>,
+    },
+    Permissions {
+        session: Uuid,
+        mode: PermissionMode,
+        revision: u64,
+    },
+    InteractionReply {
+        session: Uuid,
+        action_id: Uuid,
+        result: std::result::Result<(), String>,
+    },
+    PlanModes {
+        session: Uuid,
+        action_id: Uuid,
+        modes: Vec<PermissionMode>,
+        scheduled: bool,
+    },
     ActionReviews {
         request_id: Uuid,
         result: std::result::Result<crate::ActionReviewPage, String>,
@@ -230,6 +267,11 @@ pub enum HostEvent {
         path: PathBuf,
         message: String,
     },
+    GitHunkApplied {
+        request_id: Uuid,
+        root: PathBuf,
+        result: Result<(), String>,
+    },
     GitStatus {
         request_id: Uuid,
         root: PathBuf,
@@ -266,6 +308,16 @@ pub enum HostEvent {
         item: crate::turn_queue::QueuedTurn,
     },
     Connectors(Vec<ConnectorConfig>),
+    McpCommands {
+        request_id: Uuid,
+        workspace: Option<PathBuf>,
+        connector_id: Uuid,
+        commands: Vec<xylo_services::McpPromptCommand>,
+    },
+    ConnectorAuthorization {
+        request_id: Uuid,
+        url: String,
+    },
     ConnectorMutation {
         request_id: Uuid,
         result: std::result::Result<ConnectorMutationReceipt, String>,
@@ -295,14 +347,25 @@ pub enum HostEvent {
     /// Standing approvals of a project, after a load or a revocation.
     ApprovalRules {
         workspace: PathBuf,
-        result: std::result::Result<Vec<xylo_core::ApprovalRule>, String>,
+        result: std::result::Result<Vec<PermissionRule>, String>,
     },
     /// A conversation's title changed (user rename or generated title).
     ConversationRenamed(Conversation),
+    Worktrees(Vec<crate::workspace::worktree::Worktree>),
+    ChatWorktree {
+        session: Uuid,
+        workspace: PathBuf,
+        branch: Option<String>,
+    },
     Stopped,
 }
 
 enum HostCommand {
+    Usage(Uuid, Uuid, Vec<Uuid>, i64, i64, Option<PathBuf>),
+    OutputStyles(Uuid, PathBuf),
+    StatusLine(Uuid, PathBuf, Value),
+    StartLoop(Uuid, PathBuf, String),
+    StopWakeups(Uuid),
     PreparedCancel(Vec<turn_queue_control::PreparedStop>),
     RefusedCancel,
     Action(action_control::ActionCommand),
@@ -335,11 +398,13 @@ enum HostCommand {
     Conversations,
     ConversationPage(Option<ConversationCursor>, usize),
     SaveSettings(AppSettings),
+    SaveWebSearch(xylo_core::WebSearchSettings, Option<String>),
     Models(u64, ProviderConfig),
     SaveProvider(u64, Box<AppSettings>, ProviderConfig, Option<String>),
     Workspace(PathBuf),
     OpenFile(Uuid, PathBuf),
     Save(PathBuf, String),
+    ApplyGitHunk(Uuid, PathBuf, crate::workspace::git::hunks::Request),
     GitStatus(Uuid, PathBuf),
     GitFileDiff(
         Uuid,
@@ -356,6 +421,7 @@ enum HostCommand {
     RunQueuedTurn(Uuid, Uuid, Uuid),
     Connectors,
     SaveConnector(ConnectorConfig),
+    ConnectorSignIn(Uuid, Uuid, Option<String>),
     MutateConnector(Uuid, Option<ConnectorConfig>, Option<Uuid>, Option<String>),
     ConnectorTools(Uuid, Uuid, Option<PathBuf>),
     Schedules,
@@ -366,11 +432,16 @@ enum HostCommand {
     Capability(Uuid, String, Value),
     CancelCapability(Uuid),
     ApprovalRules(PathBuf),
-    RemoveApprovalRule(PathBuf, String),
+    RemoveApprovalRule(PathBuf, PermissionRule),
+    SavePermissionRule(PathBuf, String, PermissionDecision, bool),
     RenameConversation(Uuid, String),
     SetConversationPinned(Uuid, bool),
     SetConversationArchived(Uuid, bool),
     RemoveProvider(ProviderConfig),
+    ExportConversation(Uuid, PathBuf),
+    CreateChatWorktree(Uuid, PathBuf),
+    ListWorktrees(Option<PathBuf>),
+    RemoveWorktree(PathBuf, bool),
     Shutdown,
 }
 
@@ -381,6 +452,18 @@ pub struct HostClient {
 }
 
 impl HostClient {
+    /// Creates an isolated checkout for a new chat after an explicit UI action.
+    pub fn create_chat_worktree(&self, session: Uuid, repo: PathBuf) -> Result<()> {
+        self.enqueue(HostCommand::CreateChatWorktree(session, repo))
+    }
+    /// Lists retained worktrees for Settings.
+    pub fn list_worktrees(&self, repo: Option<PathBuf>) -> Result<()> {
+        self.enqueue(HostCommand::ListWorktrees(repo))
+    }
+    /// Removes a managed checkout; force requires a separate user confirmation.
+    pub fn remove_worktree(&self, path: PathBuf, force: bool) -> Result<()> {
+        self.enqueue(HostCommand::RemoveWorktree(path, force))
+    }
     pub fn spawn() -> Result<(Self, Receiver<HostEvent>)> {
         Self::spawn_at(AppPaths::discover()?)
     }
@@ -447,6 +530,7 @@ impl HostClient {
                     )),
                 };
                 let state = Arc::new(HostState {
+                    status_line:Default::default(),
                     discovery: host_discovery,
                     provider_save_gate: Mutex::new(()),
                     paths,
@@ -463,6 +547,7 @@ impl HostClient {
                     search_requests: Mutex::new(HashMap::new()),
                     image_import_gate: Mutex::new(()),
                     secrets: parking_lot::RwLock::new(secrets),
+                    inspection_worktrees: parking_lot::Mutex::new(HashMap::new()),
                     store,
                     settings: Mutex::new(settings.clone()),
                     latest_project_open: AtomicU64::new(0),
@@ -519,6 +604,7 @@ impl HostClient {
                     }
                     if memory_setup_needed {state.events.send(HostEvent::Status("Semantic search needs setup in Downloads. Your saved memories remain searchable.".into())).await?;}
                     if recovered > 0 {state.events.send(HostEvent::Status(format!("Recovered {recovered} interrupted actions; uncertain writes require review"))).await?;}
+                    if let Err(error) = state.cleanup_archived_worktrees().await { tracing::warn!(%error, "Retained worktree cleanup needs review"); }
                     state.send_conversations().await?;
                     let scheduling_state=state.clone();
                     let scheduling=tokio::spawn(async move{scheduling_state.schedule_loop().await;});
@@ -532,7 +618,7 @@ impl HostClient {
                         let receipt = received;
                         if matches!(command,HostCommand::Shutdown) {maintenance_stop.cancel();state.shutdown().await;scheduling.abort();editor_forwarder.abort();project_forwarder.abort();let _=learning_task.await;for task in notification_tasks {let _=task.await;}state.events.send(HostEvent::Stopped).await?;break;}
                         // Reserve at receipt, before any task can race to acquire admission.
-                        let settings_commit = matches!(&command, HostCommand::SaveSettings(_) | HostCommand::SaveProvider(..) | HostCommand::RemoveProvider(_)).then(|| settings_commits.reserve());
+                        let settings_commit = matches!(&command, HostCommand::SaveSettings(_) | HostCommand::SaveWebSearch(..) | HostCommand::SaveProvider(..) | HostCommand::RemoveProvider(_)).then(|| settings_commits.reserve());
                         // Preserve document ordering independently of concurrent
                         // host work. The language-server actor owns synchronization.
                         if state.installing.load(Ordering::Acquire) && matches!(&command,HostCommand::Workspace(_)|HostCommand::Lsp(_)) {
@@ -709,8 +795,20 @@ impl HostClient {
         self.enqueue(HostCommand::ApprovalRules(workspace))
     }
     /// Revokes one standing approval; answered with `HostEvent::ApprovalRules`.
-    pub fn remove_approval_rule(&self, workspace: PathBuf, key: String) -> Result<()> {
+    pub fn remove_approval_rule(&self, workspace: PathBuf, key: PermissionRule) -> Result<()> {
         self.enqueue(HostCommand::RemoveApprovalRule(workspace, key))
+    }
+    /// Saves an explicit allow, ask or deny rule to the selected settings file.
+    pub fn save_permission_rule(
+        &self,
+        workspace: PathBuf,
+        pattern: String,
+        decision: PermissionDecision,
+        project: bool,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::SavePermissionRule(
+            workspace, pattern, decision, project,
+        ))
     }
     /// Renames a conversation; answered with `HostEvent::ConversationRenamed`.
     pub fn rename_conversation(&self, id: Uuid, title: String) -> Result<()> {
@@ -756,6 +854,15 @@ impl HostClient {
     pub fn save_settings(&self, settings: AppSettings) -> Result<()> {
         self.enqueue(HostCommand::SaveSettings(settings))
     }
+    /// Saves a search backend, keeping API key material in the credential vault.
+    pub fn save_web_search(
+        &self,
+        settings: xylo_core::WebSearchSettings,
+        secret: Option<String>,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::SaveWebSearch(settings, secret))
+    }
+
     /// Persist credentials before settings and discovery, within one host operation.
     pub fn save_provider(&self, settings: AppSettings, secret: Option<String>) -> Result<()> {
         let provider = settings.provider.clone();
@@ -814,6 +921,10 @@ impl HostClient {
     pub fn open_file(&self, request_id: Uuid, path: PathBuf) -> Result<()> {
         self.enqueue(HostCommand::OpenFile(request_id, path))
     }
+    /// Exports the complete stored conversation to Markdown and adjacent JSONL.
+    pub fn export_conversation(&self, session: Uuid, path: PathBuf) -> Result<()> {
+        self.enqueue(HostCommand::ExportConversation(session, path))
+    }
     pub fn save_file(&self, path: PathBuf, content: String) -> Result<()> {
         self.enqueue(HostCommand::Save(path, content))
     }
@@ -847,6 +958,15 @@ impl HostClient {
     pub fn connectors(&self) -> Result<()> {
         self.enqueue(HostCommand::Connectors)
     }
+    /// Starts explicit standards-based browser sign-in for a saved remote MCP server.
+    pub fn connector_sign_in(
+        &self,
+        request_id: Uuid,
+        id: Uuid,
+        client_id: Option<String>,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::ConnectorSignIn(request_id, id, client_id))
+    }
     pub fn save_connector(&self, config: ConnectorConfig) -> Result<()> {
         self.enqueue(HostCommand::SaveConnector(config))
     }
@@ -878,6 +998,14 @@ impl HostClient {
         workspace: Option<PathBuf>,
     ) -> Result<()> {
         self.enqueue(HostCommand::ConnectorTools(request_id, id, workspace))
+    }
+    /// Starts `/loop [interval] prompt` in the selected conversation.
+    pub fn start_loop(&self, session: Uuid, workspace: PathBuf, command: String) -> Result<()> {
+        self.enqueue(HostCommand::StartLoop(session, workspace, command))
+    }
+    /// Stops all future wakeups belonging to this conversation.
+    pub fn stop_wakeups(&self, session: Uuid) -> Result<()> {
+        self.enqueue(HostCommand::StopWakeups(session))
     }
     pub fn list_schedules(&self) -> Result<()> {
         self.enqueue(HostCommand::Schedules)
@@ -1062,6 +1190,7 @@ fn startup_settings(store: &Store) -> Result<(AppSettings, bool)> {
 }
 
 struct HostState {
+    status_line: crate::status_line::Runner,
     discovery: Arc<provider_control::DiscoveryControl>,
     provider_save_gate: Mutex<()>,
     workspace: crate::workspace::WorkspaceService,
@@ -1073,6 +1202,9 @@ struct HostState {
     accounts: xylo_services::providers::ChatGptSignInService,
     /// The vault and connector broker, or why the vault could not be opened.
     secrets: parking_lot::RwLock<std::result::Result<Secrets, String>>,
+    /// Keep ownership even after disconnect, pool shutdown, or vault replacement:
+    /// those operations do not acknowledge local process-tree exit.
+    inspection_worktrees: parking_lot::Mutex<HashMap<PathBuf, std::fs::File>>,
     settings: Mutex<AppSettings>,
     /// Receipt number of the newest project open applied to `settings`; a
     /// settings snapshot received before it must not undo that open.
@@ -1616,6 +1748,14 @@ impl HostState {
                     .await?;
             }
             HostCommand::Worker(session, command) => self.worker_command(session, command).await?,
+            HostCommand::Usage(id, session, messages, start, end, workspace) => {
+                self.load_usage(id, session, messages, start, end, workspace)
+                    .await?
+            }
+            HostCommand::OutputStyles(id, workspace) => self.output_styles(id, workspace).await?,
+            HostCommand::StatusLine(id, workspace, input) => {
+                self.status_line(id, workspace, input).await?
+            }
             HostCommand::HistoryPage(id, before, limit) => {
                 let store = self.store.clone();
                 let page =
@@ -1623,6 +1763,11 @@ impl HostState {
                         .await??;
                 self.events.send(HostEvent::HistoryPage(page)).await?;
             }
+            HostCommand::CreateChatWorktree(session, repo) => {
+                self.create_chat_worktree(session, repo).await?
+            }
+            HostCommand::ListWorktrees(repo) => self.list_worktrees(repo).await?,
+            HostCommand::RemoveWorktree(path, force) => self.remove_worktree(path, force).await?,
             HostCommand::Conversations => self.send_conversations().await?,
             HostCommand::ApprovalRules(workspace) => {
                 let result = self.approval_rules(&workspace).await;
@@ -1632,6 +1777,20 @@ impl HostState {
             }
             HostCommand::RemoveApprovalRule(workspace, key) => {
                 let result = match self.revoke_approval_rule(&workspace, key).await {
+                    Ok(()) => self.approval_rules(&workspace).await,
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                self.events
+                    .send(HostEvent::ApprovalRules { workspace, result })
+                    .await?;
+            }
+            HostCommand::SavePermissionRule(workspace, pattern, decision, project) => {
+                let root = workspace.clone();
+                let result = match tokio::task::spawn_blocking(move || {
+                    SettingsFiles::for_workspace(&root).save_rule(&pattern, decision, project)
+                })
+                .await?
+                {
                     Ok(()) => self.approval_rules(&workspace).await,
                     Err(error) => Err(format!("{error:#}")),
                 };
@@ -1663,6 +1822,9 @@ impl HostState {
                     tokio::task::spawn_blocking(move || store.conversations_page(before, limit))
                         .await??;
                 self.events.send(HostEvent::ConversationPage(page)).await?;
+            }
+            HostCommand::SaveWebSearch(settings, secret) => {
+                self.save_web_search(settings, secret).await?
             }
             HostCommand::SaveSettings(settings) => {
                 let committed = self
@@ -1769,6 +1931,9 @@ impl HostState {
                     })
                     .await?;
             }
+            HostCommand::ExportConversation(session, path) => {
+                self.export_conversation(session, path).await?
+            }
             HostCommand::Save(path, content) => {
                 let result = self.save_project_file(path.clone(), content).await;
                 let event = match result {
@@ -1779,6 +1944,9 @@ impl HostState {
                     },
                 };
                 self.events.send(event).await?;
+            }
+            HostCommand::ApplyGitHunk(request_id, root, request) => {
+                self.apply_git_hunk(request_id, root, request).await?;
             }
             HostCommand::GitStatus(request_id, root) => {
                 let result = async {
@@ -1854,6 +2022,9 @@ impl HostState {
                     .send(HostEvent::MemoryMutation { request_id, result })
                     .await?;
                 self.report_embedding_failure().await;
+            }
+            HostCommand::ConnectorSignIn(request_id, id, client_id) => {
+                self.connector_sign_in(request_id, id, client_id).await?
             }
             HostCommand::Connectors => {
                 let store = self.store.clone();
@@ -1946,21 +2117,42 @@ impl HostState {
                         .into_iter()
                         .find(|config| config.id == id)
                         .context("Connection no longer exists")?;
-                    if config.transport == "stdio" {
+                    let broker = if config.transport == "stdio" {
                         let workspace = workspace
                             .clone()
                             .context("Choose a project before inspecting a local MCP connection")?;
-                        let scope = xylo_services::ConnectorLaunchScope {
-                            workspace,
-                            protected_paths: vec![self.paths.data.clone()],
-                            ..Default::default()
-                        };
-                        connectors
-                            .tools_scoped(&config, &scope, &Default::default())
-                            .await
+                        if let Some((root, lease)) =
+                            crate::workspace::worktree::retain_inspection_workspace(&workspace)?
+                        {
+                            self.inspection_worktrees
+                                .lock()
+                                .entry(root)
+                                .or_insert(lease);
+                        }
+                        connectors.as_ref().clone().with_local_scope(
+                            xylo_services::ConnectorLaunchScope {
+                                workspace,
+                                protected_paths: vec![self.paths.data.clone()],
+                                ..Default::default()
+                            },
+                        )
                     } else {
-                        connectors.tools(&config, &Default::default()).await
-                    }
+                        connectors.as_ref().clone()
+                    };
+                    let tools = broker.tools(&config, &Default::default()).await?;
+                    let commands = xylo_services::mcp_prompt_commands(
+                        &config,
+                        &broker.cached_prompts(&config)?,
+                    );
+                    self.events
+                        .send(HostEvent::McpCommands {
+                            request_id,
+                            workspace: workspace.clone(),
+                            connector_id: id,
+                            commands,
+                        })
+                        .await?;
+                    Ok::<_, anyhow::Error>(tools)
                 }
                 .await;
                 let event = match result {
@@ -1979,6 +2171,10 @@ impl HostState {
                 };
                 self.events.send(event).await?;
             }
+            HostCommand::StartLoop(session, workspace, command) => {
+                self.start_loop(session, workspace, command).await?
+            }
+            HostCommand::StopWakeups(session) => self.stop_wakeups(session).await?,
             HostCommand::Schedules => self.send_schedules().await?,
             HostCommand::CreateSchedule(prompt, cron, workspace) => {
                 self.scheduler(workspace)?.create(prompt, cron).await?;
@@ -2399,7 +2595,6 @@ impl HostState {
                 WorkerCommand::RunAuthorized { .. }
                     | WorkerCommand::ProviderCredentialUpdated { .. }
                     | WorkerCommand::Unlock { .. }
-                    | WorkerCommand::SetPermissions { .. }
                     | WorkerCommand::Hello
                     | WorkerCommand::Cancel
             ),
@@ -2436,7 +2631,51 @@ impl HostState {
                 .decide(session, &worker, action_id, allow, remember)
                 .await;
         }
+        if let WorkerCommand::Answer { action_id, answer } = command {
+            let result = async {
+                let worker = worker.context("This task is no longer running")?;
+                // Keep the cap and reply ordered with concurrent settings propagation.
+                let _permission_order = worker.permission_order.lock().await;
+                let answer = self.cap_plan_answer(session, answer).await?;
+                worker
+                    .send_control(
+                        session,
+                        Uuid::new_v4(),
+                        WorkerCommand::Answer { action_id, answer },
+                    )
+                    .await
+            }
+            .await;
+            if let Err(error) = result {
+                self.events
+                    .send(HostEvent::InteractionReply {
+                        session,
+                        action_id,
+                        result: Err(error.to_string()),
+                    })
+                    .await?;
+            }
+            return Ok(());
+        }
         let worker = worker.context("This task is no longer running")?;
+        if let WorkerCommand::SetPermissions { mode } = command {
+            let _permission_order = worker.permission_order.lock().await;
+            ensure!(
+                !mode.allows_writes() || mode == self.settings.lock().await.permissions,
+                "Choose the permission preset through application settings"
+            );
+            let mode = self.cap_interaction_mode(session, mode).await?;
+            worker.record_mode(mode);
+            worker
+                .send_control(
+                    session,
+                    Uuid::new_v4(),
+                    WorkerCommand::SetPermissions { mode },
+                )
+                .await?;
+            self.events.send(worker.permission_event(session)).await?;
+            return Ok(());
+        }
         worker.send_control(session, Uuid::new_v4(), command).await
     }
 
@@ -2461,6 +2700,36 @@ impl HostState {
                     pending.clone()
                 })
             });
+        let workspace = worker.workspace.lock().clone();
+        if allow
+            && remember
+            && let Some(pending) = first
+            && let Some(key) = pending.rule_key
+            && let Some(workspace) = workspace
+        {
+            let store = self.store.clone();
+            let project = self.settings.lock().await.permission_rules_project;
+            let saved = tokio::task::spawn_blocking(move || {
+                if key.starts_with("native-lsp:") {
+                    store.grant_native_execution(&workspace, &key)
+                } else {
+                    SettingsFiles::for_workspace(&workspace).save_rule(
+                        &key,
+                        PermissionDecision::Allow,
+                        project,
+                    )
+                }
+            })
+            .await;
+            if !matches!(saved, Ok(Ok(()))) {
+                self.events
+                    .send(HostEvent::Error(
+                        "The action was allowed, but its permission rule could not be saved."
+                            .into(),
+                    ))
+                    .await?;
+            }
+        }
         let command = WorkerCommand::Approve {
             action_id,
             allow,
@@ -2473,31 +2742,6 @@ impl HostState {
         {
             let pending = worker.approvals.lock().remove(&action_id);
             return self.report_lost_decision(session, action_id, pending).await;
-        }
-        let workspace = worker.workspace.lock().clone();
-        if allow
-            && remember
-            && let Some(pending) = first
-            && let Some(key) = pending.rule_key
-            && let Some(workspace) = workspace
-        {
-            let rule = ApprovalRule {
-                label: pending.rule.unwrap_or_else(|| key.clone()),
-                key,
-                workspace,
-                created_at: now_ms(),
-            };
-            let store = self.store.clone();
-            let saved = tokio::task::spawn_blocking(move || store.save_approval_rule(&rule)).await;
-            if !matches!(saved, Ok(Ok(()))) {
-                tracing::warn!(?saved, "Save standing approval");
-                self.events
-                    .send(HostEvent::Error(
-                        "The action was allowed, but \"always allow\" could not be saved for this project."
-                            .into(),
-                    ))
-                    .await?;
-            }
         }
         Ok(())
     }
@@ -2512,6 +2756,9 @@ impl HostState {
         draft_request_id: Option<Uuid>,
         queued_item: Option<QueuedAdmission>,
     ) -> Result<Option<crate::drafts::DraftAdmission>> {
+        if turn.provider.fallback_model.is_none() {
+            turn.provider.fallback_model = self.store.settings()?.fallback_model;
+        }
         let session = turn.session_id;
         let cancellation = {
             let mut queued = self.queued.lock();
@@ -2598,6 +2845,12 @@ impl HostState {
         if let Some(conversation) =
             tokio::task::spawn_blocking(move || store.conversation(session)).await??
         {
+            if self.scheduled.lock().await.contains_key(&session) {
+                ensure!(
+                    !conversation.archived,
+                    "Conversation wakeups cannot run in an archived chat"
+                );
+            }
             ensure!(
                 tokio::fs::canonicalize(&conversation.workspace).await? == workspace,
                 "This chat belongs to another project"
@@ -2623,14 +2876,6 @@ impl HostState {
                 .await?,
         );
         let scheduled = self.scheduled.lock().await.contains_key(&session);
-        let store = self.store.clone();
-        let rules_workspace = workspace.clone();
-        turn.approved_rules =
-            tokio::task::spawn_blocking(move || store.approval_rules(&rules_workspace))
-                .await??
-                .into_iter()
-                .map(|rule| rule.key)
-                .collect();
         {
             let mut workers = self.workers.lock().await;
             ensure!(
@@ -2709,8 +2954,13 @@ impl HostState {
         // runs with the current mode (unattended scheduled turns never with
         // Full access). Later changes reach the worker as
         // SetPermissions, ordered after this Run by the workers lock.
-        turn.permissions = effective_mode(self.settings.lock().await.permissions, scheduled);
-        *worker.mode.lock() = turn.permissions;
+        turn.permissions = self
+            .wakeup_permission(
+                session,
+                effective_mode(self.settings.lock().await.permissions, scheduled),
+            )
+            .await?;
+        worker.record_mode(turn.permissions);
         if automatic {
             ensure!(
                 !worker.queue_stopped.load(Ordering::Acquire),
@@ -2727,7 +2977,7 @@ impl HostState {
         // during SQLite commit; a following Stop ends that exact run.
         *worker.run_request.lock() = Some(request_id);
         *worker.run_turn.lock() = Some(turn.turn_id);
-        *worker.workspace.lock() = Some(workspace);
+        worker.record_workspace(workspace);
         *worker.last_used.lock() = std::time::Instant::now();
         worker.queue_epoch.fetch_add(1, Ordering::AcqRel);
         worker.active.store(true, Ordering::Release);
@@ -2746,6 +2996,11 @@ impl HostState {
             credential,
         };
         permit.send(Envelope::new(request_id, Some(session), 0, command));
+        // Admission and dispatch already succeeded. A lost UI subscriber
+        // cannot turn this into a failed admission and invite a duplicate run.
+        if let Err(error) = self.events.send(worker.permission_event(session)).await {
+            tracing::debug!(%error, "Publish admitted permission mode");
+        }
         let cancelled = {
             let mut starting = self.queued.lock();
             starting.remove(&session);
@@ -2875,6 +3130,13 @@ impl HostState {
         loop {
             let dead = {
                 let workers = self.workers.lock().await;
+                if let Some(worker) = workers.get(&session) {
+                    ensure!(
+                        !worker.worktree_retiring.load(Ordering::Acquire)
+                            || *worker.exited.borrow(),
+                        "The worktree's background jobs are still stopping"
+                    );
+                }
                 match workers.get(&session) {
                     Some(worker) if worker.dead() => Some(worker.clone()),
                     Some(_) => return Ok(()),
@@ -2925,14 +3187,29 @@ impl HostState {
         settings: AppSettings,
         fields: settings_control::ProjectFields,
     ) -> Result<AppSettings> {
+        self.commit_settings_authorized(settings, fields, None)
+            .await
+    }
+
+    /// A dedicated credential save can replace only its validated vault fields.
+    async fn commit_settings_authorized(
+        &self,
+        settings: AppSettings,
+        fields: settings_control::ProjectFields,
+        search: Option<&web_search_control::AuthorizedSearchSettings>,
+    ) -> Result<AppSettings> {
         let previous = self.settings.lock().await.clone();
         let requested = settings.secret_storage;
-        let mut applied = self.save_settings_snapshot(&settings, fields).await?;
+        let mut applied = self
+            .save_settings_snapshot(&settings, fields, search)
+            .await?;
         match self.apply_secret_storage(requested).await {
             Ok(actual) if actual == requested => {}
             Ok(actual) => {
                 applied.secret_storage = actual;
-                applied = self.save_settings_snapshot(&applied, fields).await?;
+                applied = self
+                    .save_settings_snapshot(&applied, fields, search)
+                    .await?;
                 self.events
                     .send(HostEvent::Settings(applied.clone()))
                     .await?;
@@ -2946,7 +3223,9 @@ impl HostState {
             Err(error) => {
                 // Never leave the saved choice and the live vault disagreeing.
                 applied.secret_storage = previous.secret_storage;
-                applied = self.save_settings_snapshot(&applied, fields).await?;
+                applied = self
+                    .save_settings_snapshot(&applied, fields, search)
+                    .await?;
                 if applied.permissions != previous.permissions {
                     self.forward_permissions(applied.permissions).await;
                 }
@@ -2967,9 +3246,16 @@ impl HostState {
         &self,
         settings: &AppSettings,
         fields: settings_control::ProjectFields,
+        search: Option<&web_search_control::AuthorizedSearchSettings>,
     ) -> Result<AppSettings> {
         let mut current = self.settings.lock().await;
         let mut value = settings.clone();
+        // Every generic snapshot preserves current credential ownership,
+        // independently of which project fields the caller may change.
+        value.web_search = search
+            .map(|authority| authority.configuration())
+            .unwrap_or(&current.web_search)
+            .clone();
         settings_control::merge_project_fields(
             &mut value,
             &current,
@@ -3058,28 +3344,28 @@ impl HostState {
     async fn approval_rules(
         &self,
         workspace: &std::path::Path,
-    ) -> std::result::Result<Vec<ApprovalRule>, String> {
+    ) -> std::result::Result<Vec<PermissionRule>, String> {
         let workspace = Self::approval_workspace(workspace).await;
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.approval_rules(&workspace))
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error| format!("{error:#}")))
+        tokio::task::spawn_blocking(move || {
+            Ok(SettingsFiles::for_workspace(&workspace).load()?.rules)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result: anyhow::Result<Vec<PermissionRule>>| {
+            result.map_err(|error| format!("{error:#}"))
+        })
     }
-
-    /// Revokes a standing approval. Rules live in the host and seed each
-    /// turn through `TurnRequest.approved_rules`; a worker keeps them only
-    /// for that turn, so the rule stops applying at the project's next turn
-    /// while a running turn keeps the set it started with. Workers of the
-    /// project are also retired (idle ones now, running ones when their turn
-    /// ends) as defense in depth, so no process that held the rule is reused.
-    async fn revoke_approval_rule(&self, workspace: &std::path::Path, key: String) -> Result<()> {
+    /// Revocation is visible to fresh rule evaluation in every running worker.
+    async fn revoke_approval_rule(
+        &self,
+        workspace: &std::path::Path,
+        rule: PermissionRule,
+    ) -> Result<()> {
         let workspace = Self::approval_workspace(workspace).await;
-        let store = self.store.clone();
-        let removed = workspace.clone();
-        tokio::task::spawn_blocking(move || store.remove_approval_rule(&removed, &key)).await??;
-        let workers = self.workers.lock().await;
-        for (session, worker) in workers.iter() {
+        let root = workspace.clone();
+        tokio::task::spawn_blocking(move || SettingsFiles::for_workspace(&root).remove_rule(&rule))
+            .await??;
+        for (session, worker) in self.workers.lock().await.iter() {
             if worker.workspace.lock().as_deref() == Some(workspace.as_path()) {
                 worker.retire_when_idle(*session);
             }
@@ -3347,9 +3633,16 @@ impl HostState {
                         tracing::warn!(%error,"Renew active schedule");
                     }
                 } else {
+                    let turn_id = scheduler
+                        .list()
+                        .await
+                        .ok()
+                        .and_then(|tasks| tasks.into_iter().find(|task| task.id == id))
+                        .and_then(|task| task.claim.map(|claim| claim.occurrence))
+                        .unwrap_or(session);
                     let store = self.store.clone();
                     let completed =
-                        tokio::task::spawn_blocking(move || store.completed_turn(session, session))
+                        tokio::task::spawn_blocking(move || store.completed_turn(session, turn_id))
                             .await;
                     let result = match completed {
                         Ok(Ok(Some(_))) => self.complete_schedule(session).await,
@@ -3369,6 +3662,18 @@ impl HostState {
             match scheduler.claim_due().await {
                 Ok(tasks) => {
                     for task in tasks {
+                        if task.wakeup.is_some() {
+                            if let Err(error) = self.dispatch_wakeup(task.clone()).await {
+                                let _ = scheduler.pause(task.id).await;
+                                let _ = self
+                                    .events
+                                    .send(HostEvent::Status(format!(
+                                        "Conversation wakeup paused: {error:#}"
+                                    )))
+                                    .await;
+                            }
+                            continue;
+                        }
                         let Some(occurrence) = task.claim.map(|claim| claim.occurrence) else {
                             continue;
                         };
@@ -3398,7 +3703,6 @@ impl HostState {
                             provider,
                             permissions,
                             attachments: Vec::new(),
-                            approved_rules: Vec::new(),
                         };
                         let state = self.clone();
                         let scheduler = scheduler.clone();
@@ -3557,3 +3861,5 @@ fn native_executable(name: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests;
+
+mod interaction_control;

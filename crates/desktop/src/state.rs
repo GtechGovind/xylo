@@ -29,6 +29,8 @@ pub struct ToolCard {
     pub result: Option<String>,
     pub presentation: tool_presentation::ToolPresentation,
     pub approval: bool,
+    /// Draft choices for a pending question card.
+    pub question_answers: Vec<xylo_core::QuestionAnswer>,
     /// What "always allow" would cover, when the action can be remembered.
     pub rule: Option<String>,
     /// Why the current permission mode asks before this action.
@@ -54,6 +56,7 @@ impl ToolCard {
             input,
             result: None,
             approval: false,
+            question_answers: Vec::new(),
             rule: None,
             reason: None,
             parent_id,
@@ -88,6 +91,8 @@ pub enum Segment {
     /// Assistant text streamed between tool batches. Shared so an unchanged
     /// segment hands the markdown view the same string every frame.
     Text(SharedString),
+    /// Provider reasoning, disclosed separately from the answer.
+    Thinking(SharedString),
     /// Consecutive top-level tool calls, in start order.
     Tools(Vec<Uuid>),
     /// A helper agent started by an `agent_delegate` call with this id.
@@ -155,11 +160,15 @@ pub struct TurnState {
     pub subagents: Vec<Subagent>,
     /// Helpers of earlier turns in this chat, newest last, for the Subagents panel.
     pub earlier_subagents: Vec<Subagent>,
+    /// Shell jobs survive the turn that started them.
+    pub shell_jobs: Vec<xylo_core::ShellJob>,
     /// The latest engine status note.
     pub status: Option<String>,
     /// `None` while running or before the first turn.
     pub outcome: Option<TurnOutcome>,
     pub usage: Usage,
+    pub rate_limits: Option<(String, xylo_core::RateLimits)>,
+    pub active_model: Option<String>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     /// What the turn is doing now; `None` once it ends.
@@ -347,10 +356,25 @@ impl TurnState {
             self.flush_text();
         }
         match event {
+            EngineEvent::WorkspaceChanged { .. }
+            | EngineEvent::CustomToolRequested { .. }
+            | EngineEvent::McpElicitation { .. }
+            | EngineEvent::McpElicitationClosed { .. } => return,
             EngineEvent::Ready { .. }
             | EngineEvent::TitleUpdated { .. }
             | EngineEvent::Steering { .. }
             | EngineEvent::ProviderCredentialRequested { .. } => return,
+            EngineEvent::ShellJobUpdated { job } => {
+                if let Some(current) = self
+                    .shell_jobs
+                    .iter_mut()
+                    .find(|current| current.id == job.id)
+                {
+                    *current = job;
+                } else {
+                    self.shell_jobs.push(job);
+                }
+            }
             EngineEvent::Started => {
                 // Admission may already have opened this turn with `Preparing`.
                 if !(self.running && self.segments.is_empty() && self.tools.is_empty()) {
@@ -368,6 +392,14 @@ impl TurnState {
                 self.phase_since = now_ms();
             }
             EngineEvent::Delta { text } => self.push_text(&text),
+            EngineEvent::ThinkingDelta { text } => {
+                if let Some(Segment::Thinking(previous)) = self.segments.last_mut() {
+                    *previous = format!("{previous}{text}").into();
+                } else {
+                    self.segments.push(Segment::Thinking(text.into()));
+                }
+                self.touch(self.segments.len());
+            }
             EngineEvent::Status { text } => self.status = Some(text),
             EngineEvent::HarnessNote { kind, text } => {
                 self.segments.push(Segment::Note {
@@ -404,7 +436,32 @@ impl TurnState {
                 }
                 self.touch(self.row_of_call(action_id));
             }
+            EngineEvent::QuestionRequired {
+                action_id,
+                questions,
+            } => {
+                let count = questions.len();
+                let input = serde_json::json!({"questions":questions});
+                let card = self.card(action_id, "ask_user".into(), input.clone(), None);
+                card.approval = true;
+                card.input = input;
+                card.refresh_presentation();
+                card.question_answers = vec![xylo_core::QuestionAnswer::default(); count];
+                self.touch(self.row_of_call(action_id));
+            }
+            EngineEvent::PlanRequired { action_id, plan } => {
+                let input = serde_json::json!({"plan":plan});
+                let card = self.card(action_id, "exit_plan_mode".into(), input.clone(), None);
+                card.input = input;
+                card.refresh_presentation();
+                card.approval = true;
+                self.touch(self.row_of_call(action_id));
+            }
             EngineEvent::ContextUsage { usage } => self.context = Some(usage),
+            EngineEvent::ModelMetadata { model, rate_limits } => {
+                self.rate_limits = rate_limits.map(|limits| (model.clone(), limits));
+                self.active_model = Some(model);
+            }
             EngineEvent::ToolFinished {
                 action_id,
                 result,
@@ -679,6 +736,7 @@ fn delegate_summary(card: &ToolCard) -> Option<SharedString> {
 
 pub fn message(session_id: Uuid, role: &str, content: String) -> ChatMessage {
     ChatMessage {
+        reasoning: None,
         id: Uuid::new_v4(),
         session_id,
         role: role.into(),

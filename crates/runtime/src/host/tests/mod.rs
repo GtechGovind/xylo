@@ -86,6 +86,7 @@ pub(super) fn state() -> (tempfile::TempDir, Arc<HostState>, Receiver<HostEvent>
     let lsp = crate::lsp::Service::new(paths.data.clone(), editor_events);
     let (workspace_events, _) = async_channel::bounded(16);
     let host = Arc::new(HostState {
+        status_line: Default::default(),
         discovery: Arc::new(provider_control::DiscoveryControl::default()),
         provider_save_gate: Mutex::new(()),
         workspace: crate::workspace::WorkspaceService::new(workspace_events),
@@ -110,6 +111,7 @@ pub(super) fn state() -> (tempfile::TempDir, Arc<HostState>, Receiver<HostEvent>
         memory: SqliteMemory::new(store.clone()),
         accounts,
         secrets: parking_lot::RwLock::new(Ok(secrets)),
+        inspection_worktrees: parking_lot::Mutex::new(HashMap::new()),
         store,
         settings: Mutex::new(AppSettings::default()),
         latest_project_open: std::sync::atomic::AtomicU64::new(0),
@@ -180,7 +182,6 @@ async fn cancel_before_run_task_starts_does_not_record_or_dispatch_the_turn() {
         provider: ProviderConfig::default(),
         permissions: Default::default(),
         attachments: Vec::new(),
-        approved_rules: Vec::new(),
     };
     let command = HostCommand::Worker(Some(session), WorkerCommand::Run { turn });
     assert!(host.prepare_command(&command).await.unwrap());
@@ -1266,14 +1267,10 @@ async fn approval_rules_are_listed_and_revoked_per_project() {
     let (_dir, host, events) = state();
     let workspace = host.paths.data.clone();
     let canonical = std::fs::canonicalize(&workspace).unwrap();
-    for key in ["run:cargo test", "write:project"] {
-        host.store
-            .save_approval_rule(&ApprovalRule {
-                key: key.into(),
-                label: key.into(),
-                workspace: canonical.clone(),
-                created_at: now_ms(),
-            })
+    let files = SettingsFiles::for_workspace(&canonical);
+    for key in ["Bash(cargo test:*)", "Write(*)"] {
+        files
+            .save_rule(key, PermissionDecision::Allow, false)
             .unwrap();
     }
     let session = Uuid::new_v4();
@@ -1295,7 +1292,7 @@ async fn approval_rules_are_listed_and_revoked_per_project() {
     assert_eq!(rules.len(), 2);
     host.handle(HostCommand::RemoveApprovalRule(
         workspace.clone(),
-        "run:cargo test".into(),
+        rules[0].clone(),
     ))
     .await
     .unwrap();
@@ -1310,9 +1307,9 @@ async fn approval_rules_are_listed_and_revoked_per_project() {
     assert_eq!(
         rules
             .iter()
-            .map(|rule| rule.key.as_str())
+            .map(|rule| rule.pattern.as_str())
             .collect::<Vec<_>>(),
-        vec!["write:project"]
+        vec!["Write(*)"]
     );
     assert!(
         stop.is_cancelled(),
@@ -1560,3 +1557,5 @@ fn host_derived_settings_commit_keeps_live_project_fields() {
     assert_eq!(copy.last_workspace, live.last_workspace);
     assert_eq!(copy.ui.open_projects, live.ui.open_projects);
 }
+
+mod interaction;

@@ -12,6 +12,7 @@ pub(super) const OWNER: &str = "com.qurkos.xylo.installation";
 pub(super) const PROFILE: &str = "com.qurkos.xylo.environment";
 pub(super) const CREATED: &str = "com.qurkos.xylo.create-operation";
 type Sessions = HashMap<(PathBuf, Uuid), ManagedProcess>;
+type ConnectGates = HashMap<(PathBuf, Uuid), std::sync::Arc<Mutex<()>>>;
 fn sessions() -> &'static Mutex<Sessions> {
     static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -19,8 +20,7 @@ fn sessions() -> &'static Mutex<Sessions> {
 /// Per-profile connect serialization. Entries are tiny and bounded by the
 /// number of saved profiles, so they are kept for the process lifetime.
 async fn connect_gate(root: &Path, id: Uuid) -> std::sync::Arc<Mutex<()>> {
-    static GATES: OnceLock<Mutex<HashMap<(PathBuf, Uuid), std::sync::Arc<Mutex<()>>>>> =
-        OnceLock::new();
+    static GATES: OnceLock<Mutex<ConnectGates>> = OnceLock::new();
     GATES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()

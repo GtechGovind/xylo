@@ -360,11 +360,13 @@ impl Xylo {
                                 let new_path = path.clone();
                                 let expanded = !view.sidebar_state.collapsed.contains(&path);
                                 let current = view.workspace.as_ref() == Some(&path);
-                                let label = path
-                                    .file_name()
-                                    .unwrap_or(path.as_os_str())
-                                    .to_string_lossy()
-                                    .into_owned();
+                                let label =
+                                    super::worktrees::branch_label(&path).unwrap_or_else(|| {
+                                        path.file_name()
+                                            .unwrap_or(path.as_os_str())
+                                            .to_string_lossy()
+                                            .into_owned()
+                                    });
                                 let disclosure = Disclosure::new(
                                     ElementId::Name(format!("project-{}", path.display()).into()),
                                     expanded,

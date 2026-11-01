@@ -1,0 +1,173 @@
+{
+  "lowest-64": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 64,
+      "thinkingConfig": {
+        "thinkingBudget": 0,
+        "includeThoughts": true
+      }
+    }
+  },
+  "lowest-512": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 512,
+      "thinkingConfig": {
+        "thinkingBudget": 0,
+        "includeThoughts": true
+      }
+    }
+  },
+  "lowest-513": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 513,
+      "thinkingConfig": {
+        "thinkingBudget": 512,
+        "includeThoughts": true
+      }
+    }
+  },
+  "configured-64": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 64,
+      "thinkingConfig": {
+        "thinkingBudget": 0,
+        "includeThoughts": true
+      }
+    }
+  },
+  "configured-511": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 511,
+      "thinkingConfig": {
+        "thinkingBudget": 0,
+        "includeThoughts": true
+      }
+    }
+  },
+  "configured-512": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 512,
+      "thinkingConfig": {
+        "thinkingBudget": 0,
+        "includeThoughts": true
+      }
+    }
+  },
+  "configured-513": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 513,
+      "thinkingConfig": {
+        "thinkingBudget": 512,
+        "includeThoughts": true
+      }
+    }
+  },
+  "configured-1024": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 1024,
+      "thinkingConfig": {
+        "thinkingBudget": 1023,
+        "includeThoughts": true
+      }
+    }
+  },
+  "configured-1025": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 1025,
+      "thinkingConfig": {
+        "thinkingBudget": 1024,
+        "includeThoughts": true
+      }
+    }
+  }
+}

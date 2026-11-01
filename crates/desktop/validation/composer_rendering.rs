@@ -178,7 +178,6 @@ mod xylo {
             .into_iter()
             .map(|prompt| {
                 let turn = TurnRequest {
-                    approved_rules: Vec::new(),
                     session_id: self.session,
                     turn_id: Uuid::new_v4(),
                     workspace: self.workspace.clone().unwrap(),
@@ -471,10 +470,15 @@ fn render() {
                     window.render_frame(cx);
                     let pending = window.find("composer-pending").bounds();
                     let composer = window.find("image-drop-target").bounds();
+                    let status = window.find("composer-status-line").bounds();
                     assert!(pending.bottom() <= composer.top());
                     assert!(
-                        composer.bottom() >= px(height as f32 - 35.)
-                            && composer.bottom() <= px(height as f32)
+                        composer.bottom() <= status.top(),
+                        "The status row belongs below the composer"
+                    );
+                    assert!(
+                        status.bottom() >= px(height as f32 - 35.)
+                            && status.bottom() <= px(height as f32)
                     );
                     assert_eq!(window.try_find("steer-prompt").is_some(), active);
                     assert_eq!(window.try_find(("send-queued", 0usize)).is_some(), !active);

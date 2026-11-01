@@ -23,9 +23,9 @@
 //
 // Never call process.exit(): setting process.exitCode lets output drain.
 import { spawn } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
+import { appendFileSync, realpathSync, openSync, closeSync, fstatSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const UNAVAILABLE_EXIT = 125;
@@ -33,22 +33,51 @@ const SPAWN_FAILED_EXIT = 127;
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 const singleLine = value => String(value?.message ?? value).replace(/\s+/g, ' ').trim();
 
+// The owning worker holds this pipe for a coding job's lifetime. It is not
+// inherited by the program, so no descendant can keep the worker alive.
+const guardParent = process.env.XYLO_SANDBOX_PARENT_GUARD === '1';
 let manager;
+let ownerWatcher;
 let child;
 let statusFile;
 let unavailableReported = false;
 const reported = new Set();
+
+async function guardOwner() {
+  const watcher = spawn(process.execPath, [fileURLToPath(new URL('./owner-guard.mjs', import.meta.url)), String(process.pid), `${statusFile}.cleanup`], {
+    detached: true, stdio: [process.stdin, 'ignore', 'ignore', 'ipc'], env: { PATH: '/usr/bin:/bin' },
+  });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { watcher.kill(); reject(new Error('Owner watchdog did not become ready')); }, 3000);
+    watcher.once('error', error => { clearTimeout(timer); reject(error); });
+    watcher.once('exit', () => { clearTimeout(timer); reject(new Error('Owner watchdog exited before dispatch')); });
+    watcher.once('message', message => {
+      if (message?.ready !== true) return;
+      clearTimeout(timer);
+      // Keep this IPC handle referenced: this helper is the live group anchor
+      // until the watchdog releases it with its single final group kill.
+      ownerWatcher = watcher;
+      resolve();
+    });
+  });
+}
+
+function finish(code) {
+  process.exitCode = code;
+  if (ownerWatcher?.connected) ownerWatcher.send({ finish: true, code });
+}
 
 function record(entry) {
   if (statusFile) appendFileSync(statusFile, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
 }
 
 async function unavailable(reason) {
+  if (guardParent) process.stdin.destroy();
   if (unavailableReported) return;
   unavailableReported = true;
   record({ kind: 'unavailable', reason: singleLine(reason) });
-  process.exitCode = UNAVAILABLE_EXIT;
   await manager?.reset().catch(() => {});
+  finish(UNAVAILABLE_EXIT);
 }
 
 function networkDecision(unrestricted) {
@@ -90,6 +119,8 @@ try {
   if (typeof spec.status_file === 'string' && spec.status_file) statusFile = spec.status_file;
   const [major, minor] = process.versions.node.split('.').map(Number);
   if (major < 22 || (major === 22 && minor < 12)) throw new Error('Node.js 22.12 or later is required');
+  if (!statusFile) throw new Error('Missing status file');
+  if (guardParent) await guardOwner();
   // Imported here so a missing or broken runtime package is recorded as
   // unavailable instead of an uncaught module error.
   ({ SandboxManager: manager } = await import('@anthropic-ai/sandbox-runtime'));
@@ -97,11 +128,23 @@ try {
   delete process.env.XYLO_SANDBOX_CHILD_ENV;
   if (!childEnvironment || Array.isArray(childEnvironment) || typeof childEnvironment !== 'object') throw new Error('Invalid child environment');
   for (const [name, value] of Object.entries(childEnvironment)) {
-    if (!/^[A-Za-z0-9_]{1,128}$/.test(name) || typeof value !== 'string' || name === 'XYLO_SANDBOX_CHILD_ENV') throw new Error('Reserved child environment variable');
+    if (!/^[A-Za-z0-9_]{1,128}$/.test(name) || typeof value !== 'string' || name.startsWith('XYLO_SANDBOX_')) throw new Error('Reserved child environment variable');
   }
   if (!statusFile) throw new Error('Missing status file');
   const control = dirname(statusFile);
+  const requestedInput = guardParent ? process.env.XYLO_SANDBOX_CHILD_STDIN : undefined;
+  delete process.env.XYLO_SANDBOX_CHILD_STDIN;
   const workspace = realpathSync(spec.workspace);
+  // Only the trusted coding launcher may grant one explicitly reviewed root.
+  // Canonical identity must still match when the helper starts after approval.
+  const requestedCwd = guardParent ? process.env.XYLO_SANDBOX_CWD : undefined;
+  const cwd = requestedCwd ? realpathSync(requestedCwd) : workspace;
+  if (requestedCwd && cwd !== requestedCwd) throw new Error('Reviewed shell working directory changed');
+  const requestedWriteRoot = guardParent ? process.env.XYLO_SANDBOX_WRITE_ROOT : undefined;
+  const writeRoot = requestedWriteRoot ? realpathSync(requestedWriteRoot) : undefined;
+  if (writeRoot && writeRoot !== requestedWriteRoot) throw new Error('Approved outside directory changed');
+  const writable = [workspace, ...(writeRoot ? [writeRoot] : [])];
+  if (!writable.some(root => cwd === root || cwd.startsWith(root.endsWith(sep) ? root : root + sep))) throw new Error('Shell working directory is outside the approved scope');
   if (typeof spec.program !== 'string' || !spec.program) throw new Error('Invalid program');
   if (!Array.isArray(spec.args) || !spec.args.every(a => typeof a === 'string')) throw new Error('Invalid argument array');
   const allowed = [...(spec.read_roots ?? []), ...(spec.toolchain_read_roots ?? [])].map(p => realpathSync(p));
@@ -111,16 +154,26 @@ try {
   const network = spec.network ?? 'none';
   if (network !== 'none' && network !== 'unrestricted') throw new Error('Invalid network policy');
   await manager.initialize({
-    network: { allowedDomains: spec.allowed_domains ?? [], deniedDomains: [] },
+    network: { allowedDomains: spec.allowed_domains ?? [], deniedDomains: [], allowLocalBinding: guardParent && process.env.XYLO_SANDBOX_LOCAL_BINDING === '1' },
     filesystem: {
       denyRead: [homedir(), control, ...(spec.protected_paths ?? [])],
-      allowRead: [workspace, ...allowed, helperDirectory, process.execPath],
-      allowWrite: [workspace, spec.temporary],
-      denyWrite: [join(workspace, '.git'), join(workspace, '.agents'), join(workspace, '.claude'), join(workspace, '.codex'), control, ...allowed, ...(spec.protected_paths ?? []), ...(spec.trusted_paths ?? [])],
+      allowRead: [...writable, ...allowed, helperDirectory, process.execPath],
+      allowWrite: [...writable, spec.temporary],
+      denyWrite: [...writable.flatMap(root => ['.git', '.agents', '.claude', '.codex', '.xylo'].map(name => join(root, name))), control, ...allowed, ...(spec.settings_paths ?? []), ...(spec.protected_paths ?? []), ...(spec.trusted_paths ?? [])],
     },
   }, networkDecision(network === 'unrestricted'));
   const wrapped = await manager.wrapWithSandbox([process.execPath, childEntry, spec.program, ...spec.args].map(quote).join(' '));
-  child = spawn(wrapped, { shell: '/bin/sh', cwd: workspace, stdio: ['inherit', 'inherit', 'inherit', 'pipe'], env: { ...process.env, XYLO_SANDBOX_CHILD_ENV: JSON.stringify({ TMPDIR: spec.temporary, ...codingEnvironment, ...childEnvironment }), TMPDIR: spec.temporary } });
+  let inputFd;
+  try {
+    if (requestedInput) {
+      const canonical = realpathSync(requestedInput);
+      if (canonical !== requestedInput || dirname(canonical) !== realpathSync(control)) throw new Error('Invalid private child input path');
+      inputFd = openSync(canonical, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const info = fstatSync(inputFd);
+      if (!info.isFile() || info.size > 1024 * 1024) throw new Error('Invalid private child input file');
+    }
+    child = spawn(wrapped, { shell: '/bin/sh', cwd, stdio: [inputFd ?? (guardParent ? 'ignore' : 'inherit'), 'inherit', 'inherit', 'pipe'], env: { ...process.env, XYLO_SANDBOX_CHILD_ENV: JSON.stringify({ TMPDIR: spec.temporary, ...codingEnvironment, ...childEnvironment }), TMPDIR: spec.temporary } });
+  } finally { if (inputFd !== undefined) closeSync(inputFd); }
   let failed = false;
   let spawnFailed = false;
   readControl(child.stdio[3], reason => {
@@ -130,10 +183,12 @@ try {
   });
   child.once('error', async error => { failed = true; await unavailable(`could not start the sandbox wrapper: ${singleLine(error)}`); });
   child.once('exit', async (code, signal) => {
+    if (guardParent) process.stdin.destroy();
     await manager.reset();
-    if (!failed) process.exitCode = spawnFailed ? SPAWN_FAILED_EXIT : code ?? (signal ? 130 : 1);
+    if (!failed) finish(spawnFailed ? SPAWN_FAILED_EXIT : code ?? (signal ? 130 : 1));
   });
   for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => child?.kill(signal));
 } catch (error) {
+  if (guardParent) process.stdin.destroy();
   await unavailable(error);
 }

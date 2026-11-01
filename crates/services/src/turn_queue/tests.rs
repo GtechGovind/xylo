@@ -43,7 +43,6 @@ fn turn(submission: &DraftSubmission) -> TurnRequest {
         },
         permissions: PermissionMode::ReadOnly,
         attachments: submission.attachments.clone(),
-        approved_rules: Vec::new(),
     }
 }
 #[test]

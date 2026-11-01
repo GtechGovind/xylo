@@ -1,0 +1,809 @@
+{
+  "Anthropic/claude-sonnet-4-5/low": {
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 1024
+    }
+  },
+  "Anthropic/claude-sonnet-4-5/medium": {
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 8192
+    }
+  },
+  "Anthropic/claude-sonnet-4-5/high": {
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 16384
+    }
+  },
+  "Anthropic/claude-opus-4-5/low": {
+    "model": "claude-opus-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 1024
+    },
+    "output_config": {
+      "effort": "low"
+    }
+  },
+  "Anthropic/claude-opus-4-5/medium": {
+    "model": "claude-opus-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 8192
+    },
+    "output_config": {
+      "effort": "medium"
+    }
+  },
+  "Anthropic/claude-opus-4-5/high": {
+    "model": "claude-opus-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 16384
+    },
+    "output_config": {
+      "effort": "high"
+    }
+  },
+  "Anthropic/claude-sonnet-4-6/low": {
+    "model": "claude-sonnet-4-6",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "adaptive"
+    },
+    "output_config": {
+      "effort": "low"
+    }
+  },
+  "Anthropic/claude-sonnet-4-6/medium": {
+    "model": "claude-sonnet-4-6",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "adaptive"
+    },
+    "output_config": {
+      "effort": "medium"
+    }
+  },
+  "Anthropic/claude-sonnet-4-6/high": {
+    "model": "claude-sonnet-4-6",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "adaptive"
+    },
+    "output_config": {
+      "effort": "high"
+    }
+  },
+  "Anthropic/claude-sonnet-4-6/max": {
+    "model": "claude-sonnet-4-6",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "adaptive"
+    },
+    "output_config": {
+      "effort": "max"
+    }
+  },
+  "Anthropic/claude-opus-4-6/low": {
+    "model": "claude-opus-4-6",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "adaptive"
+    },
+    "output_config": {
+      "effort": "low"
+    }
+  },
+  "Anthropic/claude-opus-4-6/medium": {
+    "model": "claude-opus-4-6",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "adaptive"
+    },
+    "output_config": {
+      "effort": "medium"
+    }
+  },
+  "Anthropic/claude-opus-4-6/high": {
+    "model": "claude-opus-4-6",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "adaptive"
+    },
+    "output_config": {
+      "effort": "high"
+    }
+  },
+  "Anthropic/claude-opus-4-6/max": {
+    "model": "claude-opus-4-6",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 65536,
+    "stream": true,
+    "thinking": {
+      "type": "adaptive"
+    },
+    "output_config": {
+      "effort": "max"
+    }
+  },
+  "Gemini/gemini-2.5-pro/low": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 65536,
+      "thinkingConfig": {
+        "thinkingBudget": 1024,
+        "includeThoughts": true
+      }
+    }
+  },
+  "Gemini/gemini-2.5-pro/medium": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 65536,
+      "thinkingConfig": {
+        "thinkingBudget": 8192,
+        "includeThoughts": true
+      }
+    }
+  },
+  "Gemini/gemini-2.5-pro/high": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 65536,
+      "thinkingConfig": {
+        "thinkingBudget": 16384,
+        "includeThoughts": true
+      }
+    }
+  },
+  "Gemini/gemini-2.5-flash/low": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 65536,
+      "thinkingConfig": {
+        "thinkingBudget": 1024,
+        "includeThoughts": true
+      }
+    }
+  },
+  "Gemini/gemini-2.5-flash/medium": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 65536,
+      "thinkingConfig": {
+        "thinkingBudget": 8192,
+        "includeThoughts": true
+      }
+    }
+  },
+  "Gemini/gemini-2.5-flash/high": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 65536,
+      "thinkingConfig": {
+        "thinkingBudget": 16384,
+        "includeThoughts": true
+      }
+    }
+  },
+  "Gemini/gemini-3-pro-preview/low": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 65536,
+      "thinkingConfig": {
+        "thinkingLevel": "low",
+        "includeThoughts": true
+      }
+    }
+  },
+  "Gemini/gemini-3-pro-preview/high": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 65536,
+      "thinkingConfig": {
+        "thinkingLevel": "high",
+        "includeThoughts": true
+      }
+    }
+  },
+  "Vertex/gemini-3-pro-preview/low": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 65536,
+      "thinkingConfig": {
+        "thinkingLevel": "low",
+        "includeThoughts": true
+      }
+    }
+  },
+  "Vertex/gemini-3-pro-preview/high": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 65536,
+      "thinkingConfig": {
+        "thinkingLevel": "high",
+        "includeThoughts": true
+      }
+    }
+  },
+  "OpenAiChat/gpt-5.2/none": {
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 65536,
+    "reasoning_effort": "none"
+  },
+  "OpenAiChat/gpt-5.2/low": {
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 65536,
+    "reasoning_effort": "low"
+  },
+  "OpenAiChat/gpt-5.2/medium": {
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 65536,
+    "reasoning_effort": "medium"
+  },
+  "OpenAiChat/gpt-5.2/high": {
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 65536,
+    "reasoning_effort": "high"
+  },
+  "OpenAiChat/gpt-5.2/xhigh": {
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 65536,
+    "reasoning_effort": "xhigh"
+  },
+  "OpenAiResponses/gpt-5.2/none": {
+    "model": "gpt-5.2",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "stream": true,
+    "store": false,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "max_output_tokens": 65536,
+    "prompt_cache_key": "xylo-83a4cbc8f9f08d075ac34790c289ef13",
+    "reasoning": {
+      "effort": "none"
+    }
+  },
+  "OpenAiResponses/gpt-5.2/low": {
+    "model": "gpt-5.2",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "stream": true,
+    "store": false,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "max_output_tokens": 65536,
+    "prompt_cache_key": "xylo-83a4cbc8f9f08d075ac34790c289ef13",
+    "reasoning": {
+      "effort": "low"
+    }
+  },
+  "OpenAiResponses/gpt-5.2/medium": {
+    "model": "gpt-5.2",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "stream": true,
+    "store": false,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "max_output_tokens": 65536,
+    "prompt_cache_key": "xylo-83a4cbc8f9f08d075ac34790c289ef13",
+    "reasoning": {
+      "effort": "medium"
+    }
+  },
+  "OpenAiResponses/gpt-5.2/high": {
+    "model": "gpt-5.2",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "stream": true,
+    "store": false,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "max_output_tokens": 65536,
+    "prompt_cache_key": "xylo-83a4cbc8f9f08d075ac34790c289ef13",
+    "reasoning": {
+      "effort": "high"
+    }
+  },
+  "OpenAiResponses/gpt-5.2/xhigh": {
+    "model": "gpt-5.2",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Hello"
+          }
+        ]
+      }
+    ],
+    "stream": true,
+    "store": false,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "max_output_tokens": 65536,
+    "prompt_cache_key": "xylo-83a4cbc8f9f08d075ac34790c289ef13",
+    "reasoning": {
+      "effort": "xhigh"
+    }
+  },
+  "Azure/gpt-5.2/none": {
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 65536,
+    "reasoning_effort": "none"
+  },
+  "Azure/gpt-5.2/low": {
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 65536,
+    "reasoning_effort": "low"
+  },
+  "Azure/gpt-5.2/medium": {
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 65536,
+    "reasoning_effort": "medium"
+  },
+  "Azure/gpt-5.2/high": {
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 65536,
+    "reasoning_effort": "high"
+  },
+  "Azure/gpt-5.2/xhigh": {
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 65536,
+    "reasoning_effort": "xhigh"
+  }
+}

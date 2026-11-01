@@ -1,0 +1,24 @@
+[package]
+name = "xylo-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless Xylo sessions and versioned JSONL stdio protocol"
+
+[dependencies]
+xylo-core.workspace = true
+xylo-runtime.workspace = true
+xylo-engine.workspace = true
+xylo-services.workspace = true
+xylo-evals = { path = "../evals" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+xylo-sdk = { path = "../../sdk/rust" }
+tempfile = "3"

@@ -45,6 +45,7 @@ impl Xylo {
         self.connector_inspected = None;
         self.connector_loading = false;
         self.connector_tools.clear();
+        self.mcp_commands.clear();
         self.plugin_scope_changed(cx);
         self.environment_scope_changed(cx);
     }

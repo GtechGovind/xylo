@@ -210,9 +210,43 @@ pub fn prepare_coding_with_network(
         read_roots,
         protected_paths,
         &[],
-        Some(network),
+        Some(CodingPolicy {
+            network,
+            write_root: None,
+        }),
     )
 }
+
+/// Prepares a coding command with one explicitly approved writable directory.
+/// That directory cannot supply the trusted launcher or its helper programs.
+pub fn prepare_coding_with_scope(
+    program: &str,
+    args: &[String],
+    workspace: &Path,
+    write_root: Option<&Path>,
+    protected_paths: &[PathBuf],
+    network: Network,
+) -> Result<PreparedSandbox> {
+    prepare_internal(
+        program,
+        args,
+        workspace,
+        &[],
+        protected_paths,
+        &[],
+        Some(CodingPolicy {
+            network,
+            write_root,
+        }),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CodingPolicy<'a> {
+    network: Network,
+    write_root: Option<&'a Path>,
+}
+
 fn prepare_internal(
     program: &str,
     args: &[String],
@@ -220,7 +254,7 @@ fn prepare_internal(
     read_roots: &[PathBuf],
     protected_paths: &[PathBuf],
     allowed_domains: &[String],
-    coding: Option<Network>,
+    coding: Option<CodingPolicy<'_>>,
 ) -> Result<PreparedSandbox> {
     ensure!(
         cfg!(any(target_os = "macos", target_os = "linux")),
@@ -229,14 +263,20 @@ fn prepare_internal(
     let workspace = workspace
         .canonicalize()
         .context("Sandbox workspace unavailable")?;
+    let write_root = coding
+        .and_then(|policy| policy.write_root)
+        .map(Path::canonicalize)
+        .transpose()?;
+    let mut launch_exclusions = read_roots.to_vec();
+    launch_exclusions.extend(write_root.iter().cloned());
     let helper = helper_path()?;
     let node = runtime_node()?;
     ensure!(
         !node.starts_with(&workspace)
-            && !read_roots
+            && !launch_exclusions
                 .iter()
                 .any(|root| root.canonicalize().is_ok_and(|root| node.starts_with(root))),
-        "Sandbox launcher must be installed outside the mutable project and plugin packages"
+        "Sandbox launcher must be installed outside the mutable project, approved writable directories and plugin packages"
     );
     // `tmp` is the child's writable TMPDIR; `control` holds the status file
     // and is denied to the child for both reading and writing.
@@ -253,29 +293,44 @@ fn prepare_internal(
     builder.create(&control)?;
     let status_file = control.join("status");
     let (toolchain_read_roots, coding_environment) = match coding {
-        Some(network) => rust_toolchain_scope(
+        Some(policy) => rust_toolchain_scope(
             &child_temporary,
             &workspace,
             protected_paths,
             program,
             args,
-            network,
+            policy.network,
         )?,
         None => (Vec::new(), std::collections::BTreeMap::new()),
     };
-    let network = match coding.unwrap_or_default() {
+    let network = match coding.map(|policy| policy.network).unwrap_or_default() {
         Network::None => "none",
         Network::Unrestricted => "unrestricted",
     };
-    let spec = json!({"program":program,"args":args,"workspace":workspace,"read_roots":read_roots,"protected_paths":protected_paths,"trusted_paths":trusted_paths_with_node(&node)?,"toolchain_read_roots":toolchain_read_roots,"coding_environment":coding_environment,"temporary":child_temporary,"status_file":status_file,"allowed_domains":allowed_domains,"network":network});
+    let settings_paths = crate::settings_files::SettingsFiles::for_workspace(&workspace)
+        .sources()
+        .map(Path::to_owned)
+        .collect::<Vec<_>>();
+    let spec = json!({"settings_paths":settings_paths,"program":program,"args":args,"workspace":workspace,"read_roots":read_roots,"protected_paths":protected_paths,"trusted_paths":trusted_paths_with_node(&node)?,"toolchain_read_roots":toolchain_read_roots,"coding_environment":coding_environment,"temporary":child_temporary,"status_file":status_file,"allowed_domains":allowed_domains,"network":network});
     let mut command = tokio::process::Command::new(&node);
     command
         .arg(helper)
         .arg(serde_json::to_string(&spec)?)
         .current_dir(&workspace)
         .env_clear()
+        .env(
+            "XYLO_SANDBOX_CLEANUP_STATUS",
+            status_file.with_extension("cleanup"),
+        )
         .kill_on_drop(true);
-    let safe_path = launcher_path(std::env::var_os("PATH").as_deref(), &workspace, read_roots)?;
+    if let Some(root) = write_root {
+        command.env("XYLO_SANDBOX_WRITE_ROOT", root);
+    }
+    let safe_path = launcher_path(
+        std::env::var_os("PATH").as_deref(),
+        &workspace,
+        &launch_exclusions,
+    )?;
     let mut directories = vec![
         node.parent()
             .context("Node runtime directory missing")?
@@ -813,6 +868,33 @@ pub fn ensure_writable_target(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Provides bounded JSON input while stdin remains a private parent-lifetime pipe.
+/// The trusted launcher opens the file before the sandbox; the child receives only its descriptor.
+pub fn set_child_input(prepared: &mut PreparedSandbox, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    ensure!(bytes.len() <= 1024 * 1024, "Sandbox input exceeds 1 MiB");
+    let path = prepared
+        .status_file
+        .parent()
+        .context("Sandbox control directory missing")?
+        .join("stdin");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    prepared
+        .command
+        .env("XYLO_SANDBOX_CHILD_STDIN", path)
+        .env("XYLO_SANDBOX_PARENT_GUARD", "1");
+    Ok(())
+}
+
 /// Plugin-controlled environment reaches only the sandboxed child. It must never
 /// influence the trusted Node launcher, runtime import, or policy initialization.
 pub fn set_child_environment(
@@ -833,7 +915,7 @@ pub fn set_child_environment(
             "Invalid child environment variable"
         );
         ensure!(
-            name != "XYLO_SANDBOX_CHILD_ENV",
+            !name.starts_with("XYLO_SANDBOX_"),
             "Reserved child environment variable"
         );
     }
@@ -851,3 +933,56 @@ mod tests;
 
 #[cfg(test)]
 mod coding_scope_tests;
+
+/// Original exit code reported by the trusted helper before the watchdog
+/// releases its group identity anchor. Only accept it after a successful fence;
+/// cancellation/owner loss has no code and must retain the caller's error.
+/// `path` is the private `XYLO_SANDBOX_CLEANUP_STATUS` path, never command output.
+pub fn read_guard_exit_code(path: &std::path::Path) -> Option<i32> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    (value["state"].as_str()? == "done")
+        .then(|| {
+            value["code"]
+                .as_i64()
+                .and_then(|code| i32::try_from(code).ok())
+        })
+        .flatten()
+}
+
+/// No positive proof exists that a spawned helper retired its descendants.
+#[derive(Debug)]
+pub struct CleanupUnknown(pub String);
+impl std::fmt::Display for CleanupUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Owned process cleanup is unconfirmed: {}", self.0)
+    }
+}
+impl std::error::Error for CleanupUnknown {}
+
+/// Waits for the trusted watchdog's fork fence, not merely the helper's exit.
+/// A missing handshake after spawn is not proof that no command was dispatched.
+pub async fn wait_for_guard_cleanup(path: &Path) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let state = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            match state.as_ref().and_then(|value| value["state"].as_str()) {
+                Some("done") => return Ok(()),
+                Some("failed") => {
+                    return Err(CleanupUnknown(
+                        "watchdog reported failure; descendants may remain".into(),
+                    )
+                    .into());
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        CleanupUnknown(
+            "missing or incomplete watchdog acknowledgment; descendants may remain".into(),
+        )
+    })?
+}

@@ -39,8 +39,16 @@ pub use learning::*;
 
 mod extension_receipts;
 
+mod usage;
+pub use usage::*;
+
 mod turn_queue;
 pub use turn_queue::*;
 
 #[cfg(test)]
 mod tests;
+
+pub mod settings_files;
+
+pub mod hooks;
+mod instruction_sources;

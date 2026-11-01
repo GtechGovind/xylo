@@ -18,6 +18,7 @@ pub(super) fn service(broker: &ToolBroker) -> ExtensionService {
             .unwrap_or(&broker.artifacts)
             .join("extensions"),
     )
+    .for_workspace(&broker.discovery_root())
 }
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![
@@ -73,7 +74,13 @@ pub(super) fn execute(
             status.setup.workspace == broker.request.workspace.canonicalize()?,
             "Component is configured for a different workspace; review its setup first"
         );
-        let mut output = broker.runtime.block_on(service.execute_component_bound(
+        let ownership = xylo_runtime::extensions::retain_hook_workspace(
+            &service,
+            package,
+            component,
+            &status.setup.workspace,
+        )?;
+        let result = broker.runtime.block_on(service.execute_component_bound(
             package,
             component,
             operation,
@@ -82,7 +89,11 @@ pub(super) fn execute(
             broker.session.vault().clone(),
             broker.cancel.child_token(),
             &status,
-        ))?;
+        ));
+        if let Some(ownership) = ownership {
+            ownership.release_after(&result)?;
+        }
+        let mut output = result?;
         if let Some(status) = output.get_mut("status").and_then(Value::as_object_mut) {
             status.remove("setup");
         }

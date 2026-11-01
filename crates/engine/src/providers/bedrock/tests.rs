@@ -302,3 +302,34 @@ fn running_out_of_room_finishes_with_length() {
         );
     }
 }
+
+#[test]
+fn bedrock_preserves_image_content_inside_tool_results() {
+    let mut result = Message::tool_result("image-call", "read image");
+    result.images.push(InlineImage {
+        media_type: "image/png".into(),
+        data: "aGVsbG8=".into(),
+    });
+    let body = converse_body(
+        "fixture",
+        &[
+            Message::user("read"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall::new("image-call", "file_read", "{}")],
+            ),
+            result,
+        ],
+        &[],
+        256,
+    )
+    .unwrap();
+    assert_eq!(
+        body["messages"][2]["content"][0]["toolResult"]["toolUseId"],
+        "image-call"
+    );
+    assert_eq!(
+        body["messages"][2]["content"][0]["toolResult"]["content"][1]["image"]["source"]["bytes"],
+        "aGVsbG8="
+    );
+}

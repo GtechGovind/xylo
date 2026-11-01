@@ -3,10 +3,12 @@
 pub mod git;
 mod index;
 mod monitor;
+pub mod output_styles;
 mod paths;
 mod reader;
 mod rules;
 mod search;
+pub mod worktree;
 pub use index::{FileCursor, FileEntry, FileOptions, FilePage};
 pub use search::{SearchCursor, SearchHit, SearchOptions, SearchPage};
 

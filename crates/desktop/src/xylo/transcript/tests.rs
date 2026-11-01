@@ -11,6 +11,7 @@ fn card(name: &str) -> ToolCard {
         result: None,
         presentation: Default::default(),
         approval: false,
+        question_answers: Vec::new(),
         rule: None,
         reason: None,
         parent_id: None,

@@ -3,14 +3,16 @@
 //! Layout comes from [`super::settings_ui`]; see `SETTINGS_DESIGN.md`.
 use super::*;
 use crate::icons::AppIcon;
+use anyhow::Context as _;
 use gpui_kit::TestSupportExt;
+use xylo_runtime::settings_files::{PermissionDecision, PermissionRule};
 
 /// Standing approvals of the open project, as shown on the Permissions page.
 #[derive(Default)]
 pub(super) struct PermissionsUi {
     /// The project whose rules are listed (or being loaded).
     workspace: Option<PathBuf>,
-    rules: Vec<ApprovalRule>,
+    rules: Vec<PermissionRule>,
     loading: bool,
     /// When the current load or revoke was sent, for the slow-wait caption.
     loading_since: Option<std::time::Instant>,
@@ -18,15 +20,6 @@ pub(super) struct PermissionsUi {
 }
 /// The tag next to a trusted connection's name in the Connections list.
 const TRUSTED_TAG: &str = "Trusted";
-fn allowed_since(created_at: i64) -> String {
-    let seconds = now_ms().saturating_sub(created_at).max(0) / 1000;
-    match seconds {
-        0..=59 => "Allowed just now".into(),
-        60..=3599 => format!("Allowed {} min ago", seconds / 60),
-        3600..=86399 => format!("Allowed {} h ago", seconds / 3600),
-        _ => format!("Allowed {} days ago", seconds / 86400),
-    }
-}
 fn secret_storage_label(storage: SecretStorage) -> &'static str {
     match storage {
         SecretStorage::LocalFile => "Local encrypted file",
@@ -216,7 +209,7 @@ impl Xylo {
         }
         cx.notify();
     }
-    fn revoke_approval_rule(&mut self, key: String, cx: &mut Context<Self>) {
+    fn revoke_approval_rule(&mut self, key: PermissionRule, cx: &mut Context<Self>) {
         let Some(workspace) = self.permissions.workspace.clone() else {
             return;
         };
@@ -236,7 +229,7 @@ impl Xylo {
     pub(super) fn approval_rules_received(
         &mut self,
         workspace: PathBuf,
-        result: Result<Vec<ApprovalRule>, String>,
+        result: Result<Vec<PermissionRule>, String>,
         cx: &mut Context<Self>,
     ) {
         if self.permissions.workspace.as_ref() != Some(&workspace) {
@@ -245,8 +238,7 @@ impl Xylo {
         self.permissions.loading = false;
         self.permissions.loading_since = None;
         match result {
-            Ok(mut rules) => {
-                rules.sort_by_key(|rule| std::cmp::Reverse(rule.created_at));
+            Ok(rules) => {
                 self.permissions.rules = rules;
                 self.permissions.error = None;
             }
@@ -325,6 +317,7 @@ impl Xylo {
             return;
         }
         self.connector_pending = None;
+        self.connector_signing_in = false;
         match result {
             Ok(receipt) => {
                 let invalidated = receipt
@@ -340,6 +333,8 @@ impl Xylo {
                         .sort_by(|left, right| left.name.cmp(&right.name));
                 }
                 self.connector_error = None;
+                self.mcp_commands
+                    .retain(|command| Some(command.connector_id) != invalidated);
                 if self.connector_inspected.is_some_and(|id| {
                     Some(id) == invalidated || !self.connectors.iter().any(|config| config.id == id)
                 }) {
@@ -670,6 +665,7 @@ impl Xylo {
                 None,
                 settings_ui::rows([self.response_timeout_row(cx)]),
             ))
+            .child(self.status_command_settings(cx))
             .child(self.about_section(cx))
             .into_any_element()
     }
@@ -734,7 +730,7 @@ impl Xylo {
                         ("permission-setting", index),
                         mode.label(),
                         mode.description(),
-                        self.settings.permissions == mode,
+                        self.current_permission_mode() == mode,
                     )
                     .caution(mode == PermissionMode::FullAccess)
                     .on_choose(move |_, cx| {
@@ -765,9 +761,14 @@ impl Xylo {
             .description("How Xylo's actions are approved. Changes apply from the next action, including in running tasks.")
             .child(settings_ui::section("Approval mode", None, modes))
             .child(settings_ui::section(
-                "Always-allowed actions",
-                Some("Actions you chose “Always allow” for in this project.".into()),
+                "Permission rules",
+                Some("Deny takes priority over ask, then allow. Managed rules cannot be edited.".into()),
                 self.approval_rules_section(cx),
+            ))
+            .child(settings_ui::section(
+                "Worktrees",
+                Some("Isolated checkouts retained by chats. Removal preserves Git branches.".into()),
+                self.worktree_settings(cx),
             ))
             .child(settings_ui::section(
                 "Security",
@@ -783,6 +784,62 @@ impl Xylo {
     }
     fn approval_rules_section(&self, cx: &mut Context<Self>) -> Div {
         let mut section = div().w_full().flex().flex_col().gap(px(10.));
+        let mut destination = div().flex().gap_2();
+        for (project, label) in [(false, "Local settings"), (true, "Shared project settings")] {
+            destination = destination.child(
+                settings_ui::secondary_button(
+                    if project {
+                        "permission-destination-project"
+                    } else {
+                        "permission-destination-local"
+                    },
+                    label,
+                )
+                .disabled(self.settings.permission_rules_project == project)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.settings.permission_rules_project = project;
+                    let settings = view.settings.clone();
+                    view.host_call(cx, |host| host.save_settings(settings));
+                    cx.notify();
+                })),
+            );
+        }
+        section = section.child(destination).child(subtitle(
+            "New rules and Always allow use this destination. Local settings are git-ignored.",
+        ));
+        section = section.child(Input::new(&self.permission_pattern));
+        let mut actions = div().flex().gap_2();
+        for decision in [
+            PermissionDecision::Allow,
+            PermissionDecision::Ask,
+            PermissionDecision::Deny,
+        ] {
+            actions = actions.child(
+                settings_ui::secondary_button(
+                    SharedString::from(format!("permission-add-{}", decision.key())),
+                    format!("Add {} rule", decision.key()),
+                )
+                .disabled(self.workspace.is_none() || self.permissions.loading)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    let Some(workspace) = view.workspace.clone() else {
+                        return;
+                    };
+                    let pattern = view.permission_pattern.read(cx).value().trim().to_owned();
+                    let project = view.settings.permission_rules_project;
+                    view.host_call(cx, |host| {
+                        host.save_permission_rule(workspace, pattern, decision, project)
+                    });
+                    view.permissions.loading = true;
+                    cx.notify();
+                })),
+            );
+        }
+        section = section.child(actions).child(
+            settings_ui::secondary_button("refresh-permission-files", "Reload rules")
+                .disabled(self.permissions.loading)
+                .on_click(cx.listener(|view, _, _, cx| view.refresh_approval_rules(cx))),
+        );
+
         if let Some(error) = &self.permissions.error {
             section = section.child(settings_ui::inline_error(error));
         }
@@ -816,33 +873,36 @@ impl Xylo {
             }
             return section.child(settings_ui::empty_state(
                 AppIcon::Permissions,
-                "Nothing is always allowed",
-                "Choose “Always allow” on an approval to skip asking for that action in this project.",
+                "No permission rules",
+                "Add a rule above, edit a settings file, or choose Always allow on an approval.",
                 None,
             ));
         }
-        let rules = self
-            .permissions
-            .rules
-            .iter()
-            .enumerate()
-            .map(|(index, rule)| {
-                let key = rule.key.clone();
-                settings_ui::list_item(
-                    ("approval-rule", index),
-                    None,
-                    rule.label.clone(),
-                    Some(allowed_since(rule.created_at).into()),
-                )
-                .trailing(
-                    settings_ui::text_button(("revoke-approval-rule", index), "Revoke")
-                        .disabled(self.permissions.loading)
+        let rules =
+            self.permissions
+                .rules
+                .iter()
+                .enumerate()
+                .map(|(index, rule)| {
+                    let key = rule.clone();
+                    settings_ui::list_item(
+                        ("approval-rule", index),
+                        None,
+                        format!("{}: {}", rule.decision.key(), rule.pattern),
+                        Some(rule.source.display().to_string().into()),
+                    )
+                    .trailing(
+                        settings_ui::text_button(
+                            ("revoke-approval-rule", index),
+                            if rule.managed { "Managed" } else { "Remove" },
+                        )
+                        .disabled(self.permissions.loading || rule.managed)
                         .on_click(cx.listener(move |view, _, _, cx| {
                             view.revoke_approval_rule(key.clone(), cx)
                         })),
-                )
-                .into_any_element()
-            });
+                    )
+                    .into_any_element()
+                });
         section.child(settings_ui::list_container(rules))
     }
 
@@ -850,25 +910,29 @@ impl Xylo {
         let busy = self.connector_pending.is_some();
         let transport = settings_ui::segmented(
             "transport",
-            [("stdio", "Local command"), ("http", "Remote server")]
-                .into_iter()
-                .map(|(value, label)| {
-                    let view = cx.entity().downgrade();
-                    settings_ui::SelectOption::new(
-                        label,
-                        self.connector_transport == value,
-                        move |_, cx| {
-                            let _ = view.update(cx, |view, cx| {
-                                if view.connector_pending.is_none() {
-                                    view.connector_transport = value.into();
-                                    cx.notify();
-                                }
-                            });
-                        },
-                    )
-                    .id(SharedString::from(format!("transport-{value}")))
-                })
-                .collect(),
+            [
+                ("stdio", "Local command"),
+                ("http", "Remote server"),
+                ("sse", "Legacy SSE"),
+            ]
+            .into_iter()
+            .map(|(value, label)| {
+                let view = cx.entity().downgrade();
+                settings_ui::SelectOption::new(
+                    label,
+                    self.connector_transport == value,
+                    move |_, cx| {
+                        let _ = view.update(cx, |view, cx| {
+                            if view.connector_pending.is_none() {
+                                view.connector_transport = value.into();
+                                cx.notify();
+                            }
+                        });
+                    },
+                )
+                .id(SharedString::from(format!("transport-{value}")))
+            })
+            .collect(),
         );
         let mut fields = vec![
             settings_ui::field("Type", transport, None).into_any_element(),
@@ -974,12 +1038,12 @@ impl Xylo {
     }
     /// A saved connection; the row opens its edit page.
     fn connection_item(&self, index: usize, connection: &ConnectorConfig) -> settings_ui::ListItem {
-        let kind = if connection.transport == "http" {
+        let kind = if connection.transport != "stdio" {
             "Remote server"
         } else {
             "Local command"
         };
-        let target = if connection.transport == "http" {
+        let target = if connection.transport != "stdio" {
             connection.endpoint.clone()
         } else {
             connection
@@ -1029,6 +1093,22 @@ impl Xylo {
         {
             page = page.child(settings_ui::inline_error(error));
         }
+        if self.connector_signing_in
+            && let Some(request) = self.connector_pending
+        {
+            page = page.child(
+                settings_ui::text_button("connector-cancel-sign-in", "Cancel sign-in").on_click(
+                    cx.listener(move |view, _, _, cx| {
+                        if let Some(host) = &view.host
+                            && let Err(error) = host.cancel_capability(request)
+                        {
+                            view.connector_error = Some(error.to_string());
+                        }
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
         let list = if self.connectors.is_empty() {
             settings_ui::empty_state(
                 AppIcon::Connectors,
@@ -1040,17 +1120,48 @@ impl Xylo {
             settings_ui::list_container(self.connectors.iter().enumerate().map(
                 |(index, connection)| {
                     let id = connection.id;
+                    let mut actions = div().flex().gap_2();
+                    if connection.transport != "stdio" {
+                        actions = actions.child(
+                            settings_ui::text_button(("connector-sign-in", index), "Sign in")
+                                .disabled(busy)
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    let request = Uuid::new_v4();
+                                    match view
+                                        .host
+                                        .as_ref()
+                                        .context("Application service unavailable")
+                                        .and_then(|host| host.connector_sign_in(request, id, None))
+                                    {
+                                        Ok(()) => {
+                                            view.connector_pending = Some(request);
+                                            view.connector_signing_in = true;
+                                            view.connector_pending_save = false;
+                                            view.connector_error = None;
+                                        }
+                                        Err(error) => {
+                                            view.connector_error = Some(error.to_string())
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                        );
+                    }
                     self.connection_item(index, connection)
                         .trailing(
-                            settings_ui::busy(
-                                settings_ui::text_button(
-                                    ("connector-tools", index),
-                                    "Inspect tools",
+                            actions.child(
+                                settings_ui::busy(
+                                    settings_ui::text_button(
+                                        ("connector-tools", index),
+                                        "Inspect tools",
+                                    ),
+                                    self.connector_loading && self.connector_inspected == Some(id),
+                                )
+                                .on_click(
+                                    cx.listener(move |view, _, _, cx| {
+                                        view.inspect_connector(id, cx)
+                                    }),
                                 ),
-                                self.connector_loading && self.connector_inspected == Some(id),
-                            )
-                            .on_click(
-                                cx.listener(move |view, _, _, cx| view.inspect_connector(id, cx)),
                             ),
                         )
                         .on_click(cx.listener(move |view, _, window, cx| {
@@ -1069,7 +1180,31 @@ impl Xylo {
         if let Some(inspection) = self.connector_inspection_section(cx) {
             page = page.child(inspection);
         }
-        page.into_any_element()
+        if !self.mcp_commands.is_empty() {
+            page = page.child(settings_ui::section(
+                "MCP commands",
+                Some("Choose a prompt to put its command in the chat composer.".into()),
+                settings_ui::list_container(self.mcp_commands.iter().enumerate().map(
+                    |(index, command)| {
+                        let command = command.command.clone();
+                        settings_ui::list_item(("mcp-command", index), None, command.clone(), None)
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                if view.composer.read(cx).value().is_empty() {
+                                    view.composer.update(cx, |input, cx| {
+                                        input.set_value(command.clone(), window, cx);
+                                        input.focus(window, cx);
+                                    });
+                                    view.draft_changed(cx);
+                                    view.navigate(Page::Chat, cx);
+                                }
+                            }))
+                            .into_any_element()
+                    },
+                )),
+            ));
+        }
+        page.child(self.web_search_settings_section(cx))
+            .into_any_element()
     }
     fn connection_form_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let editing = self.connector_editing.and_then(|id| {

@@ -387,7 +387,9 @@ async fn http_fixture(
 }
 
 /// Reads one HTTP/1.1 request with a `Content-Length` body.
-async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
+pub(super) async fn read_http_request(
+    socket: &mut tokio::net::TcpStream,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut buffer = Vec::new();
     let header_end = loop {
         if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -486,4 +488,40 @@ fn sse_parser_joins_data_and_handles_split_crlf() {
     assert_eq!(event.retry, Some(5));
     // Unterminated events are never emitted.
     assert!(parser.ready.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_mcp_lifetime_is_visible_until_disconnect_and_busy_state_is_conservative() {
+    let fixture = fixture(SERVE_LOOP);
+    let before = fixture.broker.may_have_local_processes();
+    fixture
+        .broker
+        .call(
+            &fixture.config,
+            "echo",
+            json!({}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let running = fixture.broker.may_have_local_processes();
+    let slot = fixture
+        .broker
+        .pool
+        .sessions
+        .lock()
+        .await
+        .get(&fixture.config.id)
+        .unwrap()
+        .clone();
+    let guard = slot.lock().await;
+    let busy = fixture.broker.may_have_local_processes();
+    drop(guard);
+    fixture.broker.disconnect(fixture.config.id).await.unwrap();
+    let closed = fixture.broker.may_have_local_processes();
+    assert!(
+        !before && running && busy && !closed,
+        "before={before}, running={running}, busy={busy}, closed={closed}"
+    );
 }

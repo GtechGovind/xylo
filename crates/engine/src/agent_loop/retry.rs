@@ -23,6 +23,18 @@ pub(crate) fn delay(error: &ModelError, attempt: u32) -> Option<Duration> {
     }
 }
 
+/// The explanatory application note for a chosen fallback model.
+pub(crate) fn fallback_note(model: &str) -> String {
+    format!(
+        "The primary model is unavailable after retries. Continue this turn using the configured fallback model {model}."
+    )
+}
+
+/// Only explicit service unavailability permits a configured fallback.
+pub(crate) fn permits_fallback(error: &ModelError) -> bool {
+    matches!(error, ModelError::Unavailable { .. })
+}
+
 /// Exponential backoff with ±25 % jitter, so parallel clients spread out.
 fn backoff(attempt: u32) -> Duration {
     let base = BASE_DELAY

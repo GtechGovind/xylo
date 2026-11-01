@@ -1,6 +1,7 @@
 //! Portable extension packages. Discovery never executes package code.
 //! Installed resources are immutable snapshots; readiness is per component.
 mod catalog;
+mod discovery;
 mod manifest;
 mod sources;
 pub use catalog::*;

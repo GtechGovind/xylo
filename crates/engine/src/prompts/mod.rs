@@ -20,6 +20,7 @@
 
 mod environment;
 mod instructions;
+pub(crate) mod output_styles;
 mod render;
 mod skills;
 
@@ -28,7 +29,9 @@ use std::path::Path;
 use xylo_core::{MemoryOrigin, PermissionMode};
 
 pub use environment::{GitInfo, utc_date};
+#[cfg(test)]
 pub use instructions::project_instructions;
+pub use instructions::{ScopedInstructions, project_instruction_sources};
 pub use skills::{BundledSkill, bundled_skill, bundled_skills, skills_index};
 
 const SYSTEM: &str = include_str!("../../prompts/system.md");
@@ -131,6 +134,8 @@ pub struct PromptContext<'a> {
     pub permission_mode: PermissionMode,
     /// Output of [`project_instructions`]; empty when there are none.
     pub project_instructions: String,
+    /// Canonical contributing files, recorded before showing instructions to a model.
+    pub instruction_sources: Vec<std::path::PathBuf>,
     /// Output of [`skills_index`]; empty when no skills are available. Set
     /// it with [`PromptContext::set_skills_index`].
     pub skills_index: String,
@@ -168,16 +173,16 @@ impl<'a> PromptContext<'a> {
         budget: PromptBudget,
     ) -> Self {
         let mut omitted = Vec::new();
-        let project_instructions = if budget.compact {
-            let whole = project_instructions(workspace, instructions::INSTRUCTION_BYTES);
-            if whole.len() <= budget.instruction_bytes {
+        let (project_instructions, instruction_sources) = if budget.compact {
+            let whole = project_instruction_sources(workspace, instructions::INSTRUCTION_BYTES);
+            if whole.0.len() <= budget.instruction_bytes {
                 whole
             } else {
                 omitted.push(Omitted::ProjectInstructions);
-                String::new()
+                Default::default()
             }
         } else {
-            project_instructions(workspace, budget.instruction_bytes)
+            project_instruction_sources(workspace, budget.instruction_bytes)
         };
         PromptContext {
             workspace,
@@ -188,6 +193,7 @@ impl<'a> PromptContext<'a> {
             date: utc_date(now_ms),
             permission_mode,
             project_instructions,
+            instruction_sources,
             skills_index: String::new(),
             compact: budget.compact,
             skills_index_bytes: budget.skills_index_bytes,
@@ -332,6 +338,7 @@ fn permission_policy(mode: PermissionMode) -> &'static str {
         PermissionMode::ApproveForMe => PERMISSION_APPROVE_FOR_ME,
         PermissionMode::FullAccess => PERMISSION_FULL_ACCESS,
         PermissionMode::ReadOnly => PERMISSION_READ_ONLY,
+        PermissionMode::Plan => include_str!("../../prompts/permissions/plan.md"),
     };
     text.trim_end()
 }
