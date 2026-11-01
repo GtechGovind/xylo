@@ -40,7 +40,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake pkg-config clang libclang-dev libasound2-dev libudev-dev libgtk-3-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxrandr-dev libxi-dev libxtst-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev libssl-dev libsecret-1-dev libpipewire-0.3-dev libgbm-dev libfontconfig1-dev libfreetype6-dev bubblewrap socat
+          sudo apt-get install -y build-essential cmake pkg-config clang libclang-dev libasound2-dev libudev-dev libgtk-3-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxrandr-dev libxi-dev libxtst-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev libssl-dev libsecret-1-dev libpipewire-0.3-dev libgbm-dev libfontconfig1-dev libfreetype6-dev bubblewrap socat ripgrep
       - name: Pinned Rust toolchain
         run: rustup show active-toolchain
       - name: Rust build cache
@@ -55,6 +55,12 @@ jobs:
           restore-keys: ci-${{ runner.os }}-${{ runner.arch }}-
       - name: Sandboxed command dependencies
         run: npm ci --prefix crates/services/sandbox-helper --ignore-scripts --no-audit --no-fund
+      - name: Verify sandbox dependencies
+        working-directory: crates/services/sandbox-helper
+        run: >-
+          node --input-type=module -e "import { SandboxManager } from '@anthropic-ai/sandbox-runtime';
+          const result = await SandboxManager.checkDependenciesAsync();
+          if (result.errors.length) throw new Error(result.errors.join('; '));"
       - name: Release signing policy tests
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
       - name: Formatting

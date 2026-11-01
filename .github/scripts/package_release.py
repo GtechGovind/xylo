@@ -33,6 +33,29 @@ def security(arguments, *, check=True):
     return result
 
 
+def linux_dependencies(config):
+    """Use Debian's ABI metadata instead of guessing shared-library versions."""
+    binaries = [str((Path(config["binariesDir"]) / binary["path"]).resolve())
+        for binary in config["binaries"]]
+    with tempfile.TemporaryDirectory(prefix="xylo-dependencies-") as temporary:
+        debian = Path(temporary) / "debian"
+        debian.mkdir()
+        (debian / "control").write_text(
+            "Source: xylo\n\nPackage: xylo\nArchitecture: any\nDescription: Xylo desktop workspace\n")
+        result = subprocess.run(["dpkg-shlibdeps", "-O", *[f"-e{path}" for path in binaries]],
+            cwd=temporary, text=True, capture_output=True, check=True)
+    dependencies = next((line.removeprefix("shlibs:Depends=").split(", ")
+        for line in result.stdout.splitlines() if line.startswith("shlibs:Depends=")), [])
+    if not dependencies or not all(dependencies):
+        raise ValueError("Could not determine Linux runtime dependencies")
+    # Graphics backends load these libraries dynamically; shlibdeps cannot see
+    # them. Executable tools also require bubblewrap and socat on Linux.
+    dependencies.extend(["libvulkan1", "libegl1", "libwayland-client0", "bubblewrap", "socat", "ripgrep"])
+    dependencies.extend(config.get("deb", {}).get("depends", []))
+    config.setdefault("deb", {})["depends"] = sorted(set(dependencies))
+    print("Linux runtime dependencies: " + ", ".join(config["deb"]["depends"]), flush=True)
+
+
 def run():
     manifest = Path("packager.json")
     config, apple, minisign = configure(json.loads(manifest.read_text()), os.environ, platform.system())
@@ -47,6 +70,8 @@ def run():
     for binary in config["binaries"]:
         if not (binary_directory / (binary["path"] + suffix)).is_file():
             raise SystemExit("A binary from packager.json is missing")
+    if platform.system() == "Linux":
+        linux_dependencies(config)
     environment = dict(os.environ)
     # Upstream trace instrumentation includes signing arguments; keep secrets out of logs.
     environment["RUST_LOG"] = "info"
@@ -97,7 +122,12 @@ def run():
         # Keep the generated config beside the source manifest so all resource paths resolve.
         generated = Path("packager.ci.json")
         try:
-            generated.write_text(json.dumps(config))
+            native_config = dict(config)
+            if platform.system() == "Linux":
+                # Debian's '~' sorts previews before the stable version. Keep
+                # the app's SemVer in the signed download names and receipt.
+                native_config["version"] = config["version"].replace("-", "~", 1)
+            generated.write_text(json.dumps(native_config))
             subprocess.run(["cargo", "packager", "--config", str(generated), "--formats", environment["PACKAGE_FORMATS"]], env=environment, check=True)
             collect_assets(config, environment, apple)
         finally:

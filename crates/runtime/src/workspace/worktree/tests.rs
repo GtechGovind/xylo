@@ -117,6 +117,22 @@ fn repo() -> tempfile::TempDir {
     git(dir.path(), &["commit", "-m", "base"]);
     dir
 }
+
+#[cfg(unix)]
+#[test]
+fn completed_operation_releases_lock_even_with_an_inherited_descriptor() {
+    let repo = repo();
+    let operation = lock(repo.path()).unwrap();
+    // dup and fork share the same open-file description and flock ownership.
+    let inherited = operation.0.try_clone().unwrap();
+    assert!(lock(repo.path()).is_err());
+    drop(operation);
+    let next = lock(repo.path()).expect("Completed operation must release its lock");
+    assert!(lock(repo.path()).is_err());
+    drop(next);
+    drop(inherited);
+}
+
 #[tokio::test]
 async fn lifecycle_preserves_main_and_refuses_dirty_or_unpushed() {
     let repo = repo();

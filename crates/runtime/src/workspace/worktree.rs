@@ -138,7 +138,17 @@ pub fn inspect(path: &Path) -> Result<Worktree> {
     );
     Ok(tree)
 }
-fn lock(repo: &Path) -> Result<std::fs::File> {
+struct OperationLock(std::fs::File);
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        // Closing alone can leave a Unix flock held by a descriptor inherited
+        // during another thread's fork. End the operation's lock explicitly.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+fn lock(repo: &Path) -> Result<OperationLock> {
     let path = repo.join(".git/xylo-worktrees.lock");
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
         ensure!(
@@ -153,7 +163,7 @@ fn lock(repo: &Path) -> Result<std::fs::File> {
         .write(true)
         .open(path)?;
     fs2::FileExt::try_lock_exclusive(&file).context("Another worktree operation is running")?;
-    Ok(file)
+    Ok(OperationLock(file))
 }
 
 /// Host inspection cannot yet prove that a local server's descendants exited.

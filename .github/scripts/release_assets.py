@@ -6,6 +6,7 @@ import platform
 import shutil
 import subprocess
 import tarfile
+import tempfile
 
 
 def sha256(path):
@@ -19,6 +20,37 @@ def sha256(path):
 def platform_name(system, machine):
     return {"Darwin": "macos", "Windows": "windows", "Linux": "linux"}[system], {
         "arm64": "arm64", "aarch64": "arm64", "amd64": "x64", "x86_64": "x64"}[machine.lower()]
+
+
+def verify_linux_packages(downloads, version):
+    """Check installed files and the loader, not just the package container."""
+    deb = next(path for path in downloads if path.suffix == ".deb")
+    native_version = subprocess.check_output(["dpkg-deb", "--field", str(deb), "Version"], text=True).strip()
+    if native_version != version.replace("-", "~", 1):
+        raise ValueError("Linux package has incorrect release-candidate version ordering")
+    dependencies = subprocess.check_output(["dpkg-deb", "--field", str(deb), "Depends"], text=True)
+    for name in ("libc6", "bubblewrap", "socat", "ripgrep", "libvulkan1"):
+        if name not in dependencies:
+            raise ValueError(f"Linux package is missing its {name} dependency")
+    appimage = next(path for path in downloads if path.suffix == ".AppImage")
+    with tempfile.TemporaryDirectory(prefix="xylo-package-check-") as temporary:
+        root = Path(temporary)
+        subprocess.run(["dpkg-deb", "--extract", str(deb), str(root / "deb")], check=True)
+        appimage.chmod(appimage.stat().st_mode | 0o111)
+        subprocess.run([str(appimage.resolve()), "--appimage-extract"], cwd=root,
+            check=True, stdout=subprocess.DEVNULL)
+        for installed in (root / "deb", root / "squashfs-root"):
+            for binary in ("xylo", "xylo-worker", "xylo-helper", "xylo-cli"):
+                executable = installed / "usr/bin" / binary
+                if not executable.is_file() or not executable.stat().st_mode & 0o111:
+                    raise ValueError(f"Linux package is missing executable {binary}")
+            helper = installed / "usr/lib/xylo/sandbox-helper"
+            if not (helper / "run.mjs").is_file() or not (helper / "node_modules").is_dir():
+                raise ValueError("Linux package is missing sandbox helper dependencies")
+            reported = subprocess.check_output([str(installed / "usr/bin/xylo-cli"), "--version"], text=True)
+            if f"xylo-cli {version} " not in reported:
+                raise ValueError("Linux package reports the wrong application version")
+    print("Verified Linux installed files, runtime dependencies and CLI startup", flush=True)
 
 
 def collect_assets(config, environment, apple):
@@ -40,6 +72,8 @@ def collect_assets(config, environment, apple):
         output = destination / (prefix + extension)
         shutil.copy2(matches[0], output)
         downloads.append(output)
+    if system == "Linux":
+        verify_linux_packages(downloads, version)
     if system == "Darwin":
         apps = list(packages.rglob("*.app"))
         if len(apps) != 1:
