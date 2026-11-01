@@ -612,3 +612,35 @@ fn memory_writes_after_untrusted_input_are_reviewed_without_standing_rules() {
     assert!(approval_rule_for(&call(false)).is_some());
     assert_eq!(approval_rule_for(&call(true)), None);
 }
+
+#[test]
+fn local_listening_always_asks_even_for_a_routine_download() {
+    let args = json!({"command":"cargo fetch", "network":true,"allow_local_binding":true,"justification":"Run a local server"});
+    let call = Call {
+        name: "shell_command",
+        arguments: &args,
+        writes: true,
+        origin: Origin::Model,
+        reach: &Reach::Project,
+        workspace: Path::new("/tmp"),
+        network: Some("Run a local server"),
+        untrusted_input: false,
+    };
+    assert!(matches!(
+        decide(PermissionMode::ApproveForMe, &call),
+        Verdict::Ask(_)
+    ));
+    assert!(matches!(
+        decide(PermissionMode::AskForApproval, &call),
+        Verdict::Ask(_)
+    ));
+    assert!(matches!(
+        decide(PermissionMode::ReadOnly, &call),
+        Verdict::Refuse(_)
+    ));
+    assert_eq!(decide(PermissionMode::FullAccess, &call), Verdict::Allow);
+    assert!(
+        approval_rule_for(&call).is_none(),
+        "An ordinary remembered network rule must not authorize local access"
+    );
+}

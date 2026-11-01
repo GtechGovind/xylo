@@ -150,3 +150,49 @@ async fn cancellation_terminates_child() {
     .await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn guarded_sandbox_kills_descendants_when_its_owner_pipe_closes() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let prepared = xylo_services::sandbox::prepare_coding(
+        "/bin/sh",
+        &["-c".into(), "echo ready; sleep 300".into()],
+        dir.path(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    let xylo_services::sandbox::PreparedSandbox {
+        mut command,
+        temporary,
+        ..
+    } = prepared;
+    command
+        .env("XYLO_SANDBOX_PARENT_GUARD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn().unwrap();
+    let owner = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(20), output.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(line.trim(), "ready");
+    drop(owner);
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!status.success());
+    let mut remaining = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), output.read_to_end(&mut remaining))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(temporary);
+}

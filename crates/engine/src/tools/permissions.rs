@@ -19,7 +19,7 @@
 //!   project, every connector call, the desktop, network access and every
 //!   writing tool except the [`PROJECT_WRITES`] (file edits, memory and skill
 //!   proposals). Risky in-process edits therefore ask in both presets.
-//! - **Full access** asks for nothing; commands run without the sandbox.
+//! - **Full access** asks for nothing; coding commands retain their sandbox.
 //! - **Read only** refuses every write (network access included) and treats
 //!   reads like "Ask for approval".
 //!
@@ -100,6 +100,7 @@ pub struct ToolSession {
     permissions: PermissionCell,
     vault: CredentialVault,
     connectors: Arc<OnceLock<ConnectorBroker>>,
+    pub(super) shell_jobs: super::shell_jobs::ShellJobs,
 }
 
 impl ToolSession {
@@ -111,7 +112,18 @@ impl ToolSession {
             permissions,
             vault,
             connectors: Arc::default(),
+            shell_jobs: super::shell_jobs::ShellJobs::default(),
         }
+    }
+
+    /// Delivers shell updates beyond a single model turn.
+    pub fn set_job_events(&self, events: super::shell_jobs::JobEvents) {
+        self.shell_jobs.set_events(events);
+    }
+
+    /// Stops a job only when it belongs to this conversation.
+    pub fn kill_job(&self, session: Uuid, job: Uuid) -> Result<()> {
+        self.shell_jobs.kill(session, job)
     }
 
     /// Where approval decisions are delivered.
@@ -139,6 +151,7 @@ impl ToolSession {
 
     /// Closes every MCP connection; call when the worker exits.
     pub async fn shutdown(&self) {
+        self.shell_jobs.shutdown().await;
         if let Some(connectors) = self.connectors.get() {
             connectors.shutdown().await;
         }
@@ -329,6 +342,17 @@ fn network(mode: PermissionMode, call: &Call, justification: &str) -> Verdict {
             "{} requires write permission; this task is read-only",
             call.name
         )),
+        PermissionMode::AskForApproval | PermissionMode::ApproveForMe
+            if call
+                .arguments
+                .get("allow_local_binding")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            Verdict::Ask(format!(
+                "Local listening and localhost access: {justification}"
+            ))
+        }
         PermissionMode::AskForApproval => Verdict::Ask(format!("Network access: {justification}")),
         PermissionMode::ApproveForMe => {
             match risk::routine_fetch(call.name, call.arguments, call.workspace) {
@@ -355,6 +379,7 @@ const SANDBOXED_COMMANDS: &[&str] = &["run_command", "shell_command"];
 /// assessment flags them, as "Approve for me" does: no sandbox sees them, so
 /// an edit to `.envrc`, a CI workflow or `.cargo/config.toml` asks.
 const PROJECT_WRITES: &[&str] = &[
+    "shell_kill",
     "file_write",
     "file_edit",
     "memory_remember",
@@ -416,6 +441,14 @@ const RULE_LABEL_CHARS: usize = 160;
 /// The "always allow" rule for `call`, if one may cover it. A memory write
 /// after untrusted input has none: each one is reviewed.
 pub(crate) fn approval_rule_for(call: &Call) -> Option<(String, String)> {
+    if call
+        .arguments
+        .get("allow_local_binding")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return None;
+    }
     if call.name == "memory_remember" && call.untrusted_input {
         return None;
     }

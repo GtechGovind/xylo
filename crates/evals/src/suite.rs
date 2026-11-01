@@ -26,6 +26,7 @@ use xylo_engine::{FinishReason, ToolCall};
 pub fn builtin() -> Vec<Task> {
     vec![
         tool_loop(),
+        shell_working_directory(),
         length_continuation(),
         truncated_call(),
         empty_answer(),
@@ -689,3 +690,37 @@ fn memory_from_tool_output() -> Task {
 
 #[cfg(test)]
 mod tests;
+
+/// Shell working-directory state survives separate model calls and argv execution.
+fn shell_working_directory() -> Task {
+    let mut task = task(
+        "shell-working-directory",
+        "Keep shell cwd between tool calls",
+        "Enter sub and write a proof file there using the shell.",
+        |trial| {
+            vec![
+                completed(trial),
+                Check::expect(
+                    "persistent_cwd",
+                    trial.file("sub/proof.txt").as_deref() == Some("persisted"),
+                    "The second shell must write inside sub",
+                ),
+            ]
+        },
+    );
+    task.files = vec![("sub/README.md", "Working directory fixture".into())];
+    task.script = Script::replies([
+        ModelReply::calls(1, [("shell_command", json!({"command":"cd sub"}))]),
+        ModelReply::calls(2, [("run_command", json!({"program":"pwd","args":[]}))]),
+        ModelReply::calls(
+            3,
+            [(
+                "shell_command",
+                json!({"command":"printf persisted > proof.txt"}),
+            )],
+        ),
+        ModelReply::calls(4, [("shell_jobs", json!({}))]),
+        ModelReply::text("Created sub/proof.txt from the persistent shell directory."),
+    ]);
+    task
+}

@@ -4,7 +4,6 @@ use xylo_core::PermissionMode;
 
 const PROJECT: Access = Access {
     outside: false,
-    sandboxed: true,
     network: false,
 };
 

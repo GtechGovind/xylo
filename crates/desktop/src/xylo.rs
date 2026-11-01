@@ -81,6 +81,7 @@ mod quit;
 mod settings;
 #[path = "xylo/settings_ui.rs"]
 mod settings_ui;
+mod shell_jobs;
 #[path = "xylo/work_panel.rs"]
 mod work_panel;
 use native_tools::NativeUi;

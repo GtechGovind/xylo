@@ -14,7 +14,8 @@ pub(super) fn tool_icon(name: &str) -> AppIcon {
     match name {
         "file_read" | "read_file" | "extension_resource" => AppIcon::ToolRead,
         "file_write" | "file_edit" | "write_file" | "edit_file" => AppIcon::ToolEdit,
-        "run_command" | "shell_command" | "terminal" => AppIcon::Terminal,
+        "run_command" | "shell_command" | "shell_output" | "shell_kill" | "shell_jobs"
+        | "terminal" => AppIcon::Terminal,
         "search_project" | "grep" | "glob" | "find" => AppIcon::Search,
         "files_list" | "find_files" => AppIcon::Folder,
         "git_status" | "git_diff" | "git_log" | "git_commit" => AppIcon::Branch,

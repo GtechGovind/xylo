@@ -311,7 +311,7 @@ impl Xylo {
         cx: &mut Context<Self>,
     ) {
         self.log(match &event {
-            EngineEvent::Delta { .. } => String::new(),
+            EngineEvent::Delta { .. } | EngineEvent::ShellJobUpdated { .. } => String::new(),
             EngineEvent::ToolStarted { name, .. } => format!("Tool started: {name}"),
             EngineEvent::ToolFinished { name, success, .. } => {
                 format!("Tool finished: {name}, success={success}")

@@ -23,6 +23,7 @@ pub(crate) mod lookup;
 mod permissions;
 mod portable;
 mod risk;
+pub mod shell_jobs;
 use crate::{prompts, provider_guard::EffectiveWindow};
 use anyhow::{Context, Result, bail, ensure};
 pub(crate) use code::shell_name;
@@ -195,6 +196,10 @@ impl ToolBroker {
         cancel: CancellationToken,
     ) -> Result<Self> {
         let artifacts = config.artifacts.clone();
+        if let Some(data) = artifacts.parent() {
+            session.shell_jobs.configure(request.session_id, data);
+        }
+        session.shell_jobs.turn_events(request.session_id, &events);
         let capabilities = CapabilityService::new(config.clone())?;
         let image_generation = image_generation::Configuration::load(&artifacts);
         let mut definitions = builtin::definitions();
@@ -313,6 +318,10 @@ impl ToolBroker {
     }
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    pub(crate) fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
+        self.session.shell_jobs.take_notes(self.request.session_id)
     }
 
     pub fn definitions(&self) -> &[ToolDefinition] {
@@ -606,13 +615,24 @@ impl ToolBroker {
         let exposure = (name == "memory_remember")
             .then(|| self.exposure())
             .transpose()?;
+        let permission_workspace = if matches!(name, "shell_command" | "run_command") {
+            self.session.shell_jobs.cwd(
+                self.request.session_id,
+                &self.request.workspace,
+                self.artifacts
+                    .parent()
+                    .context("Application data directory missing")?,
+            )?
+        } else {
+            self.request.workspace.clone()
+        };
         let call = Call {
             name,
             arguments: &arguments,
             writes: definition.writes,
             origin,
             reach: &reach,
-            workspace: &self.request.workspace,
+            workspace: &permission_workspace,
             network,
             untrusted_input: exposure.is_some_and(MemoryOrigin::untrusted),
         };
@@ -639,7 +659,6 @@ impl ToolBroker {
         }
         let access = builtin::Access {
             outside: matches!(reach, Reach::Outside(_)),
-            sandboxed: mode.sandboxed(),
             network: network.is_some(),
         };
         let component_snapshot = if name == "extension_component" && definition.writes {
@@ -806,7 +825,11 @@ impl ToolBroker {
             } else if let Some(memory_origin) = memory_origin {
                 builtin::remember(self, &arguments, memory_origin)?
             } else if builtin::handles(name) {
-                builtin::execute(self, name, &arguments, access)?
+                match name {
+                    "shell_command" | "run_command" | "shell_output" | "shell_kill"
+                    | "shell_jobs" => shell_jobs::execute(self, name, &arguments, access)?,
+                    _ => builtin::execute(self, name, &arguments, access)?,
+                }
             } else {
                 let operation = async {
                     let _reservation = if let Some(demand) = xylo_resources::capability_demand(name)

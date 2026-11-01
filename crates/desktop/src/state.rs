@@ -155,6 +155,8 @@ pub struct TurnState {
     pub subagents: Vec<Subagent>,
     /// Helpers of earlier turns in this chat, newest last, for the Subagents panel.
     pub earlier_subagents: Vec<Subagent>,
+    /// Shell jobs survive the turn that started them.
+    pub shell_jobs: Vec<xylo_core::ShellJob>,
     /// The latest engine status note.
     pub status: Option<String>,
     /// `None` while running or before the first turn.
@@ -351,6 +353,17 @@ impl TurnState {
             | EngineEvent::TitleUpdated { .. }
             | EngineEvent::Steering { .. }
             | EngineEvent::ProviderCredentialRequested { .. } => return,
+            EngineEvent::ShellJobUpdated { job } => {
+                if let Some(current) = self
+                    .shell_jobs
+                    .iter_mut()
+                    .find(|current| current.id == job.id)
+                {
+                    *current = job;
+                } else {
+                    self.shell_jobs.push(job);
+                }
+            }
             EngineEvent::Started => {
                 // Admission may already have opened this turn with `Preparing`.
                 if !(self.running && self.segments.is_empty() && self.tools.is_empty()) {

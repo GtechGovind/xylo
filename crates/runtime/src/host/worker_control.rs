@@ -122,6 +122,7 @@ pub(super) struct WorkerHandle {
     pub(super) approvals: Arc<parking_lot::Mutex<HashMap<Uuid, PendingApproval>>>,
     controls: Arc<parking_lot::Mutex<VecDeque<(Uuid, Control)>>>,
     pub(super) last_used: Arc<parking_lot::Mutex<Instant>>,
+    running_jobs: Arc<parking_lot::Mutex<std::collections::HashSet<Uuid>>>,
     /// Permission mode last sent to the worker, after [`effective_mode`].
     pub(super) mode: Arc<parking_lot::Mutex<PermissionMode>>,
     /// Set when the host killed the process because it ignored Stop.
@@ -154,6 +155,7 @@ impl WorkerHandle {
             approvals: Arc::default(),
             controls: Arc::default(),
             last_used: Arc::new(parking_lot::Mutex::new(Instant::now())),
+            running_jobs: Arc::default(),
             mode: Arc::default(),
             forced_stop: Arc::default(),
             stop_sent: Arc::default(),
@@ -167,7 +169,7 @@ impl WorkerHandle {
     }
 
     fn idle(&self) -> bool {
-        !self.active.load(Ordering::Acquire) && !self.dead()
+        !self.active.load(Ordering::Acquire) && self.running_jobs.lock().is_empty() && !self.dead()
     }
 
     fn record_control(&self, request_id: Uuid, control: Control) {
@@ -684,6 +686,23 @@ impl WorkerReader {
             // A generated title follows its run's terminal event, so it is
             // applied whether or not that run is still current.
             EngineEvent::TitleUpdated { .. } => return self.publish_title().await,
+            EngineEvent::ShellJobUpdated { job } => {
+                if job.running {
+                    self.worker.running_jobs.lock().insert(job.id);
+                } else {
+                    self.worker.running_jobs.lock().remove(&job.id);
+                }
+                *self.worker.last_used.lock() = Instant::now();
+                return self
+                    .events
+                    .send(self.sequences.engine(
+                        envelope.request_id,
+                        self.session,
+                        envelope.payload,
+                    ))
+                    .await
+                    .is_ok();
+            }
             _ => {}
         }
         let active_request = *self.worker.run_request.lock();

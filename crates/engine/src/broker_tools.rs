@@ -41,6 +41,13 @@ impl BrokerTools {
 }
 
 impl ToolExecutor for BrokerTools {
+    fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
+        if self.namespace.is_none() {
+            self.broker.take_notes()
+        } else {
+            Vec::new()
+        }
+    }
     fn schemas(&self) -> Vec<ToolSchema> {
         self.broker
             .initial_definitions()

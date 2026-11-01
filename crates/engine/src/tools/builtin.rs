@@ -13,30 +13,25 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xylo_core::{MemoryOrigin, MemoryRecord, ToolDefinition, now_ms};
-use xylo_services::sandbox::{self, Network};
 
 /// What the permission decision granted one call.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Access {
     /// Paths outside the project were approved (or the mode allows them).
     pub(super) outside: bool,
-    /// Commands run inside the OS sandbox.
-    pub(super) sandboxed: bool,
     /// The command asked for, and was granted, internet access.
     pub(super) network: bool,
-}
-
-/// Told to the model when the sandbox blocked a command's connections.
-fn network_hint(denied: &[String]) -> String {
-    format!(
-        "The sandbox blocked internet access to {}. If the command needs the network (package installs, downloads, git fetch, pull, clone or push), run it again with network: true and a justification.",
-        denied.join(", ")
-    )
 }
 
 /// The justification of a command that asks for internet access, or `None`
 /// for an offline command. Malformed requests are rejected before any intent.
 pub(super) fn network_request(args: &Value) -> Result<Option<&str>> {
+    if args.get("allow_local_binding").and_then(Value::as_bool) == Some(true) {
+        ensure!(
+            args.get("network").and_then(Value::as_bool) == Some(true),
+            "Local listening requires network: true and a justification"
+        );
+    }
     let requested = match args.get("network") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(requested)) => *requested,
@@ -136,17 +131,38 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ),
         def(
             "run_command",
-            "Run a program directly with an argument array (no shell) in the workspace sandbox, which has no internet access unless network is true. Non-zero exit codes are returned with stdout and stderr; inspect them and continue",
-            json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200},"network":NETWORK_PARAMETER.clone(),"justification":JUSTIFICATION_PARAMETER.clone()}),
+            "Run a program directly with an argument array (no shell) in the workspace sandbox, which has no internet access unless network is true. Set run_in_background to return a job_id immediately. Non-zero exit codes are returned with stdout and stderr",
+            json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200},"run_in_background":{"type":"boolean"},"allow_local_binding":{"type":"boolean","description":"Allow local development servers to listen and access localhost; requires network:true and justification"},"network":NETWORK_PARAMETER.clone(),"justification":JUSTIFICATION_PARAMETER.clone()}),
             &["program", "args"],
             true,
         ),
         def(
             "shell_command",
-            "Run a command line through bash in the workspace sandbox, which has no internet access unless network is true. Use for pipes, redirection, chained commands and shell built-ins. Returns exit_code, stdout and stderr; a non-zero exit is reported, not hidden",
-            json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200},"network":NETWORK_PARAMETER.clone(),"justification":JUSTIFICATION_PARAMETER.clone()}),
+            "Run a command line through bash in the conversation working directory (cd persists) in the workspace sandbox, which has no internet access unless network is true. Use for pipes, redirection, chained commands and shell built-ins. Set run_in_background for servers and long tasks: returns job_id immediately; monitor with shell_output. Foreground returns exit_code, stdout and stderr",
+            json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200},"run_in_background":{"type":"boolean"},"allow_local_binding":{"type":"boolean","description":"Allow local development servers to listen and access localhost; requires network:true and justification"},"network":NETWORK_PARAMETER.clone(),"justification":JUSTIFICATION_PARAMETER.clone()}),
             &["command"],
             true,
+        ),
+        def(
+            "shell_output",
+            "Read new output from a shell job. wait_seconds waits for output or exit; filter keeps lines containing the text. The full log path is returned.",
+            json!({"job_id":{"type":"string"},"wait_seconds":{"type":"number","minimum":0,"maximum":300},"filter":{"type":"string"}}),
+            &["job_id"],
+            false,
+        ),
+        def(
+            "shell_kill",
+            "Stop a shell job and its child processes in this conversation.",
+            json!({"job_id":{"type":"string"}}),
+            &["job_id"],
+            true,
+        ),
+        def(
+            "shell_jobs",
+            "List this conversation's shell jobs, including jobs still running from earlier turns.",
+            json!({}),
+            &[],
+            false,
         ),
         def(
             "todo_write",
@@ -228,7 +244,12 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
     ];
     // The OS sandbox is not qualified on Windows, so commands are not offered.
     if cfg!(windows) {
-        tools.retain(|tool| !matches!(tool.name.as_str(), "run_command" | "shell_command"));
+        tools.retain(|tool| {
+            !matches!(
+                tool.name.as_str(),
+                "run_command" | "shell_command" | "shell_output" | "shell_kill" | "shell_jobs"
+            )
+        });
     }
     tools
 }
@@ -244,7 +265,7 @@ pub(super) fn compact_description(name: &str) -> Option<&'static str> {
             "Replace text in a file: old_string must match exactly once, without line-number prefixes; replace_all changes every match"
         }
         "shell_command" => {
-            "Run a bash command line in the workspace sandbox; no internet unless network is true with a justification"
+            "Run bash in the sandbox; cd persists. run_in_background returns a job_id for shell_output. Network needs true and justification"
         }
         "search_tools" => {
             "Find tools not listed here (create files, search code, git, memory, skills, browser, connectors) with their arguments"
@@ -645,107 +666,6 @@ pub(super) fn execute(
                 result.stderr
             );
             json!({"output": if result.stdout.is_empty() { "No changes".to_owned() } else { result.stdout }, "truncated": result.truncated})
-        }
-        "run_command" | "shell_command" => {
-            if cfg!(windows) {
-                return Err(code::unapplied(
-                    "Commands are not supported on Windows yet; nothing was run",
-                ));
-            }
-            let (program, argv) = if name == "shell_command" {
-                let command = text(args, "command")?;
-                ensure!(!command.trim().is_empty(), "command is empty");
-                code::shell_invocation(command, root)?
-            } else {
-                let argv: Vec<String> = args
-                    .get("args")
-                    .and_then(Value::as_array)
-                    .context("args must be an array")?
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .map(str::to_owned)
-                            .context("Each argument must be a string")
-                    })
-                    .collect::<Result<_>>()?;
-                (code::resolve_program(text(args, "program")?, root)?, argv)
-            };
-            let timeout = args
-                .get("timeout_seconds")
-                .and_then(Value::as_u64)
-                .unwrap_or(120)
-                .clamp(1, 1200);
-            let protected = broker
-                .artifacts
-                .parent()
-                .map(|p| vec![p.to_path_buf()])
-                .unwrap_or_default();
-            let program = program.to_string_lossy();
-            let timeout = Duration::from_secs(timeout);
-            let (result, denied) = broker.runtime.block_on(async {
-                if access.sandboxed {
-                    // An approved network request keeps every filesystem rule;
-                    // only outbound connections to public hosts are opened.
-                    let network = if access.network {
-                        Network::Unrestricted
-                    } else {
-                        Network::None
-                    };
-                    let prepared = sandbox::prepare_coding_with_network(
-                        &program,
-                        &argv,
-                        root,
-                        &[],
-                        &protected,
-                        network,
-                    )
-                    .map_err(|error| {
-                        anyhow::Error::new(xylo_runtime::process::NotStarted(format!("{error:#}")))
-                    })?;
-                    // Start failures and refused connections come from the
-                    // launcher's private status file, never from the output.
-                    let sandboxed = xylo_runtime::process::run_prepared_sandboxed(
-                        prepared,
-                        root,
-                        timeout,
-                        broker.cancel.child_token(),
-                    )
-                    .await?;
-                    Ok::<_, anyhow::Error>((sandboxed.result, sandboxed.network_denials))
-                } else {
-                    let result = xylo_runtime::process::run(
-                        &program,
-                        &argv,
-                        root,
-                        timeout,
-                        broker.cancel.child_token(),
-                    )
-                    .await?;
-                    Ok((result, Vec::new()))
-                }
-            })?;
-            let mut output = json!({
-                "exit_code": result.code,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "output_truncated": result.truncated,
-            });
-            let hint = (!denied.is_empty()).then(|| network_hint(&denied));
-            if let Some(hint) = &hint {
-                output["network_hint"] = json!(hint);
-            }
-            // A process that ran to completion has a known outcome, whatever its
-            // exit code. Only the status distinguishes success from failure.
-            if result.code != Some(0) {
-                return Ok(json!({
-                    "status":"failed",
-                    "exit_code": result.code,
-                    "summary": output,
-                    "next_actions":[hint.as_deref().unwrap_or("Read stdout and stderr, fix the cause, then rerun")],
-                    "artifacts":[]
-                }));
-            }
-            output
         }
         _ => bail!("Unimplemented built-in tool {name}"),
     };

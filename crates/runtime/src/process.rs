@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -68,7 +68,14 @@ pub struct ProcessResult {
     pub truncated: bool,
 }
 
-async fn drain(mut stream: impl AsyncRead + Unpin) -> Result<(Vec<u8>, bool)> {
+/// Receives each output chunk; `true` identifies stderr. Callbacks must stay bounded.
+pub type OutputObserver = Arc<dyn Fn(bool, &[u8]) + Send + Sync>;
+
+async fn drain(
+    mut stream: impl AsyncRead + Unpin,
+    stderr: bool,
+    observer: Option<OutputObserver>,
+) -> Result<(Vec<u8>, bool)> {
     let mut saved = Vec::new();
     let mut buffer = [0_u8; 8192];
     let mut truncated = false;
@@ -76,6 +83,9 @@ async fn drain(mut stream: impl AsyncRead + Unpin) -> Result<(Vec<u8>, bool)> {
         let count = stream.read(&mut buffer).await?;
         if count == 0 {
             break;
+        }
+        if let Some(observer) = &observer {
+            observer(stderr, &buffer[..count]);
         }
         let retain = (OUTPUT_LIMIT - saved.len()).min(count);
         saved.extend_from_slice(&buffer[..retain]);
@@ -159,11 +169,28 @@ pub async fn run_prepared_sandboxed(
 /// Runs a prepared command without a sandbox, draining output and owning its
 /// process group until it ends.
 pub async fn run_prepared(
-    mut command: Command,
+    command: Command,
     cwd: &Path,
     timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<ProcessResult> {
+    run_prepared_observed(command, cwd, Some(timeout), cancel, None, false).await
+}
+
+/// Runs a process with live output and an optional deadline. A guarded sandbox
+/// keeps a private stdin pipe open; its launcher kills the process group if
+/// the owner exits, including an abrupt worker termination.
+pub async fn run_prepared_observed(
+    mut command: Command,
+    cwd: &Path,
+    timeout: Option<Duration>,
+    cancel: CancellationToken,
+    observer: Option<OutputObserver>,
+    guard_parent: bool,
+) -> Result<ProcessResult> {
+    if guard_parent {
+        command.env("XYLO_SANDBOX_PARENT_GUARD", "1");
+    }
     if cancel.is_cancelled() {
         return Err(NotStarted("Cancelled before process start".into()).into());
     }
@@ -172,7 +199,11 @@ pub async fn run_prepared(
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if guard_parent {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -185,16 +216,17 @@ pub async fn run_prepared(
         #[cfg(unix)]
         pid: child.id(),
     };
+    let _parent_guard = child.stdin.take();
     let stdout = child.stdout.take().context("Missing stdout pipe")?;
     let stderr = child.stderr.take().context("Missing stderr pipe")?;
-    let output = tokio::spawn(drain(stdout));
-    let errors = tokio::spawn(drain(stderr));
+    let output = tokio::spawn(drain(stdout, false, observer.clone()));
+    let errors = tokio::spawn(drain(stderr, true, observer));
     let _output_guard = AbortDrain(output.abort_handle());
     let _error_guard = AbortDrain(errors.abort_handle());
     let result = tokio::select! {
         result = child.wait() => result.context("Wait for native process"),
         _ = cancel.cancelled() => { group.terminate(); let _ = child.kill().await; Err(anyhow::anyhow!("Process cancelled; side effects may have occurred")) },
-        _ = tokio::time::sleep(timeout) => { group.terminate(); let _ = child.kill().await; Err(anyhow::anyhow!("Process timed out; side effects may have occurred")) },
+        _ = async { match timeout { Some(timeout) => tokio::time::sleep(timeout).await, None => std::future::pending().await } } => { group.terminate(); let _ = child.kill().await; Err(anyhow::anyhow!("Process timed out; side effects may have occurred")) },
     };
     group.terminate();
     let _ = child.wait().await;

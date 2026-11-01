@@ -62,6 +62,7 @@ pub(crate) fn assess(name: &str, arguments: &Value, workspace: &Path) -> Option<
             command_words(&words, workspace, 0)
         }
         "shell_command" => command(text("command")?, workspace),
+        "shell_output" | "shell_jobs" | "shell_kill" => None,
         _ => tool_risk(name).map(str::to_owned),
     }
 }

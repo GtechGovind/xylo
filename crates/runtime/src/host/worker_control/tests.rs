@@ -726,3 +726,26 @@ done
         assert!(error.contains("different Xylo version"), "{error}");
     }
 }
+
+#[test]
+fn a_worker_with_a_live_shell_job_is_not_retired_as_idle() {
+    let (sender, _receiver) = mpsc::channel(8);
+    let (_exited, receiver) = tokio::sync::watch::channel(false);
+    let worker = WorkerHandle::new(sender, receiver);
+    let id = Uuid::new_v4();
+    worker.running_jobs.lock().insert(Uuid::new_v4());
+    let mut workers = HashMap::from([(id, worker.clone())]);
+    retire_idle_workers(
+        &mut workers,
+        None,
+        Instant::now() + IDLE_WORKER_TTL + Duration::from_secs(1),
+    );
+    assert!(!worker.stop.is_cancelled());
+    worker.running_jobs.lock().clear();
+    retire_idle_workers(
+        &mut workers,
+        None,
+        Instant::now() + IDLE_WORKER_TTL + Duration::from_secs(1),
+    );
+    assert!(worker.stop.is_cancelled());
+}

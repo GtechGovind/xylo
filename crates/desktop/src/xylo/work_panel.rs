@@ -511,6 +511,7 @@ impl Xylo {
             ("changes", "Changes", AppIcon::Changes),
             ("files", "Files", AppIcon::Files),
             ("terminal", "Terminal", AppIcon::Terminal),
+            ("jobs", "Jobs", AppIcon::Terminal),
             ("subagents", "Subagents", AppIcon::Agent),
         ];
         for (key, label, glyph) in tab_list {
@@ -589,6 +590,7 @@ impl Xylo {
                     }
                 }),
             "subagents" => self.subagents_panel(cx),
+            "jobs" => self.shell_jobs_panel(cx),
             _ => self.files_page(cx),
         };
         let total = f32::from(window.viewport_size().width);
