@@ -34,6 +34,7 @@ CREATE TABLE checkpoint_messages(session_id TEXT NOT NULL REFERENCES checkpoints
 CREATE TABLE completed_turns(session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,json TEXT NOT NULL,completed_at INTEGER NOT NULL,PRIMARY KEY(session_id,turn_id));
 CREATE INDEX completed_turns_reply ON completed_turns(session_id,json_extract(json,'$.reply_id'));
 CREATE INDEX completed_turns_day ON completed_turns(completed_at);
+CREATE TABLE turn_usage(session_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,turn_id TEXT NOT NULL,call_id TEXT NOT NULL,json TEXT NOT NULL,PRIMARY KEY(session_id,turn_id,call_id));
 
 CREATE TABLE actions(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,action_key TEXT NOT NULL,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL,UNIQUE(session_id,turn_id,action_key));
 CREATE INDEX actions_state ON actions(state);

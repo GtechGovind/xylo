@@ -97,3 +97,63 @@ fn usage_reports_scope_answers_and_days_without_repricing_receipts() {
     );
     assert!(store.usage_report(session, vec![], 20, 10).is_err());
 }
+
+#[test]
+fn interrupted_request_receipts_replace_cumulative_updates_and_survive_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("db");
+    let store = Store::open(&path).unwrap();
+    let session = Uuid::new_v4();
+    let turn = Uuid::new_v4();
+    let call = Uuid::new_v4();
+    store
+        .upsert_conversation(&Conversation {
+            id: session,
+            title: "Usage".into(),
+            workspace: root.path().into(),
+            updated_at: 0,
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
+        })
+        .unwrap();
+    store.record_turn_usage(session, turn, call, None).unwrap();
+    let mut receipt = xylo_core::pricing::UsageCall {
+        model: "primary".into(),
+        input_tokens: 10,
+        output_tokens: 1,
+        ..Default::default()
+    };
+    store
+        .record_turn_usage(session, turn, call, Some(receipt.clone()))
+        .unwrap();
+    receipt.output_tokens = 3;
+    store
+        .record_turn_usage(session, turn, call, Some(receipt.clone()))
+        .unwrap();
+    drop(store);
+    let reopened = Store::open_existing(&path).unwrap();
+    assert_eq!(
+        reopened.turn_usage(session, turn).unwrap(),
+        vec![(call, Some(receipt))]
+    );
+    assert!(
+        reopened
+            .turn_usage(session, Uuid::new_v4())
+            .unwrap()
+            .is_empty()
+    );
+    reopened
+        .complete_turn(
+            session,
+            turn,
+            &serde_json::json!([]),
+            "answer",
+            &Usage::default(),
+        )
+        .unwrap();
+    assert!(
+        reopened.turn_usage(session, turn).unwrap().is_empty(),
+        "A completed receipt replaces pending call rows atomically"
+    );
+}

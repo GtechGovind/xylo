@@ -27,6 +27,33 @@ pub struct UsageReport {
 }
 
 impl Store {
+    /// Replaces one request's latest token receipt before model output advances.
+    pub fn record_turn_usage(
+        &self,
+        session: Uuid,
+        turn: Uuid,
+        call: Uuid,
+        usage: Option<xylo_core::pricing::UsageCall>,
+    ) -> Result<()> {
+        let json = serde_json::to_string(&usage)?;
+        self.call(move |connection| {
+            connection.execute("INSERT INTO turn_usage(session_id,turn_id,call_id,json) SELECT ?1,?2,?3,?4 WHERE NOT EXISTS(SELECT 1 FROM completed_turns WHERE session_id=?1 AND turn_id=?2) ON CONFLICT(session_id,turn_id,call_id) DO UPDATE SET json=excluded.json", params![session.to_string(),turn.to_string(),call.to_string(),json])?;
+            Ok(())
+        })
+    }
+    /// Restores receipts for an interrupted turn without affecting other turns.
+    pub fn turn_usage(
+        &self,
+        session: Uuid,
+        turn: Uuid,
+    ) -> Result<Vec<(Uuid, Option<xylo_core::pricing::UsageCall>)>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare_cached("SELECT call_id,json FROM turn_usage WHERE session_id=?1 AND turn_id=?2 ORDER BY rowid")?;
+            let rows = statement.query_map(params![session.to_string(),turn.to_string()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?;
+            rows.map(|row| { let (id,json) = row?; Ok((Uuid::parse_str(&id)?,serde_json::from_str(&json)?)) }).collect()
+        })
+    }
+
     /// Gets at most 500 answer details without reading unrelated message bodies.
     pub fn usage_report(
         &self,

@@ -108,7 +108,7 @@ impl Xylo {
                     .child(Input::new(field).aria_label(label)),
             )
         });
-        settings_ui::section("Token prices",Some("USD per million tokens. Published standard prices are built in; overrides apply to future turns.".into()),
+        settings_ui::section("Token prices",Some("USD per million tokens. Published standard prices are built in; overrides affect future estimates; recorded totals stay unchanged.".into()),
             fields.child(div().flex().gap_2()
                 .child(settings_ui::primary_button("save-price-override","Save override").on_click(cx.listener(|view,_,_,cx|view.save_price_override(cx))))
                 .child(settings_ui::secondary_button("current-price-model","Use current model").on_click(cx.listener(|view,_,window,cx|view.load_price_form(window,cx))))

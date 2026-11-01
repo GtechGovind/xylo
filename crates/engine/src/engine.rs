@@ -515,7 +515,10 @@ impl AgentEngine {
             managed_endpoint(&self.paths, &request.provider.endpoint)?,
         );
         let summary_deadline = guarded.timeout();
-        let usage_meter = crate::usage_meter::Meter::default();
+        let usage_store = self.store.clone();
+        let usage_meter =
+            blocking(move || crate::usage_meter::Meter::for_turn(usage_store, session, turn))
+                .await?;
         let provider = usage_meter.wrap(Arc::new(guarded), request.provider.model.clone());
         let budget = ContextBudget::new(&request.provider);
         let mut messages = self

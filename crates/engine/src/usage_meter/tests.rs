@@ -109,3 +109,61 @@ async fn dropping_a_partial_stream_retains_the_last_reported_usage() {
     meter.apply(&mut usage);
     assert_eq!((usage.input_tokens, usage.output_tokens), (10, 1));
 }
+
+#[tokio::test]
+async fn a_reopened_turn_meter_includes_prior_requests_and_new_fallback_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("db");
+    let store = Store::open(&path).unwrap();
+    let session = Uuid::new_v4();
+    let turn = Uuid::new_v4();
+    store
+        .upsert_conversation(&xylo_core::Conversation {
+            id: session,
+            title: "Usage".into(),
+            workspace: root.path().into(),
+            updated_at: 0,
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
+        })
+        .unwrap();
+    let meter = Meter::for_turn(store.clone(), session, turn).unwrap();
+    let provider = meter.wrap(
+        Arc::new(Fixture {
+            model: "primary",
+            fallback: false,
+        }),
+        "primary".into(),
+    );
+    provider
+        .complete(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    drop(provider);
+    drop(meter);
+    drop(store);
+    let meter = Meter::for_turn(Store::open_existing(&path).unwrap(), session, turn).unwrap();
+    meter
+        .wrap(
+            Arc::new(Fixture {
+                model: "alternative",
+                fallback: false,
+            }),
+            "alternative".into(),
+        )
+        .complete(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    let mut usage = xylo_core::Usage::default();
+    meter.apply(&mut usage);
+    assert_eq!((usage.input_tokens, usage.output_tokens), (20, 6));
+    assert_eq!(
+        usage
+            .calls
+            .iter()
+            .map(|call| call.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["primary", "alternative"]
+    );
+}

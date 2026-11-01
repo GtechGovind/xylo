@@ -11,7 +11,7 @@ pub struct ModelPrice {
     pub cache_write: f64,
 }
 
-/// One successful provider request, retained so context tiers are priced correctly.
+/// One model request receipt, retained so context tiers are priced correctly.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageCall {
     pub model: String,
