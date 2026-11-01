@@ -169,6 +169,43 @@ mod xylo {
             .unwrap();
         }
         #[gpui_kit::test]
+        fn an_empty_drafts_list_says_so_where_the_first_row_would_be(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let base = directory.path().canonicalize().unwrap();
+            let workspace = base.join("project");
+            std::fs::create_dir(&workspace).unwrap();
+            let paths = AppPaths::at(base.join("profile")).unwrap();
+            let host = HostClient::spawn_at(paths).unwrap();
+            let client = host.0.clone();
+            let (window, view) = open(cx, Ok(host));
+            wait(cx, &view, "initial host", |view, _| view.settings_loaded);
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.set_workspace(workspace.clone(), window, cx);
+                    view.open_saved_drafts(cx);
+                });
+            })
+            .unwrap();
+            wait(cx, &view, "empty draft list", |view, _| {
+                view.drafts.validation_list_request().is_none()
+            });
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let notice = window.find("drafts-notice");
+                assert_eq!(notice.label(), Some("No saved drafts."));
+                // The line spans the list's width with a row's height, under
+                // the scope switch rather than tucked into the corner.
+                let page = window.find("drafts-page").bounds();
+                let bounds = notice.bounds();
+                assert_eq!(bounds.size.height, gpui_kit::px(56.));
+                assert_eq!(bounds.left(), page.left() + gpui_kit::px(24.));
+                assert!(bounds.top() > page.top() + gpui_kit::px(30.));
+            })
+            .unwrap();
+            client.shutdown().unwrap();
+        }
+        #[gpui_kit::test]
         fn restarted_database_drafts_restore_in_native_chat_picker_and_cross_chat_switches(
             cx: &mut TestAppContext,
         ) {
@@ -540,7 +577,7 @@ mod xylo {
             });
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| {
-                    view.settings.provider.model = "isolated-queue-fixture".into();
+                    view.settings.provider = xylo_core::ProviderConfig { model: "isolated-queue-fixture".into(), ..Default::default() };
                     view.turns
                         .entry(key.session_id)
                         .or_default()

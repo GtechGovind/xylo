@@ -183,6 +183,17 @@ impl ProviderConfig {
             .as_deref()
             .filter(|effort| self.supported_reasoning_efforts().contains(effort))
     }
+    /// No provider configured, the active provider of a fresh profile. Its
+    /// name, endpoint and model are empty, so it is never listed as a saved
+    /// connection and never valid for a turn; the limits keep their defaults.
+    pub fn unset() -> Self {
+        Self {
+            name: String::new(),
+            endpoint: String::new(),
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.model.trim().is_empty(),
@@ -379,6 +390,11 @@ impl Default for UiPreferences {
 }
 
 impl AppSettings {
+    /// Whether a provider and model are set up, so a task can start. A fresh
+    /// profile has none: its active provider is [`ProviderConfig::unset`].
+    pub fn model_ready(&self) -> bool {
+        self.provider.validate().is_ok()
+    }
     /// Keep distinct model choices for the same endpoint without duplicates.
     pub fn remember_model(&mut self, provider: ProviderConfig) {
         if provider.model.is_empty() {
@@ -402,10 +418,10 @@ impl AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            provider: ProviderConfig::default(),
+            provider: ProviderConfig::unset(),
             providers: Vec::new(),
             permissions: PermissionMode::default(),
-            theme: "light".into(),
+            theme: "system".into(),
             last_workspace: None,
             local_context: 8192,
             telemetry_export: false,

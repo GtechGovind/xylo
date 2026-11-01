@@ -104,13 +104,6 @@ fn declared_shared_string_counts_must_fit_their_part() {
     assert!(error.contains("shared strings"), "{error}");
 }
 
-#[test]
-fn legacy_xls_is_refused() {
-    let file = tempfile::NamedTempFile::new().unwrap();
-    let error = read_file(&file, "xls", 10).unwrap_err().to_string();
-    assert!(error.contains(".xlsx"), "{error}");
-}
-
 fn table(rows: &str) -> String {
     format!(
         "<office:document-content><office:body><office:spreadsheet><table:table table:name=\"S\">{rows}</table:table></office:spreadsheet></office:body></office:document-content>"
@@ -156,4 +149,21 @@ fn ods_bombs_are_refused_before_calamine_opens_them() {
     ]);
     let error = read_file(&file, "ods", 10).unwrap_err().to_string();
     assert!(error.contains("cells"), "{error}");
+}
+
+#[test]
+fn sheet_lists_are_capped_but_every_sheet_can_be_chosen() {
+    let names: Vec<String> = (0..MAX_SHEETS + 500).map(|i| format!("S{i}")).collect();
+    let names = || names.iter().map(String::as_str);
+    let (sheet, sheets) = choose(names(), None).unwrap();
+    assert_eq!(sheet, "S0");
+    let mut value = json!({});
+    sheets.describe(&mut value);
+    assert_eq!(value["sheets"].as_array().unwrap().len(), MAX_SHEETS);
+    assert_eq!(value["sheets_truncated"], true);
+    assert_eq!(value["total_sheets"], MAX_SHEETS + 500);
+    let (sheet, _) = choose(names(), Some("S1400")).unwrap();
+    assert_eq!(sheet, "S1400");
+    assert!(choose(names(), Some("missing")).is_err());
+    assert!(choose(std::iter::empty(), None).is_err());
 }

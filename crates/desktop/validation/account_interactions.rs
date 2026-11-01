@@ -49,7 +49,7 @@ mod xylo {
             cx.update_window(window,|_,window,cx| {
                 view.update(cx,|view,cx| {
                     view.error=None;
-                    view.settings.provider.model="existing-model".into();
+                    view.settings.provider = xylo_core::ProviderConfig { model: "existing-model".into(), ..Default::default() };
                     view.settings_open=true;view.page=Page::Providers;view.provider_form_open=true;
                     let account=ProviderConfig {name:"ChatGPT".into(),family:ApiFamily::OpenAiResponses,endpoint:"https://api.openai.com/v1".into(),credential_ref:Some(CHATGPT_REF.into()),..Default::default()};
                     view.provider_form(&account,window,cx);

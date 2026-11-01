@@ -667,7 +667,17 @@ mod xylo {
                 window.click("scheduled", cx);
                 assert_eq!(view.read(cx).page, Page::Schedules);
                 window.render_frame(cx);
+                // Without a project there is no form, only a way to open one.
+                assert!(window.find("schedule-no-project").visible());
+                assert!(window.find("schedule-open-project").visible());
+                assert!(window.try_find("schedule-form").is_none());
+                view.update(cx, |view, cx| {
+                    view.workspace = Some(std::path::PathBuf::from("/fixture/project"));
+                    cx.notify();
+                });
+                window.render_frame(cx);
                 assert!(window.find("schedule-form").visible());
+                assert!(window.try_find("schedule-no-project").is_none());
                 // A page that cannot be requested stops the list from asking
                 // again on every frame.
                 view.update(cx, |view, cx| {

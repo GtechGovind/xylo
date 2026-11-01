@@ -101,6 +101,17 @@ const SMALL_WINDOW_CORE_TOOLS: [&str; 8] = [
     "call_tool",
 ];
 
+/// The resident set of a tiny window ([`EffectiveWindow::tiny`]), offered
+/// in compact form ([`compact_definition`]): reading, editing, a shell, and
+/// the two tools that reach everything else.
+const TINY_WINDOW_CORE_TOOLS: [&str; 5] = [
+    "file_read",
+    "file_edit",
+    "shell_command",
+    "search_tools",
+    "call_tool",
+];
+
 /// Most results one `search_tools` call returns.
 const SEARCH_RESULTS: usize = 8;
 /// Room left in a search result's budget for its status and next actions.
@@ -377,11 +388,20 @@ impl ToolBroker {
             .map(|skill| (skill.name.to_owned(), skill.description.to_owned()))
             .collect();
         entries.extend(portable::index(self)?);
+        // A tiny window's compact prompt takes the index whole or not at
+        // all (see `PromptContext::set_skills_index`), so it is rendered
+        // unshortened there.
+        let budget = self.window().prompt_budget();
+        let bytes = if budget.compact {
+            prompts::PromptBudget::LARGEST.skills_index_bytes
+        } else {
+            budget.skills_index_bytes
+        };
         Ok(prompts::skills_index(
             entries
                 .iter()
                 .map(|(name, description)| (name.as_str(), description.as_str())),
-            self.window().prompt_budget().skills_index_bytes,
+            bytes,
         ))
     }
     pub fn set_delegate(&self, handler: Delegate) {
@@ -390,13 +410,23 @@ impl ToolBroker {
     /// The tools to offer the model directly: a stable core set plus
     /// capabilities the user configured (browser, local inference, speech, a
     /// saved image provider and existing connectors), or only
-    /// [`SMALL_WINDOW_CORE_TOOLS`] when the model's window is small. The list
+    /// [`SMALL_WINDOW_CORE_TOOLS`] when the model's window is small, or the
+    /// compact forms of [`TINY_WINDOW_CORE_TOOLS`] when it is tiny. The list
     /// does not depend on the permission mode: tools are gated at dispatch,
     /// not filtered, so the provider's cached tools block (the front of every
     /// cached prefix) survives a mode change. Everything else stays
     /// discoverable through `search_tools`.
     pub fn initial_definitions(&self) -> Vec<ToolDefinition> {
-        let small = self.window().small();
+        let window = self.window();
+        if window.tiny() {
+            return self
+                .advertised
+                .iter()
+                .filter(|definition| TINY_WINDOW_CORE_TOOLS.contains(&definition.name.as_str()))
+                .map(compact_definition)
+                .collect();
+        }
+        let small = window.small();
         let config = &self.capability_config;
         let has_connectors = self
             .advertised
@@ -1767,6 +1797,23 @@ fn is_mcp(config: &ConnectorConfig) -> bool {
         "stdio" | "http" | "streamable_http"
     )
 }
+/// The compact form of a resident tool for a tiny window: its short
+/// description ([`builtin::compact_description`], else the first sentence)
+/// and its parameters without descriptions or numeric bounds
+/// ([`catalog::compact_parameters`]). Arguments are still validated against
+/// the full schema, which the compact one only relaxes.
+fn compact_definition(definition: &ToolDefinition) -> ToolDefinition {
+    ToolDefinition {
+        name: definition.name.clone(),
+        description: builtin::compact_description(&definition.name).map_or_else(
+            || catalog::short_description(&definition.description),
+            str::to_owned,
+        ),
+        parameters: catalog::compact_parameters(&definition.parameters),
+        writes: definition.writes,
+    }
+}
+
 /// Shrinks ranked search results until they fit `budget` bytes, so the model
 /// never sees a search result cut in the middle: lower results' full schemas
 /// become signatures first, then the weakest results go, and only then does

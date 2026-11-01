@@ -5,7 +5,8 @@
 //! cut off mid-arguments, an empty reply, a context overflow from a server
 //! that serves less than the configured window, a model repeating the same
 //! call, instructions injected through tool output, and the provenance of
-//! memory writes. Offline, the model is scripted, so a failure is always the
+//! memory writes, and a whole task on a 4K window. Offline, the model is
+//! scripted, so a failure is always the
 //! harness's. Tasks marked `live` also grade real models in matrix runs.
 //!
 //! To add a task, write a constructor returning a [`Task`] and list it in
@@ -29,6 +30,7 @@ pub fn builtin() -> Vec<Task> {
         truncated_call(),
         empty_answer(),
         context_overflow(),
+        tiny_window(),
         repeated_call(),
         delegation(),
         prompt_injection(),
@@ -276,6 +278,112 @@ fn context_overflow() -> Task {
         .map(Step::Reply)
         .collect(),
         served_window: Some(SERVED_WINDOW),
+        ..Script::default()
+    };
+    task
+}
+
+/// The window the tiny-window task's server serves and is configured with.
+const TINY_WINDOW: u32 = 4096;
+
+/// The resident tools of a tiny window, in the order they are offered.
+const TINY_TOOLS: [&str; 5] = [
+    "file_read",
+    "file_edit",
+    "shell_command",
+    "search_tools",
+    "call_tool",
+];
+
+fn tiny_window() -> Task {
+    let mut task = task(
+        "tiny-window",
+        "A 4K window reads, edits and answers on the compact profile without overflowing",
+        "The add function in src/lib.rs subtracts instead of adding. Fix it and explain the change.",
+        |trial| {
+            let source = trial.file("src/lib.rs").unwrap_or_default();
+            let agent: Vec<_> = trial.trace.agent_exchanges().collect();
+            let overflowed = agent.iter().any(|exchange| {
+                matches!(&exchange.outcome, Outcome::Error(error) if error.kind == ErrorKind::ContextOverflow)
+            });
+            let compact = agent.iter().all(|exchange| {
+                exchange.request.tools == TINY_TOOLS
+                    && exchange.request.max_tokens <= TINY_WINDOW / 4
+            });
+            let first = agent.first().map(|exchange| &exchange.request);
+            let stable = agent.iter().all(|exchange| {
+                first.is_some_and(|first| {
+                    first.system() == exchange.request.system()
+                        && first.tools_digest == exchange.request.tools_digest
+                })
+            });
+            let instructions_left_out =
+                first
+                    .and_then(|first| first.system())
+                    .is_some_and(|system| {
+                        system.contains("# Left out to fit the context window")
+                            && !system.contains("Keep every function documented.")
+                    });
+            vec![
+                completed(trial),
+                Check::expect(
+                    "bug_fixed",
+                    source.contains("a + b") && !source.contains("a - b"),
+                    format!("src/lib.rs: {source:?}"),
+                ),
+                Check::expect(
+                    "no_overflow",
+                    !overflowed,
+                    "no request exceeded the served 4K window",
+                ),
+                Check::expect(
+                    "compact_profile",
+                    compact,
+                    format!(
+                        "requests offered {:?}",
+                        agent
+                            .iter()
+                            .map(|exchange| &exchange.request.tools)
+                            .collect::<Vec<_>>()
+                    ),
+                ),
+                Check::expect(
+                    "stable_prefix",
+                    stable,
+                    "every request repeats the same system prompt and tool bytes",
+                ),
+                Check::expect(
+                    "instructions_left_out",
+                    instructions_left_out,
+                    "oversized project instructions are left out and recorded",
+                ),
+                answer_contains(trial, "answer_continued", &["a + b", "now adds"]),
+            ]
+        },
+    );
+    task.context_tokens = TINY_WINDOW;
+    task.files = vec![
+        ("src/lib.rs", LIB.into()),
+        ("AGENTS.md", "Keep every function documented.\n".repeat(80)),
+    ];
+    task.script = Script {
+        steps: [
+            ModelReply::calls(1, [("file_read", json!({"path": "src/lib.rs"}))]),
+            ModelReply::calls(
+                2,
+                [(
+                    "file_edit",
+                    json!({"path": "src/lib.rs", "old_string": "a - b", "new_string": "a + b"}),
+                )],
+            ),
+            ModelReply::text("Fixed: `add` in src/lib.rs returned a - b; it now returns a + b")
+                .truncated(),
+            ModelReply::text(", so it now adds its arguments."),
+        ]
+        .into_iter()
+        .map(Step::Reply)
+        .collect(),
+        served_window: Some(u64::from(TINY_WINDOW)),
         ..Script::default()
     };
     task

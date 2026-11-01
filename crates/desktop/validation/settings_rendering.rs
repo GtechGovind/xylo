@@ -49,13 +49,17 @@ const PAGES: [(&str, &str); 12] = [
 
 fn main() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    for width in [1000., 1400.] {
-        render(width);
+    {
+        // Cleared once, so every width's captures are kept side by side.
+        let output = capture_dir::fresh("settings-rendering");
+        for width in [1000., 1400.] {
+            render(width, &output);
+        }
     }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn render(width: f32) {
+fn render(width: f32, output: &std::path::Path) {
     use gpui_kit::{
         prelude::*,
         test::{TestQueryExt, TestWindowExt},
@@ -120,7 +124,6 @@ fn render(width: f32) {
         assert!(Instant::now() < ready, "Real Host did not become ready");
         settle(&mut cx, Duration::from_millis(50));
     }
-    let output = capture_dir::fresh("settings-rendering");
     let mut files = Vec::new();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);

@@ -649,8 +649,8 @@ impl Xylo {
         if providers.is_empty() {
             page = page.child(settings_ui::empty_state(
                 AppIcon::Model,
-                "No providers yet",
-                "Connect a model service to start a conversation.",
+                "No model provider yet",
+                "Xylo needs a model provider before it can start a conversation.",
                 Some(add("add-provider", cx).into_any_element()),
             ));
         } else {

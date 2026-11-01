@@ -1,0 +1,1 @@
+- The skills index: when the user names a skill, load it with call_tool, name extension_skill, passing the name as id.

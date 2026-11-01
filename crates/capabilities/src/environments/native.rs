@@ -16,6 +16,19 @@ fn sessions() -> &'static Mutex<Sessions> {
     static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
+/// Per-profile connect serialization. Entries are tiny and bounded by the
+/// number of saved profiles, so they are kept for the process lifetime.
+async fn connect_gate(root: &Path, id: Uuid) -> std::sync::Arc<Mutex<()>> {
+    static GATES: OnceLock<Mutex<HashMap<(PathBuf, Uuid), std::sync::Arc<Mutex<()>>>>> =
+        OnceLock::new();
+    GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .await
+        .entry((root.to_path_buf(), id))
+        .or_default()
+        .clone()
+}
 pub(super) fn active(root: &Path) -> usize {
     let Ok(mut registry) = sessions().try_lock() else {
         return 1;
@@ -230,11 +243,18 @@ pub(super) async fn ssh_connect(
     record: &EnvironmentRecord,
     cancel: CancellationToken,
 ) -> Result<()> {
+    // One connect per profile at a time: the check, the stale-socket removal
+    // and the spawn must not interleave with another connect, which could
+    // delete the socket a concurrent master has just bound. (The only caller
+    // also holds the profile's cross-process lease.)
+    let gate = connect_gate(&manager.root, record.profile.id).await;
+    let _connecting = gate.lock().await;
     if ssh_check(manager, record, cancel.clone()).await? {
         return Ok(());
     }
     #[cfg(unix)]
     {
+        remove_stale_socket(&socket(manager, record.profile.id, &cancel).await?);
         let mut args = ssh_args(manager, record, &cancel).await?;
         let host = args.pop().context("Missing SSH host")?;
         args.extend([
@@ -244,7 +264,8 @@ pub(super) async fn ssh_connect(
             "--".into(),
             host,
         ]);
-        let mut master = ManagedProcess::spawn(&spec(manager, record, args, 15, 8192)?)?;
+        let mut master =
+            ManagedProcess::spawn_tethered(&tethered(spec(manager, record, args, 15, 8192)?))?;
         let result = async {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             loop {
@@ -286,6 +307,65 @@ pub(super) async fn ssh_connect(
         Ok(())
     }
 }
+/// Runs the SSH master under a POSIX shell that ends it when its owner ends.
+/// The master runs in its own process group, so it would otherwise outlive an
+/// owner that exits without stopping it (a crash, SIGKILL, or an exit that
+/// skips destructors), holding the connection open with no one to close it.
+/// The shell's stdin is the owner's tether pipe: a watcher reads it until end
+/// of input, which the kernel delivers when the owner's write end closes, and
+/// then sends SIGTERM so the master also removes its control socket. The
+/// watcher uses only the `read` builtin, so it starts no other process. When
+/// the master exits first, the shell stops the watcher before exiting with
+/// the master's status; a watcher left waiting could otherwise signal an
+/// unrelated process that later reuses the master's PID. A failed connection
+/// still shows as an exited client. `ControlPersist` with a timeout is no substitute: it
+/// makes ssh fork the master into the background, outside this tether and
+/// the process group the owner stops.
+///
+/// Windows has no multiplexed master; there, every native process is placed
+/// in a job object that closes with its owner.
+#[cfg(unix)]
+const MASTER_TETHER: &str = r#"exec 3<&0 0</dev/null
+"$@" 3<&- &
+master=$!
+{ while read -r _ <&3; do :; done; kill -TERM "$master" 2>/dev/null; } &
+watcher=$!
+exec 3<&-
+wait "$master"
+status=$?
+kill "$watcher" 2>/dev/null
+exit "$status""#;
+
+#[cfg(unix)]
+pub(super) fn tethered(mut spec: ProcessSpec) -> ProcessSpec {
+    let client = std::mem::replace(&mut spec.executable, PathBuf::from("/bin/sh"));
+    let mut args = vec![
+        "-c".into(),
+        MASTER_TETHER.into(),
+        "xylo-ssh-master".into(),
+        client.to_string_lossy().into_owned(),
+    ];
+    args.append(&mut spec.args);
+    spec.args = args;
+    spec
+}
+
+/// A master stopped with SIGKILL leaves its control socket behind, and ssh
+/// refuses to listen on an existing path ("ControlSocket already exists,
+/// disabling multiplexing"). Only a socket nothing listens on is removed.
+#[cfg(unix)]
+pub(super) fn remove_stale_socket(path: &Path) {
+    use std::os::unix::fs::FileTypeExt;
+    let is_socket =
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket());
+    if is_socket
+        && std::os::unix::net::UnixStream::connect(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 pub(super) async fn ssh_disconnect(
     manager: &Manager,
     record: &EnvironmentRecord,

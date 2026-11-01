@@ -8,6 +8,7 @@ mod package;
 mod spreadsheet;
 mod transaction;
 mod workbook;
+mod xls;
 mod xml;
 use editing::read_bounded;
 fn check(cancel: &CancellationToken) -> Result<()> {
@@ -386,7 +387,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ),
         definition(
             "document_read",
-            "Extract PDF text with PDFium, office spreadsheet values with calamine, DOCX text or bounded UTF-8 text. Reports exact source path and page/sheet.",
+            "Extract PDF text with PDFium, office spreadsheet values (calamine for XLSX/XLSB/ODS, a bounded native reader for legacy XLS), DOCX text or bounded UTF-8 text. Reports exact source path and page/sheet.",
             json!({"path":{"type":"string"},"page":{"type":"integer","minimum":1},"max_pages":{"type":"integer","minimum":1,"maximum":20},"max_rows":{"type":"integer","minimum":1,"maximum":2000},"sheet":{"type":"string"},"password":{"type":"string"}}),
             &["path"],
             false,

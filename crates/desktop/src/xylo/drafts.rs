@@ -1660,7 +1660,22 @@ impl Xylo {
         if loading {
             page = page.child(crate::motion::skeleton_list(4));
         } else if !self.drafts.notice.is_empty() {
-            page = page.child(subtitle(self.drafts.notice.clone()));
+            // Empty and failed states sit where the first row would, with the
+            // rows' padding, as one muted line.
+            page = page.child(
+                div()
+                    .id("drafts-notice")
+                    .test_support()
+                    .aria_label(self.drafts.notice.clone())
+                    .h(px(DRAFT_ROW_HEIGHT))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(13.))
+                    .text_color(rgb(muted()))
+                    .single_line()
+                    .child(self.drafts.notice.clone()),
+            );
         }
         page.child(rows).into_any_element()
     }
@@ -1693,7 +1708,7 @@ impl Xylo {
         focus_ring(gpui_kit::base::Button::new(("open-saved-draft", index)))
             .accessibility_label(format!("Continue draft: {first_line}"))
             .w_full()
-            .h(px(56.))
+            .h(px(DRAFT_ROW_HEIGHT))
             .px(px(12.))
             .rounded(px(10.))
             .flex()
@@ -1942,6 +1957,8 @@ impl Xylo {
     }
 }
 
+/// Height of a saved-draft row and of the list's empty line.
+const DRAFT_ROW_HEIGHT: f32 = 56.;
 /// What the workspace shows about the draft's text: whether it is empty, and
 /// whether it is blank (only whitespace). Typing that changes neither needs no
 /// workspace redraw.

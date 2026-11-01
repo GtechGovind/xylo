@@ -681,6 +681,20 @@ impl Xylo {
         sidebar
             .child(content)
             .child(divider().my(px(8.)))
+            // Until a model is set up, one link leads to Providers; the footer
+            // itself always opens Settings.
+            .when(!self.settings.model_ready(), |sidebar| {
+                sidebar.child(
+                    settings_ui::text_button("footer-setup-model", "Set up a model provider")
+                        .w_full()
+                        .justify_start()
+                        .text_color(rgb(accent_text()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings_open = true;
+                            this.navigate(Page::Providers, cx);
+                        })),
+                )
+            })
             .child(
                 focus_ring(gpui_kit::base::Button::new("settings"))
                     .accessibility_label("Settings")
@@ -731,21 +745,20 @@ impl Xylo {
     }
     /// Who the footer says is using Xylo: the ChatGPT account's email or
     /// plan when that account is the connection, otherwise the provider's
-    /// name. The model already shows on the composer chip.
+    /// name, or "No model set up" until a provider and model are chosen. The
+    /// model itself shows on the composer chip.
     fn account_caption(&self) -> String {
         let provider = &self.settings.provider;
+        if !self.settings.model_ready() {
+            return "No model set up".into();
+        }
         if provider.credential_ref.as_deref() == Some(CHATGPT_REF) {
             return self
                 .account_email()
                 .map(str::to_owned)
                 .unwrap_or_else(|| "ChatGPT plan".into());
         }
-        let name = provider.name.trim();
-        if name.is_empty() {
-            "No provider connected".into()
-        } else {
-            name.to_owned()
-        }
+        provider.name.trim().to_owned()
     }
     /// Pins or unpins a chat. The row moves at once; the host's fresh page
     /// confirms it.

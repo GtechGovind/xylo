@@ -12,11 +12,13 @@
 //! - ODS materializes every table when the workbook opens, expanding
 //!   repeated cells, so `content.xml` is scanned first and the workbook is
 //!   refused when the cells calamine would build exceed [`CELL_BUDGET`].
-//! - Legacy `.xls` is refused: calamine's compound-file reader follows
-//!   sector chains without cycle checks and reserves from declared
-//!   dimensions, and bounding it would mean re-implementing that parser.
+//! - Legacy `.xls` is not given to calamine at all: its compound-file
+//!   reader follows sector chains without cycle checks, reserves from
+//!   declared dimensions and builds every sheet's bounding box on open.
+//!   [`super::xls`] reads it with bounded chains and streams one sheet's
+//!   cells through the same window as XLSX.
 
-use super::{MAX_ARCHIVE, check, preflight_archive};
+use super::{MAX_ARCHIVE, MAX_INPUT, check, preflight_archive, xls};
 use anyhow::{Context, Result, bail, ensure};
 use calamine::{Data, DataRef, Ods, Reader, Xlsb, Xlsx};
 use quick_xml::events::Event;
@@ -28,6 +30,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Most sheet names listed in a result.
+pub(super) const MAX_SHEETS: usize = 1024;
 /// Most columns returned per row.
 pub(super) const MAX_COLUMNS: u32 = 128;
 /// Most cells calamine may materialize when opening an ODS workbook. Each
@@ -50,21 +54,27 @@ pub(super) fn read(
     cancel: &CancellationToken,
 ) -> Result<Value> {
     match extension {
-        "xls" => bail!(
-            "Legacy .xls workbooks cannot be read safely; save the workbook as .xlsx and try again"
-        ),
+        "xls" => {
+            let mut bytes = Vec::new();
+            reader(file)?.take(MAX_INPUT + 1).read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 <= MAX_INPUT,
+                "Document exceeds 64MiB input budget"
+            );
+            read_xls(&bytes, sheet, limit, cancel)
+        }
         "xlsx" | "xlsm" => {
             preflight_archive(file)?;
             check_shared_strings(file, cancel)?;
             let mut workbook = Xlsx::new(reader(file)?)?;
-            let (sheet, sheets) = choose(workbook.sheet_names(), sheet)?;
+            let (sheet, sheets) = choose(workbook.sheet_names().iter().map(String::as_str), sheet)?;
             let window = stream(&mut workbook, &sheet, limit, cancel)?;
             Ok(window.json(&sheet, &sheets))
         }
         "xlsb" => {
             preflight_archive(file)?;
             let mut workbook = Xlsb::new(reader(file)?)?;
-            let (sheet, sheets) = choose(workbook.sheet_names(), sheet)?;
+            let (sheet, sheets) = choose(workbook.sheet_names().iter().map(String::as_str), sheet)?;
             let window = stream(&mut workbook, &sheet, limit, cancel)?;
             Ok(window.json(&sheet, &sheets))
         }
@@ -72,7 +82,7 @@ pub(super) fn read(
             preflight_archive(file)?;
             check_ods_cells(file, cancel)?;
             let mut workbook = Ods::new(reader(file)?)?;
-            let (sheet, sheets) = choose(workbook.sheet_names(), sheet)?;
+            let (sheet, sheets) = choose(workbook.sheet_names().iter().map(String::as_str), sheet)?;
             let range = workbook.worksheet_range(&sheet)?;
             let rows: Vec<Vec<String>> = range
                 .rows()
@@ -84,12 +94,28 @@ pub(super) fn read(
                         .collect()
                 })
                 .collect();
-            Ok(json!({"sheet":sheet,"sheets":sheets,"rows":rows,
+            let mut value = json!({"sheet":sheet,"rows":rows,
                 "total_rows":range.height(),"total_columns":range.width(),
-                "truncated":range.height() > limit || range.width() > MAX_COLUMNS as usize}))
+                "truncated":range.height() > limit || range.width() > MAX_COLUMNS as usize});
+            sheets.describe(&mut value);
+            Ok(value)
         }
         other => bail!("Unsupported spreadsheet type: {other}"),
     }
+}
+
+/// The first `limit` rows and [`MAX_COLUMNS`] columns of `sheet` (or the
+/// first sheet) of a legacy `.xls` workbook held in `bytes`.
+pub(super) fn read_xls(
+    bytes: &[u8],
+    sheet: Option<&str>,
+    limit: usize,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    let mut workbook = xls::Workbook::parse(bytes, cancel)?;
+    let (sheet, sheets) = choose(workbook.sheet_names(), sheet)?;
+    let window = stream(&mut workbook, &sheet, limit, cancel)?;
+    Ok(window.json(&sheet, &sheets))
 }
 
 /// A buffered reader over the already opened input, from its start.
@@ -99,23 +125,55 @@ fn reader(file: &File) -> Result<BufReader<File>> {
     Ok(BufReader::new(file))
 }
 
-/// The requested sheet (or the first) and every sheet name.
-fn choose(sheets: Vec<String>, requested: Option<&str>) -> Result<(String, Vec<String>)> {
+/// The sheet names a result lists; the rest are only counted.
+#[derive(Debug, PartialEq)]
+pub(super) struct Sheets {
+    /// The first [`MAX_SHEETS`] names.
+    listed: Vec<String>,
+    /// Every sheet in the workbook.
+    total: usize,
+}
+
+impl Sheets {
+    /// Sets `sheets` on a result, with `sheets_truncated` and
+    /// `total_sheets` when names were left out.
+    fn describe(&self, value: &mut Value) {
+        value["sheets"] = json!(self.listed);
+        if self.total > self.listed.len() {
+            value["sheets_truncated"] = json!(true);
+            value["total_sheets"] = json!(self.total);
+        }
+    }
+}
+
+/// The requested sheet (or the first) and the listed sheet names. A sheet
+/// beyond the listed ones can still be requested by name.
+pub(super) fn choose<'n>(
+    names: impl Iterator<Item = &'n str>,
+    requested: Option<&str>,
+) -> Result<(String, Sheets)> {
+    let mut listed = Vec::new();
+    let mut total = 0usize;
+    let mut found = false;
+    for name in names {
+        total += 1;
+        found |= requested == Some(name);
+        if listed.len() < MAX_SHEETS {
+            listed.push(name.to_owned());
+        }
+    }
     let sheet = match requested {
         Some(requested) => {
-            ensure!(
-                sheets.iter().any(|name| name == requested),
-                "Workbook has no sheet named {requested}"
-            );
+            ensure!(found, "Workbook has no sheet named {requested}");
             requested.to_owned()
         }
-        None => sheets.first().cloned().context("Workbook has no sheets")?,
+        None => listed.first().cloned().context("Workbook has no sheets")?,
     };
-    Ok((sheet, sheets))
+    Ok((sheet, Sheets { listed, total }))
 }
 
 /// Receives each cell's position and value.
-type Visit<'v> = dyn FnMut((u32, u32), &DataRef<'_>) -> Result<()> + 'v;
+pub(super) type Visit<'v> = dyn FnMut((u32, u32), &DataRef<'_>) -> Result<()> + 'v;
 
 /// A workbook whose sheets can be read one cell at a time.
 trait Cells {
@@ -143,6 +201,12 @@ impl<RS: Read + Seek> Cells for Xlsb<RS> {
     }
 }
 
+impl Cells for xls::Workbook {
+    fn each(&mut self, sheet: &str, visit: &mut Visit<'_>) -> Result<()> {
+        xls::Workbook::each(self, sheet, visit)
+    }
+}
+
 /// The used area of a sheet and the cells of its first rows and columns.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Window {
@@ -156,7 +220,7 @@ pub(super) struct Window {
 }
 
 impl Window {
-    fn json(&self, sheet: &str, sheets: &[String]) -> Value {
+    fn json(&self, sheet: &str, sheets: &Sheets) -> Value {
         let (rows, columns) = self.size();
         let shown_rows = rows.min(self.limit as u64) as u32;
         let shown_columns = columns.min(u64::from(MAX_COLUMNS)) as u32;
@@ -167,9 +231,11 @@ impl Window {
                     .collect()
             })
             .collect();
-        json!({"sheet":sheet,"sheets":sheets,"rows":rows_out,
+        let mut value = json!({"sheet":sheet,"rows":rows_out,
             "total_rows":rows,"total_columns":columns,
-            "truncated":rows > self.limit as u64 || columns > u64::from(MAX_COLUMNS)})
+            "truncated":rows > self.limit as u64 || columns > u64::from(MAX_COLUMNS)});
+        sheets.describe(&mut value);
+        value
     }
 
     /// Widens the used area to include a filled cell.

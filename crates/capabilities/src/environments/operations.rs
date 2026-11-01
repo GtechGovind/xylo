@@ -7,6 +7,10 @@ use std::sync::Arc;
 fn cleanup() -> CancellationToken {
     CancellationToken::new()
 }
+/// How long a cancelled command, or a status check that meets one, waits
+/// for the run to record its final receipt and release its operation lease.
+/// Stopping the client and publishing its output normally takes far less.
+const SETTLE_GRACE: Duration = Duration::from_secs(2);
 async fn settle_capture(
     manager: &Manager,
     operation: &Operation,
@@ -733,7 +737,7 @@ pub(super) async fn execute(
     });
     tokio::select! {
         result = &mut retained => result?,
-        _ = wait_cancel.cancelled() => match tokio::time::timeout(Duration::from_secs(2), &mut retained).await {
+        _ = wait_cancel.cancelled() => match tokio::time::timeout(SETTLE_GRACE, &mut retained).await {
             Ok(result) => result?,
             Err(_) => Ok(finishing),
         },
@@ -804,7 +808,16 @@ pub(super) async fn operation_status(
     context: Option<(Uuid, EnvironmentAction)>,
     cancel: CancellationToken,
 ) -> Result<EnvironmentReceipt> {
-    let lease = manager.try_operation_lease(id)?;
+    // A run holds this lease until its final receipt is written. A check that
+    // arrives while a cancelled run is still recording its outcome would
+    // otherwise report the stale Running receipt, and a caller acting on it
+    // could not reconcile the command. Wait briefly for the run to settle; a
+    // command that is genuinely still running is reported as running.
+    let lease = match tokio::time::timeout(SETTLE_GRACE, manager.operation_lease(id, &cancel)).await
+    {
+        Ok(lease) => Some(lease?),
+        Err(_) => None,
+    };
     if let Some(receipt) = manager.cancelled(id)? {
         if let Some((environment_id, action)) = context {
             ensure!(

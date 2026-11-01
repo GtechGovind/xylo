@@ -20,6 +20,18 @@ fn sample(workspace: &Path) -> PromptContext<'_> {
         permission_mode: PermissionMode::AskForApproval,
         project_instructions: String::new(),
         skills_index: String::new(),
+        compact: false,
+        skills_index_bytes: SKILLS_INDEX_BYTES,
+        omitted: Vec::new(),
+    }
+}
+
+/// [`sample`] with the tiny-window profile and its budgets for a 4K window.
+fn tiny_sample(workspace: &Path) -> PromptContext<'_> {
+    PromptContext {
+        compact: true,
+        skills_index_bytes: 353,
+        ..sample(workspace)
     }
 }
 
@@ -63,6 +75,13 @@ fn renderer_rejects_malformed_placeholders() {
 fn bundled_templates_use_exactly_their_placeholders() {
     let expected: &[(&str, &[&str])] = &[
         (SYSTEM, &["environment", "permissions"]),
+        (SYSTEM_TINY, &["environment", "permissions"]),
+        (SYSTEM_OMITTED, &["items"]),
+        (SYSTEM_OMITTED_INSTRUCTIONS, &[]),
+        (SYSTEM_OMITTED_SKILLS, &[]),
+        (PERMISSIONS_TINY, &["permission_mode", "permission_policy"]),
+        (RECALLED_OMITTED, &[]),
+        (COMPACTION_TINY, &["words"]),
         (
             ENVIRONMENT,
             &["workspace", "os", "arch", "shell", "git", "date"],
@@ -79,7 +98,7 @@ fn bundled_templates_use_exactly_their_placeholders() {
         (PERMISSION_APPROVE_FOR_ME, &[]),
         (PERMISSION_FULL_ACCESS, &[]),
         (PERMISSION_READ_ONLY, &[]),
-        (COMPACTION, &[]),
+        (COMPACTION, &["words"]),
         (COMPACTION_REQUEST, &["transcript"]),
         (COMPACTION_UPDATE, &["previous", "transcript"]),
         (COMPACTION_SUMMARY, &["summary"]),
@@ -193,6 +212,71 @@ fn fixed_system_prompt_stays_within_budget() {
         let size = system(&ctx).len();
         assert!(size <= FIXED_BUDGET, "{mode:?}: {size} bytes");
     }
+}
+
+/// The tiny-window prompt states the environment and the permission mode,
+/// leaves out what does not fit whole and says what it left out, and stays
+/// far below the full prompt.
+#[test]
+fn tiny_prompt_is_compact_and_records_what_it_left_out() {
+    let workspace = PathBuf::from("/work/project");
+    let full = system(&sample(&workspace));
+    let mut ctx = tiny_sample(&workspace);
+    let bare = system(&ctx);
+    assert!(
+        bare.len() * 2 < full.len(),
+        "{} vs {}",
+        bare.len(),
+        full.len()
+    );
+    for expected in [
+        "Workspace: /work/project",
+        "# Permissions: Ask for approval",
+    ] {
+        assert!(bare.contains(expected), "missing {expected:?}");
+    }
+    assert!(!bare.contains("# Left out"));
+    let index = skills_index(
+        bundled_skills()
+            .iter()
+            .map(|skill| (skill.name, skill.description)),
+        SKILLS_INDEX_BYTES,
+    );
+    assert!(index.len() > ctx.skills_index_bytes);
+    ctx.set_skills_index(index);
+    let prompt = system(&ctx);
+    assert!(!prompt.contains("# Skills"));
+    assert!(prompt.contains("# Left out to fit the context window"));
+    assert!(prompt.contains("extension_skill"));
+    assert_eq!(prompt, system(&ctx.clone()));
+    // A small index fits whole and is kept.
+    let mut fitting = tiny_sample(&workspace);
+    fitting.set_skills_index(skills_index([("tidy", "Tidy up.")], SKILLS_INDEX_BYTES));
+    assert!(system(&fitting).contains("- tidy: Tidy up."));
+    assert!(fitting.omitted.is_empty());
+}
+
+/// Under a compact budget, instruction files that do not fit whole are left
+/// out (never truncated) and recorded; ones that fit are kept.
+#[test]
+fn compact_budget_keeps_instructions_whole_or_leaves_them_out() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), "Use tabs.\n".repeat(200)).unwrap();
+    let budget = PromptBudget {
+        instruction_bytes: 700,
+        skills_index_bytes: 350,
+        compact: true,
+    };
+    let ctx = PromptContext::detect(root.path(), PermissionMode::ReadOnly, 0, budget);
+    assert!(ctx.project_instructions.is_empty());
+    assert_eq!(ctx.omitted, vec![Omitted::ProjectInstructions]);
+    let prompt = system(&ctx);
+    assert!(prompt.contains("AGENTS.md or CLAUDE.md"));
+    assert!(!prompt.contains("Use tabs."));
+    std::fs::write(root.path().join("AGENTS.md"), "Use tabs.\n").unwrap();
+    let ctx = PromptContext::detect(root.path(), PermissionMode::ReadOnly, 0, budget);
+    assert!(ctx.omitted.is_empty());
+    assert!(system(&ctx).contains("Use tabs."));
 }
 
 #[test]
@@ -616,7 +700,10 @@ fn delegated_and_auxiliary_prompts_render() {
     assert!(skill_permissions_note().contains("never grants tool access"));
     let forked = forked_skill_context("pkg:lint", "/skills/lint");
     assert!(forked.starts_with("Skill pkg:lint.") && forked.contains("/skills/lint"));
-    assert!(compaction().contains("Next steps"));
+    assert!(
+        compaction(900).contains("Next steps")
+            && compaction(900).ends_with("Stay under 900 words.")
+    );
     assert!(!title().is_empty());
     assert!(step_limit().contains("Do not call any more tools") && !step_limit().contains("{{"));
     let first = compaction_request(None, "T1");

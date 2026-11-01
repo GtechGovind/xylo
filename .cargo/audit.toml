@@ -1,0 +1,16 @@
+# Accepted RustSec "unmaintained" advisories. None is a vulnerability, and each
+# reaches Xylo only through the GPUI toolkit (`gpui-kit` 0.8.1, the newest
+# release), so removing them needs an upstream toolkit release. Re-check this
+# list whenever gpui-kit is upgraded; any advisory not listed here still fails
+# `cargo audit`.
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0384", # instant: via gpui-base
+    "RUSTSEC-2024-0436", # paste (proc-macro, build time only): via gpui-component
+    "RUSTSEC-2025-0134", # rustls-pemfile: via gpui-pre-reqwest (toolkit asset fetching)
+    "RUSTSEC-2026-0206", # rustybuzz: via usvg (SVG icon rendering in gpui-pre)
+    "RUSTSEC-2026-0192", # ttf-parser: via usvg and the toolkit's font stack
+    "RUSTSEC-2026-0371", # zbus_names: Linux accessibility (accesskit_unix) via gpui-pre-linux
+    "RUSTSEC-2026-0370", # zvariant: same Linux accessibility path
+    "RUSTSEC-2026-0372", # zvariant_derive: same Linux accessibility path
+]

@@ -7,14 +7,18 @@ Every piece of text Xylo sends to a model as instructions lives here, in Markdow
 | File | Used for | API |
 | --- | --- | --- |
 | `system.md` | Main agent: identity, working method, communication; includes the environment and permissions sections | `prompts::system(&PromptContext)` |
+| `system-tiny.md`, `permissions-tiny.md` | Compact main-agent prompt and permissions section for a tiny window (the tiny-window profile, below about 5.5K input tokens): names only the five resident tools and points at `search_tools` / `call_tool` for the rest | `prompts::system(&PromptContext)` with `compact` set |
+| `system-omitted.md`, `system-omitted-instructions.md`, `system-omitted-skills.md` | List of variable sections a compact prompt left out because they did not fit whole (project instructions, skills index), with how to reach each | (inside `system`, `subagent`) |
 | `environment.md` | Environment section shared by the main agent and helpers | (inside `system`, `subagent`) |
 | `permissions.md`, `permissions/*.md` | Permissions section and the paragraph for each mode | (inside `system`, `subagent`) |
 | `permission-change.md` | System note appended when the user changes the mode mid-task, so the cached system block stays unchanged | `prompts::permission_change(mode)` |
 | `system-project-instructions.md` | Wrapper for AGENTS.md / CLAUDE.md text, only when present | (inside `system`) |
 | `system-skills.md` | Wrapper for the skills index, only when skills exist | (inside `system`) |
 | `recalled-context.md`, `recalled-facts.md`, `recalled-procedures.md`, `recalled-skills.md` | Per-turn note after the user's message with the project facts and learned procedures retrieved for that prompt (quoted and dated as data) and any installed skill the prompt invokes by name; kept out of the system prompt so it stays byte-identical across turns | `prompts::recalled_context(facts, procedures, skills)` |
+| `recalled-omitted.md` | Note that stands in a tiny window for a recalled context too large to fit; points at `memory_search` | `prompts::recalled_omitted()` |
 | `subagent.md`, `subagent-task.md` | Delegated helper agent (`agent_delegate`): parent's environment, permissions and project instructions, then the task; no skill or fact indexes | `prompts::subagent(&PromptContext, task)` |
-| `compaction.md` | Context summarizer system prompt; requires exact paths, identifiers, dates and a cited source (call id) for each decision | `prompts::compaction()` |
+| `compaction.md` | Context summarizer system prompt; requires exact paths, identifiers, dates and a cited source (call id) for each decision; its word limit follows the summary's output limit (900 words for the full 2,048 tokens, fewer in windows under 16K of input) | `prompts::compaction(words)` |
+| `compaction-tiny.md` | Brief summarizer system prompt for a tiny window, with a word limit that fits its summary output limit (an eighth of the input budget) | `prompts::compaction_tiny(words)` |
 | `compaction-request.md`, `compaction-update.md` | Summarizer user message, first summary or update of a previous one | `prompts::compaction_request(previous, transcript)` |
 | `compaction-summary.md` | Message that replaces condensed history | `prompts::compaction_summary(summary)` |
 | `compaction-excerpts.md`, `compaction-tool-notes.md` | Headers of the fallback excerpt notes | `prompts::compaction_excerpts_header()`, `prompts::compaction_tool_notes_header()` |
@@ -56,6 +60,8 @@ Built-in skills: `../skills/<name>/SKILL.md` plus optional resource files, regis
 | Extra tool schemas | `search_tools` / `call_tool` |
 
 Budget of the fixed prompt, measured with the tests' sample context: about 3.7–3.9 KB (roughly 1,000 tokens) for identity, environment, method and permissions; about 6 KB with the six built-in skills listed. `fixed_system_prompt_stays_within_budget` fails if the prompt without project instructions (built-in skills included) exceeds 12 KiB.
+
+Tiny windows (a 4K window, measured with the engine's estimator: o200k counts × 1.3) take the compact profile instead: `system-tiny.md` with the environment and `permissions-tiny.md` is about 1.6 KB (about 380 o200k tokens, 500 estimated), against about 5 KB (1,040 tokens, 1,350 estimated) for the full prompt with the skills index. Project instructions and the skills index are included only when they fit their tiny budgets (8 % and 4 % of the input budget) whole; otherwise they are left out and `system-omitted.md` lists them. The decision depends only on the files and the window, so the prompt stays byte-identical across turns.
 
 ### Project instructions
 

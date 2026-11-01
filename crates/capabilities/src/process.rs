@@ -163,13 +163,40 @@ pub struct ManagedProcess {
     pid: Option<u32>,
     stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
     stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
+    /// Write end of the child's stdin pipe, held open and never written; see
+    /// [`ManagedProcess::spawn_tethered`].
+    _tether: Option<tokio::process::ChildStdin>,
     #[cfg(windows)]
     job: WindowsJob,
 }
 
 impl ManagedProcess {
     pub fn spawn(spec: &ProcessSpec) -> Result<Self> {
-        let mut process = Self::spawn_uncaptured(spec)?;
+        Self::captured(Self::start(command(spec)?)?, spec)
+    }
+
+    /// Like [`Self::spawn`], but the child's stdin is a pipe whose write end
+    /// this handle holds open and never writes. The kernel closes it when the
+    /// handle drops or this process ends for any reason, including SIGKILL or
+    /// `std::process::exit`, which skip destructors. A child that waits for
+    /// end of input therefore learns that its owner is gone; `kill_on_drop`
+    /// alone cannot cover an owner that never drops the handle.
+    pub(crate) fn spawn_tethered(spec: &ProcessSpec) -> Result<Self> {
+        let mut command = command(spec)?;
+        command.stdin(std::process::Stdio::piped());
+        let mut process = Self::start(command)?;
+        process._tether = process.child.stdin.take();
+        Self::captured(process, spec)
+    }
+
+    /// Closes the tether as the kernel does when this process dies, without
+    /// running any destructor.
+    #[cfg(test)]
+    pub(crate) fn sever_tether(&mut self) {
+        self._tether = None;
+    }
+
+    fn captured(mut process: Self, spec: &ProcessSpec) -> Result<Self> {
         process.stdout = process
             .child
             .stdout
@@ -186,9 +213,11 @@ impl ManagedProcess {
     /// Internal opt-in boundary for durable environment output. Generic callers
     /// retain the same bounded preview readers through `spawn` above.
     pub(crate) fn spawn_uncaptured(spec: &ProcessSpec) -> Result<Self> {
-        let child = command(spec)?
-            .spawn()
-            .context("Failed to start native helper")?;
+        Self::start(command(spec)?)
+    }
+
+    fn start(mut command: Command) -> Result<Self> {
+        let child = command.spawn().context("Failed to start native helper")?;
         #[cfg(windows)]
         let mut child = child;
         #[cfg(windows)]
@@ -209,6 +238,7 @@ impl ManagedProcess {
             pid,
             stdout: None,
             stderr: None,
+            _tether: None,
             #[cfg(windows)]
             job,
         })

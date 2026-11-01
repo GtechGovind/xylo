@@ -3,39 +3,31 @@
 //! deny write/delete sharing while validation and the final bounded read run.
 
 use super::checked;
+use crate::windows_nt::{self, Identity, identity, validate_component};
 use anyhow::{Context, Result, ensure};
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
     mem::size_of,
-    os::windows::{
-        ffi::OsStrExt,
-        io::{AsRawHandle, FromRawHandle},
-    },
+    os::windows::{ffi::OsStrExt, io::AsRawHandle},
     path::{Component, Path, Prefix},
 };
 use tokio_util::sync::CancellationToken;
 use windows_sys::{
     Wdk::{
-        Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            FILE_COMPLETE_IF_OPLOCKED, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+            FILE_COMPLETE_IF_OPLOCKED, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
             FILE_OPEN_NO_RECALL, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-            FileFsDeviceInformation, NtCreateFile, NtQueryVolumeInformationFile,
+            FileFsDeviceInformation, NtQueryVolumeInformationFile,
         },
         System::SystemServices::{FILE_FS_DEVICE_INFORMATION, FILE_REMOTE_DEVICE},
     },
     Win32::{
-        Foundation::{
-            HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING,
-        },
         Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_DIRECTORY,
-            FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DEVICE_DISK, FILE_ID_INFO,
-            FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ,
-            FILE_TRAVERSE, FILE_TYPE_DISK, FileIdInfo, GetFileInformationByHandle,
-            GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, SYNCHRONIZE,
-            VOLUME_NAME_GUID,
+            FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_OFFLINE,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_DEVICE_DISK, FILE_NAME_NORMALIZED,
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ, FILE_TRAVERSE,
+            GetFinalPathNameByHandleW, SYNCHRONIZE, VOLUME_NAME_GUID,
         },
         System::IO::IO_STATUS_BLOCK,
     },
@@ -45,12 +37,6 @@ use windows_sys::{
 struct DrivePath {
     drive: u8,
     parts: Vec<OsString>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Identity {
-    volume: u64,
-    file: [u8; 16],
 }
 
 struct DirectoryAuthority {
@@ -187,43 +173,6 @@ fn collect_parts(components: std::path::Components<'_>) -> Result<Vec<OsString>>
     Ok(parts)
 }
 
-fn validate_component(name: &OsStr) -> Result<()> {
-    let units: Vec<_> = name.encode_wide().collect();
-    ensure!(
-        !units.is_empty()
-            && units.len() <= 255
-            && !units
-                .iter()
-                .any(|unit| *unit < 32
-                    || matches!(*unit, 34 | 42 | 47 | 58 | 60 | 62 | 63 | 92 | 124))
-            && !matches!(units.last(), Some(32 | 46)),
-        "Workspace names cannot contain streams, devices, separators or trailing spaces/dots"
-    );
-    let stem: String = units
-        .iter()
-        .take_while(|unit| **unit != 46)
-        .map(|unit| char::from_u32(u32::from(*unit)).unwrap_or('\u{fffd}'))
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let numbered_device = stem
-        .strip_prefix("com")
-        .or_else(|| stem.strip_prefix("lpt"))
-        .is_some_and(|number| {
-            matches!(
-                number,
-                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            )
-        });
-    ensure!(
-        !matches!(
-            stem.as_str(),
-            "con" | "prn" | "aux" | "nul" | "conin$" | "conout$" | "clock$"
-        ) && !numbered_device,
-        "Workspace device names are not supported"
-    );
-    Ok(())
-}
-
 fn open_authority(
     path: &DrivePath,
     cancel: &CancellationToken,
@@ -259,92 +208,36 @@ fn open_relative(parent: &File, name: &OsStr, directory: bool) -> Result<File> {
 }
 
 fn native_open(parent: Option<&File>, name: &OsStr, directory: bool) -> Result<File> {
-    let mut units: Vec<_> = name.encode_wide().collect();
-    let length = u16::try_from(units.len() * size_of::<u16>())?;
-    let unicode = UNICODE_STRING {
-        Length: length,
-        MaximumLength: length,
-        Buffer: units.as_mut_ptr(),
-    };
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: parent.map_or(std::ptr::null_mut(), |file| file.as_raw_handle()),
-        ObjectName: &unicode,
-        Attributes: OBJ_CASE_INSENSITIVE
-            | if parent.is_some() {
-                OBJ_DONT_REPARSE
+    let file = windows_nt::open(
+        parent,
+        name,
+        FILE_READ_ATTRIBUTES
+            | SYNCHRONIZE
+            | if directory {
+                FILE_TRAVERSE
             } else {
-                0
+                FILE_READ_DATA
             },
-        ..Default::default()
-    };
-    let mut io = IO_STATUS_BLOCK::default();
-    let mut handle: HANDLE = std::ptr::null_mut();
-    // SAFETY: all NT structures and the counted UTF-16 name remain live for the
-    // synchronous call; the parent handle is borrowed, output ownership moves
-    // immediately into File. No create/overwrite disposition is permitted.
-    let status = unsafe {
-        NtCreateFile(
-            &mut handle,
-            FILE_READ_ATTRIBUTES
-                | SYNCHRONIZE
-                | if directory {
-                    FILE_TRAVERSE
-                } else {
-                    FILE_READ_DATA
-                },
-            &attributes,
-            &mut io,
-            std::ptr::null(),
-            0,
-            FILE_SHARE_READ,
-            FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT
-                | FILE_SYNCHRONOUS_IO_NONALERT
-                | FILE_COMPLETE_IF_OPLOCKED
-                | if directory {
-                    FILE_DIRECTORY_FILE
-                } else {
-                    // NT rejects NO_RECALL with DIRECTORY_FILE. Keep it for
-                    // regular files; directory handles still reject offline
-                    // objects and reparse points during attribute validation.
-                    FILE_NON_DIRECTORY_FILE | FILE_OPEN_NO_RECALL
-                },
-            std::ptr::null(),
-            0,
-        )
-    };
-    // Positive informational NT results (including oplock break in progress)
-    // are refused too. If an owned handle was returned, close it on refusal.
-    let file = if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
-        // SAFETY: this is a new owned handle returned by NtCreateFile.
-        Some(unsafe { File::from_raw_handle(handle) })
-    } else {
-        None
-    };
-    ensure!(
-        status == 0,
-        "Workspace file could not be opened safely (Windows status 0x{:08x})",
-        status as u32
-    );
-    let file = file.context("Windows did not return a file authority")?;
+        FILE_SHARE_READ,
+        FILE_OPEN_REPARSE_POINT
+            | FILE_SYNCHRONOUS_IO_NONALERT
+            | FILE_COMPLETE_IF_OPLOCKED
+            | if directory {
+                FILE_DIRECTORY_FILE
+            } else {
+                // NT rejects NO_RECALL with DIRECTORY_FILE. Keep it for
+                // regular files; directory handles still reject offline
+                // objects and reparse points during attribute validation.
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_NO_RECALL
+            },
+    )
+    .map_err(|refused| anyhow::anyhow!("Workspace file could not be opened safely ({refused})"))?;
     validate_handle(&file, directory)?;
     Ok(file)
 }
 
 fn validate_handle(file: &File, directory: bool) -> Result<()> {
-    // SAFETY: the File owns a live handle for these read-only queries.
-    ensure!(
-        unsafe { GetFileType(file.as_raw_handle()) } == FILE_TYPE_DISK,
-        "Plugin reads require a local disk file"
-    );
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: the output buffer has the API's exact structure size.
-    ensure!(
-        unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } != 0,
-        "Windows could not verify file attributes: {}",
-        std::io::Error::last_os_error()
-    );
+    let info = windows_nt::information(file)?;
     ensure!(
         info.dwFileAttributes
             & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE | FILE_ATTRIBUTE_OFFLINE)
@@ -362,31 +255,6 @@ fn validate_handle(file: &File, directory: bool) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn identity(file: &File) -> Result<Identity> {
-    let mut info = FILE_ID_INFO::default();
-    // SAFETY: the output type/size match FileIdInfo and the handle is live.
-    ensure!(
-        unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle(),
-                FileIdInfo,
-                std::ptr::from_mut(&mut info).cast(),
-                size_of::<FILE_ID_INFO>() as u32,
-            )
-        } != 0,
-        "Windows could not verify directory identity: {}",
-        std::io::Error::last_os_error()
-    );
-    ensure!(
-        info.FileId.Identifier != [0; 16],
-        "Filesystem does not provide a reliable directory identity"
-    );
-    Ok(Identity {
-        volume: info.VolumeSerialNumber,
-        file: info.FileId.Identifier,
-    })
 }
 
 fn reject_private(directory: &File, forbidden: Identity) -> Result<()> {

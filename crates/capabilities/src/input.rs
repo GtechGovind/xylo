@@ -9,8 +9,9 @@
 //! most 16 links). The walk refuses Xylo's management directory by identity
 //! and hands consumers that same handle. The file must be a
 //! regular file with a single link, so a hard link cannot make a file from
-//! elsewhere look like a project file. Other platforms fall back to a
-//! resolve-check-open sequence whose remaining race is documented on it.
+//! elsewhere look like a project file. Windows walks the same way with
+//! handle-relative `NtCreateFile` opens that never follow a reparse point
+//! (`input/windows.rs`); other platforms refuse every input.
 
 use crate::CapabilityConfig;
 use anyhow::{Result, bail, ensure};
@@ -314,17 +315,21 @@ mod platform {
     }
 }
 
-/// Fallback for platforms without the Unix relative no-follow walk: resolve
-/// the path, check its scope, then open it.
-///
-/// This keeps a check-then-open race: between `canonicalize` and the open, a
-/// process that can write inside the workspace could swap a component for a
-/// link to a file outside the roots. Closing it needs handle-relative opens
-/// like `plugins/windows_read.rs`, adapted to two roots and tested on
-/// Windows.
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[path = "input/windows.rs"]
+mod platform;
+
+/// Link targets as Windows stores them; also built for tests everywhere so
+/// the byte layout is checked on every platform.
+#[cfg(any(windows, test))]
+#[path = "input/reparse.rs"]
+mod reparse;
+
+/// Platforms without a handle-relative walk refuse every input rather than
+/// open one through a check-then-open race.
+#[cfg(not(any(unix, windows)))]
 mod platform {
-    use anyhow::{Result, ensure};
+    use anyhow::{Result, bail};
     use std::{
         ffi::OsString,
         fs::File,
@@ -332,27 +337,16 @@ mod platform {
     };
 
     pub(super) fn open_beneath(
-        base: &Path,
-        parts: &[OsString],
-        management: Option<&Path>,
+        _base: &Path,
+        _parts: &[OsString],
+        _management: Option<&Path>,
     ) -> Result<(File, PathBuf)> {
-        let joined = parts
-            .iter()
-            .fold(base.to_path_buf(), |path, part| path.join(part));
-        let canonical = std::fs::canonicalize(joined)?;
-        ensure!(
-            canonical.starts_with(base),
-            "Input is outside the workspace and artifacts roots"
-        );
-        ensure!(
-            !management.is_some_and(|management| canonical.starts_with(management)),
-            "Application management files are outside the tool filesystem scope"
-        );
-        ensure!(canonical.is_file(), "Input must be a regular file");
-        let file = File::open(&canonical)?;
-        Ok((file, canonical))
+        bail!("Tool inputs cannot be opened safely on this platform")
     }
 }
 
+// Paths are spelled from this file's directory so the Windows validation
+// crate, which includes this file by `#[path]`, finds the same modules.
 #[cfg(test)]
+#[path = "input/tests.rs"]
 mod tests;

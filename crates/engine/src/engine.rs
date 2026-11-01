@@ -14,7 +14,7 @@ use crate::{
     attachments::{AttachmentProvider, user_message},
     broker_tools::BrokerTools,
     model::{Message, ModelError, ModelProvider, ModelRequest, Role},
-    provider_guard::{ContextBudget, GuardedProvider},
+    provider_guard::{ContextBudget, EffectiveWindow, GuardedProvider},
     steering::SteeringControl,
     subagent::{CHILD_TIMEOUT, Delegation, MAX_CONCURRENT_CHILDREN},
     tools::{ToolBroker, ToolSession},
@@ -255,10 +255,13 @@ impl AgentEngine {
             xylo_core::now_ms(),
             broker.window().prompt_budget(),
         );
-        context.skills_index = broker.project_skill_context().unwrap_or_else(|error| {
+        context.set_skills_index(broker.project_skill_context().unwrap_or_else(|error| {
             tracing::warn!(error=%error, "Skill index unavailable");
             String::new()
-        });
+        }));
+        if !context.omitted.is_empty() {
+            tracing::debug!(omitted = ?context.omitted, "Compact system prompt left sections out");
+        }
         crate::prompts::system(&context)
     }
 
@@ -290,6 +293,21 @@ impl AgentEngine {
         });
         crate::prompts::recalled_context(&facts, &procedures, &skills)
             .map(|note| crate::agent_loop::application_note(&note))
+    }
+
+    /// `note`, or in a tiny window whose recall budget
+    /// ([`EffectiveWindow::recalled_context_bytes`]) it exceeds, a short note
+    /// that something was recalled and how to search it. The note becomes
+    /// durable history, so the choice is made once and replayed unchanged.
+    fn fitted_recall(note: Message, window: EffectiveWindow) -> Message {
+        if note.content.len() <= window.recalled_context_bytes() {
+            return note;
+        }
+        tracing::debug!(
+            bytes = note.content.len(),
+            "Recalled context left out to fit the window"
+        );
+        crate::agent_loop::application_note(crate::prompts::recalled_omitted())
     }
 
     /// Generates, stores and announces a title after the first completed
@@ -480,7 +498,7 @@ impl AgentEngine {
         if messages.last() == Some(&user_message(&request)) {
             let recalling = broker.clone();
             if let Some(note) = blocking(move || Ok(Self::recalled_context(&recalling))).await? {
-                messages.push(note);
+                messages.push(Self::fitted_recall(note, broker.window()));
             }
         }
         let mode = self.session.permissions().get();
