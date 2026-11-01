@@ -8,21 +8,30 @@ impl HostState {
         mut answer: xylo_core::InteractionAnswer,
     ) -> Result<xylo_core::InteractionAnswer> {
         if let xylo_core::InteractionAnswer::ApprovePlan { mode } = &mut answer {
-            if self.scheduled.lock().await.contains_key(&session) {
-                let current = self.settings.lock().await.permissions;
-                *mode = self
-                    .wakeup_permission(
-                        session,
-                        crate::scheduler::wakeup_mode(*mode, effective_mode(current, true)),
-                    )
-                    .await?;
-            }
+            *mode = self.cap_interaction_mode(session, *mode).await?;
             ensure!(
                 *mode != PermissionMode::Plan,
                 "This task must remain in Plan mode. Keep planning or reject the plan."
             );
         }
         Ok(answer)
+    }
+
+    /// Both explicit mode controls and plan answers obey unattended authority.
+    pub(super) async fn cap_interaction_mode(
+        &self,
+        session: Uuid,
+        mode: PermissionMode,
+    ) -> Result<PermissionMode> {
+        if !self.scheduled.lock().await.contains_key(&session) {
+            return Ok(mode);
+        }
+        let current = self.settings.lock().await.permissions;
+        self.wakeup_permission(
+            session,
+            crate::scheduler::wakeup_mode(mode, effective_mode(current, true)),
+        )
+        .await
     }
 
     pub(super) async fn wakeup_permission(

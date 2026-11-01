@@ -1,7 +1,7 @@
 //! The composer's permission control. It shows the current preset with its
-//! icon and switches presets from a menu. Settings are the source of truth and
-//! the host forwards every change to running workers, so a choice applies to
-//! the next action of the task already running.
+//! icon and switches presets from a menu. A running chat displays the effective
+//! mode reported by the host; saved settings provide the default. Explicit
+//! choices reach the worker even when the saved preset already has that value.
 use super::*;
 use crate::icons::{self, AppIcon};
 use gpui_kit::component::{
@@ -72,8 +72,17 @@ fn permission_row(mode: PermissionMode) -> Div {
 }
 
 impl Xylo {
+    pub(super) fn current_permission_mode(&self) -> PermissionMode {
+        self.effective_permissions
+            .get(&self.session)
+            .map_or(self.settings.permissions, |(_, mode)| *mode)
+    }
+
     pub(super) fn set_permission_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
         if self.settings.permissions == mode {
+            if self.current_permission_mode() != mode {
+                self.engine_command(WorkerCommand::SetPermissions { mode }, cx);
+            }
             return;
         }
         self.settings.permissions = mode;
@@ -84,7 +93,7 @@ impl Xylo {
 
     pub(super) fn composer_permissions(&self, cx: &Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
-        let mode = self.settings.permissions;
+        let mode = self.current_permission_mode();
         MenuButton::new("composer-permissions")
             .ghost()
             .accessibility_label(mode.label())
@@ -102,7 +111,7 @@ impl Xylo {
             .text_color(rgb(permission_color(mode)))
             .tooltip(mode.description())
             .dropdown_menu(move |mut menu, _, cx| {
-                let Ok(active) = weak.update(cx, |view, _| view.settings.permissions) else {
+                let Ok(active) = weak.update(cx, |view, _| view.current_permission_mode()) else {
                     return menu;
                 };
                 menu = menu.label("How should Xylo's actions be approved?");

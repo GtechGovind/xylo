@@ -58,6 +58,11 @@ pub struct ConnectorMutationReceipt {
 
 #[derive(Clone)]
 pub enum HostEvent {
+    Permissions {
+        session: Uuid,
+        mode: PermissionMode,
+        revision: u64,
+    },
     InteractionReply {
         session: Uuid,
         action_id: Uuid,
@@ -2433,7 +2438,6 @@ impl HostState {
                 WorkerCommand::RunAuthorized { .. }
                     | WorkerCommand::ProviderCredentialUpdated { .. }
                     | WorkerCommand::Unlock { .. }
-                    | WorkerCommand::SetPermissions { .. }
                     | WorkerCommand::Hello
                     | WorkerCommand::Cancel
             ),
@@ -2497,6 +2501,24 @@ impl HostState {
             return Ok(());
         }
         let worker = worker.context("This task is no longer running")?;
+        if let WorkerCommand::SetPermissions { mode } = command {
+            let _permission_order = worker.permission_order.lock().await;
+            ensure!(
+                !mode.allows_writes() || mode == self.settings.lock().await.permissions,
+                "Choose the permission preset through application settings"
+            );
+            let mode = self.cap_interaction_mode(session, mode).await?;
+            worker.record_mode(mode);
+            worker
+                .send_control(
+                    session,
+                    Uuid::new_v4(),
+                    WorkerCommand::SetPermissions { mode },
+                )
+                .await?;
+            self.events.send(worker.permission_event(session)).await?;
+            return Ok(());
+        }
         worker.send_control(session, Uuid::new_v4(), command).await
     }
 
@@ -2820,6 +2842,7 @@ impl HostState {
             credential,
         };
         permit.send(Envelope::new(request_id, Some(session), 0, command));
+        self.events.send(worker.permission_event(session)).await?;
         let cancelled = {
             let mut starting = self.queued.lock();
             starting.remove(&session);

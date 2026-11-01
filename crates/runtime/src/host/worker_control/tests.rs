@@ -492,6 +492,95 @@ done
     }
 
     #[tokio::test]
+    async fn interaction_plan_acceptance_publishes_mode_then_plan_is_delivered() {
+        let (_directory, host, events, session) = running("honor").await;
+        host.settings.lock().await.permissions = PermissionMode::Plan;
+        host.control_worker(
+            Some(session),
+            WorkerCommand::SetPermissions {
+                mode: PermissionMode::Plan,
+            },
+        )
+        .await
+        .unwrap();
+        let id = Uuid::new_v4();
+        // The fixture rejects the first answer so the same pending request is retried.
+        host.control_worker(
+            Some(session),
+            WorkerCommand::Answer {
+                action_id: id,
+                answer: xylo_core::InteractionAnswer::Reject,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for(&events, |event| {
+            matches!(event, HostEvent::InteractionReply { result: Err(_), .. })
+        })
+        .await;
+        wait_for(&events, |event| {
+            matches!(event, HostEvent::PlanModes { .. })
+        })
+        .await;
+        host.control_worker(
+            Some(session),
+            WorkerCommand::Answer {
+                action_id: id,
+                answer: xylo_core::InteractionAnswer::ApprovePlan {
+                    mode: PermissionMode::AskForApproval,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let event = wait_for(&events, |event| {
+            matches!(
+                event,
+                HostEvent::Permissions {
+                    mode: PermissionMode::AskForApproval,
+                    ..
+                }
+            )
+        })
+        .await;
+        let HostEvent::Permissions {
+            revision: accepted, ..
+        } = event
+        else {
+            unreachable!()
+        };
+        wait_for(&events, |event| {
+            matches!(event, HostEvent::InteractionReply { result: Ok(()), .. })
+        })
+        .await;
+        assert_eq!(host.settings.lock().await.permissions, PermissionMode::Plan);
+        host.control_worker(
+            Some(session),
+            WorkerCommand::SetPermissions {
+                mode: PermissionMode::Plan,
+            },
+        )
+        .await
+        .unwrap();
+        let event = wait_for(&events, |event| {
+            matches!(
+                event,
+                HostEvent::Permissions {
+                    mode: PermissionMode::Plan,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(matches!(event, HostEvent::Permissions { revision, .. } if revision > accepted));
+        assert_eq!(
+            *host.workers.lock().await[&session].mode.lock(),
+            PermissionMode::Plan
+        );
+        stop(&host, session).await;
+    }
+
+    #[tokio::test]
     async fn interaction_answer_reply_retry_keeps_host_mode_consistent() {
         let (_directory, host, events, session) = running("honor").await;
         let workspace = host.workers.lock().await[&session]

@@ -90,8 +90,9 @@ async fn interaction_plan_approval_changes_live_mode_and_allows_same_broker_to_w
         .unwrap();
     run.await.unwrap().unwrap();
     assert_eq!(broker.mode(), PermissionMode::AskForApproval);
+    let writing = broker.clone();
     tokio::task::spawn_blocking(move || {
-        broker.execute(
+        writing.execute(
             "write",
             "file_write",
             json!({"path":"approved.txt","content":"approved"}),
@@ -104,6 +105,19 @@ async fn interaction_plan_approval_changes_live_mode_and_allows_same_broker_to_w
         std::fs::read_to_string(root.path().join("approved.txt")).unwrap(),
         "approved"
     );
+    // This is the live cell used by the worker's SetPermissions handler.
+    broker.session.permissions().set(PermissionMode::Plan);
+    let refused = tokio::task::spawn_blocking(move || {
+        broker.execute(
+            "after-plan",
+            "file_write",
+            json!({"path":"refused.txt","content":"must not write"}),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(refused.is_err());
+    assert!(!root.path().join("refused.txt").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

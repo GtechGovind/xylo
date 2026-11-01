@@ -33,6 +33,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Replies to control commands arrive quickly; older entries are forgotten.
 const CONTROL_LEDGER_CAPACITY: usize = 128;
 const FORCED_STOP_NOTICE: &str = "The task did not stop in time, so Xylo ended it. Actions it had started are listed for review.";
+// Revisions remain ordered when a chat receives a replacement worker.
+static NEXT_PERMISSION_REVISION: AtomicU64 = AtomicU64::new(1);
 const LOST_DECISION: &str = "The task is no longer running, so this decision was not applied.";
 
 /// The mode a turn runs with. Scheduled turns run unattended, so Full access
@@ -226,14 +228,28 @@ impl WorkerHandle {
     /// New settings or a new turn supersede earlier plan acknowledgements.
     pub(super) fn record_mode(&self, mode: PermissionMode) {
         let mut stored = self.mode.lock();
-        self.permission_revision.fetch_add(1, Ordering::AcqRel);
+        self.permission_revision.store(
+            NEXT_PERMISSION_REVISION.fetch_add(1, Ordering::AcqRel),
+            Ordering::Release,
+        );
         *stored = mode;
     }
 
-    fn acknowledge_plan_mode(&self, mode: PermissionMode, revision: u64) {
+    fn acknowledge_plan_mode(&self, mode: PermissionMode, revision: u64) -> bool {
         let mut stored = self.mode.lock();
-        if self.permission_revision.load(Ordering::Acquire) == revision {
-            *stored = mode;
+        if self.permission_revision.load(Ordering::Acquire) != revision {
+            return false;
+        }
+        *stored = mode;
+        true
+    }
+
+    pub(super) fn permission_event(&self, session: Uuid) -> HostEvent {
+        let mode = self.mode.lock();
+        HostEvent::Permissions {
+            session,
+            mode: *mode,
+            revision: self.permission_revision.load(Ordering::Acquire),
         }
     }
 
@@ -560,6 +576,9 @@ impl HostState {
                 ),
             )
             .await;
+            if matches!(delivered, Ok(Ok(()))) {
+                let _ = self.events.send(worker.permission_event(session)).await;
+            }
             if !matches!(delivered, Ok(Ok(()))) && worker.active.load(Ordering::Acquire) {
                 let _ = self
                     .events
@@ -986,8 +1005,15 @@ impl WorkerReader {
                 }),
                 EngineEvent::Status { .. },
             ) => {
-                if let Some(mode) = mode {
-                    self.worker.acknowledge_plan_mode(mode, revision);
+                if let Some(mode) = mode
+                    && self.worker.acknowledge_plan_mode(mode, revision)
+                    && self
+                        .events
+                        .send(self.worker.permission_event(self.session))
+                        .await
+                        .is_err()
+                {
+                    return false;
                 }
                 HostEvent::InteractionReply {
                     session: self.session,

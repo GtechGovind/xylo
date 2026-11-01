@@ -307,3 +307,29 @@ async fn interaction_plan_answer_and_permission_updates_share_admission_order() 
         }
     ));
 }
+
+#[tokio::test]
+async fn interaction_plan_selection_is_forwarded_after_continuation() {
+    let (_root, host, _events) = state();
+    let session = Uuid::new_v4();
+    host.settings.lock().await.permissions = PermissionMode::Plan;
+    let (mut incoming, _exit) = draft::mock_worker(&host, session, 4).await;
+    host.control_worker(
+        Some(session),
+        WorkerCommand::SetPermissions {
+            mode: PermissionMode::Plan,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        incoming.recv().await.unwrap().payload,
+        WorkerCommand::SetPermissions {
+            mode: PermissionMode::Plan
+        }
+    ));
+    assert_eq!(
+        *host.workers.lock().await[&session].mode.lock(),
+        PermissionMode::Plan
+    );
+}

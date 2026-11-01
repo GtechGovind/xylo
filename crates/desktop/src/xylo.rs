@@ -211,6 +211,7 @@ pub struct Xylo {
     #[cfg(test)]
     validation_worker_commands: Option<std::sync::mpsc::SyncSender<(Uuid, WorkerCommand)>>,
     settings: AppSettings,
+    effective_permissions: std::collections::HashMap<Uuid, (u64, PermissionMode)>,
     page: Page,
     workspace: Option<PathBuf>,
     workspace_ready: bool,
@@ -488,6 +489,7 @@ impl Xylo {
             #[cfg(test)]
             validation_worker_commands: None,
             settings: AppSettings::default(),
+            effective_permissions: std::collections::HashMap::new(),
             page: Page::Chat,
             workspace: None,
             workspace_ready: false,
@@ -793,6 +795,19 @@ impl Xylo {
             self.note_context_usage(envelope);
         }
         match event {
+            HostEvent::Permissions {
+                session,
+                mode,
+                revision,
+            } => {
+                if self
+                    .effective_permissions
+                    .get(&session)
+                    .is_none_or(|(previous, _)| revision >= *previous)
+                {
+                    self.effective_permissions.insert(session, (revision, mode));
+                }
+            }
             HostEvent::PlanModes {
                 session,
                 action_id,
@@ -1942,7 +1957,7 @@ impl Render for Xylo {
                 {
                     let index = PermissionMode::ALL
                         .iter()
-                        .position(|mode| *mode == view.settings.permissions)
+                        .position(|mode| *mode == view.current_permission_mode())
                         .unwrap_or(0);
                     view.set_permission_mode(
                         PermissionMode::ALL[(index + 1) % PermissionMode::ALL.len()],

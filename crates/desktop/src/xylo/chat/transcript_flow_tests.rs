@@ -820,3 +820,90 @@ fn interaction_failed_local_delivery_keeps_the_card(cx: &mut TestAppContext) {
         assert!(view.error.is_some());
     });
 }
+
+#[gpui_kit::test]
+fn interaction_selecting_saved_plan_after_approval_sends_restrictive_transition(
+    cx: &mut TestAppContext,
+) {
+    with_view(cx, |view, window, cx| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        view.validation_worker_commands = Some(sender);
+        view.settings.permissions = xylo_core::PermissionMode::Plan;
+        let id = Uuid::new_v4();
+        engine(
+            view,
+            Some(view.session),
+            EngineEvent::PlanRequired {
+                action_id: id,
+                plan: "Continue".into(),
+            },
+            window,
+            cx,
+        );
+        view.event(
+            HostEvent::InteractionReply {
+                session: view.session,
+                action_id: id,
+                result: Ok(()),
+            },
+            window,
+            cx,
+        );
+        view.event(
+            HostEvent::Permissions {
+                session: view.session,
+                mode: xylo_core::PermissionMode::AskForApproval,
+                revision: 10,
+            },
+            window,
+            cx,
+        );
+        assert_eq!(
+            view.current_permission_mode(),
+            xylo_core::PermissionMode::AskForApproval
+        );
+        assert_eq!(
+            view.settings.permissions,
+            xylo_core::PermissionMode::Plan,
+            "Plan approval does not elevate global settings"
+        );
+        view.set_permission_mode(xylo_core::PermissionMode::Plan, cx);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok((
+                _,
+                WorkerCommand::SetPermissions {
+                    mode: xylo_core::PermissionMode::Plan
+                }
+            ))
+        ));
+        view.event(
+            HostEvent::Permissions {
+                session: view.session,
+                mode: xylo_core::PermissionMode::Plan,
+                revision: 11,
+            },
+            window,
+            cx,
+        );
+        view.event(
+            HostEvent::Permissions {
+                session: view.session,
+                mode: xylo_core::PermissionMode::AskForApproval,
+                revision: 10,
+            },
+            window,
+            cx,
+        );
+        assert_eq!(
+            view.current_permission_mode(),
+            xylo_core::PermissionMode::Plan
+        );
+        view.session = Uuid::new_v4();
+        assert_eq!(
+            view.current_permission_mode(),
+            xylo_core::PermissionMode::Plan,
+            "Another chat keeps its own mode"
+        );
+    });
+}
