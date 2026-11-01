@@ -40,6 +40,7 @@ mod credential_control;
 mod document_control;
 mod export_control;
 mod fact_control;
+mod git_review_control;
 mod image_control;
 mod notice_control;
 mod provider_control;
@@ -231,6 +232,11 @@ pub enum HostEvent {
         path: PathBuf,
         message: String,
     },
+    GitHunkApplied {
+        request_id: Uuid,
+        root: PathBuf,
+        result: Result<(), String>,
+    },
     GitStatus {
         request_id: Uuid,
         root: PathBuf,
@@ -341,6 +347,7 @@ enum HostCommand {
     Workspace(PathBuf),
     OpenFile(Uuid, PathBuf),
     Save(PathBuf, String),
+    ApplyGitHunk(Uuid, PathBuf, crate::workspace::git::hunks::Request),
     GitStatus(Uuid, PathBuf),
     GitFileDiff(
         Uuid,
@@ -1788,6 +1795,9 @@ impl HostState {
                     },
                 };
                 self.events.send(event).await?;
+            }
+            HostCommand::ApplyGitHunk(request_id, root, request) => {
+                self.apply_git_hunk(request_id, root, request).await?;
             }
             HostCommand::GitStatus(request_id, root) => {
                 let result = async {

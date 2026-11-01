@@ -168,6 +168,10 @@ impl WorkerHandle {
         self.stop.is_cancelled() || *self.exited.borrow() || self.commands.is_closed()
     }
 
+    pub(super) fn has_live_work(&self) -> bool {
+        self.active.load(Ordering::Acquire) || !self.running_jobs.lock().is_empty()
+    }
+
     fn idle(&self) -> bool {
         !self.active.load(Ordering::Acquire) && self.running_jobs.lock().is_empty() && !self.dead()
     }

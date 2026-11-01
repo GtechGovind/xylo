@@ -63,6 +63,8 @@ mod chat;
 use app_status::{HostHealth, StatusLine, product_error};
 #[path = "xylo/context_panel.rs"]
 mod context_panel;
+#[path = "xylo/git_review.rs"]
+mod git_review;
 #[path = "xylo/memory.rs"]
 mod memory;
 #[path = "xylo/memory_form.rs"]
@@ -1128,6 +1130,13 @@ impl Xylo {
                         );
                     }
                 }
+            }
+            HostEvent::GitHunkApplied {
+                request_id,
+                root,
+                result,
+            } => {
+                self.git_hunk_applied(request_id, root, result, cx);
             }
             HostEvent::GitStatus {
                 request_id,

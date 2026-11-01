@@ -34,6 +34,10 @@ pub(super) struct GitPanel {
     pub error: Option<String>,
     /// Lines of the selected change's diff.
     pub diff_lines: Vec<String>,
+    pub diff_source: String,
+    pub diff_hunks: Vec<xylo_runtime::workspace::git::hunks::Hunk>,
+    pub original: Option<PathBuf>,
+    pub hunk_request: Option<Uuid>,
 }
 fn group_id(group: ChangeGroup) -> u8 {
     match group {
@@ -402,7 +406,10 @@ impl Xylo {
         self.git_panel.diff_request = None;
         match result {
             Ok(diff) => {
+                self.git_panel.diff_hunks =
+                    xylo_runtime::workspace::git::hunks::parse(&diff).unwrap_or_default();
                 self.git_panel.diff_lines = diff.lines().map(str::to_owned).collect();
+                self.git_panel.diff_source = diff;
                 self.git_panel.diff_width = self
                     .git_panel
                     .diff_lines
@@ -411,13 +418,18 @@ impl Xylo {
                     .max()
                     .unwrap_or(0) as f32
                     * 7.5
-                    + 20.;
+                    + 190.;
             }
             Err(error) => self.git_panel.error = Some(error),
         }
         cx.notify();
     }
-    fn open_git_change(&mut self, group: ChangeGroup, change: GitChange, cx: &mut Context<Self>) {
+    pub(super) fn open_git_change(
+        &mut self,
+        group: ChangeGroup,
+        change: GitChange,
+        cx: &mut Context<Self>,
+    ) {
         let Some(root) = self.workspace.clone() else {
             return;
         };
@@ -426,6 +438,9 @@ impl Xylo {
         self.git_panel.selected = Some((change.path.clone(), group));
         self.git_panel.error = None;
         self.git_panel.diff_lines.clear();
+        self.git_panel.diff_source.clear();
+        self.git_panel.diff_hunks.clear();
+        self.git_panel.original = change.original.clone();
         self.host_call(cx, |host| {
             host.git_file_diff(request, root, change.path, change.original, group)
         });
@@ -801,37 +816,9 @@ impl Xylo {
             "git-diff-lines",
             self.git_panel.diff_lines.len(),
             move |range, _, cx| {
-                weak.update(cx, |view, _| {
+                weak.update(cx, |view, cx| {
                     range
-                        .filter_map(|index| {
-                            let line = view.git_panel.diff_lines.get(index)?;
-                            let addition = line.starts_with('+') && !line.starts_with("+++");
-                            let deletion = line.starts_with('-') && !line.starts_with("---");
-                            Some(
-                                div()
-                                    .h(px(22.))
-                                    .px_2()
-                                    .font_family("monospace")
-                                    .text_xs()
-                                    .whitespace_nowrap()
-                                    .bg(rgb(if addition {
-                                        diff_added_bg()
-                                    } else if deletion {
-                                        diff_removed_bg()
-                                    } else {
-                                        bg()
-                                    }))
-                                    .text_color(rgb(if addition {
-                                        success()
-                                    } else if deletion {
-                                        danger()
-                                    } else {
-                                        text()
-                                    }))
-                                    .child(line.clone())
-                                    .into_any_element(),
-                            )
-                        })
+                        .filter_map(|index| view.git_diff_line(index, cx))
                         .collect()
                 })
                 .unwrap_or_default()

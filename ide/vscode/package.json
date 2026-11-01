@@ -1,0 +1,31 @@
+{
+  "name": "xylo-ide-bridge",
+  "displayName": "Xylo IDE Bridge",
+  "description": "Attach your VS Code selection and diagnostics to Xylo.",
+  "version": "0.1.0",
+  "publisher": "xylo",
+  "private": true,
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/src/extension.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test dist/tests/*.test.js"
+  },
+  "dependencies": {
+    "ws": "8.22.1"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.0",
+    "@types/vscode": "^1.96.0"
+  }
+}
