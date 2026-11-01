@@ -238,6 +238,8 @@ async fn run(
         "gc.auto=0",
         "-c",
         "maintenance.auto=false",
+        "-c",
+        "submodule.recurse=false",
     ]);
     command.args(args);
     crate::process::run_prepared(
@@ -388,7 +390,27 @@ pub async fn status(path: &Path) -> Result<WorktreeStatus> {
     let tree = inspect(path)?;
     status_inner(&tree).await
 }
+/// Git's recursive submodule status clears our neutral repository environment
+/// and reads the nested repository's executable configuration. Refuse gitlinks
+/// using index data only; never invoke Git in a nested checkout. This also
+/// deliberately retains unpopulated submodules for manual lifecycle management.
+async fn reject_submodules(tree: &Worktree) -> Result<()> {
+    let index = checked(
+        &tree.repository,
+        Some(&tree.path),
+        &["ls-files", "--stage", "-z"],
+    )
+    .await?;
+    ensure!(
+        !index
+            .split_terminator('\0')
+            .any(|entry| entry.starts_with("160000 ")),
+        "Native worktree lifecycle does not support submodules; retain this checkout for manual Git management"
+    );
+    Ok(())
+}
 async fn status_inner(tree: &Worktree) -> Result<WorktreeStatus> {
+    reject_submodules(tree).await?;
     let raw = checked(
         &tree.repository,
         Some(&tree.path),
@@ -398,10 +420,13 @@ async fn status_inner(tree: &Worktree) -> Result<WorktreeStatus> {
             "-z",
             "--untracked-files=all",
             "--ignored=matching",
-            "--ignore-submodules=none",
+            // Never recurse even if another process changes the index after
+            // the fail-closed check above.
+            "--ignore-submodules=all",
         ],
     )
     .await?;
+    reject_submodules(tree).await?;
     let counts = checked(
         &tree.repository,
         Some(&tree.path),
@@ -443,6 +468,8 @@ async fn status_inner(tree: &Worktree) -> Result<WorktreeStatus> {
 pub async fn remove(path: &Path, force: bool) -> Result<()> {
     let tree = inspect(path)?;
     let _lock = lock(&tree.repository)?;
+    // Even explicit force must not enter a nested repository natively.
+    reject_submodules(&tree).await?;
     ensure!(
         force || status_inner(&tree).await?.removable(),
         "Worktree contains changed files or unpushed commits; keep it or explicitly force removal"

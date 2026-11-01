@@ -126,6 +126,9 @@ pub(super) struct WorkerHandle {
     pub(super) mode: Arc<parking_lot::Mutex<PermissionMode>>,
     /// Set when the host killed the process because it ignored Stop.
     pub(super) forced_stop: Arc<AtomicBool>,
+    /// Worktree removal requested graceful shutdown. Keep this process owned
+    /// and reject new turns until its exit is confirmed, including after errors.
+    pub(super) worktree_retiring: Arc<AtomicBool>,
     /// The run a Stop was already sent for; repeated Stops send nothing.
     stop_sent: Arc<parking_lot::Mutex<Option<Uuid>>>,
     /// Retire the process when its current turn ends (a standing approval of
@@ -156,6 +159,7 @@ impl WorkerHandle {
             last_used: Arc::new(parking_lot::Mutex::new(Instant::now())),
             mode: Arc::default(),
             forced_stop: Arc::default(),
+            worktree_retiring: Arc::default(),
             stop_sent: Arc::default(),
             retire_after_run: Arc::default(),
         }
@@ -163,7 +167,10 @@ impl WorkerHandle {
 
     /// The process ended, is ending, or can no longer receive commands.
     pub(super) fn dead(&self) -> bool {
-        self.stop.is_cancelled() || *self.exited.borrow() || self.commands.is_closed()
+        self.worktree_retiring.load(Ordering::Acquire)
+            || self.stop.is_cancelled()
+            || *self.exited.borrow()
+            || self.commands.is_closed()
     }
 
     fn idle(&self) -> bool {

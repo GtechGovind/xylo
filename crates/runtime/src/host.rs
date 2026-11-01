@@ -2903,6 +2903,13 @@ impl HostState {
         loop {
             let dead = {
                 let workers = self.workers.lock().await;
+                if let Some(worker) = workers.get(&session) {
+                    ensure!(
+                        !worker.worktree_retiring.load(Ordering::Acquire)
+                            || *worker.exited.borrow(),
+                        "The worktree's background jobs are still stopping"
+                    );
+                }
                 match workers.get(&session) {
                     Some(worker) if worker.dead() => Some(worker.clone()),
                     Some(_) => return Ok(()),

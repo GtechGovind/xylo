@@ -2,6 +2,12 @@
 use super::*;
 use crate::workspace::worktree;
 
+const WORKTREE_SHUTDOWN_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(10)
+};
+
 impl HostState {
     pub(super) async fn create_chat_worktree(&self, session: Uuid, repo: PathBuf) -> Result<()> {
         ensure!(
@@ -74,25 +80,36 @@ impl HostState {
             );
         }
         for chat in &associated {
-            if let Some(worker) = workers.remove(&chat.id) {
-                // A graceful shutdown lets background job owners terminate and
-                // reap their process trees before the checkout can disappear.
-                worker
-                    .commands
-                    .send(Envelope::new(
-                        Uuid::new_v4(),
-                        Some(chat.id),
-                        0,
-                        WorkerCommand::Shutdown,
-                    ))
-                    .await
-                    .context("The worktree worker could not stop its background jobs")?;
-                let mut exited = worker.exited.clone();
-                tokio::time::timeout(Duration::from_secs(10), exited.wait_for(|done| *done))
-                    .await
-                    .context(
-                        "Wait for the worktree's background jobs to stop before removing it",
-                    )??;
+            if let Some(worker) = workers.get(&chat.id).cloned() {
+                // Publish retirement before sending: failed sends and timeouts
+                // retain both process ownership and the new-turn admission fence.
+                worker.worktree_retiring.store(true, Ordering::Release);
+                tokio::time::timeout(WORKTREE_SHUTDOWN_TIMEOUT, async {
+                    if !*worker.exited.borrow() {
+                        // Graceful shutdown lets background job owners terminate
+                        // and reap their process trees before deletion.
+                        worker
+                            .commands
+                            .send(Envelope::new(
+                                Uuid::new_v4(),
+                                Some(chat.id),
+                                0,
+                                WorkerCommand::Shutdown,
+                            ))
+                            .await
+                            .context("The worktree worker could not stop its background jobs")?;
+                        let mut exited = worker.exited.clone();
+                        exited
+                            .wait_for(|done| *done)
+                            .await
+                            .context("The worktree worker's exit could not be confirmed")?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+                .context("Wait for the worktree's background jobs to stop before removing it")??;
+                // Only a positive exit notification releases ownership.
+                workers.remove(&chat.id);
             }
         }
         // Keep worker admission blocked until the checkout and durable chat roots
