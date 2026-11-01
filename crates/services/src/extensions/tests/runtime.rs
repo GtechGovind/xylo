@@ -700,7 +700,7 @@ fn uninstall_revokes_runtime_grants_before_same_version_reinstall() {
 }
 
 #[test]
-fn undelivered_hook_events_are_reported_per_entry_without_disabling_the_component() {
+fn lifecycle_hook_events_can_be_enabled() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("source");
     let workspace = directory.path().join("workspace");
@@ -734,8 +734,7 @@ fn undelivered_hook_events_are_reported_per_entry_without_disabling_the_componen
         .iter()
         .find(|entry| entry.name.starts_with("SessionStart"))
         .unwrap();
-    assert_eq!(session.readiness, Readiness::UnsupportedRequirement);
-    assert!(session.requirements[0].contains("SessionStart"));
+    assert_ne!(session.readiness, Readiness::UnsupportedRequirement);
     assert_ne!(status.readiness, Readiness::UnsupportedRequirement);
     assert!(
         service
@@ -748,8 +747,8 @@ fn undelivered_hook_events_are_reported_per_entry_without_disabling_the_componen
                     ..Default::default()
                 },
             )
-            .is_err(),
-        "An event Xylo never delivers cannot be enabled"
+            .is_ok(),
+        "SessionStart is a delivered lifecycle event"
     );
 }
 

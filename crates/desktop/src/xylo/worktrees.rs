@@ -55,7 +55,6 @@ impl Xylo {
             .and_then(|turn| turn.request.as_mut())
         {
             request.workspace = workspace.clone();
-            request.approved_rules.clear();
         }
         if session != self.session {
             return;

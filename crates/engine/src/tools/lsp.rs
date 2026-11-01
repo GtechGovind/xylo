@@ -58,11 +58,20 @@ fn automatic_authorized(broker: &ToolBroker, path: &Path) -> bool {
         network: None,
         untrusted_input: false,
     };
-    match permissions::decide(broker.mode(), &call) {
+    let Ok((verdict, explicit_rule)) = permissions::configured(broker.mode(), &call) else {
+        return false;
+    };
+    match verdict {
         Verdict::Allow => true,
         Verdict::Refuse(_) => false,
-        Verdict::Ask(_) => permissions::approval_rule_for(&call)
-            .is_some_and(|(key, _)| broker.rules.lock().contains(&key)),
+        Verdict::Ask(_) => permissions::approval_rule_for(&call).is_some_and(|(key, _)| {
+            !explicit_rule
+                && (broker.rules.lock().contains(&key)
+                    || broker
+                        .store
+                        .native_execution_granted(&broker.request.workspace, &key)
+                        .unwrap_or(false))
+        }),
     }
 }
 

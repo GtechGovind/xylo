@@ -243,7 +243,6 @@ fn turn(session: Uuid, endpoint: &str) -> TurnRequest {
         },
         permissions: PermissionMode::ReadOnly,
         attachments: Vec::new(),
-        approved_rules: Vec::new(),
     }
 }
 

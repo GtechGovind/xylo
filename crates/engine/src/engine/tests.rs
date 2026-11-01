@@ -30,7 +30,6 @@ fn fixture() -> (tempfile::TempDir, AgentEngine, TurnRequest) {
         provider: ProviderConfig::default(),
         permissions: PermissionMode::ReadOnly,
         attachments: Vec::new(),
-        approved_rules: Vec::new(),
     };
     let engine = AgentEngine::new(
         store,

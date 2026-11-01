@@ -268,6 +268,7 @@ pub struct Xylo {
     web_search_backend: Option<xylo_core::WebSearchBackend>,
     web_search_endpoint: Entity<InputState>,
     web_search_secret: Entity<InputState>,
+    permission_pattern: Entity<InputState>,
     connector_name: Entity<InputState>,
     connector_endpoint: Entity<InputState>,
     connector_command: Entity<InputState>,
@@ -554,6 +555,7 @@ impl Xylo {
                     .placeholder("API key (leave blank to keep saved key)")
                     .masked(true)
             }),
+            permission_pattern: input("Bash(npm test:*) or Edit(src/**)", window, cx),
             connector_name: input("Connector name", window, cx),
             connector_endpoint: input("https://…/mcp", window, cx),
             connector_command: input("Executable path", window, cx),

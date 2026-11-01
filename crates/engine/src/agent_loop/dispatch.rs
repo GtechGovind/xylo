@@ -50,6 +50,21 @@ pub(crate) trait ToolExecutor: Send + Sync {
     fn refreshed_system_prompt(&self) -> Option<String> {
         None
     }
+    /// A retained terminal hook stop prevents further dispatch and model steps.
+    /// Reading this value must not consume it; each scheduling boundary checks it.
+    fn pending_stop(&self) -> Option<String> {
+        None
+    }
+
+    /// Delivers a lifecycle event outside provider streaming and tool batches.
+    fn lifecycle(
+        &self,
+        _event: &str,
+        _input: Value,
+    ) -> anyhow::Result<xylo_services::hooks::HookOutput> {
+        Ok(Default::default())
+    }
+
     /// Tools offered directly to the model right now. Re-read before every
     /// model call, because the permission mode can change mid-task.
     fn schemas(&self) -> Vec<ToolSchema>;
@@ -320,8 +335,17 @@ pub(crate) async fn run_batch(
                 results[slot] = Some(joined(handle).await);
             }
         }
+        if let Some(reason) = tools.pending_stop() {
+            results[index] = Some(error_result(format!("Not run: {reason}")));
+            continue;
+        }
         let executor = tools.clone();
         let handle = tokio::task::spawn_blocking(move || {
+            // A previously queued read may have stopped while this worker
+            // waited for a blocking-thread slot.
+            if let Some(reason) = executor.pending_stop() {
+                return error_result(format!("Not run: {reason}"));
+            }
             executor
                 .execute(&id, &name, arguments)
                 .unwrap_or_else(|error| error_result(format!("{error:#}")))
@@ -349,3 +373,17 @@ async fn joined(handle: JoinHandle<String>) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// Hook edits must satisfy the same schema as model-authored tool input.
+pub(crate) fn validate_hook_input(
+    name: &str,
+    input: &Value,
+    schema: &CompiledSchema,
+) -> anyhow::Result<()> {
+    arguments::validate(input, schema).map_err(|problems| {
+        anyhow::anyhow!(
+            "Hook updatedInput for {name} is invalid: {}",
+            problems.join("; ")
+        )
+    })
+}

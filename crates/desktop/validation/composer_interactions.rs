@@ -496,7 +496,6 @@ mod xylo {
                         .or_default()
                         .apply(EngineEvent::Started);
                     let turn = xylo_core::TurnRequest {
-                        approved_rules: Vec::new(),
                         session_id: view.session,
                         turn_id: uuid::Uuid::new_v4(),
                         workspace: view.workspace.clone().unwrap(),

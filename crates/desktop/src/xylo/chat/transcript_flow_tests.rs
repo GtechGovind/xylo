@@ -180,7 +180,6 @@ fn retry_runs_the_failed_turn_again_under_its_own_id(cx: &mut TestAppContext) {
             provider: view.settings.provider.clone(),
             permissions: view.settings.permissions,
             attachments: Vec::new(),
-            approved_rules: Vec::new(),
         };
         let mut user = crate::state::message(session, "user", failed.prompt.clone());
         user.id = Uuid::new_v5(&failed.turn_id, b"user-message");

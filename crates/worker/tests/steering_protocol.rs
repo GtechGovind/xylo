@@ -194,7 +194,6 @@ fn turn(workspace: &Path, endpoint: String) -> TurnRequest {
         },
         permissions: PermissionMode::AskForApproval,
         attachments: Vec::new(),
-        approved_rules: Vec::new(),
     }
 }
 fn queue(store: &Store, turn: &TurnRequest) -> SteeringRequest {

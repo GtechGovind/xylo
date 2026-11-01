@@ -43,8 +43,11 @@ async fn worktree_switch_routes_edits_and_refreshes_root_authority() {
         let child = execution.scoped_child(uuid::Uuid::new_v4()).unwrap();
         assert_eq!(child.workspace_root(), path);
 
-        let mut stale = execution.request.clone();
-        stale.approved_rules = vec!["old-root-authority".into()];
+        execution
+            .rules
+            .lock()
+            .insert("native-lsp:old-root-authority".into());
+        let stale = execution.request.clone();
         let rebuilt = ToolBroker::new(
             stale,
             execution.store.clone(),
@@ -272,33 +275,16 @@ async fn worktree_transition_respects_an_installed_pre_tool_hook() {
             },
         )
         .unwrap();
-    let execution = broker.clone();
-    let job = tokio::task::spawn_blocking(move || {
+    // F runs pre-tool hooks before asking for the blocked action itself.
+    let error = approve_integration(broker.clone(), &mut events, |execution| {
         execution.execute(
             "hook-denied-enter",
             "worktree_enter",
             json!({"name":"blocked"}),
         )
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            if let Some(EngineEvent::ApprovalRequired { action_id, .. }) = events.recv().await {
-                broker
-                    .session
-                    .approvals()
-                    .decide_with(action_id, true, false)
-                    .unwrap();
-                break;
-            }
-        }
     })
     .await
-    .unwrap();
-    let error = tokio::time::timeout(std::time::Duration::from_secs(20), job)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
+    .unwrap_err();
     assert!(
         error.to_string().contains("Pre-tool hook prevented"),
         "{error:#}"
@@ -453,4 +439,28 @@ async fn integrated_worktree_web_utility_tracks_provider_changes_after_rebinding
     })
     .await;
     server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn integrated_settings_hooks_follow_worktrees_and_keep_terminal_controls() {
+    let (dir, broker, mut events) = fixture(PermissionMode::FullAccess);
+    initialize(dir.path());
+    approve_integration(broker.clone(), &mut events, |execution| {
+        execution.execute("enter-settings", "worktree_enter", json!({"name":"settings"})).unwrap();
+        let root = execution.workspace_root();
+        execution.execute("write-in-checkout", "shell_command", json!({"command":"printf checked > shell-result.txt"})).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("shell-result.txt")).unwrap(), "checked");
+        std::fs::create_dir_all(root.join(".xylo")).unwrap();
+        std::fs::write(root.join(".xylo/settings.json"), json!({"hooks":{
+            "Stop":[{"hooks":[{"command":"printf '%s' '{\"additionalContext\":\"current checkout context\"}'"}]}],
+            "PreToolUse":[{"matcher":"^Write$","hooks":[{"command":"printf '%s' '{\"continue\":false,\"stopReason\":\"checkout stop\",\"additionalContext\":\"checkout hook note\"}'"}]}]
+        }}).to_string()).unwrap();
+        let context = execution.lifecycle(None, "Stop", json!({})).unwrap();
+        assert!(context.context.iter().any(|value| value.contains("current checkout context")));
+        let error = execution.execute("stopped-write", "file_write", json!({"path":"never-written.txt","content":"not allowed"})).unwrap_err();
+        assert!(error.to_string().contains("Pre-tool hook prevented"), "{error:#}");
+        assert!(!root.join("never-written.txt").exists());
+        assert_eq!(execution.hook_stop.lock().as_deref(), Some("checkout stop"));
+        assert!(execution.take_hook_notes().iter().any(|(_, text)| text.contains("checkout hook note")));
+    }).await;
 }

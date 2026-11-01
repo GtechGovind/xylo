@@ -185,7 +185,6 @@ async fn repeated_active_stream_cancellation_emits_correlated_ack_and_cancelled_
             },
             permissions: PermissionMode::ReadOnly,
             attachments: Vec::new(),
-            approved_rules: Vec::new(),
         };
         let run = worker
             .send(session, WorkerCommand::Run { turn: turn.clone() })

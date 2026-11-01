@@ -34,6 +34,7 @@ use uuid::Uuid;
 use xylo_core::*;
 use xylo_helper_client::HelperClient;
 use xylo_resources::{ResourceLease, ResourceManager, TaskDemand};
+use xylo_services::settings_files::{PermissionDecision, PermissionRule, SettingsFiles};
 use xylo_services::{ConnectorBroker, CredentialVault, SqliteMemory, Store};
 mod action_control;
 mod credential_control;
@@ -298,7 +299,7 @@ pub enum HostEvent {
     /// Standing approvals of a project, after a load or a revocation.
     ApprovalRules {
         workspace: PathBuf,
-        result: std::result::Result<Vec<xylo_core::ApprovalRule>, String>,
+        result: std::result::Result<Vec<PermissionRule>, String>,
     },
     /// A conversation's title changed (user rename or generated title).
     ConversationRenamed(Conversation),
@@ -376,7 +377,8 @@ enum HostCommand {
     Capability(Uuid, String, Value),
     CancelCapability(Uuid),
     ApprovalRules(PathBuf),
-    RemoveApprovalRule(PathBuf, String),
+    RemoveApprovalRule(PathBuf, PermissionRule),
+    SavePermissionRule(PathBuf, String, PermissionDecision, bool),
     RenameConversation(Uuid, String),
     SetConversationPinned(Uuid, bool),
     SetConversationArchived(Uuid, bool),
@@ -736,8 +738,20 @@ impl HostClient {
         self.enqueue(HostCommand::ApprovalRules(workspace))
     }
     /// Revokes one standing approval; answered with `HostEvent::ApprovalRules`.
-    pub fn remove_approval_rule(&self, workspace: PathBuf, key: String) -> Result<()> {
+    pub fn remove_approval_rule(&self, workspace: PathBuf, key: PermissionRule) -> Result<()> {
         self.enqueue(HostCommand::RemoveApprovalRule(workspace, key))
+    }
+    /// Saves an explicit allow, ask or deny rule to the selected settings file.
+    pub fn save_permission_rule(
+        &self,
+        workspace: PathBuf,
+        pattern: String,
+        decision: PermissionDecision,
+        project: bool,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::SavePermissionRule(
+            workspace, pattern, decision, project,
+        ))
     }
     /// Renames a conversation; answered with `HostEvent::ConversationRenamed`.
     pub fn rename_conversation(&self, id: Uuid, title: String) -> Result<()> {
@@ -1684,6 +1698,20 @@ impl HostState {
                     .send(HostEvent::ApprovalRules { workspace, result })
                     .await?;
             }
+            HostCommand::SavePermissionRule(workspace, pattern, decision, project) => {
+                let root = workspace.clone();
+                let result = match tokio::task::spawn_blocking(move || {
+                    SettingsFiles::for_workspace(&root).save_rule(&pattern, decision, project)
+                })
+                .await?
+                {
+                    Ok(()) => self.approval_rules(&workspace).await,
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                self.events
+                    .send(HostEvent::ApprovalRules { workspace, result })
+                    .await?;
+            }
             HostCommand::RenameConversation(id, title) => {
                 self.rename_conversation(id, title).await?
             }
@@ -2512,6 +2540,36 @@ impl HostState {
                     pending.clone()
                 })
             });
+        let workspace = worker.workspace.lock().clone();
+        if allow
+            && remember
+            && let Some(pending) = first
+            && let Some(key) = pending.rule_key
+            && let Some(workspace) = workspace
+        {
+            let store = self.store.clone();
+            let project = self.settings.lock().await.permission_rules_project;
+            let saved = tokio::task::spawn_blocking(move || {
+                if key.starts_with("native-lsp:") {
+                    store.grant_native_execution(&workspace, &key)
+                } else {
+                    SettingsFiles::for_workspace(&workspace).save_rule(
+                        &key,
+                        PermissionDecision::Allow,
+                        project,
+                    )
+                }
+            })
+            .await;
+            if !matches!(saved, Ok(Ok(()))) {
+                self.events
+                    .send(HostEvent::Error(
+                        "The action was allowed, but its permission rule could not be saved."
+                            .into(),
+                    ))
+                    .await?;
+            }
+        }
         let command = WorkerCommand::Approve {
             action_id,
             allow,
@@ -2524,31 +2582,6 @@ impl HostState {
         {
             let pending = worker.approvals.lock().remove(&action_id);
             return self.report_lost_decision(session, action_id, pending).await;
-        }
-        let workspace = worker.workspace.lock().clone();
-        if allow
-            && remember
-            && let Some(pending) = first
-            && let Some(key) = pending.rule_key
-            && let Some(workspace) = workspace
-        {
-            let rule = ApprovalRule {
-                label: pending.rule.unwrap_or_else(|| key.clone()),
-                key,
-                workspace,
-                created_at: now_ms(),
-            };
-            let store = self.store.clone();
-            let saved = tokio::task::spawn_blocking(move || store.save_approval_rule(&rule)).await;
-            if !matches!(saved, Ok(Ok(()))) {
-                tracing::warn!(?saved, "Save standing approval");
-                self.events
-                    .send(HostEvent::Error(
-                        "The action was allowed, but \"always allow\" could not be saved for this project."
-                            .into(),
-                    ))
-                    .await?;
-            }
         }
         Ok(())
     }
@@ -2677,14 +2710,6 @@ impl HostState {
                 .await?,
         );
         let scheduled = self.scheduled.lock().await.contains_key(&session);
-        let store = self.store.clone();
-        let rules_workspace = workspace.clone();
-        turn.approved_rules =
-            tokio::task::spawn_blocking(move || store.approval_rules(&rules_workspace))
-                .await??
-                .into_iter()
-                .map(|rule| rule.key)
-                .collect();
         {
             let mut workers = self.workers.lock().await;
             ensure!(
@@ -3143,28 +3168,28 @@ impl HostState {
     async fn approval_rules(
         &self,
         workspace: &std::path::Path,
-    ) -> std::result::Result<Vec<ApprovalRule>, String> {
+    ) -> std::result::Result<Vec<PermissionRule>, String> {
         let workspace = Self::approval_workspace(workspace).await;
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.approval_rules(&workspace))
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error| format!("{error:#}")))
+        tokio::task::spawn_blocking(move || {
+            Ok(SettingsFiles::for_workspace(&workspace).load()?.rules)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result: anyhow::Result<Vec<PermissionRule>>| {
+            result.map_err(|error| format!("{error:#}"))
+        })
     }
-
-    /// Revokes a standing approval. Rules live in the host and seed each
-    /// turn through `TurnRequest.approved_rules`; a worker keeps them only
-    /// for that turn, so the rule stops applying at the project's next turn
-    /// while a running turn keeps the set it started with. Workers of the
-    /// project are also retired (idle ones now, running ones when their turn
-    /// ends) as defense in depth, so no process that held the rule is reused.
-    async fn revoke_approval_rule(&self, workspace: &std::path::Path, key: String) -> Result<()> {
+    /// Revocation is visible to fresh rule evaluation in every running worker.
+    async fn revoke_approval_rule(
+        &self,
+        workspace: &std::path::Path,
+        rule: PermissionRule,
+    ) -> Result<()> {
         let workspace = Self::approval_workspace(workspace).await;
-        let store = self.store.clone();
-        let removed = workspace.clone();
-        tokio::task::spawn_blocking(move || store.remove_approval_rule(&removed, &key)).await??;
-        let workers = self.workers.lock().await;
-        for (session, worker) in workers.iter() {
+        let root = workspace.clone();
+        tokio::task::spawn_blocking(move || SettingsFiles::for_workspace(&root).remove_rule(&rule))
+            .await??;
+        for (session, worker) in self.workers.lock().await.iter() {
             if worker.workspace.lock().as_deref() == Some(workspace.as_path()) {
                 worker.retire_when_idle(*session);
             }
@@ -3483,7 +3508,6 @@ impl HostState {
                             provider,
                             permissions,
                             attachments: Vec::new(),
-                            approved_rules: Vec::new(),
                         };
                         let state = self.clone();
                         let scheduler = scheduler.clone();

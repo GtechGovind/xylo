@@ -387,7 +387,7 @@ pub(super) fn write_target(
     // agent directories at the project root like the sandbox. Names compare
     // ignoring ASCII case, as the default macOS and Windows file systems do.
     const PROTECTED_AT_ANY_DEPTH: &[&str] = &[".git"];
-    const PROTECTED_AT_ROOT: &[&str] = &[".agents", ".claude", ".codex"];
+    const PROTECTED_AT_ROOT: &[&str] = &[".agents", ".claude", ".codex", ".xylo"];
     let target = permitted(broker, requested, true, access)
         .map_err(|error| code::unapplied(format!("{error:#}")))?;
     let root = std::fs::canonicalize(&broker.request.workspace)
@@ -395,6 +395,12 @@ pub(super) fn write_target(
     // Outside the project every component counts, so another repository's
     // `.git` is refused even when outside writes are approved.
     let relative = target.strip_prefix(&root).unwrap_or(&target);
+    ensure!(
+        !xylo_services::settings_files::SettingsFiles::for_workspace(&root)
+            .sources()
+            .any(|source| source.canonicalize().unwrap_or_else(|_| source.to_owned()) == target),
+        "Settings permission authority cannot be changed by tools"
+    );
     let protected = |names: &[&str], component: std::path::Component| {
         names
             .iter()

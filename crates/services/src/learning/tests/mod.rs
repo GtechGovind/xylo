@@ -36,7 +36,6 @@ fn user_turn(store: &Store, session: Uuid, scope: &str, prompt: &str) -> Uuid {
             workspace: scope.into(),
             provider: ProviderConfig::default(),
             permissions: PermissionMode::AskForApproval,
-            approved_rules: Vec::new(),
         })
         .unwrap();
     turn

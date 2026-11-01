@@ -230,7 +230,6 @@ fn user_turn_registration_is_atomic_idempotent_and_preserves_conversation_title(
         workspace: directory.path().join("original-workspace"),
         provider: Default::default(),
         permissions: Default::default(),
-        approved_rules: Vec::new(),
     };
     host.register_user_turn(&turn).unwrap();
     worker.register_user_turn(&turn).unwrap();
@@ -990,63 +989,6 @@ fn bursts_beyond_the_queue_capacity_wait_instead_of_failing() {
     }
 }
 #[test]
-fn approval_rules_are_per_project_upserted_and_revocable() {
-    let (directory, store, _) = database();
-    let project = directory.path().join("project");
-    let other = directory.path().join("other");
-    let rule =
-        |key: &str, label: &str, workspace: &std::path::Path, created_at| xylo_core::ApprovalRule {
-            key: key.into(),
-            label: label.into(),
-            workspace: workspace.into(),
-            created_at,
-        };
-    store
-        .save_approval_rule(&rule("run:cargo test", "cargo test", &project, 1))
-        .unwrap();
-    store
-        .save_approval_rule(&rule("run:cargo test", "Run cargo test", &project, 5))
-        .unwrap();
-    store
-        .save_approval_rule(&rule("edit:src", "Edit src", &project, 2))
-        .unwrap();
-    store
-        .save_approval_rule(&rule("run:cargo test", "cargo test", &other, 3))
-        .unwrap();
-    assert!(
-        store
-            .save_approval_rule(&rule(" ", "blank", &project, 4))
-            .is_err()
-    );
-    let rules = store.approval_rules(&project).unwrap();
-    assert_eq!(
-        rules
-            .iter()
-            .map(|rule| rule.key.as_str())
-            .collect::<Vec<_>>(),
-        ["run:cargo test", "edit:src"],
-        "rules are listed in creation order"
-    );
-    let updated = rules
-        .iter()
-        .find(|rule| rule.key == "run:cargo test")
-        .unwrap();
-    assert_eq!(
-        updated.label, "Run cargo test",
-        "saving again updates the label"
-    );
-    assert_eq!(
-        updated.created_at, 1,
-        "saving again keeps the original time"
-    );
-    store
-        .remove_approval_rule(&project, "run:cargo test")
-        .unwrap();
-    store.remove_approval_rule(&project, "absent").unwrap();
-    assert_eq!(store.approval_rules(&project).unwrap().len(), 1);
-    assert_eq!(store.approval_rules(&other).unwrap().len(), 1);
-}
-#[test]
 fn generated_titles_never_override_user_titles() {
     let (_directory, store, session) = database();
     let renamed = store
@@ -1325,7 +1267,6 @@ fn archived_chats_leave_the_list_and_pins_survive_turns() {
             workspace: directory.path().to_owned(),
             provider: Default::default(),
             permissions: Default::default(),
-            approved_rules: Vec::new(),
         })
         .unwrap();
     assert!(store.conversations(10).unwrap()[0].pinned);

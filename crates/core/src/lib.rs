@@ -315,17 +315,6 @@ pub enum SecretStorage {
     OsKeychain,
 }
 
-/// A user's standing approval for one kind of action in one project.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ApprovalRule {
-    /// Stable rule key emitted by the engine (`ApprovalRequired.rule_key`).
-    pub key: String,
-    /// What the rule allows, in product words.
-    pub label: String,
-    pub workspace: PathBuf,
-    pub created_at: i64,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
     pub provider: ProviderConfig,
@@ -345,6 +334,9 @@ pub struct AppSettings {
     /// Optional search service for connections without native search.
     #[serde(default)]
     pub web_search: WebSearchSettings,
+    /// Save new permission rules in the shared project file instead of local settings.
+    #[serde(default)]
+    pub permission_rules_project: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -447,6 +439,7 @@ impl Default for AppSettings {
             secret_storage: SecretStorage::default(),
             fallback_model: None,
             web_search: WebSearchSettings::default(),
+            permission_rules_project: false,
         }
     }
 }
@@ -481,9 +474,6 @@ pub struct TurnRequest {
     pub permissions: PermissionMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ImageAttachment>,
-    /// Keys of the project's standing approvals ("always allow" rules).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub approved_rules: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -709,6 +699,8 @@ pub enum NoteKind {
     ShellJob,
     /// A shell working directory was reset to its project.
     WorkingDirectory,
+    /// Context supplied by a configured lifecycle hook.
+    Hook,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

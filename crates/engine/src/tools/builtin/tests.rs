@@ -73,6 +73,7 @@ async fn repository_metadata_and_agent_configuration_are_never_written() {
     let root = directory.path();
     for folder in [
         ".git/hooks",
+        ".xylo/skills",
         ".GIT",
         "vendor/lib/.git",
         ".agents/skills",
@@ -95,11 +96,14 @@ async fn repository_metadata_and_agent_configuration_are_never_written() {
         "vendor/lib/.git/config",
         ".agents/skills/x.md",
         ".claude/settings.json",
+        ".xylo/settings.json",
+        ".xylo/skills/custom.md",
         ".codex/config.toml",
     ] {
         let error = write_target(&broker, requested, approved).unwrap_err();
         assert!(
-            error.to_string().contains("repository metadata"),
+            error.to_string().contains("repository metadata")
+                || error.to_string().contains("Settings permission authority"),
             "{requested}: {error}"
         );
     }

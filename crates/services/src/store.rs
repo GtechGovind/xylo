@@ -10,8 +10,8 @@ use std::{
 };
 use uuid::Uuid;
 use xylo_core::{
-    AppSettings, ApprovalRule, ChatMessage, ConnectorConfig, Conversation, ConversationCursor,
-    ConversationPage, HistoryPage, MessageStatus, TitleSource, TurnRequest, Usage, now_ms,
+    AppSettings, ChatMessage, ConnectorConfig, Conversation, ConversationCursor, ConversationPage,
+    HistoryPage, MessageStatus, TitleSource, TurnRequest, Usage, now_ms,
 };
 
 type JournalRow = (String, String, Option<String>, Option<String>, i64);
@@ -324,49 +324,23 @@ impl Store {
         let json = serde_json::to_string(settings)?;
         self.call(move |conn| { conn.execute("INSERT INTO settings(key,value) VALUES('app',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [json])?; Ok(()) })
     }
-    /// Standing approvals ("always allow" rules) recorded for one project.
-    pub fn approval_rules(&self, workspace: &std::path::Path) -> Result<Vec<ApprovalRule>> {
+    /// Native execution is separate from ordinary tool rules and remains scope-bound.
+    pub fn native_execution_granted(&self, workspace: &std::path::Path, key: &str) -> Result<bool> {
         let workspace = workspace.to_string_lossy().into_owned();
-        self.call(move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT key,label,workspace,created_at FROM approval_rules WHERE workspace=?1 ORDER BY created_at,key",
-            )?;
-            let rows = statement.query_map([workspace], |row| {
-                Ok(ApprovalRule {
-                    key: row.get(0)?,
-                    label: row.get(1)?,
-                    workspace: PathBuf::from(row.get::<_, String>(2)?),
-                    created_at: row.get(3)?,
-                })
-            })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })
+        let key = key.to_owned();
+        self.call(move |conn| Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM native_execution_grants WHERE workspace=?1 AND key=?2)",params![workspace,key],|row|row.get(0))?))
     }
-
-    /// Records a standing approval for one project. Saving the same key again
-    /// updates its label and keeps the original creation time.
-    pub fn save_approval_rule(&self, rule: &ApprovalRule) -> Result<()> {
+    /// Records a user-reviewed native language-server grant, never a general allow rule.
+    pub fn grant_native_execution(&self, workspace: &std::path::Path, key: &str) -> Result<()> {
         ensure!(
-            !rule.key.trim().is_empty() && rule.key.len() <= 512 && rule.label.len() <= 512,
-            "Invalid approval rule"
+            key.starts_with("native-lsp:"),
+            "Only explicit native LSP grants may be recorded"
         );
-        let rule = rule.clone();
-        self.call(move |conn| {
-            conn.execute(
-                "INSERT INTO approval_rules(workspace,key,label,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(workspace,key) DO UPDATE SET label=excluded.label",
-                params![rule.workspace.to_string_lossy(), rule.key, rule.label, rule.created_at],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Revokes a standing approval. Removing an absent rule is not an error.
-    pub fn remove_approval_rule(&self, workspace: &std::path::Path, key: &str) -> Result<()> {
         let workspace = workspace.to_string_lossy().into_owned();
         let key = key.to_owned();
         self.call(move |conn| {
             conn.execute(
-                "DELETE FROM approval_rules WHERE workspace=?1 AND key=?2",
+                "INSERT OR IGNORE INTO native_execution_grants(workspace,key) VALUES(?1,?2)",
                 params![workspace, key],
             )?;
             Ok(())
