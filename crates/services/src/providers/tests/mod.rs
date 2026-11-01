@@ -356,6 +356,90 @@ fn provider_setup_allows_discovery_before_selecting_a_model() {
     assert!(provider.validate().is_err());
 }
 
+#[tokio::test]
+async fn anthropic_discovery_uses_input_context_without_confusing_output_limits() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut request = String::new();
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            request.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+        // ModelInfo's nullable capability fields may be unknown. Its input
+        // context and max output are distinct, including for unfamiliar IDs.
+        // https://platform.claude.com/docs/en/api/models/list
+        let models = [
+            ("claude-sonnet-5-5", json!(1_000_000), 128_000),
+            ("claude-haiku-4-5-20251001", json!(200_000), 64_000),
+            ("unfamiliar-model", json!(262_144), 8192),
+            ("unknown-input", json!(null), 8192),
+            ("zero-input", json!(0), 8192),
+            ("negative-input", json!(-1), 8192),
+            ("string-input", json!("200000"), 8192),
+            ("oversized-input", json!(u64::from(u32::MAX) + 1), 8192),
+        ];
+        let rows = models
+            .into_iter()
+            .map(|(id, input, output)| {
+                json!({
+                    "type": "model",
+                    "id": id,
+                    "display_name": id,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "capabilities": null,
+                    "line": null,
+                    "lifecycle": "active",
+                    "deprecated_at": null,
+                    "retires_at": null,
+                    "max_input_tokens": input,
+                    "max_tokens": output
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = json!({
+            "data": rows,
+            "first_id": "claude-sonnet-5-5",
+            "last_id": "oversized-input",
+            "has_more": false
+        })
+        .to_string();
+        socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+    });
+    let provider = config(ApiFamily::Anthropic, &format!("http://{address}/v1"));
+    let models = super::discovery::discover_with_credential(
+        &provider,
+        &ProviderCredential::None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| (model.id.as_str(), model.context_tokens))
+            .collect::<Vec<_>>(),
+        [
+            ("claude-sonnet-5-5", Some(1_000_000)),
+            ("claude-haiku-4-5-20251001", Some(200_000)),
+            ("unfamiliar-model", Some(262_144)),
+            ("unknown-input", None),
+            ("zero-input", None),
+            ("negative-input", None),
+            ("string-input", None),
+            ("oversized-input", None),
+        ]
+    );
+    server.await.unwrap();
+}
+
 #[test]
 fn saved_models_survive_switches_and_roundtrip_without_duplicates() {
     let mut settings = xylo_core::AppSettings::default();

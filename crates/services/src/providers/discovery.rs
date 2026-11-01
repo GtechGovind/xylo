@@ -218,6 +218,10 @@ pub(crate) async fn discover_with_credential(
                     "/context_window",
                     "/context_length",
                     "/inputTokenLimit",
+                    // Anthropic Models API: input context, not `max_tokens`
+                    // (the output cap). Unknown models use catalog data too.
+                    // https://platform.claude.com/docs/en/api/models/list
+                    "/max_input_tokens",
                     "/metadata/context_length",
                     // vLLM: the length the server was started with.
                     "/max_model_len",
