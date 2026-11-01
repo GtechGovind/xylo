@@ -203,6 +203,57 @@ mod xylo {
             self.messages.clear();
             cx.notify();
         }
+        pub(crate) fn composer_popovers_capture(&mut self, cx: &mut Context<Self>) {
+            self.settings_open = false;
+            self.page = Page::Chat;
+            self.settings.ui.work_panel_open = false;
+            self.settings.providers = (0..32)
+                .map(|index| ProviderConfig {
+                    name: if index < 20 { "Alpha" } else { "Beta" }.into(),
+                    endpoint: format!(
+                        "https://{}.example.invalid/v1",
+                        if index < 20 { "alpha" } else { "beta" }
+                    ),
+                    model: format!("fixture-model-{index}"),
+                    context_tokens: 200_000,
+                    reasoning_options: Some(vec!["low".into(), "high".into()]),
+                    default_reasoning_effort: Some("high".into()),
+                    ..Default::default()
+                })
+                .collect();
+            self.settings.provider = self.settings.providers[0].clone();
+            self.settings.ui.recent_models = [0, 20]
+                .map(|index| RecentModel {
+                    endpoint: self.settings.providers[index].endpoint.clone(),
+                    model: self.settings.providers[index].model.clone(),
+                })
+                .into();
+            let turn = self.turns.entry(self.session).or_default();
+            turn.context = Some(ContextUsage {
+                capacity: 200_000,
+                system: 6_000,
+                tools: 9_000,
+                tool_count: 18,
+                deferred_tool_count: 40,
+                messages: 30_000,
+                summary: 5_000,
+                compacted: true,
+                autocompact_threshold: 160_000,
+                ..Default::default()
+            });
+            turn.rate_limits = Some((
+                "fixture-model-0".into(),
+                xylo_core::RateLimits {
+                    requests: Some(3_999),
+                    tokens: Some(2_397_000),
+                    input_tokens: Some(1_997_000),
+                    output_tokens: Some(400_000),
+                    observed_at_ms: now_ms(),
+                },
+            ));
+            self.usage_ui.report = Some((self.session, xylo_runtime::UsageReport::default()));
+            cx.notify();
+        }
         pub(crate) fn composer_capture_healthy(&self) {
             assert!(self.error.is_none(), "Actual Host error: {:?}", self.error);
             assert!(self.host.is_some(), "A real temporary Host is required");
@@ -254,7 +305,10 @@ fn render() {
         ..Default::default()
     };
     // This is a persisted display configuration, not an available/live model.
-    settings.provider = xylo_core::ProviderConfig { model: "fixture-local-coder-model".into(), ..Default::default() };
+    settings.provider = xylo_core::ProviderConfig {
+        model: "fixture-local-coder-model".into(),
+        ..Default::default()
+    };
     settings.provider.reasoning_options = Some(vec![
         "low".into(),
         "medium".into(),
@@ -571,6 +625,75 @@ fn render() {
             account_cases.push(serde_json::json!({"theme":theme,"state":if ready {"models"} else {"loading"},"image":filename,"controlled_account_status_and_catalog":true,"live_account_qualified":false,"no_auth_or_catalog_request_submitted":true}));
         }
     }
+    let mut popover_cases = Vec::new();
+    // Capture settled geometry; these cases validate layout, not motion.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    for theme in ["light", "dark"] {
+        settings.theme = theme.into();
+        client.save_settings(settings.clone()).unwrap();
+        wait(&mut cx, theme);
+        for height in [880_u32, 480] {
+            cx.update_window(handle, |_, window, cx| {
+                window.resize(size(px(1000.), px(height as f32)));
+                window.bounds_changed(cx);
+                view.update(cx, |view, cx| view.composer_popovers_capture(cx));
+                window.render_frame(cx);
+                window.click("composer-model", cx);
+                window.render_frame(cx);
+                let panel = window.find("composer-model-panel").bounds();
+                let row = window.find(("composer-model-recent", 0usize)).bounds();
+                assert!(panel.top() >= px(0.) && panel.bottom() <= px(height as f32));
+                assert!(
+                    row.size.height >= px(28.),
+                    "The catalog must scroll without compressing rows"
+                );
+            })
+            .unwrap();
+            let model_image = format!("model-picker-{theme}-{height}.png");
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(&model_image))
+                .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                window.press("up", cx);
+                window.render_frame(cx);
+                let list = window.find("composer-model-list").bounds();
+                let last = window.find(("composer-model-choice", 31usize)).bounds();
+                assert!(
+                    last.top() >= list.top() && last.bottom() <= list.bottom(),
+                    "Keyboard choice is clipped: {last:?}, list={list:?}"
+                );
+            })
+            .unwrap();
+            let scrolled_image = format!("model-picker-scrolled-{theme}-{height}.png");
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(&scrolled_image))
+                .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                window.press("escape", cx);
+                window.click("composer-context", cx);
+                window.render_frame(cx);
+                let panel = window.find("composer-context-panel").bounds();
+                assert!(panel.top() >= px(0.) && panel.bottom() <= px(height as f32));
+            })
+            .unwrap();
+            let context_image = format!("context-panel-{theme}-{height}.png");
+            cx.capture_screenshot(handle)
+                .unwrap()
+                .save(output.join(&context_image))
+                .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                window.click("composer-context", cx);
+            })
+            .unwrap();
+            popover_cases.push(serde_json::json!({
+                "theme":theme,"viewport":[1000,height],"model_image":model_image,
+                "scrolled_model_image":scrolled_image,"context_image":context_image,
+                "synthetic_catalog_context_and_quota":true,"no_request_submitted":true
+            }));
+        }
+    }
     let compiled_sources = [
         (
             "accounts.rs",
@@ -596,6 +719,14 @@ fn render() {
         ),
         ("ui.rs", include_bytes!("../src/ui.rs").as_slice()),
         (
+            "model_picker.rs",
+            include_bytes!("../src/xylo/model_picker.rs").as_slice(),
+        ),
+        (
+            "context_panel.rs",
+            include_bytes!("../src/xylo/context_panel.rs").as_slice(),
+        ),
+        (
             "composer_rendering.rs",
             include_bytes!("composer_rendering.rs").as_slice(),
         ),
@@ -607,7 +738,7 @@ fn render() {
     let metadata = serde_json::json!({
         "schema":1,
         "scope":"Controlled offscreen production Xylo capture with real temporary Host/Store, native platform fonts and GPU. Synthetic persisted model label, no inference/accounts/microphone or physical desktop acceptance.",
-        "queue_cases":queue_cases,"cases":cases,"provider_cases":provider_cases,"account_cases":account_cases,"compiled_sources":compiled_sources,
+        "queue_cases":queue_cases,"cases":cases,"provider_cases":provider_cases,"account_cases":account_cases,"popover_cases":popover_cases,"compiled_sources":compiled_sources,
         "source_errors_suppressed":false,
         "controls_clicked":true,"execution_actions_submitted":false,
     });

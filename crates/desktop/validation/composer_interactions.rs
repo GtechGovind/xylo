@@ -287,6 +287,178 @@ mod xylo {
             }).unwrap();
         }
         #[gpui_kit::test]
+        fn large_model_catalog_keeps_rows_readable_and_keyboard_choices_visible(
+            cx: &mut TestAppContext,
+        ) {
+            let (handle, view) = open(cx);
+            cx.update_window(handle, |_, window, cx| {
+                cx.set_reduce_motion(true);
+                view.update(cx, |view, cx| {
+                    model(view, cx);
+                    view.settings.providers = (0..32)
+                        .map(|index| ProviderConfig {
+                            name: if index < 20 { "Alpha" } else { "Beta" }.into(),
+                            endpoint: format!(
+                                "https://{}.example.invalid/v1",
+                                if index < 20 { "alpha" } else { "beta" }
+                            ),
+                            model: format!("fixture-model-{index}"),
+                            ..view.settings.provider.clone()
+                        })
+                        .collect();
+                    view.settings.provider = view.settings.providers[0].clone();
+                    view.settings.ui.recent_models = [0, 20]
+                        .map(|index| xylo_core::RecentModel {
+                            endpoint: view.settings.providers[index].endpoint.clone(),
+                            model: view.settings.providers[index].model.clone(),
+                        })
+                        .into();
+                    cx.notify();
+                });
+                for height in [880., 480.] {
+                    window.resize(size(px(1000.), px(height)));
+                    window.bounds_changed(cx);
+                    window.render_frame(cx);
+                    window.click("composer-model", cx);
+                    window.render_frame(cx);
+                    let panel = window.find("composer-model-panel").bounds();
+                    let list = window.find("composer-model-list").bounds();
+                    let search = window.find_by_label("Search models").bounds();
+                    let footer = window.find("composer-manage-models").bounds();
+                    assert!(
+                        panel.top() >= px(0.) && panel.bottom() <= px(height),
+                        "Picker must fit the viewport: {panel:?}"
+                    );
+                    assert!(
+                        list.top() >= search.bottom() && list.bottom() <= footer.top(),
+                        "The list must leave search and settings reachable"
+                    );
+                    let first = window.find(("composer-model-recent", 0usize)).bounds();
+                    assert!(
+                        first.size.height >= px(28.),
+                        "Catalog size must not compress model rows: {first:?}"
+                    );
+                    // Moving backwards wraps to the final model, then scrolls
+                    // each preceding choice fully into view before Enter.
+                    for index in (0usize..32).rev() {
+                        window.press("up", cx);
+                        window.render_frame(cx);
+                        let row = window.find(("composer-model-choice", index)).bounds();
+                        let list = window.find("composer-model-list").bounds();
+                        assert!(
+                            row.size.height >= px(28.),
+                            "Rows must remain readable after scrolling: {row:?}"
+                        );
+                        assert!(
+                            row.top() >= list.top() && row.bottom() <= list.bottom(),
+                            "Keyboard choice {index} is clipped: {row:?}, list={list:?}"
+                        );
+                    }
+                    window.press("enter", cx);
+                    assert!(!view.read(cx).model_picker.open);
+                    assert_eq!(view.read(cx).settings.provider.model, "fixture-model-0");
+                }
+            })
+            .unwrap();
+        }
+
+        #[gpui_kit::test]
+        fn full_context_receipt_fits_a_short_window_and_scrolls(cx: &mut TestAppContext) {
+            let (handle, view) = open(cx);
+            cx.update_window(handle, |_, window, cx| {
+                // Geometry assertions compare stable surfaces, not the
+                // intentional few-pixel popover entrance animation.
+                cx.set_reduce_motion(true);
+                view.update(cx, |view, cx| {
+                    model(view, cx);
+                    let turn = view.turns.entry(view.session).or_default();
+                    turn.context = Some(xylo_core::ContextUsage {
+                        capacity: 8_192,
+                        system: 1_700,
+                        tools: 2_000,
+                        tool_count: 8,
+                        deferred_tool_count: 67,
+                        messages: 475,
+                        summary: 1_200,
+                        compacted: true,
+                        autocompact_threshold: 7_456,
+                        ..Default::default()
+                    });
+                    turn.rate_limits = Some((
+                        "fixture-model".into(),
+                        xylo_core::RateLimits {
+                            requests: Some(3_999),
+                            tokens: Some(2_397_000),
+                            input_tokens: Some(1_997_000),
+                            output_tokens: Some(400_000),
+                            observed_at_ms: super::now_ms(),
+                        },
+                    ));
+                    view.usage_ui.report =
+                        Some((view.session, xylo_runtime::UsageReport::default()));
+                    cx.notify();
+                });
+                window.resize(size(px(1000.), px(480.)));
+                window.bounds_changed(cx);
+                window.render_frame(cx);
+                window.click("composer-context", cx);
+                window.render_frame(cx);
+                let panel = window.find("composer-context-panel").bounds();
+                let content = window.find("composer-context-content").bounds();
+                assert!(
+                    panel.top() >= px(0.) && panel.bottom() <= px(480.),
+                    "A full context and quota receipt must fit the viewport: {panel:?}"
+                );
+                assert!(
+                    panel.size.height <= px(440.),
+                    "The popover must leave an outer margin: {panel:?}"
+                );
+                window.scroll(
+                    "composer-context-panel",
+                    gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-600.))),
+                    cx,
+                );
+                window.render_frame(cx);
+                let after = window.find("composer-context-panel").bounds();
+                assert_eq!(panel, after, "Scrolling details must not move the popover");
+                let scrolled = window.find("composer-context-content").bounds();
+                assert!(
+                    scrolled.top() < content.top(),
+                    "The overflow must actually scroll"
+                );
+                assert!(
+                    scrolled.bottom() <= panel.bottom(),
+                    "The end of the receipt must be reachable"
+                );
+                window.press("escape", cx);
+                view.update(cx, |view, cx| {
+                    view.usage_ui.report_error =
+                        Some("Usage details could not be refreshed. ".repeat(30));
+                    cx.notify();
+                });
+                window.render_frame(cx);
+                window.click("usage-totals-button", cx);
+                let panel = window.find("usage-totals-panel").bounds();
+                let content = window.find("usage-totals-content").bounds();
+                assert!(
+                    panel.top() >= px(0.) && panel.bottom() <= px(480.),
+                    "Standalone usage details must also fit: {panel:?}"
+                );
+                window.scroll(
+                    "usage-totals-panel",
+                    gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-2_000.))),
+                    cx,
+                );
+                let scrolled = window.find("usage-totals-content").bounds();
+                assert!(
+                    scrolled.top() < content.top() && scrolled.bottom() <= panel.bottom(),
+                    "All usage and quota details must remain reachable"
+                );
+            })
+            .unwrap();
+        }
+
+        #[gpui_kit::test]
         fn unified_model_switching_honors_explicit_unsupported_metadata(cx: &mut TestAppContext) {
             let (window, view) = open(cx);
             cx.update_window(window, |_, window, cx| {

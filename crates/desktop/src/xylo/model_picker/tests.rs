@@ -1,7 +1,7 @@
 use super::super::CHATGPT_REF;
 use super::{
     PickerRow, choice_positions, effort_caption, effort_label, format_tokens, group_label,
-    picker_rows, remember_recent, sticky_header,
+    picker_rows, remember_recent,
 };
 use xylo_core::{ProviderConfig, RecentModel};
 
@@ -108,7 +108,7 @@ fn search_matches_group_names_and_empty_catalogs_have_no_choices() {
 }
 
 #[test]
-fn keyboard_positions_skip_headers_and_the_pinned_header_follows_scroll() {
+fn keyboard_positions_skip_group_headers() {
     let catalog = vec![
         model("alpha", "a-1"),
         model("beta", "b-1"),
@@ -116,8 +116,6 @@ fn keyboard_positions_skip_headers_and_the_pinned_header_follows_scroll() {
     ];
     let rows = picker_rows(&catalog, &catalog[0], &[], "", None);
     assert_eq!(choice_positions(&rows), vec![1, 3, 4]);
-    assert_eq!(sticky_header(&rows, 1), Some("Custom · alpha"));
-    assert_eq!(sticky_header(&rows, 4), Some("Custom · beta"));
 }
 
 #[test]

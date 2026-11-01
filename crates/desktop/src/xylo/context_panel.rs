@@ -3,6 +3,7 @@
 //! Both read the engine's `ContextUsage` for the open chat (the accounting of
 //! the latest request), never summed per-turn usage or a character estimate.
 use super::*;
+use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::{
     button::{Button as MenuButton, ButtonVariants},
     popover::Popover,
@@ -112,6 +113,21 @@ const SUMMARY: fn() -> u32 = success;
 const BUFFER: fn() -> u32 = warning_bg;
 const FREE: fn() -> u32 = hover;
 
+/// Context and usage receipts share one scroll bound. The surrounding
+/// popover contributes padding and a border outside this viewport.
+pub(super) fn receipt_viewport(
+    id: &'static str,
+    width: f32,
+    window: &Window,
+) -> impl IntoElement + ParentElement {
+    div()
+        .id(id)
+        .test_support()
+        .w(px(width))
+        .max_h((window.viewport_size().height - px(48.)).clamp(px(0.), px(480.)))
+        .overflow_y_scroll()
+}
+
 impl Xylo {
     fn current_context(&self) -> Option<&ContextUsage> {
         self.turns
@@ -164,9 +180,9 @@ impl Xylo {
                         )
                         .tooltip(tooltip),
                 )
-                .content(move |_, _, cx| {
+                .content(move |_, window, cx| {
                     let panel = weak
-                        .update(cx, |view, _| view.context_panel())
+                        .update(cx, |view, _| view.context_panel(window))
                         .unwrap_or_else(|_| div().into_any_element());
                     crate::motion::popover_surface("composer-context-surface", panel)
                         .into_any_element()
@@ -175,10 +191,12 @@ impl Xylo {
         )
     }
 
-    fn context_panel(&self) -> AnyElement {
+    fn context_panel(&self, window: &Window) -> AnyElement {
+        let viewport = receipt_viewport("composer-context-panel", 300., window);
         let panel = div()
-            .id("composer-context-panel")
-            .w(px(300.))
+            .id("composer-context-content")
+            .test_support()
+            .w_full()
             .p_2()
             .flex()
             .flex_col()
@@ -191,8 +209,8 @@ impl Xylo {
                     .child("Context window"),
             );
         let Some(usage) = self.current_context() else {
-            return panel
-                .child(subtitle("Context appears after the first reply."))
+            return viewport
+                .child(panel.child(subtitle("Context appears after the first reply.")))
                 .into_any_element();
         };
         let breakdown = ContextBreakdown::new(usage);
@@ -245,7 +263,7 @@ impl Xylo {
         } else {
             "Nothing has been condensed yet."
         };
-        panel
+        let content = panel
             .child(
                 div()
                     .text_size(px(12.5))
@@ -302,8 +320,8 @@ impl Xylo {
             .child(subtitle(compaction))
             .child(subtitle(updated))
             .child(self.quota_rows())
-            .child(self.usage_totals())
-            .into_any_element()
+            .child(self.usage_totals());
+        viewport.child(content).into_any_element()
     }
     pub(super) fn quota_rows(&self) -> AnyElement {
         let mut rows = div().flex().flex_col().gap_1();

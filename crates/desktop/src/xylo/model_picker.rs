@@ -187,18 +187,6 @@ fn choice_positions(rows: &[PickerRow]) -> Vec<usize> {
         .collect()
 }
 
-/// The group header to pin above the list once `top` (the first visible row)
-/// has scrolled past it.
-fn sticky_header(rows: &[PickerRow], top: usize) -> Option<&str> {
-    rows.iter()
-        .take(top.saturating_add(1))
-        .rev()
-        .find_map(|row| match row {
-            PickerRow::Header(name) => Some(name.as_str()),
-            PickerRow::Model { .. } => None,
-        })
-}
-
 /// Compact token count for context sizes ("8K", "200K", "1M").
 pub(super) fn format_tokens(tokens: u64) -> String {
     match tokens {
@@ -271,6 +259,7 @@ fn header_text(name: &str) -> Div {
         .pl(px(NAME_INSET))
         .pr_2()
         .h(px(26.))
+        .flex_shrink_0()
         .flex()
         .items_center()
         .text_size(px(11.5))
@@ -286,6 +275,7 @@ fn picker_row(id: impl Into<ElementId>, keyboard_highlight: bool) -> gpui_kit::b
     focus_ring(gpui_kit::base::Button::new(id))
         .w_full()
         .h(px(ROW_HEIGHT))
+        .flex_shrink_0()
         .px(px(ROW_INSET))
         .rounded(px(8.))
         .bg(rgb(panel()))
@@ -451,16 +441,16 @@ impl Xylo {
                     .child(icons::small(AppIcon::Select).text_color(rgb(icons::rest_color())))
                     .tooltip("Model and reasoning"),
             )
-            .content(move |_, _, cx| {
+            .content(move |_, window, cx| {
                 let panel = content
-                    .update(cx, |view, cx| view.model_picker_panel(cx))
+                    .update(cx, |view, cx| view.model_picker_panel(window, cx))
                     .unwrap_or_else(|_| div().into_any_element());
                 crate::motion::popover_surface("composer-model-surface", panel).into_any_element()
             })
             .into_any_element()
     }
 
-    fn model_picker_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn model_picker_panel(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
         let (up, down, enter, escape) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let rows = self.picker_rows(cx);
@@ -468,12 +458,9 @@ impl Xylo {
             .id("composer-model-list")
             .test_support()
             .max_h(px(LIST_MAX_HEIGHT))
+            .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.model_picker.scroll)
-            .on_scroll(move |_, _, cx| {
-                // Re-render so the pinned group header follows the scroll.
-                let _ = weak.update(cx, |_, cx| cx.notify());
-            })
             .flex()
             .flex_col();
         let mut choice = 0usize;
@@ -510,21 +497,13 @@ impl Xylo {
                     .child(subtitle(format!("No models match “{query}”."))),
             );
         }
-        let pinned = (self.model_picker.scroll.offset().y < px(0.))
-            .then(|| sticky_header(&rows, self.model_picker.scroll.top_item()))
-            .flatten()
-            .map(|name| {
-                header_text(name)
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bg(rgb(panel()))
-            });
         div()
             .id("composer-model-panel")
             .test_support()
             .w(px(340.))
+            // The surface contributes 26 px of padding and border; leave
+            // room for that and an outer margin on short windows.
+            .max_h((window.viewport_size().height - px(48.)).max(px(0.)))
             .flex()
             .flex_col()
             .gap_2()
@@ -550,11 +529,14 @@ impl Xylo {
             .child(
                 div()
                     .px(px(2.))
+                    .flex_shrink_0()
                     .child(Input::new(&self.model_picker.query).aria_label("Search models")),
             )
-            .child(div().relative().child(list).children(pinned))
+            // Keep headings in the scroll flow. An overlay hides the first
+            // visible model, including a keyboard choice scrolled to the top.
+            .child(list)
             .child(self.reasoning_effort_control(cx))
-            .child(self.output_style_control(cx))
+            .child(div().flex_shrink_0().child(self.output_style_control(cx)))
             .child(divider())
             .child(
                 picker_row("composer-manage-models", false)
@@ -652,6 +634,7 @@ impl Xylo {
             // with the model names.
             .px(px(ROW_INSET + 1.))
             .h(px(ROW_HEIGHT + 4.))
+            .flex_shrink_0()
             .flex()
             .items_center()
             .gap(px(8.))

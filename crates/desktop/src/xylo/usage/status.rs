@@ -13,16 +13,21 @@ impl Xylo {
                     .child("Usage")
                     .accessibility_label("Conversation and daily usage"),
             )
-            .content(move |_, _, cx| {
+            .content(move |_, window, cx| {
                 weak.update(cx, |view, _| {
-                    div()
-                        .w(px(320.))
-                        .p_3()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(view.usage_totals())
-                        .child(view.quota_rows())
+                    context_panel::receipt_viewport("usage-totals-panel", 320., window)
+                        .child(
+                            div()
+                                .id("usage-totals-content")
+                                .test_support()
+                                .w_full()
+                                .p_3()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(view.usage_totals())
+                                .child(view.quota_rows()),
+                        )
                         .into_any_element()
                 })
                 .unwrap_or_else(|_| div().into_any_element())
