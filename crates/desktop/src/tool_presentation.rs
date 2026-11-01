@@ -4,6 +4,9 @@
 //! output, a file excerpt, search hits or a short plain summary. Model-facing
 //! envelopes (skill instructions, raw JSON) never reach the screen; the raw
 //! input and output stay available to copy from the card.
+#[path = "tool_presentation/rich_reads.rs"]
+mod rich_reads;
+
 use serde_json::Value;
 
 #[derive(Clone, Debug, Default)]
@@ -215,7 +218,8 @@ impl ToolPresentation {
             "find_files" => "Find",
             "file_read" => "Read",
             "file_write" => "Write",
-            "file_edit" => "Edit",
+            "file_edit" | "notebook_edit" => "Edit",
+            "lsp" => "Inspect code",
             "search_project" => "Search",
             "run_command" | "shell_command" => "Run",
             "agent_delegate" => "Delegate",
@@ -262,7 +266,9 @@ impl ToolPresentation {
             verb: verb.replace('_', " "),
             target: short(&one_line(&target), 160),
             question: match name {
-                "file_write" | "file_edit" => "Allow this change to your project?",
+                "file_write" | "file_edit" | "notebook_edit" => {
+                    "Allow this change to your project?"
+                }
                 "run_command" | "shell_command" => "Allow this command in your project?",
                 "agent_delegate" => "Start a helper agent?",
                 "extension_skill" => "Run this skill with the current project permissions?",
@@ -360,25 +366,30 @@ impl ToolPresentation {
                 }
             }
             "file_read" => {
-                let start = output
-                    .get("start_line")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1);
-                let end = output
-                    .get("end_line")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(start);
-                let total = output.get("total_lines").and_then(Value::as_u64);
-                if let Some(total) = total {
-                    shown.meta = Some(format!("{start}–{end} · {total} lines"));
-                }
-                let (lines, remaining) = lines(text(output, "content"), true, start);
-                if result.is_none() {
-                    ToolBody::Empty
-                } else if lines.is_empty() {
-                    ToolBody::Message("Empty file".into())
+                if let Some((meta, body)) = rich_reads::prepare(output) {
+                    shown.meta = Some(meta);
+                    body
                 } else {
-                    ToolBody::Excerpt { lines, remaining }
+                    let start = output
+                        .get("start_line")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1);
+                    let end = output
+                        .get("end_line")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(start);
+                    let total = output.get("total_lines").and_then(Value::as_u64);
+                    if let Some(total) = total {
+                        shown.meta = Some(format!("{start}–{end} · {total} lines"));
+                    }
+                    let (lines, remaining) = lines(text(output, "content"), true, start);
+                    if result.is_none() {
+                        ToolBody::Empty
+                    } else if lines.is_empty() {
+                        ToolBody::Message("Empty file".into())
+                    } else {
+                        ToolBody::Excerpt { lines, remaining }
+                    }
                 }
             }
             "search_project" => {
@@ -486,7 +497,9 @@ impl ToolPresentation {
             "agent_delegate" => readable(output)
                 .map(|text| ToolBody::Markdown(short(text, 64 * 1024)))
                 .unwrap_or(ToolBody::Empty),
-            "file_write" | "file_edit" | "git_diff" if !text(output, "diff").is_empty() => {
+            "file_write" | "file_edit" | "notebook_edit" | "git_diff"
+                if !text(output, "diff").is_empty() =>
+            {
                 ToolBody::Diff(short(text(output, "diff"), 12000))
             }
             "image_generate" => ToolBody::Empty,

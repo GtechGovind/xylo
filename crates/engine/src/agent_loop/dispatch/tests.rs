@@ -25,8 +25,8 @@ impl Fake {
                 (
                     "file_edit",
                     object(
-                        json!({"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}}),
-                        &["path", "old_string", "new_string"],
+                        json!({"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["old_string","new_string"],"additionalProperties":false}}}),
+                        &["path", "edits"],
                     ),
                     Access::Writes,
                 ),
@@ -179,11 +179,11 @@ fn unambiguous_type_slips_are_repaired_before_dispatch() {
     assert_eq!(arguments, json!({"path":"a.rs","offset":5,"limit":20}));
     let (_, arguments) = ran(prepared(
         "file_edit",
-        r#"{"path":"a","oldString":"x","new_string":12,"replace_all":"TRUE"}"#,
+        r#"{"path":"a","edits":[{"oldString":"x","new_string":12,"replace_all":"TRUE"}]}"#,
     ));
     assert_eq!(
         arguments,
-        json!({"path":"a","old_string":"x","new_string":"12","replace_all":true})
+        json!({"path":"a","edits":[{"old_string":"x","new_string":"12","replace_all":true}]})
     );
 }
 
@@ -246,16 +246,20 @@ fn schema_violations_name_the_field_and_what_was_expected() {
 async fn invalid_calls_never_reach_the_executor_where_approval_happens() {
     let fake = Arc::new(Fake::new());
     let calls = [
-        ("w1", "file_edit", r#"{"path":"a","old_string":"x"}"#),
+        (
+            "w1",
+            "file_edit",
+            r#"{"path":"a","edits":[{"old_string":"x"}]}"#,
+        ),
         (
             "w2",
             "file_edit",
-            r#"{"path":"a","old_string":"x","new_string":"y","mode":"fast"}"#,
+            r#"{"path":"a","edits":[{"old_string":"x","new_string":"y","mode":"fast"}]}"#,
         ),
         (
             "w3",
             "file_edit",
-            r#"{"path":"a","old_string":"x","new_string":"y"}"#,
+            r#"{"path":"a","edits":[{"old_string":"x","new_string":"y"}]}"#,
         ),
     ];
     let prepared = calls

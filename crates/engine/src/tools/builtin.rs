@@ -80,21 +80,21 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ),
         def(
             "file_read",
-            "Read a text file in the workspace as numbered lines (cat -n style). Returns a window of lines from offset (1-based) sized to the model's context; when truncated is true, continue from next_offset. Line-number prefixes are not part of the file. Also reads a saved full tool result named in full_result",
-            json!({"path":{"type":"string","description":"Workspace-relative or absolute path"},"offset":{"type":"integer","minimum":1,"description":"First line to read (1-based)"},"limit":{"type":"integer","minimum":1,"maximum":10000,"description":"Maximum lines to return"}}),
+            "Read a file as numbered text, image content, PDF pages, or notebook cells with outputs. Text and notebooks support offset/limit paging. PDFs accept pages like 1-5, at most 20. Read existing files before editing; changed files need another read",
+            json!({"path":{"type":"string","description":"Workspace-relative or absolute path"},"pages":{"type":"string","description":"PDF page or inclusive range, at most 20 pages"},"offset":{"type":"integer","minimum":1,"description":"First text line or notebook cell to read (1-based)"},"limit":{"type":"integer","minimum":1,"maximum":10000,"description":"Maximum text lines or notebook cells to return"}}),
             &["path"],
             false,
         ),
         def(
             "file_edit",
-            "Replace exact text in an existing file. old_string must match the current file exactly once, including whitespace and indentation: read the file first and copy the text without line-number prefixes. Set replace_all to change every occurrence. Prefer this to file_write for changing existing files",
-            json!({"path":{"type":"string"},"old_string":{"type":"string","description":"Exact existing text to replace"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace every occurrence instead of requiring exactly one"}}),
-            &["path", "old_string", "new_string"],
+            "Apply edits sequentially and atomically after file_read. Each old_string must match exactly once unless replace_all is true. All edits succeed or the file stays unchanged. Refuses files changed since the last read",
+            json!({"path":{"type":"string"},"edits":{"type":"array","minItems":1,"maxItems":1000,"items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["old_string","new_string"],"additionalProperties":false}}}),
+            &["path", "edits"],
             true,
         ),
         def(
             "file_write",
-            "Create a file, or replace a file's entire contents. For changes to an existing file use file_edit",
+            "Create a file or replace its entire contents. For an existing file, first use file_read; stale files are refused",
             json!({"path":{"type":"string"},"content":{"type":"string","description":"Complete new file contents"}}),
             &["path", "content"],
             true,
@@ -115,8 +115,8 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ),
         def(
             "search_project",
-            "Search file contents with a regular expression (ripgrep engine), respecting .gitignore. Returns path:line:text rows. Use glob to filter files (for example *.ts or src/**/*.rs), path to limit to a directory or file, literal for exact text, context for surrounding lines and files_only to list matching files",
-            json!({"query":{"type":"string","description":"Regular expression, or exact text when literal is true"},"path":{"type":"string"},"glob":{"type":"string","description":"Comma-separated glob filters"},"literal":{"type":"boolean"},"case_insensitive":{"type":"boolean"},"context":{"type":"integer","minimum":0,"maximum":10},"max_results":{"type":"integer","minimum":1,"maximum":2000},"files_only":{"type":"boolean"}}),
+            "Search project content with ripgrep expressions and types. output_mode is content, files, or count. Use before/after for context, multiline for patterns spanning lines, and zero-based offset to page results",
+            json!({"query":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"literal":{"type":"boolean"},"case_insensitive":{"type":"boolean"},"output_mode":{"type":"string","enum":["content","files","count"]},"before":{"type":"integer","minimum":0,"maximum":10},"after":{"type":"integer","minimum":0,"maximum":10},"multiline":{"type":"boolean"},"type":{"type":"string","description":"Ripgrep language type such as rust or ts"},"offset":{"type":"integer","minimum":0,"maximum":200000},"max_results":{"type":"integer","minimum":1,"maximum":2000}}),
             &["query"],
             false,
         ),
@@ -227,6 +227,8 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ),
     ];
     // The OS sandbox is not qualified on Windows, so commands are not offered.
+    tools.push(def("notebook_edit", "Edit a notebook cell after file_read. Insert after cell_id, or use an empty cell_id to insert first; replace clears old execution outputs; delete removes the cell", json!({"path":{"type":"string"},"cell_id":{"type":"string"},"new_source":{"type":"string"},"cell_type":{"type":"string","enum":["code","markdown","raw"]},"edit_mode":{"type":"string","enum":["replace","insert","delete"]}}), &["path","cell_id","new_source","edit_mode"], true));
+    tools.push(def("lsp", "Query native language intelligence; starts the file language server on demand. Positions are zero-based UTF-16. Workspace symbols searches the symbol at that position", json!({"operation":{"type":"string","enum":["definition","references","hover","symbols","workspace_symbols","diagnostics"]},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}), &["operation","path"], false));
     if cfg!(windows) {
         tools.retain(|tool| !matches!(tool.name.as_str(), "run_command" | "shell_command"));
     }
@@ -238,10 +240,10 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
 pub(super) fn compact_description(name: &str) -> Option<&'static str> {
     Some(match name {
         "file_read" => {
-            "Read a text file as numbered lines; when truncated, continue from next_offset"
+            "Read text, images, PDF pages or notebook cells before editing; text supports offset/limit"
         }
         "file_edit" => {
-            "Replace text in a file: old_string must match exactly once, without line-number prefixes; replace_all changes every match"
+            "Atomically apply edits:[{old_string,new_string,replace_all?}] after file_read; refuses stale files"
         }
         "shell_command" => {
             "Run a bash command line in the workspace sandbox; no internet unless network is true with a justification"
@@ -437,15 +439,22 @@ pub(super) fn change_preview(
 ) -> Result<Value> {
     let root = &broker.request.workspace;
     let path = write_target(broker, text(args, "path")?, access)?;
+    broker
+        .session
+        .reads
+        .require(broker.request.session_id, root, &path)?;
     let shown = code::display(root, &path);
     let mut preview = match name {
-        "file_edit" => {
-            let plan = code::plan_edit(&path, &shown, args)?;
+        "file_edit" | "notebook_edit" => {
+            let plan = if name == "notebook_edit" {
+                super::notebook::plan(&path, &shown, args)?
+            } else {
+                code::plan_edit(&path, &shown, args)?
+            };
             let mut preview =
                 code::approval_diff(&shown, &plan.original, &plan.updated, APPROVAL_DIFF_BYTES);
             preview["replacements"] = json!(plan.replacements);
-            preview["request"] =
-                json!({"path":text(args, "path")?,"replace_all":args.get("replace_all")});
+            preview["request"] = json!({"path":text(args, "path")?,"edit_count":args.get("edits").and_then(Value::as_array).map(Vec::len),"cell_id":args.get("cell_id"),"edit_mode":args.get("edit_mode")});
             preview
         }
         _ => {
@@ -552,16 +561,54 @@ pub(super) fn execute(
     let value = match name {
         "file_read" => {
             let path = permitted(broker, text(args, "path")?, false, access)?;
-            code::read(&path, &code::display(root, &path), args, &broker.window())?
+            super::file_read::execute(broker, &path, args)?
+        }
+        "notebook_edit" => {
+            let path = write_target(broker, text(args, "path")?, access)?;
+            broker
+                .session
+                .reads
+                .require(broker.request.session_id, root, &path)?;
+            let shown = code::display(root, &path);
+            let plan = super::notebook::plan(&path, &shown, args)?;
+            broker
+                .session
+                .reads
+                .require(broker.request.session_id, root, &path)?;
+            code::write_atomic(&path, &plan.updated)?;
+            broker
+                .session
+                .reads
+                .updated(broker.request.session_id, root, &path)?;
+            let mut result = code::diff(&shown, &plan.original, &plan.updated);
+            result["path"] = json!(shown);
+            result
+        }
+        "lsp" => {
+            let path = permitted(broker, text(args, "path")?, false, access)?;
+            super::lsp::execute(broker, &path, args)?
         }
         "file_edit" => {
             let path = write_target(broker, text(args, "path")?, access)?;
             let shown = code::display(root, &path);
+            broker
+                .session
+                .reads
+                .require(broker.request.session_id, root, &path)?;
             let plan = code::plan_edit(&path, &shown, args)?;
+            broker
+                .session
+                .reads
+                .require(broker.request.session_id, root, &path)?;
             code::write_atomic(&path, &plan.updated)?;
+            broker
+                .session
+                .reads
+                .updated(broker.request.session_id, root, &path)?;
             let mut result = code::diff(&shown, &plan.original, &plan.updated);
             result["path"] = json!(shown);
             result["replacements"] = json!(plan.replacements);
+            super::lsp::after_write(broker, &path, &mut result);
             result
         }
         "file_write" => {
@@ -573,11 +620,20 @@ pub(super) fn execute(
             let shown = code::display(root, &path);
             let existing = code::existing_text(&path);
             let created = !path.exists();
+            broker
+                .session
+                .reads
+                .require(broker.request.session_id, root, &path)?;
             code::write_atomic(&path, content)?;
+            broker
+                .session
+                .reads
+                .updated(broker.request.session_id, root, &path)?;
             let mut result = code::diff(&shown, existing.as_deref().unwrap_or(""), content);
             result["path"] = json!(shown);
             result["bytes"] = json!(content.len());
             result["created"] = json!(created);
+            super::lsp::after_write(broker, &path, &mut result);
             result
         }
         "files_list" => code::list(&directory()?)?,

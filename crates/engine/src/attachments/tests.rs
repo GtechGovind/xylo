@@ -98,3 +98,24 @@ fn the_first_use_still_checks_integrity() {
     .unwrap_err();
     assert!(matches!(error, ModelError::InvalidRequest(_)), "{error:?}");
 }
+
+#[test]
+fn tool_images_survive_checkpoint_replay_and_are_hydrated() {
+    let (_directory, store, session, attachment) = imported();
+    let tool = Message::tool_result(
+        "image-call",
+        serde_json::json!({"images":[attachment]}).to_string(),
+    );
+    let durable = serde_json::to_string(&tool).unwrap();
+    let mut messages = vec![serde_json::from_str(&durable).unwrap()];
+    hydrate(
+        &store,
+        session,
+        &Mutex::new(HashMap::new()),
+        &mut messages,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(messages[0].images.len(), 1);
+    assert_eq!(serde_json::to_string(&messages[0]).unwrap(), durable);
+}

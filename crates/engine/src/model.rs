@@ -95,7 +95,7 @@ pub struct Message {
     pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<NativeContent>,
-    /// Managed image references attached to a user message.
+    /// Managed image references attached to a user message or tool observation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ImageAttachment>,
     /// Marks the model-written summary that replaced earlier history.
@@ -148,6 +148,16 @@ impl Message {
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         let mut message = Self::new(Role::Tool, content);
         message.tool_call_id = Some(tool_call_id.into());
+        // Rich tool observations carry only managed references. Provider image
+        // bytes are hydrated and validated by AttachmentProvider each request.
+        if let Ok(value) = serde_json::from_str::<Value>(&message.content)
+            && let Some(images) = value
+                .get("images")
+                .or_else(|| value.pointer("/summary/images"))
+            && let Ok(attachments) = serde_json::from_value(images.clone())
+        {
+            message.attachments = attachments;
+        }
         message
     }
 

@@ -29,7 +29,7 @@ use std::path::{Component, Path, PathBuf};
 pub(crate) fn assess(name: &str, arguments: &Value, workspace: &Path) -> Option<String> {
     let text = |key: &str| arguments.get(key).and_then(Value::as_str);
     match name {
-        "file_write" | "file_edit" => {
+        "file_write" | "file_edit" | "notebook_edit" => {
             let path = resolve(workspace, text("path")?);
             if !inside(workspace, &path) {
                 return Some(format!(
@@ -41,7 +41,7 @@ pub(crate) fn assess(name: &str, arguments: &Value, workspace: &Path) -> Option<
                 .map(|kind| format!("Changes {kind}"))
                 .or_else(|| auto_run_config(workspace, &path))
         }
-        "file_read" | "files_list" | "find_files" | "search_project" => {
+        "file_read" | "lsp" | "files_list" | "find_files" | "search_project" => {
             let path = resolve(workspace, text("path").unwrap_or("."));
             secret_path(&path).map(|kind| format!("Reads {kind}"))
         }

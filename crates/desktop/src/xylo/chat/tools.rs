@@ -12,8 +12,10 @@ use serde_json::Value;
 /// The icon for a kind of call, so a run of calls scans at a glance.
 pub(super) fn tool_icon(name: &str) -> AppIcon {
     match name {
-        "file_read" | "read_file" | "extension_resource" => AppIcon::ToolRead,
-        "file_write" | "file_edit" | "write_file" | "edit_file" => AppIcon::ToolEdit,
+        "file_read" | "lsp" | "read_file" | "extension_resource" => AppIcon::ToolRead,
+        "file_write" | "file_edit" | "notebook_edit" | "write_file" | "edit_file" => {
+            AppIcon::ToolEdit
+        }
         "run_command" | "shell_command" | "terminal" => AppIcon::Terminal,
         "search_project" | "grep" | "glob" | "find" => AppIcon::Search,
         "files_list" | "find_files" => AppIcon::Folder,
@@ -694,7 +696,7 @@ fn full_code_block(id: impl Into<ElementId>, text: &str) -> AnyElement {
 
 fn approval_preview(i: usize, tool: &ToolCard) -> AnyElement {
     match tool.name.as_str() {
-        "file_write" | "file_edit" => {
+        "file_write" | "file_edit" | "notebook_edit" => {
             let diff = text_arg(&tool.input, "diff");
             if diff.trim().is_empty() {
                 subtitle("No textual change.").into_any_element()

@@ -1607,3 +1607,5 @@ fn context_overflow_is_recognised_from_codes_and_messages() {
     ));
     assert!(!overflow(500, "request_failed", Some("prompt is too long")));
 }
+
+mod tool_images;

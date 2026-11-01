@@ -389,14 +389,20 @@ fn converse_body(
                 }
                 push_message(&mut converted, "assistant", content);
             }
-            Role::Tool => push_message(
-                &mut converted,
-                "user",
-                vec![json!({"toolResult":{
-                    "toolUseId": message.tool_call_id.clone().unwrap_or_default(),
-                    "content": text_or_placeholder(&message.content),
-                }})],
-            ),
+            Role::Tool => {
+                let mut result = text_or_placeholder(&message.content);
+                for image in &message.images {
+                    request::check_image(image)?;
+                    result.push(json!({"image":{"format":image.media_type.trim_start_matches("image/"),"source":{"bytes":image.data}}}));
+                }
+                push_message(
+                    &mut converted,
+                    "user",
+                    vec![
+                        json!({"toolResult":{"toolUseId":message.tool_call_id.clone().unwrap_or_default(),"content":result}}),
+                    ],
+                );
+            }
         }
     }
     // Converse requires the conversation to start and end with a user turn.

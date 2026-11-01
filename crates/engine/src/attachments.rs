@@ -65,9 +65,9 @@ fn hydrate(
     let mut encoded_size = 0usize;
     let mut count = 0;
     for message in messages.iter_mut().filter(|m| !m.attachments.is_empty()) {
-        if message.role != Role::User {
+        if !matches!(message.role, Role::User | Role::Tool) {
             return Err(ModelError::InvalidRequest(
-                "Only user messages may contain images".into(),
+                "Only user and tool messages may contain images".into(),
             ));
         }
         for attachment in &message.attachments {

@@ -96,7 +96,7 @@ fn verdict(
 #[test]
 fn presets_follow_the_codex_table() {
     use PermissionMode::*;
-    let edit = json!({"path":"src/lib.rs","old_string":"a","new_string":"b"});
+    let edit = json!({"path":"src/lib.rs","edits":[{"old_string":"a","new_string":"b"}]});
     let outside = Reach::Outside(PathBuf::from("/etc/hosts"));
     let cases = [
         (
@@ -438,7 +438,8 @@ fn ask_for_approval_asks_before_editing_files_that_run_code() {
         ".env",
     ] {
         for name in ["file_write", "file_edit"] {
-            let arguments = json!({"path":path,"content":"x","old_string":"a","new_string":"b"});
+            let arguments =
+                json!({"path":path,"content":"x","edits":[{"old_string":"a","new_string":"b"}]});
             assert!(
                 matches!(
                     project_verdict(AskForApproval, name, arguments, true),

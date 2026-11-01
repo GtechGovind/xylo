@@ -100,6 +100,8 @@ pub struct ToolSession {
     permissions: PermissionCell,
     vault: CredentialVault,
     connectors: Arc<OnceLock<ConnectorBroker>>,
+    pub(crate) reads: Arc<super::read_state::ReadState>,
+    pub(crate) lsp: Arc<OnceLock<xylo_runtime::lsp::AgentService>>,
 }
 
 impl ToolSession {
@@ -111,6 +113,8 @@ impl ToolSession {
             permissions,
             vault,
             connectors: Arc::default(),
+            reads: Arc::default(),
+            lsp: Arc::default(),
         }
     }
 
@@ -139,6 +143,9 @@ impl ToolSession {
 
     /// Closes every MCP connection; call when the worker exits.
     pub async fn shutdown(&self) {
+        if let Some(lsp) = self.lsp.get() {
+            lsp.shutdown().await;
+        }
         if let Some(connectors) = self.connectors.get() {
             connectors.shutdown().await;
         }
@@ -357,6 +364,7 @@ const SANDBOXED_COMMANDS: &[&str] = &["run_command", "shell_command"];
 const PROJECT_WRITES: &[&str] = &[
     "file_write",
     "file_edit",
+    "notebook_edit",
     "memory_remember",
     "skill_propose",
 ];
@@ -447,7 +455,7 @@ fn rule(
         } else {
             path.parent().unwrap_or(path)
         };
-        let (kind, label) = if matches!(name, "file_write" | "file_edit") {
+        let (kind, label) = if matches!(name, "file_write" | "file_edit" | "notebook_edit") {
             ("edit", "file edits")
         } else {
             ("read", "reading files")
@@ -463,13 +471,15 @@ fn rule(
     match name {
         // Risky project files (secrets, hooks, CI, tool configuration) get a
         // rule of their own that ordinary edits never cover.
-        "file_write" | "file_edit" => match risk::assess(name, arguments, workspace) {
-            Some(_) => {
-                let shown = risk::project_relative(workspace, text("path")?)?;
-                Some((format!("edit:{shown}"), format!("edits to `{shown}`")))
+        "file_write" | "file_edit" | "notebook_edit" => {
+            match risk::assess(name, arguments, workspace) {
+                Some(_) => {
+                    let shown = risk::project_relative(workspace, text("path")?)?;
+                    Some((format!("edit:{shown}"), format!("edits to `{shown}`")))
+                }
+                None => Some(("edit".into(), "file edits in this project".into())),
             }
-            None => Some(("edit".into(), "file edits in this project".into())),
-        },
+        }
         "run_command" => {
             let (key, label) = command_rule(arguments, workspace)?;
             Some((format!("run:{key}"), label))

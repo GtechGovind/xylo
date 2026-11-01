@@ -70,10 +70,12 @@ pub(crate) trait ToolExecutor: Send + Sync {
 }
 
 /// Exact names other agents use for Xylo's tools.
-const ALIASES: [(&str, &str); 9] = [
+const ALIASES: [(&str, &str); 11] = [
     ("read", "file_read"),
     ("write", "file_write"),
     ("edit", "file_edit"),
+    ("notebookedit", "notebook_edit"),
+    ("lsp", "lsp"),
     ("bash", "shell_command"),
     ("shell", "shell_command"),
     ("grep", "search_project"),
