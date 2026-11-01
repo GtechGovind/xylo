@@ -30,6 +30,12 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
+      - name: Pin the CI sandbox runtime
+        shell: bash
+        # Hosted tool caches are intentionally shared-writable. The workflow
+        # explicitly trusts the Node installed by setup-node, like an operator
+        # configured runtime; production discovery still rejects such paths.
+        run: echo "XYLO_SANDBOX_NODE=$(command -v node)" >> "$GITHUB_ENV"
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
@@ -38,7 +44,8 @@ jobs:
       - name: Pinned Rust toolchain
         run: rustup show active-toolchain
       - name: Rust build cache
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        id: rust-cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
             ~/.cargo/registry
@@ -67,3 +74,12 @@ jobs:
         run: cargo install cargo-audit --locked --version 0.22.2
       - name: Dependency audit
         run: cargo audit
+      - name: Save Rust build cache
+        if: always() && !cancelled() && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}

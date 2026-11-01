@@ -14,7 +14,7 @@
   </p>
   <p>
     <img alt="Status" src="https://img.shields.io/badge/status-development_preview-f59e0b?style=flat-square">
-    <img alt="Version" src="https://img.shields.io/badge/version-0.1.1--rc.2-2563eb?style=flat-square">
+    <img alt="Version" src="https://img.shields.io/badge/version-0.1.1--rc.3-2563eb?style=flat-square">
     <img alt="Rust" src="https://img.shields.io/badge/Rust-1.98%2B-dea584?style=flat-square&logo=rust&logoColor=white">
     <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-334155?style=flat-square">
     <img alt="Platforms" src="https://img.shields.io/badge/targets-macOS_·_Windows_·_Linux-334155?style=flat-square">

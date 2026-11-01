@@ -6,7 +6,7 @@ default-members = ["crates/desktop", "crates/worker", "crates/helper", "crates/c
 exclude = ["third_party"]
 
 [workspace.package]
-version = "0.1.1-rc.2"
+version = "0.1.1-rc.3"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.98"
