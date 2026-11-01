@@ -8,6 +8,7 @@ pub(crate) mod fallback;
 mod gemini_cache;
 mod renewal;
 mod request;
+mod search;
 mod stream;
 mod thinking;
 
@@ -73,6 +74,7 @@ struct NativeProvider {
     client: reqwest::Client,
     chatgpt_plan: bool,
     error_redactions: Arc<Vec<String>>,
+    search_headers: reqwest::header::HeaderMap,
     prefix_cache: Arc<gemini_cache::PrefixCache>,
 }
 
@@ -124,7 +126,8 @@ impl NativeProvider {
         }
         let error_redactions = redactions(&headers);
         Ok(Self {
-            client: http_client(headers)?,
+            client: http_client(headers.clone())?,
+            search_headers: headers,
             config,
             endpoint,
             chatgpt_plan,
@@ -277,7 +280,25 @@ fn context_overflow(status: u16, code: &str, reason: Option<&str>) -> bool {
         })
 }
 
+#[async_trait::async_trait]
 impl ModelProvider for NativeProvider {
+    fn supports_search(&self) -> bool {
+        matches!(
+            self.endpoint.protocol,
+            ProviderProtocol::Responses
+                | ProviderProtocol::AnthropicMessages
+                | ProviderProtocol::GeminiGenerateContent
+        )
+    }
+    async fn search(
+        &self,
+        arguments: Value,
+        addresses: Vec<std::net::SocketAddr>,
+        cancel: CancellationToken,
+    ) -> Result<Value, ModelError> {
+        search::execute(self, arguments, addresses, cancel).await
+    }
+
     fn stream(&self, request: ModelRequest, cancel: CancellationToken) -> EventStream {
         let provider = self.clone();
         Box::pin(async_stream::try_stream! {

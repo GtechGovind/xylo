@@ -504,9 +504,11 @@ impl AgentEngine {
             .served_context_tokens(&request.provider, &cancel)
             .await;
         broker.set_served_context(request.provider.served_context_tokens);
+        let native_provider = self.provider(&request.provider)?;
+        broker.set_web_provider(native_provider.clone());
         let guarded = GuardedProvider::new(
             Arc::new(AttachmentProvider::new(
-                self.provider(&request.provider)?,
+                native_provider,
                 attachment_store,
                 request.session_id,
             )),

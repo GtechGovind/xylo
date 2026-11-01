@@ -165,3 +165,10 @@ async fn parallel_children_are_classified_apart_from_the_parent() {
     assert_eq!(result.metrics.child_calls, 4);
     assert_eq!(trial.trace.child_conversations().len(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn web_fetch_task_reads_a_real_offline_page_with_private_approval() {
+    let task = find("web-fetch").unwrap();
+    let (_, result) = graded(&task).await;
+    assert!(result.passed, "{}", explain(&result));
+}

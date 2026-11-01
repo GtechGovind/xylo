@@ -253,6 +253,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
             )
         });
     }
+    tools.extend(super::web::definitions());
     tools
 }
 

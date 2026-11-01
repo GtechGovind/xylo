@@ -47,6 +47,7 @@ mod settings_control;
 mod steering_control;
 mod turn_queue_control;
 mod update_control;
+mod web_search_control;
 mod worker_control;
 use worker_control::{SessionSequences, WorkerHandle, effective_mode, retire_idle_workers};
 
@@ -336,6 +337,7 @@ enum HostCommand {
     Conversations,
     ConversationPage(Option<ConversationCursor>, usize),
     SaveSettings(AppSettings),
+    SaveWebSearch(xylo_core::WebSearchSettings, Option<String>),
     Models(u64, ProviderConfig),
     SaveProvider(u64, Box<AppSettings>, ProviderConfig, Option<String>),
     Workspace(PathBuf),
@@ -534,7 +536,7 @@ impl HostClient {
                         let receipt = received;
                         if matches!(command,HostCommand::Shutdown) {maintenance_stop.cancel();state.shutdown().await;scheduling.abort();editor_forwarder.abort();project_forwarder.abort();let _=learning_task.await;for task in notification_tasks {let _=task.await;}state.events.send(HostEvent::Stopped).await?;break;}
                         // Reserve at receipt, before any task can race to acquire admission.
-                        let settings_commit = matches!(&command, HostCommand::SaveSettings(_) | HostCommand::SaveProvider(..) | HostCommand::RemoveProvider(_)).then(|| settings_commits.reserve());
+                        let settings_commit = matches!(&command, HostCommand::SaveSettings(_) | HostCommand::SaveWebSearch(..) | HostCommand::SaveProvider(..) | HostCommand::RemoveProvider(_)).then(|| settings_commits.reserve());
                         // Preserve document ordering independently of concurrent
                         // host work. The language-server actor owns synchronization.
                         if state.installing.load(Ordering::Acquire) && matches!(&command,HostCommand::Workspace(_)|HostCommand::Lsp(_)) {
@@ -758,6 +760,15 @@ impl HostClient {
     pub fn save_settings(&self, settings: AppSettings) -> Result<()> {
         self.enqueue(HostCommand::SaveSettings(settings))
     }
+    /// Saves a search backend, keeping API key material in the credential vault.
+    pub fn save_web_search(
+        &self,
+        settings: xylo_core::WebSearchSettings,
+        secret: Option<String>,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::SaveWebSearch(settings, secret))
+    }
+
     /// Persist credentials before settings and discovery, within one host operation.
     pub fn save_provider(&self, settings: AppSettings, secret: Option<String>) -> Result<()> {
         let provider = settings.provider.clone();
@@ -1669,6 +1680,9 @@ impl HostState {
                     tokio::task::spawn_blocking(move || store.conversations_page(before, limit))
                         .await??;
                 self.events.send(HostEvent::ConversationPage(page)).await?;
+            }
+            HostCommand::SaveWebSearch(settings, secret) => {
+                self.save_web_search(settings, secret).await?
             }
             HostCommand::SaveSettings(settings) => {
                 let committed = self
@@ -2937,14 +2951,29 @@ impl HostState {
         settings: AppSettings,
         fields: settings_control::ProjectFields,
     ) -> Result<AppSettings> {
+        self.commit_settings_authorized(settings, fields, None)
+            .await
+    }
+
+    /// A dedicated credential save can replace only its validated vault fields.
+    async fn commit_settings_authorized(
+        &self,
+        settings: AppSettings,
+        fields: settings_control::ProjectFields,
+        search: Option<&web_search_control::AuthorizedSearchSettings>,
+    ) -> Result<AppSettings> {
         let previous = self.settings.lock().await.clone();
         let requested = settings.secret_storage;
-        let mut applied = self.save_settings_snapshot(&settings, fields).await?;
+        let mut applied = self
+            .save_settings_snapshot(&settings, fields, search)
+            .await?;
         match self.apply_secret_storage(requested).await {
             Ok(actual) if actual == requested => {}
             Ok(actual) => {
                 applied.secret_storage = actual;
-                applied = self.save_settings_snapshot(&applied, fields).await?;
+                applied = self
+                    .save_settings_snapshot(&applied, fields, search)
+                    .await?;
                 self.events
                     .send(HostEvent::Settings(applied.clone()))
                     .await?;
@@ -2958,7 +2987,9 @@ impl HostState {
             Err(error) => {
                 // Never leave the saved choice and the live vault disagreeing.
                 applied.secret_storage = previous.secret_storage;
-                applied = self.save_settings_snapshot(&applied, fields).await?;
+                applied = self
+                    .save_settings_snapshot(&applied, fields, search)
+                    .await?;
                 if applied.permissions != previous.permissions {
                     self.forward_permissions(applied.permissions).await;
                 }
@@ -2979,9 +3010,16 @@ impl HostState {
         &self,
         settings: &AppSettings,
         fields: settings_control::ProjectFields,
+        search: Option<&web_search_control::AuthorizedSearchSettings>,
     ) -> Result<AppSettings> {
         let mut current = self.settings.lock().await;
         let mut value = settings.clone();
+        // Every generic snapshot preserves current credential ownership,
+        // independently of which project fields the caller may change.
+        value.web_search = search
+            .map(|authority| authority.configuration())
+            .unwrap_or(&current.web_search)
+            .clone();
         settings_control::merge_project_fields(
             &mut value,
             &current,

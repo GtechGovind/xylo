@@ -167,7 +167,30 @@ impl RenewableProvider {
     }
 }
 
+#[async_trait::async_trait]
 impl ModelProvider for RenewableProvider {
+    fn supports_search(&self) -> bool {
+        true
+    }
+    async fn search(
+        &self,
+        arguments: Value,
+        addresses: Vec<std::net::SocketAddr>,
+        cancel: CancellationToken,
+    ) -> Result<Value, ModelError> {
+        let (provider, generation, refreshed) = self.prepare(None, &cancel).await?;
+        match provider
+            .search(arguments.clone(), addresses.clone(), cancel.clone())
+            .await
+        {
+            Err(error) if !refreshed && expired_rejection(&error) => {
+                let (provider, _, _) = self.prepare(Some(generation), &cancel).await?;
+                provider.search(arguments, addresses, cancel).await
+            }
+            result => result,
+        }
+    }
+
     fn stream(&self, request: ModelRequest, cancel: CancellationToken) -> EventStream {
         let this = self.clone();
         Box::pin(async_stream::try_stream! {

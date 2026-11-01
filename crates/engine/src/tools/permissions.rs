@@ -99,6 +99,7 @@ pub struct ToolSession {
     approvals: ApprovalGate,
     permissions: PermissionCell,
     vault: CredentialVault,
+    pub(super) web: Arc<super::web::WebSession>,
     connectors: Arc<OnceLock<ConnectorBroker>>,
     pub(crate) reads: Arc<super::read_state::ReadState>,
     pub(crate) lsp: Arc<OnceLock<xylo_runtime::lsp::AgentService>>,
@@ -113,6 +114,7 @@ impl ToolSession {
             approvals: ApprovalGate::default(),
             permissions,
             vault,
+            web: Arc::default(),
             connectors: Arc::default(),
             reads: Arc::default(),
             lsp: Arc::default(),
@@ -306,6 +308,11 @@ pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
                     .unwrap_or_default()
             )),
         };
+    }
+
+    if matches!(call.name, "web_fetch" | "web_search") {
+        // The web module checks domain and private-network authority per hop.
+        return Verdict::Allow;
     }
     if call.origin == Origin::Hook {
         return Verdict::Allow;
