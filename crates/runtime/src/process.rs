@@ -26,6 +26,13 @@ struct ProcessGroup {
     pid: Option<u32>,
 }
 impl ProcessGroup {
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pid = None;
+        }
+    }
+
     fn terminate(&self) {
         #[cfg(unix)]
         if let Some(pid) = self.pid {
@@ -204,8 +211,8 @@ pub async fn run_prepared(
 }
 
 /// Runs a process with live output and an optional deadline. A guarded sandbox
-/// keeps a private stdin pipe open; its launcher kills the process group if
-/// the owner exits, including an abrupt worker termination.
+/// keeps a private stdin pipe open; its detached watchdog fences and kills
+/// the process group if the owner exits, including abrupt worker termination.
 pub async fn run_prepared_observed(
     command: Command,
     cwd: &Path,
@@ -245,17 +252,28 @@ async fn run_prepared_io(
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(!guard_parent);
     #[cfg(unix)]
     command.process_group(0);
+    let cleanup_status = guard_parent
+        .then(|| {
+            command.as_std().get_envs().find_map(|(name, value)| {
+                (name == "XYLO_SANDBOX_CLEANUP_STATUS")
+                    .then(|| value.map(std::path::PathBuf::from))
+                    .flatten()
+            })
+        })
+        .flatten();
     let mut child = command
         .spawn()
         .map_err(|error| anyhow::Error::new(NotStarted(format!("Start process: {error}"))))?;
-    let group = ProcessGroup {
+    let mut group = ProcessGroup {
         #[cfg(unix)]
-        pid: child.id(),
+        // The helper is the watchdog's live identity anchor. Only the watchdog
+        // may kill guarded groups, including when this execution future drops.
+        pid: if guard_parent { None } else { child.id() },
     };
-    let _parent_guard = child.stdin.take();
+    let parent_guard = child.stdin.take();
     let stdout = child.stdout.take().context("Missing stdout pipe")?;
     let stderr = child.stderr.take().context("Missing stderr pipe")?;
     let output = tokio::spawn(drain(stdout, false, observer.clone()));
@@ -264,25 +282,65 @@ async fn run_prepared_io(
     let _error_guard = AbortDrain(errors.abort_handle());
     let result = tokio::select! {
         result = child.wait() => result.context("Wait for native process"),
-        _ = cancel.cancelled() => { group.terminate(); let _ = child.kill().await; Err(anyhow::anyhow!("Process cancelled; side effects may have occurred")) },
-        _ = async { match timeout { Some(timeout) => tokio::time::sleep(timeout).await, None => std::future::pending().await } } => { group.terminate(); let _ = child.kill().await; Err(anyhow::anyhow!("Process timed out; side effects may have occurred")) },
+        _ = cancel.cancelled() => { if !guard_parent { group.terminate(); let _ = child.kill().await; } Err(anyhow::anyhow!("Process cancelled; side effects may have occurred")) },
+        _ = async { match timeout { Some(timeout) => tokio::time::sleep(timeout).await, None => std::future::pending().await } } => { if !guard_parent { group.terminate(); let _ = child.kill().await; } Err(anyhow::anyhow!("Process timed out; side effects may have occurred")) },
     };
     group.terminate();
-    let _ = child.wait().await;
+    // Owner EOF requests the fence; the helper must stay alive until its
+    // watchdog has frozen all descendants and releases the identity anchor.
+    drop(parent_guard);
+    let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    let cleanup = match &cleanup_status {
+        Some(path) => wait_for_guard_cleanup(path).await,
+        None => Ok(()),
+    };
+    if guard_parent && cleanup.is_ok() {
+        // The watchdog fenced this group; never signal a potentially reused ID.
+        group.disarm();
+    }
     // Descendant processes can retain pipes after the direct child exits. Bound cleanup too.
     let captured = tokio::time::timeout(Duration::from_secs(2), async {
         Ok::<_, anyhow::Error>((output.await??, errors.await??))
     })
     .await;
+    cleanup?;
+    reaped.context("Native process did not retire")??;
     let status = result?;
     let ((out, out_truncated), (err, err_truncated)) =
         captured.context("Process output pipes did not close")??;
     Ok(ProcessResult {
-        code: status.code(),
+        code: cleanup_status
+            .as_deref()
+            .and_then(xylo_services::sandbox::read_guard_exit_code)
+            .or_else(|| status.code()),
         stdout: String::from_utf8_lossy(&out).into_owned(),
         stderr: String::from_utf8_lossy(&err).into_owned(),
         truncated: out_truncated || err_truncated,
     })
+}
+
+/// Waits for the trusted watchdog's fork fence, not merely the helper's exit.
+async fn wait_for_guard_cleanup(path: &Path) -> Result<()> {
+    // No handshake means the helper never gained authority to dispatch.
+    if !path.exists() {
+        return Ok(());
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let state = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            match state.as_ref().and_then(|value| value["state"].as_str()) {
+                Some("done") => return Ok(()),
+                Some("failed") => {
+                    bail!("Owned process group cleanup failed; side effects may have occurred")
+                }
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .context("Owned process group cleanup did not finish")?
 }
 
 /// Require a successful exit while retaining the actual native error message.
