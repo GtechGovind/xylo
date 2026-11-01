@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build a complete local macOS app; no links into Cargo's disposable cache."""
 import argparse
+import json
 from pathlib import Path
 import plistlib
 import shutil
@@ -12,6 +13,7 @@ parser.add_argument('--profile', choices=('debug', 'release'), default='release'
 parser.add_argument('--skip-build', action='store_true')
 args = parser.parse_args()
 root = Path(__file__).resolve().parent.parent
+version = json.loads((root / 'packager.json').read_text())['version']
 if not args.skip_build:
     command = ['cargo', 'build', '--locked', '--bins']
     if args.profile == 'release':
@@ -35,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix='xylo-bundle-', dir=out) as temporary:
     with (stage / 'Contents' / 'Info.plist').open('wb') as handle:
         plistlib.dump(dict(CFBundleExecutable='xylo', CFBundleDisplayName='Xylo',
             CFBundleName='Xylo', CFBundleIdentifier='com.qurkos.xylo', CFBundlePackageType='APPL',
-            CFBundleShortVersionString='0.1.0', CFBundleVersion='1', CFBundleIconFile='xylo.icns',
+            CFBundleShortVersionString=version, CFBundleVersion=version.split('-')[0], CFBundleIconFile='xylo.icns',
             NSHighResolutionCapable=True, NSPrincipalClass='NSApplication'), handle)
     iconset = Path(temporary) / 'xylo.iconset'
     iconset.mkdir()
