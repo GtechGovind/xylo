@@ -210,7 +210,28 @@ impl EventState {
             fallback,
             self.request_id.as_deref(),
         );
-        if transient_code(value) {
+        let error = value.get("error").unwrap_or(value);
+        if ["type", "code", "status"].iter().any(|key| {
+            error[*key].as_str().is_some_and(|code| {
+                matches!(
+                    code,
+                    "overloaded_error"
+                        | "server_error"
+                        | "api_error"
+                        | "internal_error"
+                        | "internal_server_error"
+                        | "service_unavailable"
+                        | "UNAVAILABLE"
+                        | "INTERNAL"
+                )
+            })
+        }) {
+            ModelError::Unavailable {
+                status: 503,
+                retry_after: None,
+                message,
+            }
+        } else if transient_code(value) {
             ModelError::transient(message)
         } else {
             ModelError::permanent(message)

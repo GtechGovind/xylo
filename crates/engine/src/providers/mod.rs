@@ -4,9 +4,12 @@
 //! application's auth cache, or silently changes to another API family.
 mod bedrock;
 mod diagnostics;
+pub(crate) mod fallback;
+mod gemini_cache;
 mod renewal;
 mod request;
 mod stream;
+mod thinking;
 
 pub(crate) use renewal::build_renewable;
 
@@ -70,6 +73,7 @@ struct NativeProvider {
     client: reqwest::Client,
     chatgpt_plan: bool,
     error_redactions: Arc<Vec<String>>,
+    prefix_cache: Arc<gemini_cache::PrefixCache>,
 }
 
 impl NativeProvider {
@@ -96,7 +100,28 @@ impl NativeProvider {
             !matches!(credential, ProviderCredential::Aws { .. }),
             "AWS credentials require the Bedrock API family"
         );
-        let headers = credential.headers(&config.family, &config.headers)?;
+        let mut headers = credential.headers(&config.family, &config.headers)?;
+        if config.family == ApiFamily::Anthropic
+            && !config.supported_reasoning_efforts().is_empty()
+            && !config.adaptive_thinking()
+        {
+            const INTERLEAVED: &str = "interleaved-thinking-2025-05-14";
+            let previous = headers
+                .get("anthropic-beta")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if !previous.split(',').any(|value| value.trim() == INTERLEAVED) {
+                let beta = if previous.is_empty() {
+                    INTERLEAVED.to_owned()
+                } else {
+                    format!("{previous},{INTERLEAVED}")
+                };
+                headers.insert(
+                    "anthropic-beta",
+                    reqwest::header::HeaderValue::from_str(&beta)?,
+                );
+            }
+        }
         let error_redactions = redactions(&headers);
         Ok(Self {
             client: http_client(headers)?,
@@ -104,6 +129,7 @@ impl NativeProvider {
             endpoint,
             chatgpt_plan,
             error_redactions,
+            prefix_cache: Arc::default(),
         })
     }
 
@@ -196,6 +222,12 @@ impl NativeProvider {
                 retry_after,
                 message,
             }
+        } else if (500..=599).contains(&status) {
+            ModelError::Unavailable {
+                status,
+                retry_after,
+                message,
+            }
         } else if overflow {
             ModelError::ContextOverflow(message)
         } else if unavailable_model
@@ -250,11 +282,27 @@ impl ModelProvider for NativeProvider {
         let provider = self.clone();
         Box::pin(async_stream::try_stream! {
             let body = request::body(&provider, &request.messages, &request.tools, request.max_tokens, request.reasoning)?;
+            let cached = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(ModelError::Interrupted),
+                cached = tokio::time::timeout(Duration::from_secs(5), provider.cached_body(&body)) => Ok(cached.ok().flatten()),
+            }?;
             let response = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => Err(ModelError::Interrupted),
-                response = provider.send(&body) => response,
-            }?;
+                response = provider.send(cached.as_ref().unwrap_or(&body)) => response,
+            };
+            let response = match response {
+                Err(ModelError::InvalidRequest(_) | ModelError::Provider { retryable: false, .. }) if cached.is_some() => {
+                    provider.invalidate_cache().await;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => Err(ModelError::Interrupted),
+                        response = provider.send(&body) => response,
+                    }?
+                }
+                result => result?,
+            };
             let request_id = response
                 .headers()
                 .get("x-request-id")

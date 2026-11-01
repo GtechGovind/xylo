@@ -105,6 +105,19 @@ fn hydrate(
 }
 
 impl ModelProvider for AttachmentProvider {
+    fn fallback(&self) -> Option<(String, Arc<dyn ModelProvider>)> {
+        let (name, inner) = self.inner.fallback()?;
+        Some((
+            name,
+            Arc::new(Self {
+                inner,
+                store: self.store.clone(),
+                session: self.session,
+                encoded: self.encoded.clone(),
+            }),
+        ))
+    }
+
     fn stream(&self, request: ModelRequest, cancel: CancellationToken) -> EventStream {
         let inner = self.inner.clone();
         let store = self.store.clone();

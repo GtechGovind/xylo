@@ -95,6 +95,7 @@ pub(crate) fn register_user_turn_in_transaction(
     conversation.updated_at = timestamp;
     conn.execute("INSERT INTO conversations(id,json,updated_at) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET json=excluded.json,updated_at=excluded.updated_at",params![turn.session_id.to_string(),serde_json::to_string(&conversation)?,timestamp])?;
     let message = ChatMessage {
+        reasoning: None,
         id: message_id,
         session_id: turn.session_id,
         role: "user".into(),
@@ -478,6 +479,7 @@ impl Store {
             return Ok(());
         }
         let message = ChatMessage {
+            reasoning: None,
             id: interrupted_reply_id(turn_id),
             session_id,
             role: "assistant".into(),
@@ -651,6 +653,24 @@ impl Store {
         usage: &Usage,
         status: MessageStatus,
     ) -> Result<()> {
+        self.complete_turn_with_reasoning(session_id, turn_id, messages, text, usage, status, None)
+    }
+
+    /// Completes a reply with its separately disclosed provider reasoning.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The reply fields share one atomic transaction."
+    )]
+    pub fn complete_turn_with_reasoning(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        messages: &Value,
+        text: &str,
+        usage: &Usage,
+        status: MessageStatus,
+        reasoning: Option<String>,
+    ) -> Result<()> {
         let messages = crate::checkpoint::message_rows(messages)?;
         let receipt = CompletedTurn {
             text: text.into(),
@@ -662,7 +682,7 @@ impl Store {
             if let Some(existing)=existing{ensure!(serde_json::from_str::<Value>(&existing)?==serde_json::from_str::<Value>(&receipt_json)?,"Turn was already completed with a different result");return Ok(())}
             let timestamp=now_ms();
             crate::checkpoint::write_rows(&tx,session_id,turn_id,&messages,None,timestamp)?;
-            let message=ChatMessage{id:assistant_reply_id(turn_id),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new(), status,};
+            let message=ChatMessage{ reasoning,id:assistant_reply_id(turn_id),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new(), status,};
             tx.execute("INSERT INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4)",params![message.id.to_string(),session_id.to_string(),serde_json::to_string(&message)?,timestamp])?;
             tx.execute("DELETE FROM messages WHERE id=?1",[interrupted_reply_id(turn_id).to_string()])?;
             tx.execute("INSERT INTO completed_turns(session_id,turn_id,json,completed_at) VALUES(?1,?2,?3,?4)",params![session_id.to_string(),turn_id.to_string(),receipt_json,timestamp])?;

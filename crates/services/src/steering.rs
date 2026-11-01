@@ -319,7 +319,7 @@ impl Store {
                     messages.push(json!({"role":"user","content":record.request.text,"name":name}));
                 }
                 let timestamp = now_ms();
-                let message = ChatMessage {
+                let message = ChatMessage { reasoning: None,
                     id:Uuid::new_v5(&id,b"steering-message"), session_id:session, role:"user".into(),
                     content:record.request.text.clone(), created_at:timestamp, attachments:Vec::new(), status: Default::default(),
                 };

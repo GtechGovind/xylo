@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use xylo_core::{ErrorKind, ImageAttachment};
 
@@ -369,6 +369,12 @@ pub enum ModelError {
         retry_after: Option<Duration>,
         message: String,
     },
+    /// The provider rejected the request because its service is unavailable.
+    Unavailable {
+        status: u16,
+        retry_after: Option<Duration>,
+        message: String,
+    },
     /// The request itself is invalid for this provider or model.
     InvalidRequest(String),
     /// The conversation does not fit the model's context window.
@@ -409,7 +415,10 @@ impl ModelError {
     /// Whether repeating the same request may succeed.
     pub fn retryable(&self) -> bool {
         match self {
-            Self::RateLimited { .. } | Self::Timeout(_) | Self::EmptyResponse(_) => true,
+            Self::RateLimited { .. }
+            | Self::Unavailable { .. }
+            | Self::Timeout(_)
+            | Self::EmptyResponse(_) => true,
             Self::Provider { retryable, .. } => *retryable,
             Self::Authentication(_)
             | Self::InvalidRequest(_)
@@ -423,9 +432,9 @@ impl ModelError {
     /// The delay the provider asked for, when it named one.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::RateLimited { retry_after, .. } | Self::Provider { retry_after, .. } => {
-                *retry_after
-            }
+            Self::RateLimited { retry_after, .. }
+            | Self::Unavailable { retry_after, .. }
+            | Self::Provider { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -435,9 +444,10 @@ impl ModelError {
         match self {
             Self::Authentication(_) => ErrorKind::Authentication,
             Self::RateLimited { .. } => ErrorKind::RateLimited,
-            Self::Provider { .. } | Self::Timeout(_) | Self::InvalidRequest(_) => {
-                ErrorKind::Provider
-            }
+            Self::Provider { .. }
+            | Self::Unavailable { .. }
+            | Self::Timeout(_)
+            | Self::InvalidRequest(_) => ErrorKind::Provider,
             Self::ContextOverflow(_) => ErrorKind::ContextOverflow,
             Self::Stalled(_) => ErrorKind::Stalled,
             Self::EmptyResponse(_) => ErrorKind::EmptyResponse,
@@ -452,6 +462,7 @@ impl fmt::Display for ModelError {
             Self::Authentication(message)
             | Self::RateLimited { message, .. }
             | Self::Provider { message, .. }
+            | Self::Unavailable { message, .. }
             | Self::InvalidRequest(message)
             | Self::ContextOverflow(message)
             | Self::Timeout(message)
@@ -474,6 +485,11 @@ pub trait ModelProvider: Send + Sync {
     /// Streams one response. Cancelling `cancel` ends the stream with
     /// [`ModelError::Interrupted`] promptly.
     fn stream(&self, request: ModelRequest, cancel: CancellationToken) -> EventStream;
+
+    /// The configured alternative on the same authorized connection.
+    fn fallback(&self) -> Option<(String, Arc<dyn ModelProvider>)> {
+        None
+    }
 
     /// One complete response, assembled from [`ModelProvider::stream`].
     async fn complete(

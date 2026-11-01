@@ -221,6 +221,14 @@ impl Xylo {
             Segment::Tools(ids) => self.tool_group_row(turn, ids, window, cx),
             Segment::Subagent(id) => self.subagent_row(turn, *id, window, cx),
             Segment::Note { text, .. } => note_row(text.clone()),
+            Segment::Thinking(text) => self.thinking_block(
+                Uuid::new_v5(
+                    &self.session,
+                    format!("thinking-{}-{index}", turn.started_at.unwrap_or_default()).as_bytes(),
+                ),
+                text.clone(),
+                cx,
+            ),
         };
         motion::fade_slide_in(
             ElementId::NamedInteger(format!("live-row-{}", self.session).into(), index as u64),

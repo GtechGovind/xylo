@@ -7,13 +7,13 @@ use crate::model::{
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-struct Recorded {
-    line: String,
+pub(super) struct Recorded {
+    pub(super) line: String,
     headers: String,
-    body: Value,
+    pub(super) body: Value,
 }
 
-async fn fixture(
+pub(super) async fn fixture(
     payload: Vec<u8>,
     status: u16,
     content_type: &'static str,
@@ -73,7 +73,7 @@ fn config(family: ApiFamily, endpoint: String) -> ProviderConfig {
     }
 }
 
-fn provider(family: ApiFamily, endpoint: String) -> NativeProvider {
+pub(super) fn provider(family: ApiFamily, endpoint: String) -> NativeProvider {
     NativeProvider::new(
         config(family, endpoint),
         ProviderCredential::ApiKey("fixture-key".into()),
@@ -1607,3 +1607,5 @@ fn context_overflow_is_recognised_from_codes_and_messages() {
     ));
     assert!(!overflow(500, "request_failed", Some("prompt is too long")));
 }
+
+mod thinking;

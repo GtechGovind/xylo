@@ -2512,6 +2512,9 @@ impl HostState {
         draft_request_id: Option<Uuid>,
         queued_item: Option<QueuedAdmission>,
     ) -> Result<Option<crate::drafts::DraftAdmission>> {
+        if turn.provider.fallback_model.is_none() {
+            turn.provider.fallback_model = self.store.settings()?.fallback_model;
+        }
         let session = turn.session_id;
         let cancellation = {
             let mut queued = self.queued.lock();

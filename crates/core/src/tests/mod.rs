@@ -61,3 +61,5 @@ fn a_fresh_profile_has_no_provider_and_follows_the_system_theme() {
     };
     assert!(configured.model_ready());
 }
+
+mod provider_controls;

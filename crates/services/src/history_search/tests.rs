@@ -21,6 +21,7 @@ fn message(store: &Store, session: Uuid, text: &str) -> Uuid {
     let id = Uuid::new_v4();
     store
         .append_message(&ChatMessage {
+            reasoning: None,
             attachments: Vec::new(),
             id,
             session_id: session,

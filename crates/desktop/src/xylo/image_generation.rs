@@ -779,6 +779,7 @@ impl Xylo {
             return div().into_any_element();
         }
         let output = ChatMessage {
+            reasoning: None,
             id: tool.id,
             session_id: self.session,
             role: "assistant".into(),
