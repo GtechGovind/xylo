@@ -58,9 +58,10 @@ impl UsageUi {
                 }
             }));
         }
-        subscriptions.push(cx.subscribe(&command, |view, _, event: &InputEvent, _| {
+        subscriptions.push(cx.subscribe(&command, |view, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 view.usage_ui.editing_command = true;
+                cx.notify();
             }
         }));
         Self {
@@ -129,31 +130,6 @@ pub(super) fn cost_label(cost: Option<CostEstimate>) -> String {
     }
 }
 
-fn usage_label(usage: &Usage) -> String {
-    format!(
-        "{} in · {} out · {} cache read · {} cache write · {}",
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cache_read_tokens.unwrap_or(0),
-        usage.cache_write_tokens.unwrap_or(0),
-        cost_label(usage.estimated_cost)
-    )
-}
-
-fn totals_label(totals: &UsageTotals) -> String {
-    format!(
-        "{} in · {} out · {} cache read · {} cache write · {}",
-        model_picker::format_tokens(totals.input_tokens),
-        model_picker::format_tokens(totals.output_tokens),
-        model_picker::format_tokens(totals.cache_read_tokens),
-        model_picker::format_tokens(totals.cache_write_tokens),
-        cost_label(Some(CostEstimate {
-            usd: totals.estimated_usd,
-            unpriced_calls: totals.unpriced_calls
-        }))
-    )
-}
-
 impl Xylo {
     /// Schedules a bounded read only when the visible answer set or day changes.
     pub(super) fn refresh_usage(&mut self, cx: &mut Context<Self>) {
@@ -216,43 +192,6 @@ impl Xylo {
         cx.notify();
     }
 
-    pub(super) fn answer_usage(&self, id: Uuid, index: usize) -> Option<AnyElement> {
-        let usage = self
-            .usage_ui
-            .report
-            .as_ref()
-            .filter(|(session, _)| *session == self.session)
-            .and_then(|(_, report)| report.messages.get(&id))
-            .or_else(|| {
-                self.turns
-                    .get(&self.session)
-                    .filter(|turn| chat::live_answer_key(self.session, turn) == id)
-                    .map(|turn| &turn.usage)
-            })?;
-        if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.estimated_cost.is_none() {
-            return None;
-        }
-        Some(
-            div()
-                .id(("answer-usage", index))
-                .test_support()
-                .ml_2()
-                .min_w_0()
-                .flex_1()
-                .single_line()
-                .text_size(px(11.))
-                .text_color(rgb(muted()))
-                .opacity(0.)
-                .group_hover("chat-message", |style| style.opacity(1.))
-                .child(usage_label(usage))
-                .tooltip({
-                    let label = usage_label(usage);
-                    move |_, cx| cx.new(|_| XyloTooltip(label.clone().into())).into()
-                })
-                .into_any_element(),
-        )
-    }
-
     pub(super) fn usage_totals(&self) -> AnyElement {
         let Some((_, report)) = self
             .usage_ui
@@ -264,28 +203,125 @@ impl Xylo {
                 self.usage_ui
                     .report_error
                     .clone()
-                    .unwrap_or_else(|| "Usage appears when a model request reports tokens.".into()),
+                    .unwrap_or_else(|| "Usage will appear after your first task.".into()),
             )
             .into_any_element();
         };
-        div()
+        if report.conversation == Default::default()
+            && report.daily == Default::default()
+            && self.usage_ui.report_error.is_none()
+        {
+            return subtitle("Usage will appear after your first task.").into_any_element();
+        }
+        let cost_card = |title: &'static str, totals: &UsageTotals| {
+            div()
+                .id(SharedString::from(format!("usage-cost-{title}")))
+                .flex_1()
+                .min_w_0()
+                .p(px(12.))
+                .rounded(px(10.))
+                .aria_label(format!(
+                    "{title}: {}",
+                    cost_label(Some(CostEstimate {
+                        usd: totals.estimated_usd,
+                        unpriced_calls: totals.unpriced_calls
+                    }))
+                ))
+                .bg(rgb(crate::ui::selected()))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(muted()))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(21.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(format!(
+                            "${:.4}{}",
+                            totals.estimated_usd,
+                            if totals.unpriced_calls > 0 { "+" } else { "" }
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(muted()))
+                        .child("Estimated cost"),
+                )
+        };
+        let number = |value: String| div().w(px(76.)).flex_shrink_0().text_right().child(value);
+        let mut table = div()
+            .id("usage-token-table")
+            .test_support()
             .flex()
             .flex_col()
-            .gap_1()
-            .text_size(px(11.5))
-            .text_color(rgb(text_secondary()))
-            .child(format!(
-                "Conversation · {}",
-                totals_label(&report.conversation)
-            ))
-            .child(format!("Today · {}", totals_label(&report.daily)))
-            .child("Estimates cover reported turn tokens, including helpers. Title generation, service and tool fees are excluded.")
-            .children(
-                self.usage_ui
-                    .report_error
-                    .as_ref()
-                    .map(|error| settings_ui::inline_error(error)),
-            )
+            .gap(px(2.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px(px(4.))
+                    .pb(px(6.))
+                    .text_size(px(11.))
+                    .text_color(rgb(muted()))
+                    .child(div().flex_1().child("Tokens"))
+                    .child(number("This chat".into()))
+                    .child(number("Today".into())),
+            );
+        for (label, chat, today) in [
+            (
+                "Input",
+                report.conversation.input_tokens,
+                report.daily.input_tokens,
+            ),
+            (
+                "Output",
+                report.conversation.output_tokens,
+                report.daily.output_tokens,
+            ),
+            (
+                "Cache read",
+                report.conversation.cache_read_tokens,
+                report.daily.cache_read_tokens,
+            ),
+            (
+                "Cache write",
+                report.conversation.cache_write_tokens,
+                report.daily.cache_write_tokens,
+            ),
+        ] {
+            table = table.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px(px(4.))
+                    .py(px(7.))
+                    .border_b_1()
+                    .border_color(rgb(border()))
+                    .text_size(px(12.5))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgb(text_secondary()))
+                            .child(label),
+                    )
+                    .child(number(model_picker::format_tokens(chat)))
+                    .child(number(model_picker::format_tokens(today))),
+            );
+        }
+        div().id("usage-summary").test_support().flex().flex_col().gap(px(16.))
+            .child(div().flex().gap(px(10.)).child(cost_card("This chat", &report.conversation)).child(cost_card("Today", &report.daily)))
+            .child(table)
+            .when(report.conversation.unpriced_calls + report.daily.unpriced_calls > 0, |body| body.child(
+                subtitle("Some usage has no price yet and is excluded from the estimate.")))
+            .child(div().text_size(px(11.)).line_height(relative(1.5)).text_color(rgb(muted()))
+                .child("Includes subagents. Title generation and service or tool fees are excluded."))
+            .children(self.usage_ui.report_error.as_ref().map(|error| settings_ui::inline_error(error)))
             .into_any_element()
     }
 
@@ -334,8 +370,27 @@ impl Xylo {
         let weak = cx.entity().downgrade();
         let picker = MenuButton::new("output-style-picker")
             .ghost()
+            .h(px(32.))
+            .text_size(px(13.))
+            .justify_start()
+            .pl(px(28.))
             .accessibility_label(format!("Output style: {selected}"))
-            .child(format!("Output style · {selected}"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .w_full()
+                    .gap(px(8.))
+                    .child("Output style")
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(muted()))
+                            .child(selected.to_owned()),
+                    )
+                    .child(icons::small(AppIcon::ChevronDown).size(px(12.))),
+            )
             .dropdown_menu(move |mut menu, _, cx| {
                 let Ok((styles, selected)) = weak.update(cx, |view, _| {
                     (
@@ -383,6 +438,6 @@ impl Xylo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "usage/tests.rs"]
 mod tests;

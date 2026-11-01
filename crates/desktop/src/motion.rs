@@ -676,6 +676,6 @@ pub fn slow_hint(
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "motion/tests.rs"]
 mod tests;

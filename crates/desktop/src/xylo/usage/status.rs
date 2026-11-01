@@ -3,96 +3,105 @@ use super::*;
 
 impl Xylo {
     pub(in crate::xylo) fn composer_status(&self, cx: &Context<Self>) -> AnyElement {
-        let weak = cx.entity().downgrade();
-        let usage = gpui_kit::component::popover::Popover::new("usage-popover")
-            .anchor(Anchor::BottomRight)
-            .trigger(
-                MenuButton::new("usage-totals-button")
-                    .ghost()
-                    .h(px(22.))
-                    .child("Usage")
-                    .accessibility_label("Conversation and daily usage"),
-            )
-            .content(move |_, window, cx| {
-                weak.update(cx, |view, _| {
-                    context_panel::receipt_viewport("usage-totals-panel", 320., window)
-                        .child(
-                            div()
-                                .id("usage-totals-content")
-                                .test_support()
-                                .w_full()
-                                .p_3()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(view.usage_totals())
-                                .child(view.quota_rows()),
-                        )
-                        .into_any_element()
-                })
-                .unwrap_or_else(|_| div().into_any_element())
-            });
-        let turn = self.turns.get(&self.session);
-        let percent = turn
-            .and_then(|turn| turn.context.as_ref())
-            .filter(|context| context.capacity > 0)
-            .map(|context| {
-                format!(
-                    "{}% context",
-                    (context.used().saturating_mul(100) / context.capacity).min(100)
-                )
-            })
-            .unwrap_or_else(|| "Context —".into());
-        let cost = self
-            .usage_ui
-            .report
-            .as_ref()
-            .filter(|(session, _)| *session == self.session)
-            .map(|(_, report)| CostEstimate {
-                usd: report.conversation.estimated_usd,
-                unpriced_calls: report.conversation.unpriced_calls,
-            });
-        let branch = self
-            .usage_ui
-            .report
-            .as_ref()
-            .filter(|(session, _)| *session == self.session)
-            .and(self.usage_ui.branch.as_deref())
-            .unwrap_or("No branch");
-        let model = turn
-            .and_then(|turn| turn.active_model.as_deref())
-            .unwrap_or_else(|| {
-                if self.settings.provider.model.is_empty() {
-                    "No model"
-                } else {
-                    &self.settings.provider.model
-                }
-            });
-        let text = format!(
-            "{} · {} · {} · {} · {} · {} jobs",
-            model,
-            self.current_permission_mode().label(),
-            percent,
-            cost_label(cost),
-            branch,
-            self.running_job_count()
-        );
+        use gpui_kit::component::WindowExt;
+        let usage = button("usage-totals-button", "Usage")
+            .h(px(26.))
+            .min_h(px(26.))
+            .px(px(5.))
+            .text_size(px(11.))
+            .font_weight(FontWeight::NORMAL)
+            .text_color(rgb(muted()))
+            .accessibility_label("Conversation and daily usage")
+            .on_click(cx.listener(|view, _, window, cx| {
+                let weak = cx.entity().downgrade();
+                window.open_dialog(cx, move |dialog, window, cx| {
+                    let content = weak
+                        .update(cx, |view, _| {
+                            super::super::context_panel::receipt_viewport(
+                                "usage-details",
+                                420.,
+                                window,
+                            )
+                            .child(
+                                div()
+                                    .id("usage-content")
+                                    .test_support()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(12.))
+                                    .child(view.quota_rows())
+                                    .child(view.usage_totals()),
+                            )
+                            .into_any_element()
+                        })
+                        .unwrap_or_else(|_| div().into_any_element());
+                    dialog
+                        .title("Usage")
+                        .width(px(480.))
+                        .rounded(px(16.))
+                        .bg(rgb(panel()))
+                        .border_color(rgb(border_strong()))
+                        .child(content)
+                });
+                let _ = view;
+            }));
         div()
             .id("composer-status-line")
             .test_support()
-            .pt_1()
-            .px_2()
+            .pt(px(3.))
+            .px(px(8.))
             .flex()
             .flex_col()
             .gap_1()
-            .text_size(px(11.))
+            .min_h(px(30.))
+            .text_size(px(chat::tokens::META_SIZE))
             .text_color(rgb(muted()))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().min_w_0().single_line().child(text))
+                    .when(
+                        self.composer_focused && self.chat_width.get() >= 750.,
+                        |row| {
+                            let key = |label: &'static str| {
+                                div()
+                                    .px(px(4.))
+                                    .py(px(1.))
+                                    .rounded(px(3.))
+                                    .border_1()
+                                    .border_color(rgb(border_strong()))
+                                    .text_size(px(11.))
+                                    .child(label)
+                            };
+                            row.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .text_size(px(11.))
+                                    .child(key("↵"))
+                                    .child("Send")
+                                    .child(div().w(px(3.)))
+                                    .child(key("⇧ ↵"))
+                                    .child("New line"),
+                            )
+                        },
+                    )
+                    .child(div().flex_1())
+                    .child(self.composer_context(cx))
+                    .child(
+                        button("chat-saved-drafts", "Saved drafts")
+                            .h(px(26.))
+                            .min_h(px(26.))
+                            .px(px(5.))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(rgb(muted()))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_saved_drafts_dialog(window, cx)
+                            })),
+                    )
                     .child(usage),
             )
             .children(

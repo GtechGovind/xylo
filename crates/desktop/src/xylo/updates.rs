@@ -246,18 +246,12 @@ impl Xylo {
         .detach();
     }
     pub(super) fn begin_update_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.recovery.mutation_busy() {
-            self.updates.notice = "Wait for the observed outcome request before installing.".into();
-            cx.notify();
-            return;
-        }
         if !self.management_check_close(DraftFlushAction::Update, window, cx) {
             return;
         }
         if !self.flush_drafts(DraftFlushAction::Update, cx)
             || !self.memory_forms_flush(DraftFlushAction::Update, cx)
             || !self.document_drafts_flush(DraftFlushAction::Update, cx)
-            || !self.recovery_flush(DraftFlushAction::Update, cx)
         {
             return;
         }
@@ -304,6 +298,7 @@ impl Xylo {
             .unwrap_or("");
         let can_install = status["can_install"] == true;
         let can_download = status["can_download"] == true;
+        let can_check = status["can_check"] == true;
         let pending = |name: &str| self.updates.pending.values().any(|pending| pending == name);
         let (checking, downloading) = (pending("updates_check"), pending("updates_download"));
         let progress_fraction = status["progress"].as_object().and_then(|progress| {
@@ -328,9 +323,17 @@ impl Xylo {
                 )
             }
             None if can_install => "Downloaded and verified. Installing closes Xylo.".into(),
-            None => "Install after your tasks finish.".into(),
+            None if can_download => "Download the latest version of Xylo.".into(),
+            None if !can_check && !busy => {
+                if self.updates.notice.is_empty() {
+                    "Updates are not available in this build.".into()
+                } else {
+                    self.updates.notice.clone()
+                }
+            }
+            None => String::new(),
         };
-        if self.speech.busy() {
+        if can_install && self.speech.busy() {
             description
                 .push_str(" Finish your recording, playback or speech task before installing.");
         }
@@ -367,7 +370,9 @@ impl Xylo {
                     ),
             );
         }
-        controls = controls.child(primary_action);
+        if can_check || can_install || can_download || busy {
+            controls = controls.child(primary_action);
+        }
         let headline = match status["phase"].as_str() {
             Some("checking") => "Checking for updates…".to_owned(),
             Some("downloading") => "Downloading update…".to_owned(),
@@ -375,14 +380,16 @@ impl Xylo {
             _ if can_install => format!("Xylo {version} is ready to install"),
             _ if offer.is_some() => format!("Xylo {version} is available"),
             Some("up_to_date") => "You're up to date".to_owned(),
-            _ => "Update status".to_owned(),
+            _ => "App updates".to_owned(),
         };
-        let feedback = (!self.updates.notice.is_empty())
+        let feedback = (!self.updates.notice.is_empty()
+            && self.updates.notice != description
+            && self.updates.notice.trim_end_matches('.') != headline)
             .then(|| settings_ui::Feedback::Pending(self.updates.notice.clone().into()));
         let status_row = settings_ui::setting_row(
             headline.clone(),
-            Some(description.into()),
-            Some(controls.into_any_element()),
+            (!description.is_empty()).then(|| description.into()),
+            (can_check || can_install || can_download || busy).then(|| controls.into_any_element()),
         )
         .feedback(feedback);
         let mut application = div().w_full().flex().flex_col().child(settings_ui::rows([

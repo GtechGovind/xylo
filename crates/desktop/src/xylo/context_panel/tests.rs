@@ -55,19 +55,3 @@ fn freshness_reads_as_relative_time() {
     assert_eq!(updated_label(0, 180_000), "3 min ago");
     assert_eq!(updated_label(0, 7_200_000), "2 h ago");
 }
-
-#[test]
-fn the_ring_appears_only_once_a_chat_uses_five_percent() {
-    let used = |messages: u64| {
-        ContextBreakdown::new(&ContextUsage {
-            capacity: 100_000,
-            messages,
-            ..ContextUsage::default()
-        })
-        .percent()
-        .filter(|percent| *percent >= super::RING_THRESHOLD)
-    };
-    assert_eq!(used(4_999), None);
-    assert_eq!(used(5_000), Some(5));
-    assert_eq!(used(17_000), Some(17));
-}

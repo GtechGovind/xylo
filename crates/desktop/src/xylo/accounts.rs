@@ -347,6 +347,6 @@ fn forget_chatgpt(settings: &mut AppSettings) -> bool {
     active || before != settings.providers.len()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "accounts/tests.rs"]
 mod tests;

@@ -56,7 +56,6 @@
 //! | Expanded / open menu | `ChevronDown` | ChevronDown |
 //! | Collapsed / navigate into | `ChevronRight` | ChevronRight |
 //! | Collapse upward | `ChevronUp` | ChevronUp |
-//! | Select (picker caret) | `Select` | ChevronsUpDown |
 //! | Success | `Success` | CircleCheck |
 //! | Warning | `Warning` | TriangleAlert |
 //! | Error | `Error` | CircleAlert |
@@ -203,8 +202,6 @@ app_icons! {
     ChevronRight => ChevronRight,
     /// Collapse upward.
     ChevronUp => ChevronUp,
-    /// Picker caret.
-    Select => ChevronsUpDown,
     /// Success.
     Success => CircleCheck,
     /// Warning.
@@ -233,6 +230,8 @@ app_icons! {
     Memory => Brain,
     /// Model or model provider.
     Model => Sparkles,
+    /// Choose the model in the chat composer.
+    ModelSelection => Zap,
     /// Reasoning effort.
     Reasoning => Gauge,
     /// Skills.
@@ -360,6 +359,6 @@ pub fn button_frame(
         .active(|style| style.bg(rgb(ui::pressed())))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "icons/tests.rs"]
 mod tests;

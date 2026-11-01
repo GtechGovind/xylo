@@ -49,7 +49,7 @@ pub(super) struct ModelPickerUi {
 
 impl ModelPickerUi {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Xylo>) -> Self {
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search models"));
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Find a model…"));
         let subscription = cx.subscribe(&query, |view, query, event: &InputEvent, cx| {
             let value = query.read(cx).value().to_string();
             if matches!(event, InputEvent::Change) && value != view.model_picker.last_query {
@@ -282,6 +282,7 @@ fn picker_row(id: impl Into<ElementId>, keyboard_highlight: bool) -> gpui_kit::b
         .when(keyboard_highlight, |row| row.border_color(rgb(accent())))
         .flex()
         .items_center()
+        .justify_start()
         .gap(px(8.))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(hover())))
@@ -401,10 +402,19 @@ impl Xylo {
     /// The composer trigger and its popover. `label` is the active model's
     /// name, or a prompt to choose one.
     pub(super) fn unified_model_control(&self, label: String, cx: &Context<Self>) -> AnyElement {
-        let effort_label = effort_label(&self.settings.provider);
+        let effort_label = (self.chat_width.get() >= 1050.)
+            .then(|| effort_label(&self.settings.provider))
+            .flatten();
         let content = cx.entity().downgrade();
         let change = cx.entity().downgrade();
-        let mut trigger_layout = div().min_w_0().max_w(px(250.)).flex_shrink(1.);
+        let width = if self.chat_width.get() < 520. {
+            135.
+        } else if self.chat_width.get() < 750. {
+            185.
+        } else {
+            245.
+        };
+        let mut trigger_layout = div().min_w_0().max_w(px(width)).flex_shrink(1.);
         Popover::new("composer-model-popover")
             .appearance(false)
             .trigger_style(trigger_layout.style().clone())
@@ -419,12 +429,13 @@ impl Xylo {
                 MenuButton::new("composer-model")
                     .ghost()
                     .accessibility_label(label.clone())
+                    .child(icons::small(AppIcon::ModelSelection).size(px(17.)))
                     .child(div().min_w_0().single_line().child(label))
-                    .h(px(30.))
+                    .h(px(chat::tokens::CONTROL_SIZE))
                     .rounded_full()
-                    .text_size(px(12.5))
+                    .text_size(px(12.))
                     .text_color(rgb(text_secondary()))
-                    .max_w(px(250.))
+                    .max_w(px(width))
                     .w_full()
                     .min_w_0()
                     .flex_shrink(1.)
@@ -435,10 +446,14 @@ impl Xylo {
                                 .flex_shrink_0()
                                 .single_line()
                                 .text_color(rgb(muted()))
-                                .child(format!("· {effort}")),
+                                .child(effort),
                         )
                     })
-                    .child(icons::small(AppIcon::Select).text_color(rgb(icons::rest_color())))
+                    .child(
+                        icons::small(AppIcon::ChevronDown)
+                            .size(px(12.))
+                            .text_color(rgb(icons::rest_color())),
+                    )
                     .tooltip("Model and reasoning"),
             )
             .content(move |_, window, cx| {
@@ -450,7 +465,24 @@ impl Xylo {
             .into_any_element()
     }
 
+    #[cfg(feature = "validation")]
+    pub(crate) fn model_picker_capture_query(
+        &mut self,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.model_picker
+            .query
+            .update(cx, |input, cx| input.set_value(value, window, cx));
+    }
+
     fn model_picker_panel(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let has_models = self
+            .settings
+            .providers
+            .iter()
+            .any(|model| !model.model.trim().is_empty());
         let weak = cx.entity().downgrade();
         let (up, down, enter, escape) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let rows = self.picker_rows(cx);
@@ -480,9 +512,10 @@ impl Xylo {
             });
         }
         let query = self.model_picker.query.read(cx).value().trim().to_owned();
-        if choice == 0 && query.is_empty() {
+        if !has_models {
             list = list.child(
                 picker_row("composer-connect-provider", false)
+                    .accessibility_label("Connect a provider")
                     .child(leading_column().child(icons::small(AppIcon::Add)))
                     .child(div().text_size(px(13.)).child("Connect a provider"))
                     .on_click(cx.listener(|view, _, window, cx| {
@@ -500,16 +533,26 @@ impl Xylo {
         div()
             .id("composer-model-panel")
             .test_support()
-            .w(px(340.))
+            .w(px(if has_models { 340. } else { 240. }))
+            .max_w((window.viewport_size().width - px(58.)).max(px(0.)))
             // The surface contributes 26 px of padding and border; leave
             // room for that and an outer margin on short windows.
             .max_h((window.viewport_size().height - px(48.)).max(px(0.)))
             .flex()
             .flex_col()
-            .gap_2()
-            .pt(px(8.))
-            .px(px(6.))
-            .pb(px(4.))
+            .gap(px(4.))
+            .when(!has_models, |panel| {
+                panel
+                    .track_focus(&self.model_picker.query.read(cx).focus_handle(cx))
+                    .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                        match event.keystroke.key.as_str() {
+                            "escape" => view.set_model_picker_open(false, window, cx),
+                            "enter" => view.open_providers_from_picker(window, cx),
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                    }))
+            })
             .capture_action(move |_: &MoveUp, _, cx| {
                 cx.stop_propagation();
                 let _ = up.update(cx, |view, cx| view.move_model_highlight(-1, cx));
@@ -526,33 +569,49 @@ impl Xylo {
                 cx.stop_propagation();
                 let _ = escape.update(cx, |view, cx| view.set_model_picker_open(false, window, cx));
             })
-            .child(
-                div()
-                    .px(px(2.))
-                    .flex_shrink_0()
-                    .child(Input::new(&self.model_picker.query).aria_label("Search models")),
-            )
+            .when(has_models, |panel| {
+                panel.child(
+                    div().px(px(2.)).flex_shrink_0().child(
+                        Input::new(&self.model_picker.query)
+                            .aria_label("Search models")
+                            .h(px(32.))
+                            .text_size(px(13.))
+                            .focus_bordered(false)
+                            .border_color(rgb(border_strong()))
+                            .prefix(icons::small(AppIcon::Search).text_color(rgb(muted()))),
+                    ),
+                )
+            })
             // Keep headings in the scroll flow. An overlay hides the first
             // visible model, including a keyboard choice scrolled to the top.
             .child(list)
-            .child(self.reasoning_effort_control(cx))
-            .child(div().flex_shrink_0().child(self.output_style_control(cx)))
-            .child(divider())
-            .child(
-                picker_row("composer-manage-models", false)
-                    .child(leading_column().child(
-                        icons::small(AppIcon::Settings).text_color(rgb(icons::rest_color())),
-                    ))
+            .when(has_models, |panel| {
+                panel
+                    .when(effort_label(&self.settings.provider).is_some(), |panel| {
+                        panel.child(self.reasoning_effort_control(cx))
+                    })
+                    .child(div().flex_shrink_0().child(self.output_style_control(cx)))
+                    .child(divider())
                     .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(rgb(text_secondary()))
-                            .child("Add or manage providers…"),
+                        picker_row("composer-manage-models", false)
+                            .accessibility_label("Manage providers")
+                            .child(
+                                leading_column().child(
+                                    icons::small(AppIcon::Settings)
+                                        .text_color(rgb(icons::rest_color())),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(text_secondary()))
+                                    .child("Manage providers"),
+                            )
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_providers_from_picker(window, cx)
+                            })),
                     )
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_providers_from_picker(window, cx)
-                    })),
-            )
+            })
             .into_any_element()
     }
 
@@ -655,9 +714,13 @@ impl Xylo {
                     .gap_1()
                     .child(div().single_line().child(current.clone()))
                     .h(px(28.))
-                    .text_size(px(12.5))
+                    .text_size(px(12.))
                     .flex_shrink_0()
-                    .child(icons::small(AppIcon::Select).text_color(rgb(icons::rest_color())))
+                    .child(
+                        icons::small(AppIcon::ChevronDown)
+                            .size(px(12.))
+                            .text_color(rgb(icons::rest_color())),
+                    )
                     .accessibility_label(format!("Reasoning effort: {current}"))
                     .dropdown_menu(move |mut menu, _, cx| {
                         let Ok(provider) =
@@ -818,6 +881,6 @@ impl Xylo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "model_picker/tests.rs"]
 mod tests;

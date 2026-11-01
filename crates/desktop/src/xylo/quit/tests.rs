@@ -3,10 +3,10 @@ use super::{running_tasks_detail, unsaved_kinds};
 #[test]
 fn unsaved_work_is_named_in_product_words() {
     assert_eq!(
-        unsaved_kinds(true, false, true, false),
+        unsaved_kinds(true, false, true),
         vec!["message drafts", "document edits"]
     );
-    assert!(unsaved_kinds(false, false, false, false).is_empty());
+    assert!(unsaved_kinds(false, false, false).is_empty());
 }
 
 #[test]

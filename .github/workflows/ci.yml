@@ -46,8 +46,6 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Workspace tests
         run: cargo test --workspace --locked
-      - name: Evaluation suites
-        run: cargo test -p xylo-evals --locked
       - name: CLI scripted-provider acceptance
         shell: bash
         env:

@@ -41,6 +41,12 @@ enum PaletteRow {
 }
 
 pub(super) struct HistorySearchUi {
+    chat_query: Entity<InputState>,
+    _chat_subscription: Subscription,
+    chat_session: Option<Uuid>,
+    chat_request: Option<Uuid>,
+    chat_hits: Vec<(Uuid, String)>,
+    chat_error: Option<String>,
     open: bool,
     items: Vec<HistoryMatch>,
     before: Option<ConversationCursor>,
@@ -58,8 +64,20 @@ pub(super) struct HistorySearchUi {
     scroll: UniformListScrollHandle,
 }
 impl HistorySearchUi {
-    pub(super) fn new(_window: &mut Window, _cx: &mut Context<Xylo>) -> Self {
+    pub(super) fn new(window: &mut Window, cx: &mut Context<Xylo>) -> Self {
+        let chat_query = cx.new(|cx| InputState::new(window, cx).placeholder("Search messages…"));
+        let subscription = cx.subscribe(&chat_query, |view, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                view.chat_search_changed(cx);
+            }
+        });
         Self {
+            chat_query,
+            _chat_subscription: subscription,
+            chat_session: None,
+            chat_request: None,
+            chat_hits: vec![],
+            chat_error: None,
             open: false,
             items: Vec::new(),
             before: None,
@@ -158,6 +176,107 @@ pub(super) fn age_label(timestamp: i64) -> String {
 }
 
 impl Xylo {
+    pub(super) fn chat_search_received(
+        &mut self,
+        id: Uuid,
+        session: Uuid,
+        result: Result<Vec<(Uuid, String)>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.history_search.chat_request != Some(id)
+            || self.history_search.chat_session != Some(session)
+            || self.session != session
+        {
+            return;
+        }
+        self.history_search.chat_request = None;
+        match result {
+            Ok(items) => self.history_search.chat_hits = items,
+            Err(_) => {
+                self.history_search.chat_error =
+                    Some("Search couldn’t be completed. Try again.".into())
+            }
+        }
+        cx.notify();
+    }
+    fn chat_search_changed(&mut self, cx: &mut Context<Self>) {
+        self.history_search.chat_hits.clear();
+        self.history_search.chat_error = None;
+        self.history_search.chat_request = None;
+        let Some(session) = self
+            .history_search
+            .chat_session
+            .filter(|session| *session == self.session)
+        else {
+            return;
+        };
+        let query = self
+            .history_search
+            .chat_query
+            .read(cx)
+            .value()
+            .trim()
+            .to_owned();
+        if query.is_empty() {
+            cx.notify();
+            return;
+        }
+        if query.len() > 512 {
+            self.history_search.chat_error = Some("Try a shorter search.".into());
+            cx.notify();
+            return;
+        }
+        let id = Uuid::new_v4();
+        if let Some(host) = &self.host {
+            match host.search_chat(id, session, query) {
+                Ok(()) => self.history_search.chat_request = Some(id),
+                Err(_) => {
+                    self.history_search.chat_error = Some("Saved history is unavailable.".into())
+                }
+            }
+        }
+        cx.notify();
+    }
+    pub(super) fn open_chat_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt;
+        self.history_search.chat_session = Some(self.session);
+        self.history_search.chat_hits.clear();
+        self.history_search.chat_error = None;
+        self.history_search.chat_request = None;
+        self.history_search
+            .chat_query
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let session = self.session;
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let body = weak.update(cx, |view, cx| {
+                let query = view.history_search.chat_query.read(cx).value().trim().to_lowercase();
+                let body = div().flex().flex_col().gap(px(14.)).child(Input::new(&view.history_search.chat_query).aria_label("Search messages").w_full());
+                let mut matches = div().id("chat-search-results").test_support().h(px(320.)).overflow_y_scroll().flex().flex_col().gap(px(10.));
+                let mut results=view.history_search.chat_hits.clone();
+                if !query.is_empty() && view.session==session {
+                    for message in &view.messages {if message.content.to_lowercase().contains(&query) && !results.iter().any(|(id,_)|*id==message.id) {results.push((message.id,message.content.chars().take(500).collect()));}}
+                    if let Some(turn)=view.turns.get(&session) {for segment in &turn.segments {if let crate::state::Segment::Text(text)=segment&& text.to_lowercase().contains(&query) {results.push((Uuid::nil(),text.chars().take(500).collect()));}}}
+                }
+                results.truncate(100);
+                if results.is_empty() && !query.is_empty() {matches=matches.child(subtitle(if view.history_search.chat_request.is_some() {"Searching…"} else {"No matching messages."}));}
+                if results.len()>=100 {matches=matches.child(subtitle("Showing the first 100 matches. Refine your search for more specific results."));}
+                for (index,(id,snippet)) in results.into_iter().enumerate() {
+                    matches = matches.child(focus_ring(gpui_kit::base::Button::new(("chat-search-result",index))).w_full().p(px(12.)).rounded(px(8.)).text_size(px(13.)).text_color(rgb(text_secondary())).hover(|style|style.bg(rgb(hover()))).child(snippet).on_click(cx.listener(move |view,_,window,cx| {
+                        window.close_dialog(cx);
+                        if view.session != session {return;}
+                        if id.is_nil() {view.jump_to_latest(cx);}
+                        else if let Some(index)=view.messages.iter().position(|message|message.id==id) {if let Some(history)=view.histories.get(&session) {history.list.scroll_to(gpui_kit::ListOffset {item_ix:index+1,offset_in_item:px(0.)});}}
+                        else if let Some(chat)=view.conversations.iter().find(|chat|chat.id==session).cloned() {view.open_history_message(chat,id,window,cx);}
+                        cx.notify();
+                    })));
+                }
+                body.when_some(view.history_search.chat_error.clone(),|body,error|body.child(subtitle(error))).child(matches).into_any_element()
+            }).unwrap_or_else(|_|div().into_any_element());
+            let close=weak.clone();
+            dialog.title("Find in chat").width(px(720.)).rounded(px(16.)).bg(rgb(panel())).border_color(rgb(border_strong())).on_ok(|_,_,_|false).on_close(move |_,_,cx|{let _=close.update(cx,|view,_|{view.history_search.chat_session=None;view.history_search.chat_request=None;});}).child(body)
+        });
+    }
     /// Opens the palette with an empty query, or closes it when open.
     pub(super) fn open_history_search(
         &mut self,
@@ -624,6 +743,6 @@ fn project_name(root: &Path) -> String {
         .unwrap_or_else(|| "Project".into())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "history_search/tests.rs"]
 mod tests;

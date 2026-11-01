@@ -21,6 +21,8 @@ async fn a_full_output_queue_cannot_drop_a_quiet_jobs_start() {
     .unwrap();
     let events = sink(output, sequence);
     let job = ShellJob {
+        action_id: None,
+        background: true,
         id: Uuid::new_v4(),
         turn_id: Uuid::new_v4(),
         command: "quiet server".into(),
@@ -66,7 +68,10 @@ async fn busy_output_coalesces_to_the_latest_job_state_and_drains_on_shutdown() 
     .await
     .unwrap();
     let events = sink(output, sequence);
+    let action = Uuid::new_v4();
     let mut job = ShellJob {
+        action_id: Some(action),
+        background: false,
         id: Uuid::new_v4(),
         turn_id: Uuid::new_v4(),
         command: "server".into(),
@@ -101,4 +106,17 @@ async fn busy_output_coalesces_to_the_latest_job_state_and_drains_on_shutdown() 
     assert!(!last.running);
     assert_eq!(last.exit_code, Some(0));
     assert_eq!(last.output, "99");
+    assert_eq!(last.turn_id, job.turn_id);
+    assert_eq!(last.action_id, Some(action));
+    assert!(!last.background);
+    let encoded = serde_json::to_value(last).unwrap();
+    let decoded: ShellJob = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded.action_id, Some(action));
+    assert!(!decoded.background);
+    let mut legacy = encoded;
+    legacy.as_object_mut().unwrap().remove("action_id");
+    legacy.as_object_mut().unwrap().remove("background");
+    let legacy: ShellJob = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.action_id.is_none());
+    assert!(legacy.background);
 }

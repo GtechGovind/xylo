@@ -16,7 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Xylo's mark drawn directly in Rust for the window icon: a white prompt
 /// chevron with a spark, on an indigo tile.
 pub fn brand_pixels(size: u32) -> image::RgbaImage {
-    let s = size as f32;
+    let canvas = size as f32;
+    let inset = canvas * 0.08;
+    let s = canvas - 2. * inset;
+    let radius = s * 0.25;
     let stroke = (s / 11.).max(1.);
     // Chevron ">" in the lower-left two thirds; spark centre upper-right.
     let (ax, ay) = (s * 0.22, s * 0.30);
@@ -30,7 +33,16 @@ pub fn brand_pixels(size: u32) -> image::RgbaImage {
         ((x - px).powi(2) + (y - py).powi(2)).sqrt()
     };
     image::RgbaImage::from_fn(size, size, |x, y| {
-        let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+        let (fx, fy) = (x as f32 + 0.5 - inset, y as f32 + 0.5 - inset);
+        // An inset rounded tile keeps the Dock silhouette and visual weight
+        // consistent with native macOS icons. Fractional coverage softens edges.
+        let qx = (fx - s * 0.5).abs() - (s * 0.5 - radius);
+        let qy = (fy - s * 0.5).abs() - (s * 0.5 - radius);
+        let distance = qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - radius;
+        let alpha = ((0.5 - distance).clamp(0., 1.) * 255.).round() as u8;
+        if alpha == 0 {
+            return image::Rgba([0, 0, 0, 0]);
+        }
         let chevron = segment(fx, fy, ax, ay, bx, by) <= stroke / 2.
             || segment(fx, fy, bx, by, cx, cy) <= stroke / 2.;
         let underline = segment(fx, fy, s * 0.50, s * 0.80, s * 0.82, s * 0.80) <= stroke / 2.;
@@ -39,9 +51,9 @@ pub fn brand_pixels(size: u32) -> image::RgbaImage {
         let spark = dx.sqrt() + dy.sqrt() <= sr.sqrt();
         let mark = chevron || underline || spark;
         image::Rgba(if mark {
-            [0xff, 0xff, 0xff, 255]
+            [0xff, 0xff, 0xff, alpha]
         } else {
-            [0x5b, 0x5f, 0xe6, 255]
+            [0x5b, 0x5f, 0xe6, alpha]
         })
     })
 }
@@ -103,11 +115,12 @@ pub fn text_secondary() -> u32 {
 }
 /// Captions, metadata and placeholders.
 pub fn muted() -> u32 {
-    color(0x646b78, 0x8f97a6)
+    color(0x565d6a, 0xa3aab8)
 }
-/// Faint text for tertiary metadata.
+/// Faint text for tertiary metadata. Still readable (4.5:1 or better on the
+/// canvas and panel in both themes); `muted` stays one step stronger.
 pub fn faint() -> u32 {
-    color(0x9aa1ad, 0x5f6675)
+    color(0x666d7b, 0x8a92a2)
 }
 /// The single brand accent.
 pub fn brand() -> u32 {
@@ -116,8 +129,14 @@ pub fn brand() -> u32 {
 pub fn brand_hover() -> u32 {
     color(0x4a4ed0, 0x9b98ff)
 }
+/// Text and icons on a `brand` fill: white on the light-theme indigo, ink on
+/// the lighter dark-theme accent (white would be about 3:1 there).
 pub fn brand_foreground() -> u32 {
-    0xffffff
+    color(0xffffff, 0x15171d)
+}
+/// Text and icons on a `danger` fill, with the same reasoning as above.
+pub fn danger_foreground() -> u32 {
+    color(0xffffff, 0x15171d)
 }
 /// Accent tinted surface.
 pub fn brand_soft() -> u32 {
@@ -204,47 +223,13 @@ pub fn mono(cx: &App) -> SharedString {
         .clone()
 }
 
-/// Large display text.
-pub fn display(text: impl Into<SharedString>) -> Div {
-    div()
-        .text_size(px(30.))
-        .line_height(relative(1.3))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(crate::ui::text()))
-        .child(text.into())
-}
 /// Page title, used at the top of settings and tool pages.
-pub fn title(text: impl Into<SharedString>) -> Div {
-    div()
-        .text_size(px(24.))
-        .line_height(relative(1.3))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(crate::ui::text()))
-        .child(text.into())
-}
 pub fn subtitle(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(12.5))
         .line_height(relative(1.45))
         .text_color(rgb(muted()))
         .child(text.into())
-}
-/// Body copy on pages.
-pub fn body_text(text: impl Into<SharedString>) -> Div {
-    div()
-        .text_size(px(14.))
-        .line_height(relative(1.55))
-        .text_color(rgb(text_secondary()))
-        .child(text.into())
-}
-pub fn heading(title_text: impl Into<SharedString>, description: impl Into<SharedString>) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .mb_6()
-        .child(title(title_text))
-        .child(body_text(description).max_w(px(640.)))
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +276,7 @@ pub fn avatar(initial: impl Into<SharedString>, size: f32) -> Div {
         .justify_center()
         .text_size(px(size * 0.46))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(0xffffff))
+        .text_color(rgb(color(0xffffff, 0x0f1117)))
         .child(initial.into())
 }
 
@@ -427,26 +412,6 @@ pub fn send_button(
                 style.bg(rgb(brand_hover()))
             }
         })
-}
-/// Circular neutral stop control shown while a task runs.
-pub fn stop_button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-) -> gpui_kit::base::Button {
-    let label: SharedString = label.into();
-    focus_ring(gpui_kit::base::Button::new(id))
-        .accessibility_label(label)
-        .size(px(32.))
-        .rounded_full()
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgb(color(0x15171d, 0xeceef4)))
-        .text_color(rgb(color(0xffffff, 0x15171d)))
-        .cursor_pointer()
-        .hover(|style| style.bg(rgb(color(0x2b2f3a, 0xd3d7e2))))
-        .child(crate::icons::small(AppIcon::Stop))
 }
 /// Segmented choice (theme, timeouts, modes).
 pub fn segment(
@@ -623,6 +588,7 @@ pub fn badge(text: impl Into<SharedString>, tone: BadgeTone) -> Div {
         BadgeTone::Danger => (danger_bg(), danger()),
     };
     div()
+        .flex_shrink_0()
         .px(px(8.))
         .h(px(22.))
         .flex()
@@ -632,7 +598,7 @@ pub fn badge(text: impl Into<SharedString>, tone: BadgeTone) -> Div {
         .text_size(px(11.5))
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(foreground))
-        .child(text.into())
+        .child(div().single_line().child(text.into()))
 }
 /// Centered empty state with a title and description.
 pub fn empty_state(
@@ -855,7 +821,7 @@ pub fn sync_toolkit_theme(cx: &mut App) {
         theme.link_hover = hsla(brand());
         theme.link_active = hsla(brand_hover());
         theme.danger = hsla(danger());
-        theme.danger_foreground = hsla(0xffffff);
+        theme.danger_foreground = hsla(danger_foreground());
         theme.success = hsla(success());
         theme.warning = hsla(warning());
         theme.info = hsla(accent_text());
@@ -883,6 +849,6 @@ pub fn sync_toolkit_theme(cx: &mut App) {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "ui/tests.rs"]
 mod tests;

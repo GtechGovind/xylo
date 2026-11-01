@@ -432,13 +432,14 @@ impl Xylo {
         } else if active {
             "Stop recording"
         } else {
-            "Record voice"
+            "Voice input"
         };
         icons::icon_button(
             "record-voice-composer",
             if active { AppIcon::Stop } else { AppIcon::Mic },
             label,
         )
+        .size(px(34.))
         .on_click(cx.listener(move |view, _, _, cx| {
             if active {
                 view.speech_record_stop(cx);

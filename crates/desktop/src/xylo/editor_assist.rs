@@ -171,12 +171,10 @@ impl Xylo {
         if self.draft_flush_pending()
             || self.memory_forms_flush_pending()
             || self.document_drafts_flush_pending()
-            || self.recovery_flush_pending()
         {
             self.cancel_draft_flush(cx);
             self.cancel_memory_forms_flush(cx);
             self.cancel_document_drafts_flush(cx);
-            self.cancel_recovery_flush(cx);
         }
         let Some(assist) = self.editor_assist.clone() else {
             cx.notify();

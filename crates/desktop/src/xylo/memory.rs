@@ -612,6 +612,6 @@ pub(super) fn memory_age(saved_at: i64) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "memory/tests.rs"]
 mod tests;

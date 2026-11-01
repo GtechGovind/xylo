@@ -281,7 +281,11 @@ mod xylo {
                 })
                 .unwrap();
             let saved: Vec<_> = (0..800)
-                .map(|index| ChatMessage { reasoning: None,
+                .map(|index| ChatMessage {
+                    activity_count: 0,
+                    activity_summary: None,
+                    turn_id: None,
+                    reasoning: None,
                     status: Default::default(),
                     id: Uuid::new_v4(),
                     session_id: session,

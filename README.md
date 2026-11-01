@@ -5,14 +5,34 @@
   <p>
     <a href="#what-you-can-do">Features</a> ·
     <a href="#get-started">Get started</a> ·
+    <a href="#agents">Agents</a> ·
+    <a href="#development-checks">Development checks</a> ·
+    <a href="docs/README.md">Docs</a> ·
     <a href="https://github.com/GtechGovind/xylo/releases">Releases</a> ·
     <a href="#contribute-and-get-help">Contribute</a> ·
     <a href="#license">License</a>
   </p>
-  <p><strong>Open source · Development preview · macOS, Windows and Linux targets</strong></p>
+  <p>
+    <img alt="Status" src="https://img.shields.io/badge/status-development_preview-f59e0b?style=flat-square">
+    <img alt="Version" src="https://img.shields.io/badge/version-0.1.0-2563eb?style=flat-square">
+    <img alt="Rust" src="https://img.shields.io/badge/Rust-1.98%2B-dea584?style=flat-square&logo=rust&logoColor=white">
+    <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-334155?style=flat-square">
+    <img alt="Platforms" src="https://img.shields.io/badge/targets-macOS_·_Windows_·_Linux-334155?style=flat-square">
+  </p>
 </div>
 
+---
+
 Xylo keeps conversations, project files and practical tools together. Bring a local model or connect your preferred provider, work with your project in context, and return to saved chats and drafts.
+
+## Why Xylo
+
+- **Native, not a wrapped web page.** One Rust codebase and a GPU-drawn interface. No web view renders the window and no JavaScript runtime sits behind it; Node.js is used only by the sandbox helper for executable tools.
+- **The UI never runs the agent.** Agent turns execute in a separate supervised worker process. A stuck model call, a runaway tool or a crashing native parser cannot freeze the window.
+- **Your keys stay yours.** Credentials live in the operating system credential store. The host alone opens the secret vault and hands workers a key over a private pipe.
+- **Permission is explicit.** Every tool call is admitted against the current mode, and executable tools run inside a pinned OS sandbox. Missing sandbox dependencies fail closed instead of falling back to unrestricted execution.
+- **Local or cloud, your choice.** The same workspace drives a laptop Ollama server or a hosted frontier model; the model is always named, never implied.
+- **Honest about status.** This README, the docs and the UI say what is qualified and what is not. A green build is not a claim of coverage.
 
 ## What you can do
 
@@ -21,7 +41,7 @@ Xylo keeps conversations, project files and practical tools together. Bring a lo
 | **Work with your project** | Browse and search files, use the native editor and terminal, and review Git diffs alongside chat.          |
 | **Choose your model**      | Connect local model servers, cloud providers or a compatible endpoint. Choose models explicitly.           |
 | **Keep useful context**    | Save project facts, search conversation history, and review reusable skills.                               |
-| **Stay in control**        | Review tool approvals and inspect interrupted actions before recording an observed outcome.                |
+| **Stay in control**        | Review tool approvals and stop running tasks from the conversation.                |
 | **Work with documents**    | Edit supported DOCX content and multi-sheet XLSX files, save a separate copy, and recover retained drafts. |
 | **Connect your tools**     | Add MCP connections, review plugin permissions, and configure SSH or container environments.               |
 
@@ -29,23 +49,43 @@ Browser actions, images, voice and local model tools extend the workspace throug
 
 Xylo uses a native interface, background execution and automatic local resource scheduling. Responsiveness is a design priority; performance measurements are still being qualified.
 
+## Agents
+
+Xylo's primary coding agent reads, edits, runs commands and verifies its work under your permission mode. It can delegate bounded tasks to helper agents (at most two at once, no nested delegation) and load built-in skills for review, debugging, tests, refactoring, commits and skill authoring.
+
+| Mode               | Behavior                                                    |
+|--------------------|-------------------------------------------------------------|
+| `ask_for_approval` | Each action waits for your decision                         |
+| `approve_for_me`   | Asks only when an action is flagged as risky                |
+| `full_access`      | No routine prompts or repeat confirmations for explicit app actions; commands still run in the OS sandbox |
+| `read_only`        | Reading only; writes are refused                            |
+| `plan`             | Reading and questions only; ends with a plan for approval   |
+
+See [Agents in Xylo](docs/modules/engine-agents-and-skills.md) for helpers, skills, plugin roles and headless use, and the [module documentation](docs/README.md) for every crate.
+
 ## Local or cloud, by your choice
 
 Use an existing **Ollama, LM Studio, llama.cpp or vLLM** server, or configure a supported local model through Xylo's asset setup. Connect **OpenAI, Anthropic, Gemini** and other supported cloud providers in Settings. Custom endpoints are supported where the provider protocol matches.
 
-Choose the provider and model under **Settings → Model**. Credentials use the operating system credential store. Available tools, image support and context limits depend on the selected model and provider.
+Choose the provider and model under **Settings → Providers**. Credentials use the operating system credential store. Available tools, image support and context limits depend on the selected model and provider.
 
 ## Get started
 
 **Xylo is in development preview. The first downloadable release is being prepared.** Follow the [Releases page](https://github.com/GtechGovind/xylo/releases) for published files and release notes, or build from source with standard Cargo commands:
 
 ```sh
-cargo build --locked --workspace --bins
+cargo app
 npm ci --prefix crates/services/sandbox-helper --ignore-scripts --no-audit --no-fund
-cargo run --locked
+cargo run --locked --bin xylo
 ```
 
-The pinned Rust toolchain is selected by `rust-toolchain.toml`. Application builds do not require packaging scripts, icon files, or updater configuration. Automatic updates are disabled until a trusted release feed is configured.
+On macOS, `python3 scripts/bundle-macos.py` builds a complete release app at `dist/Xylo.app`.
+The bundle includes its worker, helper and CLI, and remains usable after cleaning the Cargo cache.
+
+
+The pinned Rust toolchain is selected by `rust-toolchain.toml`. Run `cargo app` from the repository root to build the four shipped binaries; evaluation tools are built only when requested. Use `cargo check -p xylo --locked` for a faster compile check and `cargo app-release` for an optimized build. Application builds use the checked-in assets and do not require a packager or updater configuration. Automatic updates are disabled until a trusted release feed is configured.
+
+Native UI checks share the root build cache and should be run by target, for example `cargo native-test --test composer-interactions`. See [Native validation](crates/desktop/validation/README.md) for focused checks and cache cleanup.
 
 Local executable tools use a pinned OS sandbox helper and require Node.js 22.12 or later. Xylo uses a bundled runtime first, then `XYLO_SANDBOX_NODE` if set, then `node` from `PATH` (including nvm, volta, fnm or asdf installs under your home directory) as long as the binary and its parent directories are owned by you or root and are not writable by other users; otherwise sandboxed tools report which Node.js was rejected and why. Install its locked dependencies with the command above. Missing sandbox dependencies fail closed; Xylo does not fall back to unrestricted execution. The native UI and Rust backend do not run in Node.js. macOS sandbox execution has local regression coverage; Linux packaging and Windows execution remain unqualified.
 
@@ -75,8 +115,60 @@ These are release targets, not a claim that every platform is already qualified.
 Once the app is running:
 
 1. Open a project folder.
-2. Choose a provider and model in **Settings → Model**.
+2. Choose a provider and model in **Settings → Providers**.
 3. Start a conversation and review requested actions as you work.
+
+## Development checks
+
+Every push and pull request runs the same gates on **macOS 15 and Ubuntu 24.04** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+
+| Gate                        | Command                                                            |
+|-----------------------------|---------------------------------------------------------------------|
+| Formatting                  | `cargo fmt --all -- --check`                                        |
+| Lints, zero tolerance       | `cargo clippy --workspace --all-targets --locked -- -D warnings`    |
+| Tests                       | `cargo test --workspace --locked`                                   |
+| Headless acceptance         | `xylo-cli` run against a scripted provider fixture, output asserted |
+| Release signing policy      | `python3 -m unittest discover -s .github/scripts -p 'test_*.py'`    |
+| Dependency advisories       | `cargo audit` (pinned `cargo-audit` version)                        |
+
+Native UI behavior and rendering are checked separately per target, for example `cargo native-test --test composer-interactions`; see [Native validation](crates/desktop/validation/README.md).
+
+## Project layout
+
+```mermaid
+flowchart LR
+    Desktop["desktop\nnative UI"] -.->|supervises| Worker["worker\ntask process"]
+    Worker --> Engine["engine\nagent loop, helpers, skills"]
+    CLI["cli\nheadless"] --> Engine
+    Engine --> Services["services\ndurable local state"]
+    Engine --> Caps["capabilities\nbrowser, documents, models"]
+    Engine --> Resources["resources\nwork admission"]
+    Caps --> Resources
+    Caps --> Sched["scheduler\nUTC schedules"]
+    Helper["helper\ncapability process"] --> Caps
+```
+
+| Path                  | Purpose                                                                        |
+|-----------------------|--------------------------------------------------------------------------------|
+| `crates/desktop`      | Native desktop app (default workspace member)                                  |
+| `crates/engine`       | Agent loop, prompts, helper agents and built-in skills                         |
+| `crates/worker`       | Supervised task worker; runs one root task at a time, JSONL over stdout        |
+| `crates/cli`          | `xylo-cli` headless frontend                                                   |
+| `crates/services`     | Durable local application services                                             |
+| `crates/capabilities` | Browser, document, model and other native services, started on demand          |
+| `crates/helper`       | Native capability process, with `helper-client` as its small client            |
+| `crates/scheduler`    | Cross-process durable UTC scheduling; never runs agents or shell commands      |
+| `crates/resources`    | Shared admission of heavy native work                                          |
+| `crates/distribution` | Signed cargo-packager updates                                                  |
+| `crates/notifications`| Opt-in native notifications                                                    |
+| `crates/evals`        | Deterministic evaluation and trace harness                                     |
+| `crates/core`         | Application-owned contracts                                                    |
+| `sdk/`                | Rust SDK, plugin SDK and [protocol-v1](sdk/protocol-v1.md)                     |
+| `ide/vscode`          | Development VS Code bridge exposing selection and diagnostics over local MCP   |
+| `examples/plugins`    | Minimal example plugins                                                        |
+| `docs/`               | [Documentation index](docs/README.md) and [Agents in Xylo](docs/modules/engine-agents-and-skills.md)     |
+
+Solid arrows follow crate dependencies in the `Cargo.toml` files; the dotted arrow is a process relationship. Shared crates (`core`, `runtime`) are omitted.
 
 ## Contribute and get help
 

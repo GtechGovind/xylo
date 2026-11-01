@@ -46,11 +46,11 @@ impl Xylo {
                 && entry.conflict.is_none()
         })
     }
-    fn ensure_memory_form(&mut self, scope: &str, cx: &mut Context<Self>) -> bool {
+    fn ensure_memory_form(&mut self, scope: &str, _cx: &mut Context<Self>) -> bool {
         if self.facts.forms.entries.contains_key(scope) {
             return true;
         }
-        if self.facts.forms.entries.len() >= 64 {
+        while self.facts.forms.entries.len() >= 64 {
             let removable = self
                 .facts
                 .forms
@@ -68,10 +68,8 @@ impl Xylo {
             if let Some(key) = removable {
                 self.facts.forms.entries.remove(&key);
             } else {
-                self.error =
-                    Some("Save your pending Memory entries before opening another project.".into());
-                cx.notify();
-                return false;
+                // Keep unsaved entries; cache pressure must not block navigation.
+                break;
             }
         }
         self.facts
@@ -91,20 +89,6 @@ impl Xylo {
         }
         if let Some(scope) = self.facts.forms.active.clone() {
             self.persist_memory_form(&scope, cx);
-        }
-        if self.facts.forms.entries.len() >= 64
-            && !self.facts.forms.entries.iter().any(|(scope, entry)| {
-                Some(scope) != self.facts.forms.active.as_ref()
-                    && !entry.dirty
-                    && entry.save.is_none()
-                    && entry.load.is_none()
-                    && entry.conflict.is_none()
-                    && entry.error.is_none()
-            })
-        {
-            self.error = Some("Save your pending Memory entries before switching projects.".into());
-            cx.notify();
-            return false;
         }
         true
     }
@@ -206,7 +190,6 @@ impl Xylo {
         if changed_input {
             self.cancel_draft_flush(cx);
             self.cancel_document_drafts_flush(cx);
-            self.cancel_recovery_flush(cx);
         }
         self.facts.forms.debounce = Some(cx.spawn(async move |view, cx| {
             cx.background_executor()

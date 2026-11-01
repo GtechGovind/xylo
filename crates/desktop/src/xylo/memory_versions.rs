@@ -222,14 +222,14 @@ impl Xylo {
             "{} saved version(s) in {}. {consequence}\n\nChat history, learned skills, checkpoints and unsaved Memory entries remain saved.",
             preview.versions, scope
         );
-        let answer = window.prompt(
-            PromptLevel::Warning,
+        let answer = self.confirm_explicit_action(
             title,
             Some(&body),
             &[
                 PromptButton::cancel("Cancel"),
                 PromptButton::new("Delete saved versions"),
             ],
+            window,
             cx,
         );
         self.facts.versions.prompt = Some(id);
@@ -240,7 +240,7 @@ impl Xylo {
                     return;
                 }
                 view.facts.versions.prompt = None;
-                if matches!(confirmed, Ok(1)) {
+                if confirmed {
                     view.submit_fact_delete(
                         FactDeleteRequest {
                             operation_id: Uuid::new_v4(),
@@ -398,7 +398,7 @@ impl Xylo {
                 .into_any_element(),
             ]),
         );
-        let danger = settings_ui::danger_zone([settings_ui::setting_row(
+        let danger = settings_ui::removal_actions([settings_ui::setting_row(
             "Delete all project facts",
             Some("Every saved version in this project is deleted. Chats and skills stay.".into()),
             Some(
@@ -709,7 +709,7 @@ impl Xylo {
             Some("Open a version to read it or delete only that version.".into()),
             self.memory_version_list(cx),
         ))
-        .child(settings_ui::danger_zone([
+        .child(settings_ui::removal_actions([
             settings_ui::setting_row(
                 "Delete this version",
                 Some("Other versions stay saved; none is restored as current.".into()),

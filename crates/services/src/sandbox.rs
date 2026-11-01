@@ -359,10 +359,17 @@ fn prepare_internal(
         status_file,
     })
 }
-/// The sandbox helper entrypoint. Release builds only use the copy packaged
-/// with the application; the source tree is a fallback for debug builds.
+/// Bundles own their helper. Binaries run from this checkout's Cargo target
+/// directory may use its source helper in either development build profile.
 pub fn helper_path() -> Result<PathBuf> {
-    let executable = std::env::current_exe()?;
+    resolve_helper_path(
+        &std::env::current_exe()?,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        cfg!(debug_assertions),
+    )
+}
+
+fn resolve_helper_path(executable: &Path, services: &Path, debug_build: bool) -> Result<PathBuf> {
     let packaged = executable
         .parent()
         .context("Missing executable directory")?
@@ -370,9 +377,13 @@ pub fn helper_path() -> Result<PathBuf> {
     if packaged.is_file() {
         return Ok(packaged.canonicalize()?);
     }
-    #[cfg(debug_assertions)]
-    {
-        let development = Path::new(env!("CARGO_MANIFEST_DIR")).join("sandbox-helper/run.mjs");
+    let in_cargo_target = services
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|workspace| workspace.join("target").canonicalize().ok())
+        .is_some_and(|target| executable.starts_with(target));
+    if debug_build || in_cargo_target {
+        let development = services.join("sandbox-helper/run.mjs");
         if development.is_file() {
             return Ok(development.canonicalize()?);
         }

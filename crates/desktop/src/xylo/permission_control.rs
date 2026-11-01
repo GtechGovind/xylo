@@ -20,28 +20,28 @@ pub(super) fn permission_glyph(mode: PermissionMode) -> AppIcon {
     }
 }
 
-/// Full access removes every guard, so it is always drawn as a warning.
-fn permission_color(mode: PermissionMode) -> u32 {
-    if mode == PermissionMode::FullAccess {
-        warning()
-    } else {
-        text_secondary()
-    }
+/// A selected permission mode is ordinary context, not a persistent warning.
+fn permission_color(_mode: PermissionMode) -> u32 {
+    text_secondary()
 }
 
 /// One menu row: icon, label and the preset's one-line description.
-fn permission_row(mode: PermissionMode) -> Div {
-    let color = if mode == PermissionMode::FullAccess {
-        warning()
-    } else {
-        text()
-    };
+fn permission_row(mode: PermissionMode, active: bool) -> impl IntoElement {
+    let color = text();
     div()
-        .w(px(300.))
+        .id(ElementId::Name(
+            format!("permission-choice-{}", mode.label()).into(),
+        ))
+        .role(gpui_kit::Role::MenuItem)
+        .aria_label(format!("{}. {}", mode.label(), mode.description()))
+        .w(px(284.))
+        .rounded(px(8.))
+        .px(px(8.))
+        .when(active, |row| row.bg(rgb(crate::ui::selected())))
         .flex()
         .items_start()
         .gap_2()
-        .py(px(2.))
+        .py(px(8.))
         .child(
             icons::small(permission_glyph(mode))
                 .mt(px(2.))
@@ -58,15 +58,34 @@ fn permission_row(mode: PermissionMode) -> Div {
                         .text_size(px(13.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(color))
-                        .child(mode.label()),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().child(mode.label()))
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .flex_shrink_0()
+                                .when(active, |slot| slot.child(icons::small(AppIcon::Done))),
+                        ),
                 )
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(px(chat::tokens::META_SIZE))
                         .line_height(relative(1.4))
                         .text_color(rgb(muted()))
                         .whitespace_normal()
-                        .child(mode.description()),
+                        .child(match mode {
+                            PermissionMode::AskForApproval => {
+                                "Ask before working outside this project"
+                            }
+                            PermissionMode::ApproveForMe => {
+                                "Ask only when an action needs your review"
+                            }
+                            PermissionMode::FullAccess => "Work with files and the internet freely",
+                            PermissionMode::ReadOnly => "Explore files without making changes",
+                            PermissionMode::Plan => "Prepare a plan before making changes",
+                        }),
                 ),
         )
 }
@@ -99,27 +118,32 @@ impl Xylo {
             .accessibility_label(mode.label())
             .gap_1()
             .child(
-                icons::small(permission_glyph(mode))
+                icons::small(AppIcon::Permissions)
+                    .size(px(17.))
                     .flex_shrink_0()
                     .text_color(rgb(permission_color(mode))),
             )
-            .child(div().min_w_0().single_line().child(mode.label()))
+            .when(self.chat_width.get() >= 520., |button| {
+                button.child(div().min_w_0().single_line().child(mode.label()))
+            })
             .max_w(px(170.))
-            .h(px(30.))
+            .h(px(chat::tokens::CONTROL_SIZE))
             .rounded_full()
-            .text_size(px(12.5))
+            .text_size(px(12.))
             .text_color(rgb(permission_color(mode)))
             .tooltip(mode.description())
-            .dropdown_menu(move |mut menu, _, cx| {
+            .dropdown_menu(move |mut menu, window, cx| {
                 let Ok(active) = weak.update(cx, |view, _| view.current_permission_mode()) else {
                     return menu;
                 };
-                menu = menu.label("How should Xylo's actions be approved?");
+                menu = menu
+                    .label("Access")
+                    .scrollable(true)
+                    .max_h((window.viewport_size().height - px(64.)).max(px(160.)));
                 for mode in PermissionMode::ALL {
                     let view = weak.clone();
                     menu = menu.item(
-                        PopupMenuItem::element(move |_, _| permission_row(mode))
-                            .checked(active == mode)
+                        PopupMenuItem::element(move |_, _| permission_row(mode, active == mode))
                             .on_click(move |_, _, cx| {
                                 let _ =
                                     view.update(cx, |view, cx| view.set_permission_mode(mode, cx));
@@ -132,6 +156,6 @@ impl Xylo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "permission_control/tests.rs"]
 mod tests;

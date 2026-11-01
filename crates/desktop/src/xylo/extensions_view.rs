@@ -866,7 +866,7 @@ impl Xylo {
             Some("No network access until you allow exact hosts in a component's setup.".into()),
             permissions,
         ))
-        .child(settings_ui::danger_zone([settings_ui::setting_row(
+        .child(settings_ui::removal_actions([settings_ui::setting_row(
             "Remove plugin",
             Some("Its skills, commands, hooks and servers are removed with their setup.".into()),
             Some(

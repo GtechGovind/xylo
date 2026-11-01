@@ -59,18 +59,54 @@ pub fn create() -> Result<(TrayIcon, async_channel::Receiver<Event>)> {
     }
     Ok((builder.build()?, rx))
 }
-/// macOS receives an alpha template; other platforms receive a light tile.
-fn tray_icon() -> Result<Icon> {
-    let image = crate::ui::brand_pixels(24);
+/// macOS receives only the mark as an alpha template; other platforms use
+/// the rounded application tile. Transparent corners must stay transparent.
+fn tray_image() -> image::RgbaImage {
+    // Supersampling keeps the small mark smooth at menu-bar scale.
+    let image = crate::ui::brand_pixels(96);
     #[cfg(target_os = "macos")]
     let image = {
         let mut image = image;
         for pixel in image.pixels_mut() {
-            let alpha = if pixel.0[0] == 255 { 0 } else { 255 };
+            let alpha = if pixel.0[..3] == [255, 255, 255] {
+                pixel.0[3]
+            } else {
+                0
+            };
             *pixel = image::Rgba([0, 0, 0, alpha]);
         }
         image
     };
+    image::imageops::resize(&image, 24, 24, image::imageops::FilterType::Lanczos3)
+}
+
+fn tray_icon() -> Result<Icon> {
+    let image = tray_image();
     let (width, height) = image.dimensions();
     Ok(Icon::from_rgba(image.into_raw(), width, height)?)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    fn menu_bar_template_is_a_smooth_mark_with_no_background_tile() {
+        let image = super::tray_image();
+        assert_eq!(image.dimensions(), (24, 24));
+        for edge in 0..24 {
+            for (x, y) in [(edge, 0), (edge, 23), (0, edge), (23, edge)] {
+                assert_eq!(
+                    image.get_pixel(x, y).0[3],
+                    0,
+                    "Opaque menu-bar edge at {x},{y}"
+                );
+            }
+        }
+        let visible = image.pixels().filter(|pixel| pixel.0[3] > 127).count();
+        assert!(
+            (30..180).contains(&visible),
+            "The icon must be a mark, not an opaque tile: {visible}"
+        );
+        assert!(image.pixels().any(|pixel| (1..255).contains(&pixel.0[3])));
+        assert!(image.pixels().all(|pixel| pixel.0[..3] == [0, 0, 0]));
+    }
 }

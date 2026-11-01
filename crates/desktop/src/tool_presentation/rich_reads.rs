@@ -87,6 +87,6 @@ pub(super) fn prepare(output: &Value) -> Option<(String, ToolBody)> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "rich_reads/tests.rs"]
 mod tests;

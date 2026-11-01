@@ -90,11 +90,11 @@ mod layout {
     use super::super::{
         CONTENT_GUTTER, CONTENT_MAX_WIDTH, CONTROL_HEIGHT, Feedback, LIST_ITEM_HEIGHT, MenuAction,
         NavGroup, ROW_MIN_HEIGHT, SIDEBAR_WIDTH, SelectOption, Status, Tone, breadcrumb, busy,
-        caption, crumb, danger_zone, destructive_button, empty_state, field, form_actions,
-        form_column, inline_error, list_container, list_item, loading_list, monogram,
-        overflow_menu, pill, primary_button, radio_list, radio_option, rows, secondary_button,
-        section, segmented, select, setting_row, settings_nav_item, settings_page,
-        settings_sidebar, skeleton_list_item, status_pill, switch, text_button, value_text,
+        caption, crumb, destructive_button, empty_state, field, form_actions, form_column,
+        inline_error, list_container, list_item, loading_list, monogram, overflow_menu, pill,
+        primary_button, radio_list, radio_option, removal_actions, rows, secondary_button, section,
+        segmented, select, setting_row, settings_nav_item, settings_page, settings_sidebar,
+        skeleton_list_item, status_pill, switch, text_button, value_text,
     };
     use crate::icons::AppIcon;
     use crate::ui::set_dark;
@@ -222,7 +222,7 @@ mod layout {
                 .child(loading_list(2, None))
                 .child(busy(primary_button("gallery-busy", "Install"), true))
                 .child(pill("Disabled after update", Tone::Warning))
-                .child(danger_zone([setting_row(
+                .child(removal_actions([setting_row(
                     "Reset settings",
                     Some("Restore every preference to its default.".into()),
                     Some(destructive_button("gallery-reset", "Reset").into_any_element()),
@@ -274,11 +274,14 @@ mod layout {
     }
 
     #[gpui_kit::test]
-    fn the_content_column_sits_beside_the_sidebar_at_its_maximum_width(cx: &mut TestAppContext) {
+    fn the_content_column_is_centered_in_the_pane_at_its_maximum_width(cx: &mut TestAppContext) {
         let cx = gallery(cx, 1400.);
         assert_eq!(bounds(cx, "sidebar").size.width, px(SIDEBAR_WIDTH));
         let section = bounds(cx, "section");
-        assert_eq!(section.origin.x, px(SIDEBAR_WIDTH + CONTENT_GUTTER));
+        assert_eq!(
+            section.origin.x,
+            px(SIDEBAR_WIDTH + (1400. - SIDEBAR_WIDTH - CONTENT_MAX_WIDTH) / 2.)
+        );
         assert_eq!(section.size.width, px(CONTENT_MAX_WIDTH));
     }
 

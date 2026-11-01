@@ -202,11 +202,7 @@ impl Xylo {
                 let image_id = image.id;
                 if self.add_draft_attachment_to(&key, image, cx) {
                     self.attachments.previews.insert(image_id, path);
-                    self.draft_attachment_notice(
-                        &key,
-                        "Image attached. The selected model must support image input.".into(),
-                        cx,
-                    );
+                    self.draft_attachment_notice(&key, String::new(), cx);
                 }
             }
             Ok(_) => self.draft_attachment_notice(
@@ -304,63 +300,86 @@ impl Xylo {
     /// The draft's images as compact chips: a thumbnail, the name and size,
     /// and a remove control.
     pub(super) fn attachment_strip(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut strip = div().flex().flex_wrap().gap_2();
+        let mut strip = div()
+            .id("chat-attachments")
+            .overflow_x_scroll()
+            .flex()
+            .gap(px(8.));
         for image in self.draft_attachments() {
             let id = image.id;
-            let thumbnail = div()
-                .size(px(40.))
-                .flex_shrink_0()
-                .rounded(px(6.))
-                .overflow_hidden()
-                .bg(rgb(well()))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(match self.attachments.previews.get(&id) {
-                    Some(path) => img(path.clone())
-                        .size(px(40.))
-                        .object_fit(ObjectFit::Cover)
-                        .into_any_element(),
-                    None => icons::small(AppIcon::Image)
-                        .text_color(rgb(icons::rest_color()))
-                        .into_any_element(),
-                });
+            let preview = self.attachments.previews.get(&id).cloned();
+            let title = image.name.clone();
+            let thumbnail = focus_ring(gpui_kit::base::Button::new(SharedString::from(format!(
+                "preview-draft-image-{id}"
+            ))))
+            .accessibility_label(format!("Preview {}", title))
+            .on_click(move |_, window, cx| {
+                use gpui_kit::component::WindowExt;
+                if let Some(path) = preview.clone() {
+                    let title = title.clone();
+                    window.open_dialog(cx, move |dialog, _, _| {
+                        dialog
+                            .title(title.clone())
+                            .width(px(720.))
+                            .rounded(px(16.))
+                            .bg(rgb(panel()))
+                            .child(
+                                img(path.clone())
+                                    .w_full()
+                                    .max_h(px(520.))
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                    });
+                }
+            })
+            .size(px(40.))
+            .flex_shrink_0()
+            .rounded(px(6.))
+            .overflow_hidden()
+            .bg(rgb(well()))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(match self.attachments.previews.get(&id) {
+                Some(path) => img(path.clone())
+                    .size(px(40.))
+                    .object_fit(ObjectFit::Cover)
+                    .into_any_element(),
+                None => icons::small(AppIcon::Image)
+                    .text_color(rgb(icons::rest_color()))
+                    .into_any_element(),
+            });
             strip = strip.child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .p(px(4.))
-                    .pr(px(2.))
+                    .p(px(7.))
+                    .max_w(px(230.))
                     .rounded(px(10.))
                     .border_1()
-                    .border_color(rgb(border()))
-                    .bg(rgb(bg()))
+                    .border_color(rgb(border_strong()))
+                    .bg(rgb(well()))
                     .child(thumbnail)
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .max_w(px(160.))
+                            .max_w(px(138.))
                             .min_w_0()
                             .child(
                                 div()
                                     .single_line()
-                                    .text_size(px(12.5))
+                                    .text_size(px(12.))
                                     .text_color(rgb(text()))
                                     .child(image.name),
                             )
                             .child(
                                 div()
                                     .single_line()
-                                    .text_size(px(11.5))
+                                    .text_size(px(11.))
                                     .text_color(rgb(muted()))
-                                    .child(format!(
-                                        "{} × {} · {} KiB",
-                                        image.width,
-                                        image.height,
-                                        image.bytes.div_ceil(1024)
-                                    )),
+                                    .child(format!("Image · {} KB", image.bytes.div_ceil(1024))),
                             ),
                     )
                     .child(
@@ -369,6 +388,8 @@ impl Xylo {
                             AppIcon::Close,
                             "Remove image",
                         )
+                        .w(px(22.))
+                        .h(px(26.))
                         .on_click(
                             cx.listener(move |view, _, _, cx| view.remove_draft_attachment(id, cx)),
                         ),

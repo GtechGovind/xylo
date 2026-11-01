@@ -1,4 +1,4 @@
-use super::{answer_segment, duration_label, group_summary, has_work, latest_step, phase_label};
+use super::{answer_segment, duration_label, group_summary, has_work, phase_label};
 use crate::state::{ToolCard, TurnState};
 use uuid::Uuid;
 use xylo_core::{EngineEvent, TurnPhase};
@@ -61,7 +61,7 @@ fn activity_follows_phase_and_waiting_approvals() {
     turn.apply(EngineEvent::Phase {
         phase: TurnPhase::Compacting,
     });
-    assert_eq!(phase_label(&turn), "Condensing earlier context…");
+    assert_eq!(phase_label(&turn), "Summarizing earlier messages…");
     turn.apply(EngineEvent::Phase {
         phase: TurnPhase::Retrying {
             attempt: 2,
@@ -101,11 +101,6 @@ fn a_finished_turn_ends_in_its_answer_and_folds_the_steps_before_it() {
         None,
         "A running turn has no answer yet"
     );
-    assert_eq!(
-        latest_step(&turn),
-        None,
-        "A top-level call shows its own running row"
-    );
     turn.apply(EngineEvent::ToolFinished {
         action_id: read,
         name: "file_read".into(),
@@ -113,7 +108,6 @@ fn a_finished_turn_ends_in_its_answer_and_folds_the_steps_before_it() {
         success: true,
         parent_id: None,
     });
-    assert_eq!(latest_step(&turn), None, "Nothing is in flight");
     turn.apply(EngineEvent::Completed {
         text: "It starts in main.".into(),
         usage: Default::default(),
@@ -129,19 +123,6 @@ fn a_finished_turn_ends_in_its_answer_and_folds_the_steps_before_it() {
     });
     assert_eq!(answer_segment(&plain), Some(0));
     assert!(!has_work(&plain), "A plain reply has nothing to summarise");
-}
-
-#[test]
-fn the_activity_line_names_a_helper_agents_call_on_one_line() {
-    let mut turn = TurnState::default();
-    turn.apply(EngineEvent::Started);
-    turn.apply(EngineEvent::ToolStarted {
-        action_id: Uuid::new_v4(),
-        name: "search_project".into(),
-        arguments: serde_json::json!({"query": "first\nsecond"}),
-        parent_id: Some(Uuid::new_v4()),
-    });
-    assert_eq!(latest_step(&turn).as_deref(), Some("Search first second"));
 }
 
 #[test]

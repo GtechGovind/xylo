@@ -95,6 +95,9 @@ pub(crate) fn register_user_turn_in_transaction(
     conversation.updated_at = timestamp;
     conn.execute("INSERT INTO conversations(id,json,updated_at) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET json=excluded.json,updated_at=excluded.updated_at",params![turn.session_id.to_string(),serde_json::to_string(&conversation)?,timestamp])?;
     let message = ChatMessage {
+        activity_count: 0,
+        activity_summary: None,
+        turn_id: Some(turn.turn_id),
         reasoning: None,
         id: message_id,
         session_id: turn.session_id,
@@ -479,10 +482,10 @@ impl Store {
             status != MessageStatus::Complete,
             "Use complete_turn for completed replies"
         );
-        if text.trim().is_empty() {
-            return Ok(());
-        }
-        let message = ChatMessage {
+        let mut message = ChatMessage {
+            activity_count: 0,
+            activity_summary: None,
+            turn_id: Some(turn_id),
             reasoning: None,
             id: interrupted_reply_id(turn_id),
             session_id,
@@ -500,6 +503,7 @@ impl Store {
                 |row| row.get(0),
             )?;
             if !completed {
+                crate::turn_activity::hydrate_activity(&tx, &mut message)?;
                 tx.execute(
                     "INSERT INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET json=excluded.json",
                     params![message.id.to_string(), session_id.to_string(), serde_json::to_string(&message)?, message.created_at],
@@ -583,7 +587,11 @@ impl Store {
         })
     }
     pub fn messages(&self, session_id: Uuid, limit: usize) -> Result<Vec<ChatMessage>> {
-        self.call(move |conn| { json_rows(conn,"SELECT json FROM (SELECT rowid,json,created_at FROM messages WHERE session_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT ?2) ORDER BY created_at,rowid",params![session_id.to_string(),limit.min(MAX_PAGE) as i64]) })
+        self.call(move |conn| {
+            let mut messages: Vec<ChatMessage> = json_rows(conn,"SELECT json FROM (SELECT rowid,json,created_at FROM messages WHERE session_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT ?2) ORDER BY created_at,rowid",params![session_id.to_string(),limit.min(MAX_PAGE) as i64])?;
+            for message in &mut messages { crate::turn_activity::hydrate_activity(conn, message)?; }
+            Ok(messages)
+        })
     }
     /// Pages display history in append order, independently of tied wall clocks.
     /// `before` in the result is the cursor for the next older page, when present.
@@ -608,7 +616,8 @@ impl Store {
             rows.truncate(limit);
             let next_before = has_more.then(|| rows.last().map(|row| row.0)).flatten();
             rows.reverse();
-            let messages = rows.into_iter().map(|(_, json)| serde_json::from_str(&json).map_err(Into::into)).collect::<Result<Vec<_>>>()?;
+            let mut messages = rows.into_iter().map(|(_, json)| serde_json::from_str::<ChatMessage>(&json).map_err(Into::into)).collect::<Result<Vec<_>>>()?;
+            for message in &mut messages { crate::turn_activity::hydrate_activity(conn, message)?; }
             Ok(HistoryPage { session_id, messages, before: next_before, has_more })
         })
     }
@@ -703,7 +712,8 @@ impl Store {
             if let Some(existing)=existing{ensure!(serde_json::from_str::<Value>(&existing)?==serde_json::from_str::<Value>(&receipt_json)?,"Turn was already completed with a different result");return Ok(())}
             let timestamp=now_ms();
             crate::checkpoint::write_rows(&tx,session_id,turn_id,&messages,None,timestamp)?;
-            let message=ChatMessage{ reasoning,id:assistant_reply_id(turn_id),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new(), status,};
+            let mut message=ChatMessage{ activity_count: 0, activity_summary: None, turn_id: Some(turn_id), reasoning,id:assistant_reply_id(turn_id),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new(), status,};
+            crate::turn_activity::hydrate_activity(&tx, &mut message)?;
             tx.execute("INSERT INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4)",params![message.id.to_string(),session_id.to_string(),serde_json::to_string(&message)?,timestamp])?;
             tx.execute("DELETE FROM messages WHERE id=?1",[interrupted_reply_id(turn_id).to_string()])?;
             tx.execute("INSERT INTO completed_turns(session_id,turn_id,json,completed_at) VALUES(?1,?2,?3,?4)",params![session_id.to_string(),turn_id.to_string(),receipt_json,timestamp])?;

@@ -32,13 +32,52 @@ image={version="=0.25.10",default-features=false,features=["png"]}
 
 [workspace]
 
-# Match the desktop application's development debug information setting.
+# Capture and acceptance executables are regenerated on demand. Keep their
+# large copied desktop sources out of incremental caches and debug symbols.
 [profile.dev]
-debug = 1
+debug = false
+incremental = false
 
 # Same as the main workspace: dependencies lightly optimized in development.
 [profile.dev.package."*"]
 opt-level = 1
+debug = false
+
+# This is a separate workspace, so its path dependencies otherwise inherit
+# the wildcard dependency profile. Match the main workspace's local crates
+# to reuse their artifacts when the enabled features also match.
+[profile.dev.package.xylo-core]
+opt-level = 0
+debug = 1
+incremental = true
+[profile.dev.package.xylo-distribution]
+opt-level = 0
+debug = 1
+incremental = true
+[profile.dev.package.xylo-helper-client]
+opt-level = 0
+debug = 1
+incremental = true
+[profile.dev.package.xylo-notifications]
+opt-level = 0
+debug = 1
+incremental = true
+[profile.dev.package.xylo-resources]
+opt-level = 0
+debug = 1
+incremental = true
+[profile.dev.package.xylo-runtime]
+opt-level = 0
+debug = 1
+incremental = true
+[profile.dev.package.xylo-scheduler]
+opt-level = 0
+debug = 1
+incremental = true
+[profile.dev.package.xylo-services]
+opt-level = 0
+debug = 1
+incremental = true
 
 [profile.release]
 lto = "thin"

@@ -34,10 +34,11 @@ use uuid::Uuid;
 use xylo_core::*;
 use xylo_helper_client::HelperClient;
 use xylo_resources::{ResourceLease, ResourceManager, TaskDemand};
-pub use xylo_services::McpPromptCommand;
 use xylo_services::settings_files::{PermissionDecision, PermissionRule, SettingsFiles};
 use xylo_services::{ConnectorBroker, CredentialVault, SqliteMemory, Store};
+pub use xylo_services::{JournalAction, McpPromptCommand, TurnActivityPage};
 mod action_control;
+mod activity_control;
 mod credential_control;
 mod document_control;
 mod export_control;
@@ -46,12 +47,14 @@ mod git_review_control;
 mod image_control;
 mod mcp_control;
 mod notice_control;
+mod output_control;
 mod provider_control;
 mod settings_control;
 mod steering_control;
 mod turn_queue_control;
 mod update_control;
 mod usage_control;
+pub use output_control::CommandOutputPage;
 mod web_search_control;
 mod worker_control;
 mod worktree_control;
@@ -65,6 +68,38 @@ pub struct ConnectorMutationReceipt {
 
 #[derive(Clone)]
 pub enum HostEvent {
+    SubagentActivity {
+        request_id: Uuid,
+        session: Uuid,
+        result: std::result::Result<Vec<JournalAction>, String>,
+    },
+    TurnActivity {
+        request_id: Uuid,
+        session: Uuid,
+        turn: Uuid,
+        result: std::result::Result<xylo_services::TurnActivityPage, String>,
+    },
+    TurnAction {
+        request_id: Uuid,
+        session: Uuid,
+        turn: Uuid,
+        action: Uuid,
+        result: std::result::Result<Option<xylo_services::JournalAction>, String>,
+    },
+    CommandOutput {
+        request_id: Uuid,
+        session: Uuid,
+        turn: Uuid,
+        job: Uuid,
+        result: std::result::Result<CommandOutputPage, String>,
+    },
+    CommandOutputCopy {
+        request_id: Uuid,
+        session: Uuid,
+        turn: Uuid,
+        job: Uuid,
+        result: std::result::Result<String, String>,
+    },
     Usage {
         request_id: Uuid,
         session_id: Uuid,
@@ -204,6 +239,11 @@ pub enum HostEvent {
         session_id: Uuid,
         attachment_id: Uuid,
         result: std::result::Result<PathBuf, String>,
+    },
+    ChatSearch {
+        request_id: Uuid,
+        session: Uuid,
+        result: std::result::Result<Vec<(Uuid, String)>, String>,
     },
     HistorySearch {
         request_id: Uuid,
@@ -361,6 +401,12 @@ pub enum HostEvent {
 }
 
 enum HostCommand {
+    SubagentActivity(Uuid, Uuid),
+    TurnActivity(Uuid, Uuid, Uuid, Option<i64>),
+    TurnAction(Uuid, Uuid, Uuid, Uuid),
+    CommandOutput(Uuid, Uuid, Uuid, Uuid, u64),
+    CommandOutputEnd(Uuid, Uuid, Uuid, Uuid),
+    CommandOutputCopy(Uuid, Uuid, Uuid, Uuid),
     Usage(Uuid, Uuid, Vec<Uuid>, i64, i64, Option<PathBuf>),
     OutputStyles(Uuid, PathBuf),
     StatusLine(Uuid, PathBuf, Value),
@@ -376,6 +422,7 @@ enum HostCommand {
     Foreground(bool),
     DraftLoad(Uuid, crate::drafts::DraftKey),
     DraftSave(Uuid, crate::drafts::DraftWrite),
+    PreserveDraft(Uuid, crate::drafts::DraftWrite, Vec<ImageAttachment>),
     DraftList(
         Uuid,
         Option<PathBuf>,
@@ -386,6 +433,7 @@ enum HostCommand {
     ImageImport(Uuid, Uuid, PathBuf, AttachmentSource),
     ImagePreview(Uuid, ImageAttachment),
     SearchHistory(Uuid, String, Option<ConversationCursor>, usize),
+    SearchChat(Uuid, Uuid, String),
     HistoryWindow(Uuid, Uuid, usize),
     HistoryAfter(Uuid, i64, usize),
     WorkspaceRefresh,
@@ -417,7 +465,10 @@ enum HostCommand {
     Remember(Uuid, MemoryRecord),
     QueueDraft(Uuid, TurnRequest, crate::drafts::DraftSubmission),
     ListTurnQueue(Uuid, Uuid),
+    SetTurnQueuePaused(Uuid, Uuid, bool),
+    SteerQueuedTurn(Uuid, Uuid, Uuid),
     RemoveQueuedTurn(Uuid, Uuid, Uuid),
+    RestoreQueuedTurn(Uuid, Uuid, Uuid),
     RunQueuedTurn(Uuid, Uuid, Uuid),
     Connectors,
     SaveConnector(ConnectorConfig),
@@ -488,6 +539,7 @@ impl HostClient {
                 let store = Store::open(&paths.database)?;
                 let database_reset = store.reset_notice();
                 let recovered = store.recover_interrupted()?;
+                if recovered > 0 { tracing::debug!(recovered, "Retained interrupted action outcomes"); }
                 store.recover_steering()?;
                 store.recover_turn_queue()?;
                 let (mut settings, settings_reset) = startup_settings(&store)?;
@@ -603,7 +655,6 @@ impl HostClient {
                         state.events.send(HostEvent::Status(notice)).await?;
                     }
                     if memory_setup_needed {state.events.send(HostEvent::Status("Semantic search needs setup in Downloads. Your saved memories remain searchable.".into())).await?;}
-                    if recovered > 0 {state.events.send(HostEvent::Status(format!("Recovered {recovered} interrupted actions; uncertain writes require review"))).await?;}
                     if let Err(error) = state.cleanup_archived_worktrees().await { tracing::warn!(%error, "Retained worktree cleanup needs review"); }
                     state.send_conversations().await?;
                     let scheduling_state=state.clone();
@@ -712,6 +763,15 @@ impl HostClient {
     }
     pub fn save_draft(&self, request_id: Uuid, write: crate::drafts::DraftWrite) -> Result<()> {
         self.enqueue(HostCommand::DraftSave(request_id, write))
+    }
+    /// Copies images into the backup chat before acknowledging its durable draft.
+    pub fn preserve_draft(
+        &self,
+        id: Uuid,
+        write: crate::drafts::DraftWrite,
+        validate: Vec<ImageAttachment>,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::PreserveDraft(id, write, validate))
     }
     pub fn list_drafts(
         &self,
@@ -828,6 +888,9 @@ impl HostClient {
     /// answered with `HostEvent::Settings`.
     pub fn remove_provider(&self, provider: ProviderConfig) -> Result<()> {
         self.enqueue(HostCommand::RemoveProvider(provider))
+    }
+    pub fn search_chat(&self, id: Uuid, session: Uuid, query: String) -> Result<()> {
+        self.enqueue(HostCommand::SearchChat(id, session, query))
     }
     pub fn search_history(
         &self,
@@ -1245,6 +1308,9 @@ impl HostState {
                     return Ok(false);
                 }
                 HostCommand::ListTurnQueue(id, session)
+                | HostCommand::SteerQueuedTurn(id, session, _)
+                | HostCommand::SetTurnQueuePaused(id, session, _)
+                | HostCommand::RestoreQueuedTurn(id, session, _)
                 | HostCommand::RemoveQueuedTurn(id, session, _)
                 | HostCommand::RunQueuedTurn(id, session, _) => {
                     self.emit_turn_queue(
@@ -1317,6 +1383,7 @@ impl HostState {
                 }
                 HostCommand::DraftLoad(id, _)
                 | HostCommand::DraftSave(id, _)
+                | HostCommand::PreserveDraft(id, _, _)
                 | HostCommand::DraftList(id, _, _, _)
                 | HostCommand::DraftSubmit(id, _, _) => {
                     let message = "Wait for the update installation to finish".to_owned();
@@ -1325,10 +1392,12 @@ impl HostState {
                             request_id: *id,
                             result: Err(message),
                         },
-                        HostCommand::DraftSave(_, _) => HostEvent::DraftSaved {
-                            request_id: *id,
-                            result: Err(message),
-                        },
+                        HostCommand::DraftSave(_, _) | HostCommand::PreserveDraft(_, _, _) => {
+                            HostEvent::DraftSaved {
+                                request_id: *id,
+                                result: Err(message),
+                            }
+                        }
                         HostCommand::DraftList(_, _, _, _) => HostEvent::Drafts {
                             request_id: *id,
                             result: Err(message),
@@ -1577,8 +1646,18 @@ impl HostState {
             HostCommand::ListTurnQueue(id, session) => {
                 self.handle_list_turn_queue(id, session).await?
             }
+            HostCommand::SteerQueuedTurn(id, session, item) => {
+                self.handle_steer_queued_turn(id, session, item).await?
+            }
+            HostCommand::SetTurnQueuePaused(id, session, paused) => {
+                self.handle_set_turn_queue_paused(id, session, paused)
+                    .await?
+            }
             HostCommand::RemoveQueuedTurn(id, session, item) => {
                 self.handle_remove_queued_turn(id, session, item).await?
+            }
+            HostCommand::RestoreQueuedTurn(id, session, item) => {
+                self.handle_restore_queued_turn(id, session, item).await?
             }
             HostCommand::RunQueuedTurn(id, session, item) => {
                 self.handle_run_queued_turn(id, session, item).await?
@@ -1590,6 +1669,19 @@ impl HostState {
                     .map_err(|error| error.to_string());
                 self.events
                     .send(HostEvent::DraftLoaded { request_id, result })
+                    .await?;
+            }
+            HostCommand::PreserveDraft(request_id, write, validate) => {
+                let result = crate::drafts::preserve(
+                    self.store.clone(),
+                    self.paths.artifacts.clone(),
+                    write,
+                    validate,
+                )
+                .await
+                .map_err(|error| error.to_string());
+                self.events
+                    .send(HostEvent::DraftSaved { request_id, result })
                     .await?;
             }
             HostCommand::DraftSave(request_id, write) => {
@@ -1664,6 +1756,20 @@ impl HostState {
                         request_id,
                         session_id,
                         attachment_id,
+                        result,
+                    })
+                    .await?;
+            }
+            HostCommand::SearchChat(id, session, query) => {
+                let store = self.store.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || store.search_chat(session, &query))
+                        .await?
+                        .map_err(|error| error.to_string());
+                self.events
+                    .send(HostEvent::ChatSearch {
+                        request_id: id,
+                        session,
                         result,
                     })
                     .await?;
@@ -1753,6 +1859,24 @@ impl HostState {
                     .await?
             }
             HostCommand::OutputStyles(id, workspace) => self.output_styles(id, workspace).await?,
+            HostCommand::SubagentActivity(id, session) => {
+                self.subagent_activity(id, session).await?
+            }
+            HostCommand::TurnActivity(id, session, turn, after) => {
+                self.turn_activity(id, session, turn, after).await?
+            }
+            HostCommand::TurnAction(id, session, turn, action) => {
+                self.turn_action(id, session, turn, action).await?
+            }
+            HostCommand::CommandOutput(id, session, turn, job, offset) => {
+                self.command_output(id, session, turn, job, offset).await?
+            }
+            HostCommand::CommandOutputEnd(id, session, turn, job) => {
+                self.command_output_end(id, session, turn, job).await?
+            }
+            HostCommand::CommandOutputCopy(id, session, turn, job) => {
+                self.command_output_copy(id, session, turn, job).await?
+            }
             HostCommand::StatusLine(id, workspace, input) => {
                 self.status_line(id, workspace, input).await?
             }

@@ -1,7 +1,7 @@
 //! The live turn, the way Codex reads: while it runs, its text and tool calls
 //! stream in order and one activity line at the bottom says what is happening
 //! (phase, latest step, elapsed time, Esc to stop). When it finishes, the work
-//! folds under a single "Worked for 1m 12s" line and only the answer stays
+//! folds under a single "Activity · 1m 12s" line and only the answer stays
 //! full size, followed by its action row. Activity and answer share one left
 //! edge; there is no avatar gutter.
 //!
@@ -58,7 +58,7 @@ fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
         "connector_prompts" | "connector_prompt_get" => ("Loaded", "MCP prompt", "MCP prompts"),
         "ask_user" => ("Asked", "question", "questions"),
         "exit_plan_mode" => ("Reviewed", "plan", "plans"),
-        "schedule_wakeup" => ("Scheduled", "wakeup", "wakeups"),
+        "schedule_wakeup" => ("Scheduled", "follow-up", "follow-ups"),
         "lsp" => ("Inspected", "code location", "code locations"),
         "worktree_enter" | "worktree_exit" => ("Changed", "worktree", "worktrees"),
         "file_read" | "read_file" => ("Read", "file", "files"),
@@ -71,7 +71,7 @@ fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
         "file_write" | "file_edit" | "notebook_edit" | "write_file" | "edit_file" => {
             ("Edited", "file", "files")
         }
-        "shell_output" => ("Read", "job output", "job outputs"),
+        "shell_output" => ("Read", "command output", "command outputs"),
         "shell_kill" => ("Stopped", "shell job", "shell jobs"),
         "shell_jobs" => ("Listed", "shell job", "shell jobs"),
         "web_fetch" | "browser" => ("Fetched", "page", "pages"),
@@ -95,6 +95,9 @@ pub(super) fn duration_label(ms: i64) -> String {
 
 /// The live activity of a running turn, in plain words.
 pub(super) fn phase_label(turn: &TurnState) -> String {
+    if turn.cancel_requested {
+        return "Stopping…".into();
+    }
     if let Some(tool) = turn.pending_approvals().next() {
         return match tool.name.as_str() {
             "ask_user" => "Waiting for your answers",
@@ -107,10 +110,22 @@ pub(super) fn phase_label(turn: &TurnState) -> String {
         Some(TurnPhase::Preparing) => "Preparing…".into(),
         Some(TurnPhase::Thinking) => "Thinking…".into(),
         Some(TurnPhase::Responding) => "Responding…".into(),
-        Some(TurnPhase::RunningTools) => "Running tools…".into(),
+        Some(TurnPhase::RunningTools) => turn
+            .tools
+            .iter()
+            .rev()
+            .find(|tool| tool.success.is_none() && !tool.not_completed)
+            .map(|tool| match tool.name.as_str() {
+                "run_command" | "shell_command" => "Running command…",
+                "file_read" | "read_file" | "files_list" => "Reading files…",
+                "search_project" | "find_files" | "web_search" => "Searching…",
+                _ => "Working…",
+            })
+            .unwrap_or("Working…")
+            .into(),
         Some(TurnPhase::WaitingForApproval) => "Waiting for approval".into(),
-        Some(TurnPhase::Compacting) => "Condensing earlier context…".into(),
-        Some(TurnPhase::Delegating) => "Helper agent working…".into(),
+        Some(TurnPhase::Compacting) => "Summarizing earlier messages…".into(),
+        Some(TurnPhase::Delegating) => "Working on a subtask…".into(),
         Some(TurnPhase::Retrying { attempt, delay_ms }) => {
             let waited = (now_ms() - turn.phase_since).max(0) as u64;
             let seconds = delay_ms.saturating_sub(waited).div_ceil(1000);
@@ -124,39 +139,24 @@ pub(super) fn phase_label(turn: &TurnState) -> String {
     }
 }
 
-/// A helper agent's call in flight, as its row reads ("Read src/main.rs"),
-/// for the activity line. A top-level call already shows its own running row
-/// just above the line, so it is not repeated; nothing once every call has
-/// reported back.
-pub(super) fn latest_step(turn: &TurnState) -> Option<String> {
-    let tool = turn.tools.last()?;
-    if tool.parent_id.is_none() || tool.approval || tool.success.is_some() {
-        return None;
-    }
-    let shown = &tool.presentation;
-    Some(one_line(&format!("{} {}", shown.verb, shown.target)))
-}
-
 /// The segment that is the turn's answer: the text it ended with. A turn that
 /// is still running has no answer yet.
 pub(super) fn answer_segment(turn: &TurnState) -> Option<usize> {
     if turn.running || turn.outcome.is_none() {
         return None;
     }
-    match turn.segments.last() {
-        Some(Segment::Text(text)) if !text.trim().is_empty() => Some(turn.segments.len() - 1),
-        _ => None,
-    }
+    turn.segments
+        .iter()
+        .rposition(|segment| matches!(segment, Segment::Text(text) if !text.trim().is_empty()))
 }
 
 /// Whether a finished turn did anything besides answering, so it has work to
 /// summarise. Harness notes alone are not work.
 pub(super) fn has_work(turn: &TurnState) -> bool {
     let answer = answer_segment(turn);
-    turn.segments
-        .iter()
-        .enumerate()
-        .any(|(index, segment)| Some(index) != answer && !matches!(segment, Segment::Note { .. }))
+    turn.segments.iter().enumerate().any(|(index, segment)| {
+        Some(index) != answer && !matches!(segment, Segment::Note { .. } | Segment::Thinking(_))
+    })
 }
 
 /// A harness note in the transcript: quiet, one line per sentence, marked as
@@ -220,7 +220,7 @@ impl Xylo {
         let answer = answer_segment(turn);
         let folded = self.work_folded(turn);
         if folded && Some(index) != answer {
-            return self.folded_segment(turn, index, cx);
+            return self.folded_segment(turn, index, window, cx);
         }
         // A finished turn's notes are steps: they live inside its work, and a
         // turn that only answered has no steps to show.
@@ -228,6 +228,10 @@ impl Xylo {
             && turn.outcome.is_some()
             && !has_work(turn)
             && matches!(turn.segments[index], Segment::Note { .. })
+        {
+            return div().into_any_element();
+        }
+        if !turn.running && !has_work(turn) && matches!(turn.segments[index], Segment::Thinking(_))
         {
             return div().into_any_element();
         }
@@ -241,14 +245,33 @@ impl Xylo {
             Segment::Tools(ids) => self.tool_group_row(turn, ids, window, cx),
             Segment::Subagent(id) => self.subagent_row(turn, *id, window, cx),
             Segment::Note { text, .. } => note_row(text.clone()),
-            Segment::Thinking(text) => self.thinking_block(
-                Uuid::new_v5(
-                    &self.session,
-                    format!("thinking-{}-{index}", turn.started_at.unwrap_or_default()).as_bytes(),
-                ),
-                text.clone(),
-                cx,
-            ),
+            Segment::Thinking(_) => {
+                let first = turn.segments.iter().position(
+                    |segment| matches!(segment, Segment::Thinking(text) if !text.trim().is_empty()),
+                );
+                if first != Some(index) {
+                    return div().into_any_element();
+                }
+                let text = turn
+                    .segments
+                    .iter()
+                    .filter_map(|segment| match segment {
+                        Segment::Thinking(text) if !text.trim().is_empty() => Some(text.as_ref()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                self.thinking_block(
+                    Uuid::new_v5(
+                        &self.session,
+                        format!("thinking-{}-{index}", turn.started_at.unwrap_or_default())
+                            .as_bytes(),
+                    ),
+                    text.into(),
+                    window,
+                    cx,
+                )
+            }
         };
         motion::fade_slide_in(
             ElementId::NamedInteger(format!("live-row-{}", self.session).into(), index as u64),
@@ -267,12 +290,12 @@ impl Xylo {
     /// A finished turn shows only its answer until the reader opens its work.
     pub(super) fn work_folded(&self, turn: &TurnState) -> bool {
         !turn.running
-            && turn.outcome.is_some()
+            && matches!(turn.outcome, Some(crate::state::TurnOutcome::Completed))
             && has_work(turn)
             && !self.expanded_tools.contains(&self.work_key(turn))
     }
 
-    /// "Worked for 1m 12s ›" above a finished turn; nothing while it runs or
+    /// "Activity · 1m 12s ›" above a finished turn; nothing while it runs or
     /// when the turn only answered.
     fn work_summary(
         &self,
@@ -286,62 +309,97 @@ impl Xylo {
         let key = self.work_key(turn);
         let open = self.expanded_tools.contains(&key);
         let disclosure = Disclosure::new(ElementId::Uuid(key), open, window, cx);
-        let label = format!("Worked for {}", duration_label(turn.elapsed_ms()));
+        let label = if turn.tools.is_empty() {
+            "Reviewed the request".to_owned()
+        } else {
+            group_summary(turn.tools.iter())
+        };
         div()
             .w_full()
-            .pt(px(6.))
-            .pb(px(8.))
+            .mb(px(18.))
             .flex()
             .items_center()
-            .gap(px(10.))
             .child(
                 focus_ring(gpui_kit::base::Button::new("turn-summary"))
+                    .aria_expanded(open)
                     .accessibility_label(format!(
                         "{label}. {}",
-                        if open { "Hide steps" } else { "Show steps" }
+                        if open {
+                            "Hide activity"
+                        } else {
+                            "Show activity"
+                        }
                     ))
-                    .ml(px(-6.))
-                    .px(px(6.))
-                    .h(px(26.))
+                    .ml(px(-5.))
+                    .px(px(5.))
+                    .h(px(32.))
                     .rounded(px(6.))
                     .flex()
                     .items_center()
-                    .gap(px(4.))
+                    .gap(px(8.))
                     .cursor_pointer()
                     .text_size(px(13.))
                     .text_color(rgb(muted()))
-                    .hover(|style| style.text_color(rgb(text_secondary())))
-                    .child(div().single_line().child(label))
-                    .child(disclosure.chevron())
+                    .hover(|style| style.bg(rgb(panel())).text_color(rgb(text())))
+                    .child(
+                        icons::small(
+                            if turn.outcome == Some(crate::state::TurnOutcome::Completed) {
+                                AppIcon::Done
+                            } else {
+                                AppIcon::Info
+                            },
+                        )
+                        .size(px(17.)),
+                    )
+                    .child(label)
+                    .child(disclosure.chevron().size(px(13.)))
                     .on_click(cx.listener(move |view, _, _, cx| view.toggle_expanded(key, cx))),
             )
-            .child(div().flex_1().h(px(1.)).bg(rgb(border())))
             .into_any_element()
     }
 
     /// A folded work segment: only generated images stay, since they are
     /// results rather than steps.
-    fn folded_segment(&self, turn: &TurnState, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let Some(Segment::Tools(ids)) = turn.segments.get(index) else {
-            return div().into_any_element();
-        };
-        let images: Vec<AnyElement> = ids
-            .iter()
-            .filter_map(|id| turn.tool(*id))
-            .filter(|tool| tool.name == "image_generate" && tool.success == Some(true))
-            .map(|tool| self.generated_tool_image_card(tool, cx))
-            .collect();
-        if images.is_empty() {
-            return div().into_any_element();
+    fn folded_segment(
+        &self,
+        turn: &TurnState,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match turn.segments.get(index) {
+            Some(Segment::Tools(ids)) => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(
+                    ids.iter()
+                        .filter_map(|id| {
+                            turn.tools
+                                .iter()
+                                .enumerate()
+                                .find(|(_, tool)| tool.id == *id)
+                        })
+                        .filter(|(_, tool)| {
+                            tool.success != Some(true)
+                                || tool.name == "image_generate"
+                                || self
+                                    .tool_command_job(tool)
+                                    .is_some_and(|job| job.running || job.exit_code != Some(0))
+                        })
+                        .map(|(i, tool)| self.tool_row(i, tool, window, cx)),
+                )
+                .into_any_element(),
+            Some(Segment::Subagent(id))
+                if turn
+                    .subagent(*id)
+                    .is_some_and(|agent| agent.state != SubagentState::Completed) =>
+            {
+                self.subagent_row(turn, *id, window, cx)
+            }
+            _ => div().into_any_element(),
         }
-        div()
-            .w_full()
-            .py(px(4.))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .children(images)
-            .into_any_element()
     }
 
     /// Consecutive finished calls collapse into one summary row; running,
@@ -364,7 +422,10 @@ impl Xylo {
                 // Earlier checklists fold into the newest one.
                 continue;
             }
-            if tool.is_done() && !always_visible(tool) {
+            if tool.is_done()
+                && !always_visible(tool)
+                && !self.tool_command_job(tool).is_some_and(|job| job.running)
+            {
                 run.push(index);
                 continue;
             }
@@ -388,7 +449,7 @@ impl Xylo {
         let merged = merge_identical(&turn.tools, &indices);
         match merged.as_slice() {
             [] => None,
-            [single] => Some(self.call_run_row(turn, *single, window, cx)),
+            [single] => Some(self.call_run_row(turn, single.clone(), window, cx)),
             _ => Some(self.collapsed_group(turn, &indices, &merged, window, cx)),
         }
     }
@@ -409,6 +470,9 @@ impl Xylo {
         let disclosure = Disclosure::new(ElementId::Uuid(key), expanded, window, cx);
         let summary = group_summary(indices.iter().map(|index| &turn.tools[*index]));
         let header = focus_ring(gpui_kit::base::Button::new(("tool-group", first)))
+            .self_start()
+            .max_w_full()
+            .aria_expanded(expanded)
             .accessibility_label(format!(
                 "{summary}. {}",
                 if expanded { "Hide calls" } else { "Show calls" }
@@ -420,7 +484,7 @@ impl Xylo {
             .justify_start()
             .gap(px(4.))
             .px(px(8.))
-            .h(px(30.))
+            .min_h(px(CONTROL_SIZE))
             .rounded(px(8.))
             .cursor_pointer()
             .text_color(rgb(muted()))
@@ -442,22 +506,22 @@ impl Xylo {
         let mut group = div().w_full().flex().flex_col().child(header);
         if disclosure.is_visible() {
             let mut calls = div()
-                .ml(px(6.))
-                .pl(px(12.))
+                .ml(px(7.))
+                .pl(px(16.))
                 .border_l_1()
                 .border_color(rgb(border()))
                 .flex()
                 .flex_col();
             for run in rows {
-                calls = calls.child(self.call_run_row(turn, *run, window, cx));
+                calls = calls.child(self.call_run_row(turn, run.clone(), window, cx));
             }
             group = group.child(disclosure.reveal(calls, window, cx));
         }
         group.into_any_element()
     }
 
-    /// "Agent · task · 12 tool calls · 1m 04s"; its calls fold underneath and
-    /// its final answer follows as markdown.
+    /// Task identity and compact progress, with calls underneath and a small
+    /// action opening the result in the task panel.
     fn subagent_row(
         &self,
         turn: &TurnState,
@@ -476,62 +540,66 @@ impl Xylo {
         let expanded = self.expanded_tools.contains(&key);
         let disclosure = Disclosure::new(ElementId::Uuid(key), expanded, window, cx);
         let calls = agent.tools.len();
+        let (role, icon) = subagent_identity(&agent.task);
         let meta = format!(
-            "{calls} tool call{} · {}",
+            "{role} · {calls} tool{} · {}",
             if calls == 1 { "" } else { "s" },
             duration_label(agent.elapsed_ms())
         );
         let header = focus_ring(gpui_kit::base::Button::new(("subagent", card_index)))
+            .aria_expanded(expanded)
             .accessibility_label(format!(
-                "Helper agent: {}. {meta}. {}",
+                "Subtask: {}. {}. {meta}. {}",
                 agent.task,
+                match agent.state {
+                    SubagentState::Running => "Running",
+                    SubagentState::Completed => "Completed",
+                    SubagentState::Failed => "Failed",
+                    SubagentState::NotCompleted => "Incomplete",
+                },
                 if expanded { "Hide calls" } else { "Show calls" }
             ))
             .mx(px(-8.))
             .min_w_0()
             .flex()
-            .items_center()
+            .items_start()
             .justify_start()
             .gap(px(8.))
             .px(px(8.))
-            .h(px(30.))
+            .py(px(5.))
+            .min_h(px(CONTROL_SIZE))
             .rounded(px(8.))
             .cursor_pointer()
             .hover(|style| style.bg(rgb(hover())))
             .child(
-                icons::small(AppIcon::Agent)
-                    .flex_shrink_0()
-                    .text_color(rgb(icons::rest_color())),
-            )
-            .child(
                 div()
+                    .pt(px(2.))
                     .flex_shrink_0()
-                    .single_line()
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(text_secondary()))
-                    .child(if card.name == crate::state::DELEGATE_TOOL {
-                        "Agent"
-                    } else {
-                        "Skill"
-                    }),
+                    .child(icons::small(icon).text_color(rgb(icons::rest_color()))),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .single_line()
-                    .text_size(px(13.))
-                    .text_color(rgb(muted()))
-                    .child(one_line(&agent.task)),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .single_line()
-                    .text_size(px(11.5))
-                    .text_color(rgb(faint()))
-                    .child(meta),
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .line_clamp(2)
+                            .text_size(px(13.))
+                            .line_height(relative(1.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(text_secondary()))
+                            .child(one_line(&agent.task)),
+                    )
+                    .child(
+                        div()
+                            .single_line()
+                            .text_size(px(11.))
+                            .text_color(rgb(muted()))
+                            .child(meta),
+                    ),
             )
             .children(
                 subagent_state_icon(agent.state).map(|mark| div().flex_shrink_0().child(mark)),
@@ -587,24 +655,22 @@ impl Xylo {
                 disclosure.reveal(children, window, cx)
             });
         }
-        if let Some(summary) = agent.summary.clone() {
-            let failed = agent.state == SubagentState::Failed;
+        if agent
+            .summary
+            .as_ref()
+            .is_some_and(|summary| !summary.trim().is_empty())
+        {
             row = row.child(
-                div()
-                    .ml(px(6.))
-                    .pl(px(12.))
-                    .border_l_1()
-                    .border_color(rgb(if failed { danger() } else { border() }))
-                    .text_size(px(14.))
-                    .line_height(relative(1.6))
-                    .text_color(rgb(if failed { danger() } else { text_secondary() }))
-                    .child(
-                        TextView::markdown(
-                            SharedString::from(format!("subagent-summary-{id}")),
-                            summary,
-                        )
-                        .selectable(true),
-                    ),
+                super::tools::detail_action(("subagent-open-result", card_index), "View result")
+                    .self_start()
+                    .ml(px(14.))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.expanded_tools
+                            .insert(Uuid::new_v5(&id, b"panel-output"));
+                        view.settings.ui.work_panel = "details".into();
+                        view.settings.ui.work_panel_open = true;
+                        cx.notify();
+                    })),
             );
         }
         row.into_any_element()
@@ -622,16 +688,41 @@ impl Xylo {
         match turn {
             Some(turn) if turn.running => {
                 self.keep_turn_clock(window, cx);
-                activity_line(
-                    phase_label(turn),
-                    latest_step(turn),
-                    turn.elapsed_ms(),
-                    turn.pending_approvals().next().is_some(),
-                )
+                div().into_any_element()
             }
-            _ if self.sending_turn() => self.waiting_line("Sending…", window, cx),
+            _ if self.sending_turn() => div().into_any_element(),
             Some(turn) if turn.resend => self.waiting_line("Retrying…", window, cx),
-            Some(turn) if turn.stopped() => stopped_marker(),
+            Some(turn) if turn.stopped() => div()
+                .w_full()
+                .my(px(18.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(stopped_marker())
+                .child(
+                    button("continue-stopped-task", "Continue")
+                        .text_size(px(13.))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            if !view.running()
+                                && !view.sending_turn()
+                                && view
+                                    .turns
+                                    .get(&view.session)
+                                    .is_some_and(|turn| turn.stopped())
+                            {
+                                view.submit_message_payload(
+                                    super::super::drafts::MessagePayload {
+                                        text:
+                                            "Continue from the saved response and remaining work."
+                                                .into(),
+                                        attachments: vec![],
+                                    },
+                                    cx,
+                                );
+                            }
+                        })),
+                )
+                .into_any_element(),
             Some(turn) => match turn.failure() {
                 Some(failure) => self.failure_row(failure, turn.request.is_some(), cx),
                 None => self.live_answer_actions(turn, 1 + self.messages.len() + row, cx),
@@ -690,14 +781,13 @@ impl Xylo {
         };
         div()
             .w_full()
-            .pt(px(2.))
-            .pb(px(6.))
+            .pt(px(12.))
+            .pb(px(30.))
             .child(self.answer_actions(
                 index,
                 super::Answer {
                     id: super::live_answer_key(self.session, turn),
                     text: text.clone(),
-                    at_ms: turn.finished_at.unwrap_or_else(now_ms),
                     note: turn.answer_note.clone(),
                     latest: true,
                 },
@@ -735,7 +825,7 @@ impl Xylo {
         let mut actions = div().flex().flex_wrap().items_center().gap_1();
         if failure.retryable && resumable {
             actions = actions.child(
-                secondary("retry-turn", "Retry")
+                secondary("retry-turn", "Send again")
                     .min_h(px(28.))
                     .h(px(28.))
                     .text_size(px(12.5))
@@ -826,74 +916,169 @@ impl Xylo {
         let mut list = div()
             .id("subagents-panel")
             .test_support()
-            .size_full()
-            .overflow_y_scroll()
-            .p_2()
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
-            .gap_1();
-        let live = turn.subagents.iter().rev().map(|agent| (agent, true));
-        let earlier = turn
-            .earlier_subagents
-            .iter()
-            .rev()
-            .map(|agent| (agent, false));
-        for (index, (agent, current)) in live.chain(earlier).enumerate() {
-            let id = agent.id;
-            let calls = agent.tools.len();
-            let entry = focus_ring(gpui_kit::base::Button::new(("subagent-entry", index)))
-                .accessibility_label(format!("Helper agent: {}", agent.task))
-                .w_full()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py(px(6.))
-                .rounded(px(8.))
-                .when(current, |entry| {
-                    entry
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(hover())))
-                        .on_click(cx.listener(move |view, _, _, cx| view.reveal_subagent(id, cx)))
-                })
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .w(icons::SMALL)
-                        .children(subagent_state_icon(agent.state)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .single_line()
-                                .text_size(px(12.5))
-                                .text_color(rgb(text()))
-                                .child(if agent.task.trim().is_empty() {
-                                    "Helper agent".to_owned()
+            .gap_2();
+        for (label, agents, current) in [
+            ("This turn", &turn.subagents, true),
+            ("Earlier results", &turn.earlier_subagents, false),
+        ] {
+            if agents.is_empty() {
+                continue;
+            }
+            list = list.child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(muted()))
+                    .child(format!("{label} · {}", agents.len())),
+            );
+            for agent in agents.iter().rev() {
+                let id = agent.id;
+                let (name, icon) = subagent_identity(&agent.task);
+                let key = Uuid::new_v5(&id, b"panel-output");
+                let expanded = self.expanded_tools.contains(&key);
+                let mut card = div()
+                    .id(SharedString::from(format!("subagent-result-{id}")))
+                    .test_support()
+                    .w_full()
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .p_3()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(border()))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(icons::small(icon).text_color(rgb(icons::rest_color())))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(text()))
+                                    .child(name),
+                            )
+                            .children(subagent_state_icon(agent.state))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(muted()))
+                                    .child(subagent_state_word(agent.state)),
+                            ),
+                    );
+                if !agent.task.trim().is_empty() {
+                    card = card.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(muted()))
+                            .line_clamp(3)
+                            .child(one_line(&agent.task)),
+                    );
+                }
+                if let Some(summary) = agent
+                    .summary
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    let long = summary.chars().count() > 1200 || summary.lines().count() > 18;
+                    let output = if long && !expanded {
+                        subagent_output_preview(summary)
+                    } else {
+                        summary.to_string()
+                    };
+                    card = card.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_size(px(13.))
+                            .line_height(relative(1.55))
+                            .text_color(rgb(if agent.state == SubagentState::Failed {
+                                danger()
+                            } else {
+                                text_secondary()
+                            }))
+                            .child(
+                                TextView::markdown(
+                                    SharedString::from(format!("subagent-panel-output-{id}")),
+                                    output,
+                                )
+                                .selectable(true),
+                            ),
+                    );
+                    if long {
+                        card = card.child(
+                            super::tools::detail_action(
+                                SharedString::from(format!("subagent-output-toggle-{id}")),
+                                if expanded {
+                                    "Show less"
                                 } else {
-                                    one_line(&agent.task)
-                                }),
-                        )
-                        .child(
+                                    "Show full output"
+                                },
+                            )
+                            .on_click(cx.listener(
+                                move |view, _, _, cx| {
+                                    if !view.expanded_tools.remove(&key) {
+                                        view.expanded_tools.insert(key);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        );
+                    }
+                } else {
+                    let message = match agent.state {
+                        SubagentState::Running => "Working on this task…",
+                        SubagentState::Completed => "Finished without a text result.",
+                        SubagentState::Failed => "The helper failed without reporting a reason.",
+                        SubagentState::NotCompleted => {
+                            "The turn ended before this helper reported back."
+                        }
+                    };
+                    if agent.state != SubagentState::Running {
+                        card = card.child(
                             div()
-                                .single_line()
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(rgb(muted()))
-                                .child(format!(
-                                    "{} · {calls} tool call{} · {}",
-                                    subagent_state_word(agent.state),
-                                    if calls == 1 { "" } else { "s" },
-                                    duration_label(agent.elapsed_ms())
-                                )),
-                        ),
+                                .child(message),
+                        );
+                    }
+                }
+                let mut footer = div().flex().items_center().justify_between().gap_2().when(
+                    agent.started_at > 0,
+                    |footer| {
+                        footer.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(faint()))
+                                .child(duration_label(agent.elapsed_ms())),
+                        )
+                    },
                 );
-            list = list.child(entry);
+                if current && !agent.tools.is_empty() {
+                    footer = footer.child(
+                        super::tools::detail_action(
+                            SharedString::from(format!("subagent-calls-link-{id}")),
+                            format!("View {} tool calls", agent.tools.len()),
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| view.reveal_subagent(id, cx))),
+                    );
+                }
+                list = list.child(card.when(
+                    agent.started_at > 0 || (current && !agent.tools.is_empty()),
+                    |card| card.child(footer),
+                ));
+            }
         }
         list.into_any_element()
     }
@@ -958,6 +1143,46 @@ fn subagent_key(id: Uuid) -> Uuid {
     Uuid::new_v5(&id, b"subagent-calls")
 }
 
+/// Task words choose useful roles without inventing a personal identity.
+fn subagent_identity(task: &str) -> (&'static str, AppIcon) {
+    let words: Vec<_> = task
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let has = |needles: &[&str]| words.iter().any(|word| needles.contains(&word.as_str()));
+    if has(&["review", "audit", "inspect"]) {
+        ("Review", AppIcon::ToolRead)
+    } else if has(&["test", "tests", "testing", "verify", "validation"]) {
+        ("Verification", AppIcon::Plan)
+    } else if has(&["research", "search", "investigate", "explore", "find"]) {
+        ("Research", AppIcon::Search)
+    } else if has(&["design", "layout", "visual", "ui", "ux"]) {
+        ("Interface", AppIcon::Image)
+    } else if has(&["fix", "implement", "build", "refactor", "edit", "update"]) {
+        ("Implementation", AppIcon::ToolEdit)
+    } else if has(&["document", "documentation", "docs", "write", "summarize"]) {
+        ("Writing", AppIcon::Drafts)
+    } else {
+        ("Helper", AppIcon::Agent)
+    }
+}
+
+fn subagent_output_preview(summary: &str) -> String {
+    let mut preview = String::new();
+    for line in summary.lines().take(18) {
+        if !preview.is_empty() && preview.chars().count() + line.chars().count() > 1200 {
+            break;
+        }
+        if !preview.is_empty() {
+            preview.push('\n');
+        }
+        preview.extend(line.chars().take(1200));
+    }
+    preview.push_str("\n\n…");
+    preview
+}
+
 fn subagent_state_word(state: SubagentState) -> &'static str {
     match state {
         SubagentState::Running => "Working",
@@ -992,13 +1217,14 @@ fn text_segment(session: Uuid, index: usize, body: SharedString, prominent: bool
         .min_w_0()
         .py(px(4.))
         .text_size(px(if prominent { 15. } else { 14. }))
-        .line_height(relative(1.7))
+        .line_height(relative(1.75))
         .text_color(rgb(if prominent { text() } else { text_secondary() }))
         .child(
             TextView::markdown(
                 SharedString::from(format!("turn-text-{session}-{index}")),
                 body,
             )
+            .style(super::tokens::response_style())
             .selectable(true),
         )
         .into_any_element()
@@ -1080,7 +1306,6 @@ fn stopped_marker() -> AnyElement {
     div()
         .id("turn-stopped")
         .test_support()
-        .w_full()
         .py(px(6.))
         .flex()
         .items_center()
@@ -1092,6 +1317,45 @@ fn stopped_marker() -> AnyElement {
         .into_any_element()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "transcript/tests.rs"]
 mod tests;
+
+#[cfg(all(test, not(feature = "validation")))]
+mod subagent_panel_tests {
+    use super::{subagent_identity, subagent_output_preview};
+
+    #[test]
+    fn task_roles_match_words_and_keep_a_truthful_fallback() {
+        assert_eq!(
+            subagent_identity("Review authentication handling").0,
+            "Review"
+        );
+        assert_eq!(subagent_identity("Implement sidebar layout").0, "Interface");
+        assert_eq!(
+            subagent_identity("Run tests for cancellation").0,
+            "Verification"
+        );
+        assert_eq!(
+            subagent_identity("Search provider documentation").0,
+            "Research"
+        );
+        assert_eq!(subagent_identity("preview latest state").0, "Helper");
+        assert_eq!(subagent_identity("").0, "Helper");
+    }
+
+    #[test]
+    fn output_preview_keeps_unicode_and_limits_long_results() {
+        let summary = "界".repeat(1400);
+        let preview = subagent_output_preview(&summary);
+        assert!(preview.starts_with(&"界".repeat(1200)));
+        assert!(preview.ends_with("\n\n…"));
+        let lines = (0..30)
+            .map(|i| format!("Line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = subagent_output_preview(&lines);
+        assert!(preview.contains("Line 17"));
+        assert!(!preview.contains("Line 18"));
+    }
+}

@@ -153,6 +153,8 @@ pub struct TurnState {
     /// Changes only when a reducer event alters this turn, never while rendering.
     pub render_revision: u64,
     pub running: bool,
+    /// Local acknowledgement; only a terminal runtime event confirms stop.
+    pub cancel_requested: bool,
     /// The transcript in event order.
     pub segments: Vec<Segment>,
     /// Every card of this turn, including helper-agent calls.
@@ -177,6 +179,8 @@ pub struct TurnState {
     pub phase_since: i64,
     /// Context accounting of the latest model request; kept after the turn ends.
     pub context: Option<ContextUsage>,
+    /// Model that produced the latest context receipt, independent of the next selection.
+    pub context_model: Option<String>,
     /// The newest checklist; earlier `todo_write` calls fold into it.
     pub plan: Option<Uuid>,
     /// The request of the chat's latest admitted turn, recorded by the UI at
@@ -329,6 +333,7 @@ impl TurnState {
         self.started_at = None;
         self.finished_at = None;
         self.resend = false;
+        self.cancel_requested = false;
         self.answer_note = None;
         self.stream.clear();
         self.stream_open = false;
@@ -344,6 +349,7 @@ impl TurnState {
             && self.phase == Some(TurnPhase::Preparing)
         {
             self.running = false;
+            self.cancel_requested = false;
             self.phase = None;
             self.started_at = None;
             self.touch(0);
@@ -364,16 +370,36 @@ impl TurnState {
             | EngineEvent::TitleUpdated { .. }
             | EngineEvent::Steering { .. }
             | EngineEvent::ProviderCredentialRequested { .. } => return,
-            EngineEvent::ShellJobUpdated { job } => {
+            EngineEvent::ShellJobUpdated { mut job } => {
+                if !job.background
+                    && job.running
+                    && job
+                        .action_id
+                        .and_then(|id| self.tool(id))
+                        .is_some_and(|tool| tool.success.is_some() || tool.not_completed)
+                {
+                    job.running = false;
+                }
                 if let Some(current) = self
                     .shell_jobs
                     .iter_mut()
                     .find(|current| current.id == job.id)
                 {
-                    *current = job;
+                    // A delayed live snapshot must never reopen a terminal command.
+                    if current.running || !job.running {
+                        *current = job;
+                    }
                 } else {
                     self.shell_jobs.push(job);
                 }
+                while self.shell_jobs.len() > 128 {
+                    if let Some(index) = self.shell_jobs.iter().position(|job| !job.running) {
+                        self.shell_jobs.remove(index);
+                    } else {
+                        break;
+                    }
+                }
+                self.touch(0);
             }
             EngineEvent::Started => {
                 // Admission may already have opened this turn with `Preparing`.
@@ -398,7 +424,14 @@ impl TurnState {
                 } else {
                     self.segments.push(Segment::Thinking(text.into()));
                 }
-                self.touch(self.segments.len());
+                // The chat presents reasoning as one disclosure at its first
+                // non-empty segment; later deltas must remeasure that row.
+                let first = self
+                    .segments
+                    .iter()
+                    .position(|segment| matches!(segment, Segment::Thinking(_)))
+                    .unwrap_or(0);
+                self.touch(first + 1);
             }
             EngineEvent::Status { text } => self.status = Some(text),
             EngineEvent::HarnessNote { kind, text } => {
@@ -457,7 +490,13 @@ impl TurnState {
                 card.approval = true;
                 self.touch(self.row_of_call(action_id));
             }
-            EngineEvent::ContextUsage { usage } => self.context = Some(usage),
+            EngineEvent::ContextUsage { usage } => {
+                self.context_model = self
+                    .request
+                    .as_ref()
+                    .map(|request| request.provider.model.clone());
+                self.context = Some(usage);
+            }
             EngineEvent::ModelMetadata { model, rate_limits } => {
                 self.rate_limits = rate_limits.map(|limits| (model.clone(), limits));
                 self.active_model = Some(model);
@@ -468,6 +507,25 @@ impl TurnState {
                 success,
                 ..
             } => {
+                let exit = serde_json::from_str::<serde_json::Value>(&result)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("summary")
+                            .unwrap_or(&value)
+                            .get("exit_code")
+                            .and_then(serde_json::Value::as_i64)
+                    });
+                for job in self
+                    .shell_jobs
+                    .iter_mut()
+                    .filter(|job| job.action_id == Some(action_id) && !job.background)
+                {
+                    job.running = false;
+                    if let Some(code) = exit {
+                        job.exit_code = Some(code as i32);
+                    }
+                }
                 self.finish_tool(action_id, result, success);
                 self.touch(self.row_of_call(action_id));
             }
@@ -703,6 +761,7 @@ impl TurnState {
         self.touch(0);
         let now = now_ms();
         self.running = false;
+        self.cancel_requested = false;
         self.finished_at = Some(now);
         self.phase = None;
         self.outcome = Some(outcome);
@@ -736,6 +795,9 @@ fn delegate_summary(card: &ToolCard) -> Option<SharedString> {
 
 pub fn message(session_id: Uuid, role: &str, content: String) -> ChatMessage {
     ChatMessage {
+        activity_count: 0,
+        activity_summary: None,
+        turn_id: None,
         reasoning: None,
         id: Uuid::new_v4(),
         session_id,
@@ -747,6 +809,6 @@ pub fn message(session_id: Uuid, role: &str, content: String) -> ChatMessage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "state/tests.rs"]
 mod tests;

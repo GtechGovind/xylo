@@ -102,7 +102,10 @@ fn main() {
         theme: "light".into(),
         ..Default::default()
     };
-    settings.provider = xylo_core::ProviderConfig { model: "fixture-display-only".into(), ..Default::default() };
+    settings.provider = xylo_core::ProviderConfig {
+        model: "fixture-display-only".into(),
+        ..Default::default()
+    };
     settings.remember_model(settings.provider.clone());
     store.save_settings(&settings).unwrap();
     let host = HostClient::spawn_at(paths).unwrap();

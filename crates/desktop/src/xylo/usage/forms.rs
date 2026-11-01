@@ -119,15 +119,46 @@ impl Xylo {
     }
 
     pub(in crate::xylo) fn status_command_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        settings_ui::section("Status command",Some("Optional command receives session JSON on stdin and prints one line. It runs without network access, with a two-second limit.".into()),
-            div().flex().flex_col().gap_2().child(Input::new(&self.usage_ui.command).aria_label("Status command"))
-                .child(settings_ui::primary_button("save-status-command","Save command").on_click(cx.listener(|view,_,_,cx|{
-                    let command=view.usage_ui.command.read(cx).value().trim().to_owned();
-                    if command.len()>8192{view.usage_ui.command_error=Some("Use a command shorter than 8 KiB.".into());cx.notify();return;}
-                    view.settings.status_line_command=(!command.is_empty()).then_some(command);view.usage_ui.editing_command=false;view.usage_ui.status_text=None;view.usage_ui.command_error=None;
-                    let settings=view.settings.clone();view.host_call(cx,|host|host.save_settings(settings));cx.notify();
-                })))
-                .children(self.usage_ui.command_error.as_ref().map(|error|settings_ui::inline_error(error)))
+        let changed = self.usage_ui.command.read(cx).value().trim()
+            != self.settings.status_line_command.as_deref().unwrap_or("");
+        settings_ui::section(
+            "Custom status",
+            Some("Show a short message below the composer using a local command.".into()),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().id("status-command-control").test_support().flex_1().min_w_0().child(
+                            Input::new(&self.usage_ui.command)
+                                .aria_label("Status command")
+                                .min_h(px(settings_ui::CONTROL_HEIGHT))
+                                .max_h(px(settings_ui::CONTROL_HEIGHT)),
+                        ))
+                        .child(settings_ui::primary_button("save-status-command", "Save")
+                            .disabled(!changed)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                let command = view.usage_ui.command.read(cx).value().trim().to_owned();
+                                if command.len() > 8192 {
+                                    view.usage_ui.command_error = Some("This command is too long. Shorten it and try again.".into());
+                                    cx.notify();
+                                    return;
+                                }
+                                view.settings.status_line_command = (!command.is_empty()).then_some(command);
+                                view.usage_ui.editing_command = false;
+                                view.usage_ui.status_text = None;
+                                view.usage_ui.command_error = None;
+                                let settings = view.settings.clone();
+                                view.host_call(cx, |host| host.save_settings(settings));
+                                cx.notify();
+                            }))),
+                )
+                .child(settings_ui::caption("Leave empty to use the built-in status. Commands receive chat data as JSON and return one line; they run offline for up to two seconds."))
+                .children(self.usage_ui.command_error.as_ref().map(|error| settings_ui::inline_error(error))),
         ).into_any_element()
     }
 }

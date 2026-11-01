@@ -779,6 +779,9 @@ impl Xylo {
             return div().into_any_element();
         }
         let output = ChatMessage {
+            activity_count: 0,
+            activity_summary: None,
+            turn_id: None,
             reasoning: None,
             id: tool.id,
             session_id: self.session,
@@ -796,6 +799,6 @@ impl Xylo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "image_generation/tests.rs"]
 mod tests;

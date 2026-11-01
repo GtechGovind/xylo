@@ -16,8 +16,7 @@ actions!(
         AllowPendingAction,
         DenyOrStop,
         EscapePressed,
-        FocusComposer,
-        CyclePermissions
+        FocusComposer
     ]
 );
 /// Expands to the platform's primary-modifier chord as a `&'static str`
@@ -48,7 +47,6 @@ pub(super) fn bind(cx: &mut App) {
         // xylo while the composer is focused.
         KeyBinding::new(chord!("shift-enter"), AllowPendingAction, Some("Xylo")),
         KeyBinding::new(chord!("."), DenyOrStop, Some("Xylo")),
-        KeyBinding::new("shift-tab", CyclePermissions, Some("Xylo")),
         KeyBinding::new("escape", EscapePressed, Some("Xylo")),
         KeyBinding::new(chord!("l"), FocusComposer, Some("Xylo")),
     ]);
@@ -57,7 +55,8 @@ pub(super) fn bind(cx: &mut App) {
 impl Xylo {
     /// Routes a bare Escape that no input, menu or popover consumed.
     pub(super) fn escape_pressed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_state.renaming_focused(window, cx) {
+        if self.close_output(cx) {
+        } else if self.sidebar_state.renaming_focused(window, cx) {
             self.cancel_rename(cx);
         } else if self.history_search.is_open() {
             self.close_history_search(cx);

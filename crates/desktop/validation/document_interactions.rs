@@ -418,7 +418,7 @@ mod xylo {
             shutdown(cx, &client, &paths.data);
         }
         #[gpui_kit::test]
-        fn document_typing_during_ack_survives_and_project_switch_waits(cx: &mut TestAppContext) {
+        fn document_typing_during_ack_survives_project_switch(cx: &mut TestAppContext) {
             cx.executor().allow_parking();
             let directory = tempfile::tempdir().unwrap();
             let base = directory.path().canonicalize().unwrap();
@@ -477,11 +477,9 @@ mod xylo {
                 window.render_frame(cx);
                 window.input(" plus newer typing", cx);
                 view.update(cx, |view, cx| {
-                    view.set_workspace(other.clone(), window, cx);
-                    assert_eq!(
-                        view.workspace.as_ref(),
-                        Some(&workspace),
-                        "Switch cannot discard unacknowledged recovery"
+                    assert!(
+                        view.document_before_workspace_switch(cx),
+                        "Cached document edits should not block navigation while saving"
                     );
                     assert!(!view.document_drafts_flush(super::DraftFlushAction::Quit, cx));
                     assert!(view.document_drafts_flush_pending());
@@ -494,9 +492,26 @@ mod xylo {
                 cx.update(|cx| !view.read(cx).document_drafts_flush_pending()),
                 "New typing cancels delayed Quit"
             );
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.set_workspace(other.clone(), window, cx);
+                    assert_eq!(
+                        view.workspace.as_ref(),
+                        Some(&other),
+                        "Ordinary autosaves must not hold project navigation hostage"
+                    );
+                });
+            })
+            .unwrap();
             lock.execute_batch("COMMIT").unwrap();
             cx.executor().advance_clock(Duration::from_millis(400));
-            wait(cx, &view, |view, _| view.documents_validation_saved());
+            wait(cx, &view, |view, _| {
+                view.workspace_ready && view.workspace.as_ref() == Some(&other)
+                    && store.document_draft(xylo_runtime::DocumentDraftKey {
+                        workspace: workspace.clone(), source: source.clone(),
+                    }).unwrap().state.is_some_and(|state| matches!(&state.edits[..],
+                        [DocumentEdit::Text { text }] if text == "First edit plus newer typing after quit intent"))
+            });
             let draft = store
                 .document_draft(xylo_runtime::DocumentDraftKey {
                     workspace: workspace.clone(),

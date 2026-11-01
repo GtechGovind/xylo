@@ -91,7 +91,7 @@ Requested capabilities and resource budgets belong in a package template, not
 in agent input. A user may grant only a subset. Import availability never bypasses
 stored grants, private-storage exclusion or quotas. Host errors are ordinary
 `Result` values; an error after artifact publication does not roll back the
-committed file. See [native plugin behavior](../../docs/native-plugins.md) for
+committed file. See [native plugin behavior](../../docs/modules/plugin-sdk.md) for
 permissions, cancellation, retained artifacts and platform qualifications.
 
 Our SDK and example use Apache-2.0. Preserve dependency licenses and notices when

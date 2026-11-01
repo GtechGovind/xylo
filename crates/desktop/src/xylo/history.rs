@@ -100,9 +100,6 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.recovery_before_switch(cx) {
-            return;
-        }
         if self.editor_dirty {
             self.error = Some("Save your changes before switching conversations.".into());
             cx.notify();
@@ -117,7 +114,9 @@ impl Xylo {
             return;
         }
         self.session = id;
-        self.recovery_scope_changed(cx);
+        if self.settings.ui.work_panel_open {
+            self.load_subagent_activity(cx);
+        }
         self.draft_switch_deferred(cx);
         if let Some(history) = self.histories.get_mut(&id) {
             if history.windowed {
@@ -139,7 +138,6 @@ impl Xylo {
         if refresh {
             self.request_history(false, cx);
         }
-        self.recovery_activate(window, cx);
         self.persist_ui(cx);
         self.refresh_composer_placeholder(cx);
         cx.notify();
@@ -363,9 +361,6 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.recovery_before_switch(cx) {
-            return;
-        }
         if self.editor_dirty {
             self.error = Some("Save your changes before opening another conversation.".into());
             cx.notify();
@@ -380,7 +375,9 @@ impl Xylo {
             return;
         }
         self.session = conversation.id;
-        self.recovery_scope_changed(cx);
+        if self.settings.ui.work_panel_open {
+            self.load_subagent_activity(cx);
+        }
         self.draft_switch_deferred(cx);
         self.page = Page::Chat;
         self.settings_open = false;
@@ -394,7 +391,6 @@ impl Xylo {
             .or_insert_with(ChatHistory::new)
             .highlight = Some(anchor);
         self.request_message_window(anchor, cx);
-        self.recovery_activate(window, cx);
         self.persist_ui(cx);
         self.refresh_composer_placeholder(cx);
     }

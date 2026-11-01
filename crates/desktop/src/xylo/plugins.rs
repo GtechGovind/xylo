@@ -306,18 +306,15 @@ impl Xylo {
             let epoch = self.plugins.epoch;
             let digest = inspection.package_sha256.clone();
             self.plugins.confirming = true;
-            let answer = window.prompt(
-                PromptLevel::Warning,
-                "Update this plugin?",
+            let answer = self.confirm_explicit_action(
+            "Update this plugin?",
                 Some("The reviewed version and permissions will replace the installed version. Existing artifacts stay unchanged."),
-                &[PromptButton::cancel("Cancel"), PromptButton::new("Update plugin")],
-                cx,
-            );
+                &[PromptButton::cancel("Cancel"), PromptButton::new("Update plugin")], window, cx);
             cx.spawn_in(window, async move |view, cx| {
                 let answer = answer.await;
                 let _ = view.update_in(cx, |view, _, cx| {
                     view.plugins.confirming = false;
-                    if matches!(answer, Ok(1))
+                    if answer
                         && epoch == view.plugins.epoch
                         && view
                             .plugins
@@ -428,8 +425,7 @@ impl Xylo {
         } else {
             "The plugin will lose permission to access files and allowed websites. Its existing artifacts stay unchanged."
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
+        let answer = self.confirm_explicit_action(
             title,
             Some(detail),
             &[
@@ -440,13 +436,14 @@ impl Xylo {
                     "Revoke permissions"
                 }),
             ],
+            window,
             cx,
         );
         cx.spawn_in(window, async move |view, cx| {
             let answer = answer.await;
             let _ = view.update_in(cx, |view, _, cx| {
                 view.plugins.confirming = false;
-                if matches!(answer, Ok(1))
+                if answer
                     && view.plugins.epoch == epoch
                     && view.plugins.selected.as_ref().is_some_and(|plugin| {
                         plugin.manifest.id == id && plugin.package_sha256 == digest
@@ -523,18 +520,15 @@ impl Xylo {
         }
         let epoch = self.plugins.epoch;
         self.plugins.confirming = true;
-        let answer = window.prompt(
-            PromptLevel::Warning,
+        let answer = self.confirm_explicit_action(
             "Dismiss this local settings request?",
             Some("This does not undo a change already saved. Check the refreshed installed list before making another change."),
-            &[PromptButton::cancel("Cancel"), PromptButton::new("Dismiss request")],
-            cx,
-        );
+            &[PromptButton::cancel("Cancel"), PromptButton::new("Dismiss request")], window, cx);
         cx.spawn_in(window, async move |view, cx| {
             let answer = answer.await;
             let _ = view.update_in(cx, |view, _, cx| {
                 view.plugins.confirming = false;
-                if matches!(answer, Ok(1)) && epoch == view.plugins.epoch {
+                if answer && epoch == view.plugins.epoch {
                     view.plugins.retry = None;
                     view.plugins.notice = "Local request dismissed. Saved plugin settings stay as shown in the installed list.".into();
                 }

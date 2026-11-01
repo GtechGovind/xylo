@@ -506,6 +506,8 @@ fn thinking_stays_separate_from_answer_text_and_survives_completion() {
 fn shell_jobs_continue_across_completed_and_new_turns() {
     let mut state = TurnState::default();
     let mut job = xylo_core::ShellJob {
+        action_id: None,
+        background: true,
         id: Uuid::new_v4(),
         turn_id: Uuid::new_v4(),
         command: "npm run dev".into(),
@@ -535,3 +537,79 @@ fn shell_jobs_continue_across_completed_and_new_turns() {
 
 #[path = "tests/interaction.rs"]
 mod interaction;
+
+#[test]
+fn foreground_snapshots_never_reopen_finished_calls_or_mix_identical_commands() {
+    let mut state = TurnState::default();
+    state.apply(EngineEvent::Started);
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    started(&mut state, first, "shell_command", None);
+    started(&mut state, second, "shell_command", None);
+    let job = |action| xylo_core::ShellJob {
+        id: Uuid::new_v4(),
+        turn_id: Uuid::new_v4(),
+        action_id: Some(action),
+        background: false,
+        command: "same command".into(),
+        cwd: "/project".into(),
+        log_path: "/unused".into(),
+        running: true,
+        exit_code: None,
+        output: action.to_string(),
+        error: None,
+    };
+    let a = job(first);
+    let b = job(second);
+    state.apply(EngineEvent::ShellJobUpdated { job: a.clone() });
+    state.apply(EngineEvent::ShellJobUpdated { job: b.clone() });
+    state.apply(EngineEvent::ToolFinished {
+        action_id: first,
+        name: "shell_command".into(),
+        result: "{\"summary\":{\"exit_code\":1}}".into(),
+        success: false,
+        parent_id: None,
+    });
+    state.apply(EngineEvent::ShellJobUpdated { job: a });
+    assert!(!state.shell_jobs[0].running);
+    assert!(state.shell_jobs[1].running);
+    assert_eq!(state.shell_jobs[1].output, second.to_string());
+}
+
+#[test]
+fn context_model_stays_with_its_receipt_when_the_next_model_changes() {
+    let mut state = TurnState {
+        request: Some(xylo_core::TurnRequest {
+            session_id: Uuid::new_v4(),
+            turn_id: Uuid::new_v4(),
+            workspace: "/fixture".into(),
+            prompt: "Fixture".into(),
+            attachments: vec![],
+            permissions: xylo_core::PermissionMode::ReadOnly,
+            provider: xylo_core::ProviderConfig {
+                model: "first-model".into(),
+                context_tokens: 500_000,
+                ..Default::default()
+            },
+        }),
+        ..Default::default()
+    };
+    state.apply(EngineEvent::ContextUsage {
+        usage: ContextUsage {
+            capacity: 500_000,
+            ..Default::default()
+        },
+    });
+    state.request.as_mut().unwrap().provider.model = "next-model".into();
+    state.archive();
+    assert_eq!(state.context_model.as_deref(), Some("first-model"));
+    assert_eq!(state.context.as_ref().unwrap().capacity, 500_000);
+    state.apply(EngineEvent::ContextUsage {
+        usage: ContextUsage {
+            capacity: 1_000_000,
+            ..Default::default()
+        },
+    });
+    assert_eq!(state.context_model.as_deref(), Some("next-model"));
+    assert_eq!(state.context.as_ref().unwrap().capacity, 1_000_000);
+}

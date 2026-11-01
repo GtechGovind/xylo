@@ -1064,9 +1064,9 @@ fn sidebar_chat_button(
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "sidebar/motion_tests.rs"]
 mod motion_tests;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "sidebar/tests.rs"]
 mod tests;

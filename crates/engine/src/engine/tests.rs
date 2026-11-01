@@ -385,6 +385,71 @@ fn titles_are_reduced_to_one_plain_line() {
     assert!(clean_title(&"word ".repeat(100)).unwrap().chars().count() <= TITLE_CHARS);
 }
 
+#[test]
+fn title_script_guard_preserves_multilingual_requests() {
+    assert!(!title_matches_request_script(
+        "Xylo Rust 项目架构说明",
+        "Explain this Rust project."
+    ));
+    assert!(title_matches_request_script(
+        "Explain Xylo project architecture",
+        "Explain this Rust project."
+    ));
+    assert!(title_matches_request_script(
+        "项目架构说明",
+        "说明这个项目的架构"
+    ));
+    assert!(title_matches_request_script(
+        "Xylo 项目架构",
+        "Explain Xylo 项目"
+    ));
+    assert!(title_matches_request_script(
+        "Réparer le résumé",
+        "Réparer le résumé"
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_language_title_keeps_the_original_and_the_completed_answer() {
+    let (_directory, engine, mut request) = fixture();
+    let (endpoint, _) = serve(|body| {
+        if is_title(body) {
+            message("Xylo Rust 项目架构说明")
+        } else {
+            message("An English architecture summary.")
+        }
+    })
+    .await;
+    request.provider = responses(endpoint);
+    request.prompt = "Explain this project using read-only inspection.".into();
+    let (events, mut receiver) = mpsc::channel(256);
+    engine
+        .run(request.clone(), events, CancellationToken::new())
+        .await
+        .unwrap();
+    let events = drain(&mut receiver);
+    assert!(events.iter().any(|event| matches!(event, EngineEvent::Completed { text, .. } if text == "An English architecture summary.")));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TitleUpdated { .. }))
+    );
+    let conversation = engine
+        .store
+        .conversation(request.session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(conversation.title, "Resume fixture");
+    assert_eq!(conversation.title_source, TitleSource::Prompt);
+    assert!(
+        engine
+            .store
+            .completed_turn(request.session_id, request.turn_id)
+            .unwrap()
+            .is_some()
+    );
+}
+
 /// How the fixture server answers one Responses request.
 enum Reply {
     Output(Value),

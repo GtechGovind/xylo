@@ -836,6 +836,7 @@ impl Xylo {
         }
         section = section.child(actions).child(
             settings_ui::secondary_button("refresh-permission-files", "Reload rules")
+                .self_start()
                 .disabled(self.permissions.loading)
                 .on_click(cx.listener(|view, _, _, cx| view.refresh_approval_rules(cx))),
         );
@@ -1236,7 +1237,7 @@ impl Xylo {
             self.connector_form(cx),
         ));
         if let Some((index, id, _)) = editing {
-            page = page.child(settings_ui::danger_zone([settings_ui::setting_row(
+            page = page.child(settings_ui::removal_actions([settings_ui::setting_row(
                 "Remove connection",
                 Some(
                     "Chats can no longer use its tools. Its saved access token is removed.".into(),
@@ -1257,6 +1258,6 @@ impl Xylo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "settings/tests.rs"]
 mod tests;

@@ -1,4 +1,4 @@
-use super::{is_image_path, reply_status_label, speakable_text, time_label};
+use super::{is_image_path, reply_status_label, speakable_text};
 use std::path::Path;
 
 #[test]
@@ -8,19 +8,6 @@ fn read_aloud_speaks_prose_not_markup_or_code() {
         speakable_text(answer),
         "Findings\nThe runtime host routes WorkerCommands. See the docs.\na  b\nFirst point"
     );
-}
-
-#[test]
-fn answer_times_read_as_a_clock_today_and_a_date_before() {
-    use chrono::{Local, TimeZone};
-    let now = Local.with_ymd_and_hms(2026, 10, 31, 15, 8, 0).unwrap();
-    let today = Local.with_ymd_and_hms(2026, 10, 31, 3, 8, 0).unwrap();
-    let earlier = Local.with_ymd_and_hms(2026, 10, 30, 21, 5, 0).unwrap();
-    let last_year = Local.with_ymd_and_hms(2025, 1, 2, 9, 0, 0).unwrap();
-    let ms = |at: chrono::DateTime<Local>| at.timestamp_millis();
-    assert_eq!(time_label(ms(today), ms(now)), "3:08 AM");
-    assert_eq!(time_label(ms(earlier), ms(now)), "Oct 30, 9:05 PM");
-    assert_eq!(time_label(ms(last_year), ms(now)), "Jan 2 2025, 9:00 AM");
 }
 
 #[test]
@@ -36,5 +23,5 @@ fn a_reloaded_cut_off_answer_says_it_reached_the_output_limit() {
     use xylo_core::MessageStatus;
     assert_eq!(reply_status_label(MessageStatus::Complete), None);
     let label = reply_status_label(MessageStatus::Truncated).unwrap();
-    assert!(label.contains("output limit"), "{label}");
+    assert!(label.contains("length limit"), "{label}");
 }

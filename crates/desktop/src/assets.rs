@@ -51,6 +51,7 @@ icon_assets!(
         Volume2,
         Wrench,
         X,
+        Zap,
     ]
 );
 
@@ -202,6 +203,6 @@ fn attribute_value(tag: &str, name: &str) -> Option<std::ops::Range<usize>> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "assets/tests.rs"]
 mod tests;

@@ -1,7 +1,7 @@
 //! The settings design system: layout, rows, lists and controls shared by
 //! every settings destination.
 //!
-//! Pages are a left settings sidebar plus one left-aligned content column.
+//! Pages are a left settings sidebar plus one centered content column.
 //! Inside the column a page is a header (optional breadcrumb, title, one-line
 //! description) followed by sections; a section is a heading and a run of
 //! setting rows separated by hairlines. Bordered containers are reserved for
@@ -38,7 +38,7 @@ type ChoiceHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 pub(super) const SIDEBAR_WIDTH: f32 = 220.;
 /// Height of one settings navigation row.
 pub(super) const NAV_ROW_HEIGHT: f32 = 32.;
-/// Widest the content column grows; it stays left-aligned beyond this.
+/// Widest the content column grows; spare space is shared on both sides.
 pub(super) const CONTENT_MAX_WIDTH: f32 = 680.;
 /// Horizontal padding between the sidebar edge and the content column.
 pub(super) const CONTENT_GUTTER: f32 = 48.;
@@ -210,7 +210,7 @@ pub(super) fn settings_nav_item(
 // ---------------------------------------------------------------------------
 
 /// A settings page: scrolls as a whole, with the header and sections in one
-/// left-aligned column. Children are sections; the page spaces them.
+/// centered column. Children are sections; the page spaces them.
 #[derive(IntoElement)]
 pub(super) struct SettingsPage {
     id: ElementId,
@@ -306,6 +306,9 @@ impl RenderOnce for SettingsPage {
             .when_some(self.breadcrumb, |header, trail| header.child(trail))
             .child(heading);
         let column = div()
+            .id("settings-content-column")
+            .test_support()
+            .mx_auto()
             .w_full()
             .max_w(px(CONTENT_MAX_WIDTH))
             .flex()
@@ -433,13 +436,13 @@ pub(super) enum Feedback {
 }
 /// The feedback line, announced as a status; `owner` (the row or field
 /// label) keys its accessibility node.
-fn feedback_line(owner: &str, feedback: Feedback) -> Stateful<Div> {
+fn feedback_line(owner: &str, feedback: Feedback) -> impl IntoElement {
     let (glyph, color, message) = match feedback {
         Feedback::Pending(message) => (None, muted(), message),
         Feedback::Saved(message) => (Some(AppIcon::Success), success(), message),
         Feedback::Error(message) => (Some(AppIcon::Error), danger(), message),
     };
-    div()
+    let line = div()
         .id(SharedString::from(format!("feedback-{owner}")))
         .role(Role::Status)
         .aria_label(message.clone())
@@ -453,7 +456,8 @@ fn feedback_line(owner: &str, feedback: Feedback) -> Stateful<Div> {
         .when_some(glyph, |line, glyph| {
             line.child(icons::small(glyph).mt(px(2.)).text_color(rgb(color)))
         })
-        .child(div().flex_1().min_w_0().child(message))
+        .child(div().flex_1().min_w_0().child(message.clone()));
+    motion::fade_on_change(format!("feedback-{owner}-motion"), &message, line)
 }
 
 /// A page- or section-level failure: a danger notice in product wording.
@@ -463,8 +467,27 @@ pub(super) fn inline_error(error: &str) -> Div {
 }
 
 impl Xylo {
-    /// The one destructive confirmation: Cancel first, the destructive action
-    /// second. `confirmed` runs only when the destructive action is chosen.
+    /// Confirms an explicit action outside Full access. These prompts use Cancel
+    /// first and the action second; unsaved-edit decisions use their own prompts.
+    pub(super) fn confirm_explicit_action(
+        &self,
+        title: &str,
+        detail: Option<&str>,
+        buttons: &[PromptButton],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl std::future::Future<Output = bool> + use<> {
+        let answer = (self.settings.permissions != PermissionMode::FullAccess)
+            .then(|| window.prompt(PromptLevel::Warning, title, detail, buttons, cx));
+        async move {
+            match answer {
+                Some(answer) => matches!(answer.await, Ok(1)),
+                None => true,
+            }
+        }
+    }
+
+    /// Executes the selected action, with confirmation in guarded modes.
     pub(super) fn confirm_destructive(
         &mut self,
         title: &str,
@@ -474,15 +497,15 @@ impl Xylo {
         cx: &mut Context<Self>,
         confirmed: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        let answer = window.prompt(
-            PromptLevel::Warning,
+        let answer = self.confirm_explicit_action(
             title,
             Some(detail),
             &[PromptButton::cancel("Cancel"), PromptButton::new(action)],
+            window,
             cx,
         );
         cx.spawn_in(window, async move |view, cx| {
-            if matches!(answer.await, Ok(1)) {
+            if answer.await {
                 let _ = view.update_in(cx, |view, window, cx| confirmed(view, window, cx));
             }
         })
@@ -565,17 +588,10 @@ impl RenderOnce for SettingRow {
     }
 }
 
-/// The final section of a page for irreversible actions: rows inside a
-/// danger-tinted container. Each row's action is a [`destructive_button`]
-/// whose handler confirms first (`Xylo::confirm_destructive`, Cancel first).
-pub(super) fn danger_zone(body: impl IntoIterator<Item = AnyElement>) -> Div {
-    section(
-        "Danger zone",
-        None,
-        container_frame()
-            .border_color(rgba((danger() << 8) | 0x55))
-            .child(rows(body)),
-    )
+/// Removal actions use the same frame and insets as other settings.
+/// The action carries the destructive colour; the surrounding page stays neutral.
+pub(super) fn removal_actions(body: impl IntoIterator<Item = AnyElement>) -> Div {
+    container_frame().child(rows(body))
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,7 +1061,15 @@ pub(super) fn pill(label: impl Into<SharedString>, tone: Tone) -> Div {
         .text_size(px(CAPTION_SIZE))
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(foreground))
-        .child(div().size(px(6.)).rounded_full().bg(rgb(foreground)))
+        .when(tone != Tone::Neutral, |pill| {
+            pill.child(
+                div()
+                    .size(px(5.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(rgb(foreground)),
+            )
+        })
         .child(div().single_line().child(label.into()))
 }
 
@@ -1114,6 +1138,9 @@ fn settings_button(
     let label: SharedString = label.into();
     focus_ring(gpui_kit::base::Button::new(id))
         .accessibility_label(label.clone())
+        .styles(|styles| {
+            styles.disabled(|style| style.bg(rgb(well())).text_color(rgb(muted())).opacity(1.))
+        })
         .flex_shrink_0()
         .h(px(CONTROL_HEIGHT))
         .px(px(12.))
@@ -1529,7 +1556,7 @@ pub(super) fn form_actions(children: impl IntoIterator<Item = AnyElement>) -> Di
         .children(children)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "settings_ui/tests.rs"]
 mod tests;
 
@@ -1583,8 +1610,9 @@ impl Xylo {
             ));
         }
         content = content.child(
-            text_button("web-search-save", "Save search service").on_click(cx.listener(
-                move |view, _, window, cx| {
+            secondary_button("web-search-save", "Save search service")
+                .self_start()
+                .on_click(cx.listener(move |view, _, window, cx| {
                     let endpoint = view.web_search_endpoint.read(cx).value().to_string();
                     let secret = view.web_search_secret.read(cx).value().to_string();
                     let config = xylo_core::WebSearchSettings {
@@ -1601,8 +1629,7 @@ impl Xylo {
                     });
                     Self::set_input(&view.web_search_secret, "", window, cx);
                     cx.notify();
-                },
-            )),
+                })),
         );
         section("Web search",Some("Native provider search is used automatically when available. Search results and pages are untrusted content.".into()),content).into_any_element()
     }

@@ -1,13 +1,7 @@
-//! The composer's context window ring and its breakdown popover. The ring is a
-//! static arc over a visible track, hidden until a chat uses 5% of the window.
-//! Both read the engine's `ContextUsage` for the open chat (the accounting of
+//! The composer's visible Context control. It reads the engine's `ContextUsage` for the open chat (the accounting of
 //! the latest request), never summed per-turn usage or a character estimate.
 use super::*;
 use gpui_kit::base::TestSupportExt;
-use gpui_kit::component::{
-    button::{Button as MenuButton, ButtonVariants},
-    popover::Popover,
-};
 use model_picker::format_tokens;
 
 /// The figures the panel shows, derived once from a `ContextUsage`.
@@ -65,46 +59,6 @@ fn updated_label(updated_at_ms: i64, now_ms: i64) -> String {
     }
 }
 
-/// Below this share of the window the ring is noise and stays hidden.
-const RING_THRESHOLD: u64 = 5;
-/// Diameter and stroke of the ring.
-const RING_SIZE: f32 = 14.;
-const RING_STROKE: f32 = 2.;
-
-/// A static progress arc over a full track, starting at twelve o'clock. It
-/// never animates, so it cannot be mistaken for a spinner; the arc turns to
-/// the warning colour once the window is nearly full.
-fn usage_ring(percent: u64) -> impl IntoElement {
-    use gpui_kit::component::plot::shape::{Arc, ArcData};
-    use std::f32::consts::TAU;
-    let track: Hsla = rgb(border_strong()).into();
-    let arc: Hsla = rgb(if percent >= 90 {
-        warning()
-    } else {
-        text_secondary()
-    })
-    .into();
-    let fraction = (percent.min(100) as f32) / 100.;
-    canvas(
-        |bounds, _, _| bounds,
-        move |_, bounds, window, _| {
-            let outer = bounds.size.width.min(bounds.size.height).as_f32() / 2.;
-            let shape = Arc::new()
-                .inner_radius(outer - RING_STROKE)
-                .outer_radius(outer);
-            shape.paint(&ArcData::new(&(), 0, 100., 0., TAU), track, &bounds, window);
-            shape.paint(
-                &ArcData::new(&(), 1, percent as f32, 0., fraction * TAU),
-                arc,
-                &bounds,
-                window,
-            );
-        },
-    )
-    .size(px(RING_SIZE))
-    .flex_shrink_0()
-}
-
 /// Segment colors of the bar, shared with the row swatches.
 const MESSAGES: fn() -> u32 = brand;
 const SYSTEM: fn() -> u32 = lavender;
@@ -123,12 +77,47 @@ pub(super) fn receipt_viewport(
     div()
         .id(id)
         .test_support()
-        .w(px(width))
-        .max_h((window.viewport_size().height - px(48.)).clamp(px(0.), px(480.)))
+        .w(px(width).min((window.viewport_size().width - px(80.)).max(px(0.))))
+        .max_h((window.viewport_size().height - px(180.)).clamp(px(100.), px(480.)))
         .overflow_y_scroll()
 }
 
 impl Xylo {
+    pub(super) fn composer_context(&self, cx: &Context<Self>) -> AnyElement {
+        use gpui_kit::component::WindowExt;
+        let label = self
+            .current_context()
+            .filter(|usage| usage.capacity > 0)
+            .map(|usage| format!("Context {}", ContextBreakdown::new(usage).percent_label()))
+            .unwrap_or_else(|| "Context".into());
+        button("composer-context", label.clone())
+            .accessibility_label(format!("{label}. View context details"))
+            .h(px(26.))
+            .min_h(px(26.))
+            .px(px(5.))
+            .text_size(px(11.))
+            .font_weight(FontWeight::NORMAL)
+            .text_color(rgb(muted()))
+            .on_click(cx.listener(|_view, _, window, cx| {
+                let weak = cx.entity().downgrade();
+                window.open_dialog(cx, move |dialog, window, cx| {
+                    let (content, width) = weak
+                        .update(cx, |view, _| {
+                            (view.context_panel(window), view.context_panel_width())
+                        })
+                        .unwrap_or_else(|_| (div().into_any_element(), 480.));
+                    dialog
+                        .title("Context")
+                        .width(px(width))
+                        .rounded(px(16.))
+                        .bg(rgb(panel()))
+                        .border_color(rgb(border_strong()))
+                        .child(content)
+                });
+            }))
+            .into_any_element()
+    }
+
     fn current_context(&self) -> Option<&ContextUsage> {
         self.turns
             .get(&self.session)
@@ -145,54 +134,20 @@ impl Xylo {
         }
     }
 
-    /// The context ring in the composer toolbar, shown once a chat uses at
-    /// least [`RING_THRESHOLD`] percent of the window; it opens the breakdown.
-    pub(super) fn composer_context(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let breakdown = self.current_context().map(ContextBreakdown::new)?;
-        let percent = breakdown
-            .percent()
-            .filter(|percent| *percent >= RING_THRESHOLD)?;
-        let tooltip = format!("Context window · {} used", breakdown.percent_label());
-        let weak = cx.entity().downgrade();
-        let mut trigger_layout = div().flex_shrink_0();
-        Some(
-            Popover::new("composer-context-popover")
-                .appearance(false)
-                .trigger_style(trigger_layout.style().clone())
-                .anchor(Anchor::BottomRight)
-                .offset(px(8.))
-                .trigger(
-                    MenuButton::new("composer-context")
-                        .accessibility_label("Context window")
-                        .ghost()
-                        .h(px(30.))
-                        .px_1p5()
-                        .gap_1p5()
-                        .child(usage_ring(percent))
-                        // The number makes the ring read as a gauge, never
-                        // as a loading spinner.
-                        .child(
-                            div()
-                                .single_line()
-                                .text_size(px(12.5))
-                                .text_color(rgb(text_secondary()))
-                                .child(format!("{percent}%")),
-                        )
-                        .tooltip(tooltip),
-                )
-                .content(move |_, window, cx| {
-                    let panel = weak
-                        .update(cx, |view, _| view.context_panel(window))
-                        .unwrap_or_else(|_| div().into_any_element());
-                    crate::motion::popover_surface("composer-context-surface", panel)
-                        .into_any_element()
-                })
-                .into_any_element(),
-        )
+    pub(super) fn context_panel_width(&self) -> f32 {
+        if self.current_context().is_some() {
+            720.
+        } else {
+            480.
+        }
     }
 
-    fn context_panel(&self, window: &Window) -> AnyElement {
-        let viewport = receipt_viewport("composer-context-panel", 300., window);
+    pub(super) fn context_panel(&self, window: &Window) -> AnyElement {
+        let viewport = receipt_viewport(
+            "composer-context-panel",
+            self.context_panel_width() - 60.,
+            window,
+        );
         let panel = div()
             .id("composer-context-content")
             .test_support()
@@ -208,11 +163,31 @@ impl Xylo {
                     .text_color(rgb(text()))
                     .child("Context window"),
             );
+        let panel = panel.child(subtitle(
+            "The configured limit for this connection. It may differ from the model’s maximum.",
+        ));
         let Some(usage) = self.current_context() else {
+            let message = if self.settings.model_ready() {
+                format!(
+                    "{} · {} tokens. Usage appears after the first request.",
+                    self.settings.provider.model,
+                    format_tokens(u64::from(self.settings.provider.context_window()))
+                )
+            } else {
+                "Context details appear after you choose a model and start a task.".into()
+            };
             return viewport
-                .child(panel.child(subtitle("Context appears after the first reply.")))
+                .child(panel.child(subtitle(message)))
                 .into_any_element();
         };
+        let model = self
+            .turns
+            .get(&self.session)
+            .and_then(|turn| turn.context_model.as_deref());
+        let panel = panel.child(subtitle(match model {
+            Some(model) => format!("Latest request · {model}"),
+            None => "Latest request".into(),
+        }));
         let breakdown = ContextBreakdown::new(usage);
         let summary = if breakdown.capacity > 0 {
             format!(
@@ -259,9 +234,9 @@ impl Xylo {
             })
             .unwrap_or_else(|| "Last updated with the latest reply".into());
         let compaction = if usage.compacted {
-            "Earlier work was condensed to fit the window."
+            "Earlier messages were summarized to make room for new work."
         } else {
-            "Nothing has been condensed yet."
+            ""
         };
         let content = panel
             .child(
@@ -283,7 +258,7 @@ impl Xylo {
                     ))
                     .child(context_row(
                         Some(SYSTEM()),
-                        "System prompt",
+                        "App instructions",
                         tokens(usage.system),
                     ))
                     .child(context_row(
@@ -293,12 +268,12 @@ impl Xylo {
                     ))
                     .child(context_row(
                         None,
-                        &format!("Deferred tools ({})", usage.deferred_tool_count),
+                        &format!("Tools available on demand ({})", usage.deferred_tool_count),
                         "not counted".into(),
                     ))
                     .child(context_row(
                         Some(SUMMARY()),
-                        "Condensed earlier work",
+                        "Earlier message summary",
                         if usage.compacted {
                             tokens(usage.summary)
                         } else {
@@ -307,7 +282,7 @@ impl Xylo {
                     ))
                     .child(context_row(
                         Some(BUFFER()),
-                        "Autocompact buffer",
+                        "Reserved space",
                         tokens(breakdown.buffer),
                     ))
                     .child(context_row(
@@ -317,10 +292,8 @@ impl Xylo {
                     )),
             )
             .child(divider())
-            .child(subtitle(compaction))
-            .child(subtitle(updated))
-            .child(self.quota_rows())
-            .child(self.usage_totals());
+            .when(usage.compacted, |panel| panel.child(subtitle(compaction)))
+            .child(subtitle(updated));
         viewport.child(content).into_any_element()
     }
     pub(super) fn quota_rows(&self) -> AnyElement {
@@ -378,6 +351,6 @@ fn context_row(swatch: Option<u32>, label: &str, value: String) -> Div {
         .child(div().flex_shrink_0().text_color(rgb(muted())).child(value))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "context_panel/tests.rs"]
 mod tests;

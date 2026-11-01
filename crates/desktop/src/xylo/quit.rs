@@ -7,12 +7,11 @@
 use super::*;
 
 /// What still has to be saved before Xylo closes, in product words.
-fn unsaved_kinds(drafts: bool, memory: bool, documents: bool, recovery: bool) -> Vec<&'static str> {
+fn unsaved_kinds(drafts: bool, memory: bool, documents: bool) -> Vec<&'static str> {
     [
         (drafts, "message drafts"),
         (memory, "memory edits"),
         (documents, "document edits"),
-        (recovery, "action review notes"),
     ]
     .into_iter()
     .filter_map(|(pending, label)| pending.then_some(label))
@@ -43,11 +42,6 @@ impl Xylo {
             || self.quit_prompt_open
             || self.quit_after_save.is_some()
         {
-            return;
-        }
-        if self.recovery.mutation_busy() {
-            self.error = Some("Wait for the observed outcome request, or stop waiting and check its result, before closing.".into());
-            cx.notify();
             return;
         }
         if !self.management_check_close(DraftFlushAction::Quit, window, cx) {
@@ -104,6 +98,11 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings.permissions == PermissionMode::FullAccess {
+            self.quit_tasks_confirmed = true;
+            self.request_quit(window, cx);
+            return;
+        }
         window.activate_window();
         cx.activate(true);
         self.quit_prompt_open = true;
@@ -146,7 +145,6 @@ impl Xylo {
         if !self.flush_drafts(DraftFlushAction::Quit, cx)
             || !self.memory_forms_flush(DraftFlushAction::Quit, cx)
             || !self.document_drafts_flush(DraftFlushAction::Quit, cx)
-            || !self.recovery_flush(DraftFlushAction::Quit, cx)
         {
             self.quit_waiting_for_saves = true;
             cx.notify();
@@ -200,7 +198,6 @@ impl Xylo {
         self.draft_flush_pending()
             || self.memory_forms_flush_pending()
             || self.document_drafts_flush_pending()
-            || self.recovery_flush_pending()
     }
 
     /// Banner while saves run before quitting or installing an update. A quit
@@ -212,12 +209,7 @@ impl Xylo {
         }
         let memory = self.memory_forms_flush_pending();
         let documents = self.document_drafts_flush_pending();
-        let unsaved = unsaved_kinds(
-            self.draft_flush_pending(),
-            memory,
-            documents,
-            self.recovery_flush_pending(),
-        );
+        let unsaved = unsaved_kinds(self.draft_flush_pending(), memory, documents);
         let quitting = self.quit_waiting_for_saves;
         let headline = if !self.host_running() {
             "Xylo's background service stopped, so this work can't be saved."
@@ -292,6 +284,6 @@ impl Xylo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "quit/tests.rs"]
 mod tests;

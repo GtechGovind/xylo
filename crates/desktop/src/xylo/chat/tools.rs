@@ -40,11 +40,12 @@ pub(super) fn tool_icon(name: &str) -> AppIcon {
 
 /// Consecutive calls that read as one row: card indices of the first and the
 /// latest call, and how many there were.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CallRun {
     pub first: usize,
     pub last: usize,
     pub count: usize,
+    pub members: Vec<usize>,
 }
 
 /// Folds consecutive finished calls that show the same row (same tool, same
@@ -63,6 +64,7 @@ pub(super) fn merge_identical(tools: &[ToolCard], indices: &[usize]) -> Vec<Call
             {
                 run.last = index;
                 run.count += 1;
+                run.members.push(index);
                 continue;
             }
         }
@@ -70,6 +72,7 @@ pub(super) fn merge_identical(tools: &[ToolCard], indices: &[usize]) -> Vec<Call
             first: index,
             last: index,
             count: 1,
+            members: vec![index],
         });
     }
     runs
@@ -152,7 +155,7 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.call_row(i, tool, tool, 1, window, cx)
+        self.call_row(i, tool, tool, &[(i, tool)], window, cx)
     }
 
     /// A run of identical calls; the row keeps the first call's identity and
@@ -168,7 +171,10 @@ impl Xylo {
             run.first,
             &turn.tools[run.first],
             &turn.tools[run.last],
-            run.count,
+            &run.members
+                .iter()
+                .map(|index| (*index, &turn.tools[*index]))
+                .collect::<Vec<_>>(),
             window,
             cx,
         )
@@ -179,13 +185,23 @@ impl Xylo {
         i: usize,
         first: &ToolCard,
         tool: &ToolCard,
-        count: usize,
+        members: &[(usize, &ToolCard)],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if tool.approval && matches!(tool.name.as_str(), "ask_user" | "exit_plan_mode") {
+            return self.approval_panel(i, tool, window, cx);
+        }
         if tool.name == crate::state::PLAN_TOOL && tool.success != Some(false) {
             return plan_card(i, tool);
         }
+        if members.len() == 1
+            && !tool.approval
+            && let Some(job) = self.tool_command_job(tool)
+        {
+            return self.command_tail(job, cx);
+        }
+        let count = members.len();
         let key = first.id;
         let shown = &tool.presentation;
         // Calls without a readable body (skills, skill files) never expand.
@@ -203,6 +219,7 @@ impl Xylo {
         let (status, state_word) = call_status(tool);
         let group: SharedString = format!("tool-row-{key}").into();
         let header = focus_ring(gpui_kit::base::Button::new(("tool-detail", i)))
+            .when(expandable, |header| header.aria_expanded(expanded))
             .accessibility_label(format!(
                 "{} {}{}, {state_word}.{}",
                 shown.verb,
@@ -219,14 +236,16 @@ impl Xylo {
                 }
             ))
             .group(group.clone())
-            .w_full()
+            .self_start()
+            .max_w_full()
+            .when(expanded || tool.approval, |header| header.w_full())
             .min_w_0()
             .flex()
             .items_center()
             .justify_start()
             .gap(px(8.))
             .px(px(8.))
-            .h(px(30.))
+            .min_h(px(CONTROL_SIZE))
             .rounded(px(8.))
             .when_some(shown.tooltip.clone(), |header, tooltip| {
                 header.tooltip(move |_, cx| cx.new(|_| XyloTooltip(tooltip.clone().into())).into())
@@ -251,10 +270,13 @@ impl Xylo {
             )
             .child(
                 div()
-                    .flex_1()
+                    .when(expanded || tool.approval, |target| target.flex_1())
+                    .when(!expanded && !tool.approval, |target| {
+                        target.max_w(px((self.chat_width.get() - 190.).clamp(80., 520.)))
+                    })
                     .min_w_0()
                     .single_line()
-                    .text_size(px(12.5))
+                    .text_size(px(DETAIL_SIZE))
                     .font_family(mono(cx))
                     .text_color(rgb(muted()))
                     .child(shown.target.clone()),
@@ -264,7 +286,7 @@ impl Xylo {
                     div()
                         .flex_shrink_0()
                         .single_line()
-                        .text_size(px(11.5))
+                        .text_size(px(META_SIZE))
                         .text_color(rgb(faint()))
                         .child(meta),
                 )
@@ -279,7 +301,7 @@ impl Xylo {
                         .rounded_full()
                         .bg(rgb(hover()))
                         .single_line()
-                        .text_size(px(11.))
+                        .text_size(px(META_SIZE))
                         .text_color(rgb(muted()))
                         .child(format!("×{count}")),
                 )
@@ -291,13 +313,10 @@ impl Xylo {
                     .hover(|style| style.bg(rgb(hover())))
                     .child(
                         div()
+                            .id(("tool-chevron", i))
+                            .test_support()
                             .flex_shrink_0()
                             .text_color(rgb(faint()))
-                            .when(!expanded, |chevron| {
-                                chevron
-                                    .opacity(0.)
-                                    .group_hover(group.clone(), |style| style.opacity(1.))
-                            })
                             .child(disclosure.chevron()),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_expanded(key, cx)))
@@ -316,6 +335,9 @@ impl Xylo {
                 card.border_color(rgb(border())).bg(rgb(panel()))
             })
             .child(header);
+        if let Some(job) = self.tool_command_job(tool) {
+            card = card.child(self.command_tail(job, cx));
+        }
         // A failed call stays one row with its reason underneath.
         if let Some(error) = &shown.error {
             card = card.child(
@@ -325,7 +347,7 @@ impl Xylo {
                     .pl(px(30.))
                     .pr_2()
                     .pb(px(6.))
-                    .text_size(px(12.5))
+                    .text_size(px(DETAIL_SIZE))
                     .line_height(relative(1.45))
                     .text_color(rgb(danger()))
                     .child(error.clone()),
@@ -343,7 +365,7 @@ impl Xylo {
             card = card
                 .border_color(rgb(border_strong()))
                 .shadow_sm()
-                .child(self.approval_panel(i, tool, cx));
+                .child(self.approval_panel(i, tool, window, cx));
             // A decision the task is waiting on announces itself once.
             return crate::motion::emphasize_in(
                 ElementId::Name(format!("approval-enter-{key}").into()),
@@ -354,7 +376,17 @@ impl Xylo {
             .into_any_element();
         }
         if let Some(disclosure) = disclosure.filter(|_| details_visible) {
-            let details = self.structured_tool_details(i, tool, cx);
+            let details = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .children(members.iter().enumerate().map(|(member, (index, tool))| {
+                    div()
+                        .when(count > 1, |body| {
+                            body.child(subtitle(format!("Call {} of {count}", member + 1)))
+                        })
+                        .child(self.structured_tool_details(*index, tool, cx))
+                }));
             card = card.child(disclosure.reveal(details, window, cx));
         }
         card.into_any_element()
@@ -429,12 +461,18 @@ impl Xylo {
 
     /// The decision card: what the agent wants to do, a preview of it, and
     /// Allow / Deny with their shortcuts.
-    fn approval_panel(&self, i: usize, tool: &ToolCard, cx: &mut Context<Self>) -> AnyElement {
+    fn approval_panel(
+        &self,
+        i: usize,
+        tool: &ToolCard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         if tool.name == "ask_user" {
-            return self.question_card(i, tool, cx);
+            return self.question_card(i, tool, window, cx);
         }
         if tool.name == "exit_plan_mode" {
-            return self.plan_decision_card(i, tool, cx);
+            return self.plan_decision_card(i, tool, window, cx);
         }
         let id = tool.id;
         let incomplete = tool.input.get("diff_truncated").and_then(Value::as_bool) == Some(true);
@@ -461,7 +499,7 @@ impl Xylo {
             .when_some(tool.reason.clone(), |panel, reason| {
                 panel.child(subtitle(reason).id(("approval-reason", i)).test_support())
             })
-            .child(approval_preview(i, tool))
+            .child(approval_preview(i, tool, cx))
             .child(self.full_action_inspector(i, tool, cx))
             .when(incomplete, |panel| {
                 panel.child(subtitle(
@@ -519,8 +557,7 @@ pub(super) fn detail_action(
     label: impl Into<SharedString>,
 ) -> gpui_kit::base::Button {
     button(id, label)
-        .min_h(px(26.))
-        .h(px(26.))
+        .min_h(px(CONTROL_SIZE))
         .px(px(8.))
         .text_size(px(12.))
         .font_weight(FontWeight::NORMAL)
@@ -622,60 +659,9 @@ fn plan_card(i: usize, tool: &ToolCard) -> AnyElement {
         .into_any_element()
 }
 
-/// Unified diff with added and removed lines tinted; long diffs scroll.
-pub(super) fn diff_view(id: impl Into<ElementId>, diff: &str) -> AnyElement {
-    const LINES: usize = 600;
-    let mut body = div().flex().flex_col().min_w_full();
-    let mut shown = 0;
-    for line in diff.lines().take(LINES) {
-        shown += 1;
-        let (background, foreground) = if line.starts_with("+++") || line.starts_with("---") {
-            (None, muted())
-        } else if line.starts_with('+') {
-            (Some(diff_added_bg()), success())
-        } else if line.starts_with('-') {
-            (Some(diff_removed_bg()), danger())
-        } else if line.starts_with("@@") {
-            (None, accent())
-        } else {
-            (None, text())
-        };
-        body = body.child(
-            div()
-                .px_2()
-                .whitespace_nowrap()
-                .when_some(background, |row, color| row.bg(rgb(color)))
-                .text_color(rgb(foreground))
-                .child(if line.is_empty() {
-                    " ".to_owned()
-                } else {
-                    line.to_owned()
-                }),
-        );
-    }
-    if diff.lines().count() > shown {
-        body = body.child(
-            div()
-                .px_2()
-                .text_color(rgb(muted()))
-                .child("… diff preview shortened; use full inspection or copy controls"),
-        );
-    }
-    div()
-        .id(id)
-        .w_full()
-        .max_h(px(360.))
-        .overflow_scroll()
-        .py_1()
-        .rounded(px(8.))
-        .bg(rgb(code_bg()))
-        .border_1()
-        .border_color(rgb(border()))
-        .font_family("monospace")
-        .text_size(px(12.5))
-        .line_height(relative(1.55))
-        .child(body)
-        .into_any_element()
+/// Wrapped, numbered change preview using Xylo's shared palette.
+pub(super) fn diff_view(id: impl Into<ElementId>, diff: &str, cx: &App) -> AnyElement {
+    super::diff_preview::view(id, diff, cx)
 }
 
 /// Selectable, scrollable preview; full action inspection is explicit.
@@ -708,14 +694,14 @@ fn full_code_block(id: impl Into<ElementId>, text: &str) -> AnyElement {
         .into_any_element()
 }
 
-fn approval_preview(i: usize, tool: &ToolCard) -> AnyElement {
+fn approval_preview(i: usize, tool: &ToolCard, cx: &App) -> AnyElement {
     match tool.name.as_str() {
         "file_write" | "file_edit" | "notebook_edit" => {
             let diff = text_arg(&tool.input, "diff");
             if diff.trim().is_empty() {
                 subtitle("No textual change.").into_any_element()
             } else {
-                diff_view(("approval-diff", i), diff)
+                diff_view(("approval-diff", i), diff, cx)
             }
         }
         "run_command" | "shell_command" => code_block(
@@ -726,6 +712,6 @@ fn approval_preview(i: usize, tool: &ToolCard) -> AnyElement {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "tools/tests.rs"]
 mod tests;

@@ -10,7 +10,7 @@ fn execute(
     let context = matches!(name, "shell_command" | "run_command")
         .then(|| prepare(broker, args))
         .transpose()?;
-    super::execute(broker, name, args, access, context)
+    super::execute(broker, Uuid::new_v4(), name, args, access, context)
 }
 
 #[test]
@@ -366,6 +366,8 @@ async fn a_ninth_running_job_is_refused_before_its_command_runs() {
                 publication: Mutex::new(()),
                 state: Mutex::new(JobState {
                     snapshot: ShellJob {
+                        action_id: None,
+                        background: true,
                         id: Uuid::new_v4(),
                         turn_id: broker.request.turn_id,
                         command: "fixture".into(),
@@ -636,6 +638,8 @@ fn review_delayed_live_publication_cannot_follow_completion() {
         publication: Mutex::new(()),
         state: Mutex::new(JobState {
             snapshot: ShellJob {
+                action_id: None,
+                background: true,
                 id: Uuid::new_v4(),
                 turn_id: Uuid::new_v4(),
                 command: "fixture".into(),
@@ -845,4 +849,129 @@ async fn approved_outside_cwd_cannot_write_siblings_or_survive_a_root_change() {
             .unwrap(),
         directory.path().canonicalize().unwrap()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_output_arrives_before_failure_with_action_identity() {
+    let (_directory, broker, _events) =
+        super::super::tests::fixture(xylo_core::PermissionMode::FullAccess);
+    let broker = Arc::new(broker);
+    let (sender, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    broker
+        .session
+        .shell_jobs
+        .set_events(Arc::new(move |session, event| {
+            let _ = sender.send((session, event));
+        }));
+    let action = Uuid::new_v4();
+    let owner = broker.request.session_id;
+    let task = broker.clone();
+    let running = tokio::task::spawn_blocking(move || {
+        let args = json!({"command":"printf 'first\\n'; sleep 0.4; printf 'last\\n'; exit 7"});
+        let context = prepare(&task, &args).unwrap();
+        super::execute(
+            &task,
+            action,
+            "shell_command",
+            &args,
+            builtin::Access {
+                outside: false,
+                network: false,
+            },
+            Some(context),
+        )
+    });
+    let mut observed_live_output = false;
+    loop {
+        let (session, event) = tokio::time::timeout(Duration::from_secs(10), receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let EngineEvent::ShellJobUpdated { job } = event {
+            assert_eq!(session, owner);
+            assert_eq!(job.action_id, Some(action));
+            assert!(!job.background);
+            assert!(job.output.len() <= UI_TAIL_BYTES + 3);
+            if job.running && job.output.contains("first") {
+                observed_live_output = true;
+                assert!(!running.is_finished());
+            }
+            if !job.running {
+                assert_eq!(job.exit_code, Some(7));
+                assert!(job.output.contains("last"));
+                break;
+            }
+        }
+    }
+    assert!(observed_live_output);
+    assert_eq!(running.await.unwrap().unwrap()["status"], "failed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_foreground_commands_keep_journaled_output_after_reopen() {
+    for cancelled in [false, true] {
+        let (directory, broker, _events) =
+            super::super::tests::fixture(xylo_core::PermissionMode::FullAccess);
+        let (sender, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        broker
+            .session
+            .shell_jobs
+            .set_events(Arc::new(move |_, event| {
+                let _ = sender.send(event);
+            }));
+        let execution = broker.clone();
+        let running = tokio::task::spawn_blocking(move || {
+            execution.execute(
+            "interrupted-output", "shell_command",
+            json!({"command":"printf 'retained before interruption\\n'; sleep 30", "timeout_seconds":if cancelled { 30 } else { 1 }}),
+        )
+        });
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), receive.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let EngineEvent::ShellJobUpdated { job } = event
+                && job.output.contains("retained before interruption")
+            {
+                if cancelled {
+                    broker.cancel.cancel();
+                }
+                break;
+            }
+        }
+        assert!(running.await.unwrap().is_err());
+        let action = broker.journaled("interrupted-output").unwrap().unwrap();
+        let reopened =
+            xylo_services::Store::open(directory.path().join("profile/xylo.db")).unwrap();
+        let record = reopened
+            .turn_action(
+                broker.request.session_id,
+                broker.request.turn_id,
+                action.intent.id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.state, "outcome_unknown",
+            "Interrupted writes must stay uncertain"
+        );
+        let result = record.result.unwrap();
+        let job = Uuid::parse_str(result["summary"]["job_id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            result["summary"]["job_turn_id"],
+            json!(broker.request.turn_id)
+        );
+        let retained = broker
+            .artifacts
+            .join("shell-jobs")
+            .join(broker.request.session_id.to_string())
+            .join(format!("{job}.log"));
+        assert!(
+            std::fs::read_to_string(retained)
+                .unwrap()
+                .contains("retained before interruption")
+        );
+        broker.session.shell_jobs.shutdown().await;
+    }
 }

@@ -906,3 +906,56 @@ fn interaction_selecting_saved_plan_after_approval_sends_restrictive_transition(
         );
     });
 }
+
+#[gpui_kit::test]
+fn stopped_after_a_tool_keeps_the_last_useful_text(cx: &mut TestAppContext) {
+    with_view(cx, |view, _, _| {
+        use crate::state::TurnState;
+        let mut turn = TurnState::default();
+        turn.apply(EngineEvent::Started);
+        turn.apply(EngineEvent::Delta {
+            text: "Useful partial answer".into(),
+        });
+        turn.apply(EngineEvent::ToolStarted {
+            action_id: Uuid::new_v4(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path":"a.rs"}),
+            parent_id: None,
+        });
+        turn.apply(EngineEvent::Cancelled);
+        assert_eq!(super::transcript::answer_segment(&turn), Some(0));
+        assert!(!view.work_folded(&turn));
+    });
+}
+
+#[gpui_kit::test]
+fn stop_acknowledges_once_and_waits_for_runtime(cx: &mut TestAppContext) {
+    with_view(cx, |view, window, cx| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        view.validation_worker_commands = Some(sender);
+        let session = Some(view.session);
+        engine(view, session, EngineEvent::Started, window, cx);
+        view.request_stop(cx);
+        view.request_stop(cx);
+        assert!(view.turns[&view.session].running);
+        assert!(view.turns[&view.session].cancel_requested);
+        assert_eq!(
+            super::transcript::phase_label(&view.turns[&view.session]),
+            "Stopping…"
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap().1,
+            WorkerCommand::Cancel
+        ));
+        assert!(receiver.try_recv().is_err());
+        engine(view, session, EngineEvent::Cancelled, window, cx);
+        assert!(!view.turns[&view.session].cancel_requested);
+        assert!(view.turns[&view.session].stopped());
+        engine(view, session, EngineEvent::Started, window, cx);
+        assert!(!view.turns[&view.session].cancel_requested);
+        drop(receiver);
+        view.request_stop(cx);
+        assert!(!view.turns[&view.session].cancel_requested);
+        assert!(view.error.as_ref().unwrap().contains("Couldn’t stop"));
+    });
+}

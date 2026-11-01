@@ -18,6 +18,9 @@ fn exports_all_pages_in_order_to_adjacent_files() {
     for index in 0..405 {
         store
             .append_message(&ChatMessage {
+                activity_count: 0,
+                activity_summary: None,
+                turn_id: None,
                 id: Uuid::new_v4(),
                 session_id: session,
                 role: "user".into(),

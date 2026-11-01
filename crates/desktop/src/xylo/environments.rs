@@ -959,8 +959,7 @@ impl Xylo {
         } else {
             "The saved profile will be removed. This does not remove remote files or existing containers."
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
+        let answer = self.confirm_explicit_action(
             title,
             Some(detail),
             &[
@@ -971,13 +970,14 @@ impl Xylo {
                     "Remove profile"
                 }),
             ],
+            window,
             cx,
         );
         cx.spawn_in(window, async move |view, cx| {
             let answer = answer.await;
             let _ = view.update_in(cx, |view, _, cx| {
                 view.environments.confirming = false;
-                if matches!(answer, Ok(1))
+                if answer
                     && epoch == view.environments.epoch
                     && view.environments.selected_record().is_some_and(|record| {
                         record.profile.id == id && record.revision == revision
@@ -1113,17 +1113,15 @@ impl Xylo {
         }
         self.environments.confirming = true;
         let epoch = self.environments.epoch;
-        let answer = window.prompt(
-            PromptLevel::Warning,
+        let answer = self.confirm_explicit_action(
             "Record this observed result?",
             Some("This records your observation and does not repeat the action. Check the remote or container result first."),
-            &[PromptButton::cancel("Cancel"), PromptButton::new("Record result")], cx,
-        );
+            &[PromptButton::cancel("Cancel"), PromptButton::new("Record result")], window, cx);
         cx.spawn_in(window, async move |view, cx| {
             let answer = answer.await;
             let _ = view.update_in(cx, |view, _, cx| {
                 view.environments.confirming = false;
-                if matches!(answer, Ok(1)) && epoch == view.environments.epoch {
+                if answer && epoch == view.environments.epoch {
                     view.environment_request(
                         "helper_environment_resolve",
                         json!({"operation_id":operation_id,"succeeded":succeeded,"note":note}),

@@ -235,6 +235,12 @@ impl Xylo {
             self.project_search.notice =
                 "Project changed. Search again for current results.".into();
         }
+        if self.settings.ui.work_panel_open
+            && self.git_panel.request.is_none()
+            && (!index.changed.is_empty() || !index.removed.is_empty() || !index.changes_complete)
+        {
+            self.refresh_git(cx);
+        }
         self.project_search.revision = index.revision;
         self.update_file_browser(&index, cx);
         if let Some(path) = self.editor_path.clone() {

@@ -1,24 +1,10 @@
 //! The chat page's chrome: the toolbar title and the conversation "…" menu,
-//! the work panel beside the chat (Changes, Files, Terminal and, while the
-//! chat has helpers, Subagents) and its virtualized Git folder tree. The work
-//! panel opens only when the user asks for it or opens a file or diff; it is
-//! never shown on other pages.
+//! the task results beside the chat and the file changes viewer. The panel
+//! opens when requested; empty utility sections do not occupy the chat UI.
 use super::*;
 use crate::icons::{self, AppIcon};
 use xylo_runtime::workspace::git::{ChangeGroup, GitChange, GitStatus};
 
-#[derive(Clone)]
-enum GitRow {
-    Group(ChangeGroup, &'static str, usize),
-    Folder(ChangeGroup, PathBuf, usize),
-    File(ChangeGroup, GitChange, usize),
-}
-#[derive(Default)]
-struct Node {
-    children: BTreeMap<(bool, String), Node>,
-    file: Option<GitChange>,
-    path: PathBuf,
-}
 #[derive(Default)]
 pub(super) struct GitPanel {
     pub request: Option<Uuid>,
@@ -26,10 +12,7 @@ pub(super) struct GitPanel {
     diff_width: f32,
     pub root: Option<PathBuf>,
     pub status: Option<GitStatus>,
-    trees: Vec<(ChangeGroup, &'static str, usize, Node)>,
     pub statuses: BTreeMap<PathBuf, char>,
-    rows: std::sync::Arc<Vec<GitRow>>,
-    collapsed: BTreeSet<(u8, PathBuf)>,
     pub selected: Option<(PathBuf, ChangeGroup)>,
     pub error: Option<String>,
     /// Lines of the selected change's diff.
@@ -39,25 +22,9 @@ pub(super) struct GitPanel {
     pub original: Option<PathBuf>,
     pub hunk_request: Option<Uuid>,
 }
-fn group_id(group: ChangeGroup) -> u8 {
-    match group {
-        ChangeGroup::Staged => 0,
-        ChangeGroup::Unstaged => 1,
-        ChangeGroup::Untracked => 2,
-    }
-}
 impl GitPanel {
-    pub(super) fn prepare(
-        root: PathBuf,
-        status: GitStatus,
-        collapsed: BTreeSet<(u8, PathBuf)>,
-    ) -> Self {
-        let mut panel = Self {
-            root: Some(root.clone()),
-            collapsed,
-            ..Self::default()
-        };
-        panel.statuses = status
+    pub(super) fn prepare(root: PathBuf, status: GitStatus) -> Self {
+        let statuses = status
             .changes
             .iter()
             .map(|change| {
@@ -73,91 +40,19 @@ impl GitPanel {
                 )
             })
             .collect();
-        for (group, label) in [
-            (ChangeGroup::Staged, "Staged"),
-            (ChangeGroup::Unstaged, "Unstaged"),
-            (ChangeGroup::Untracked, "Untracked"),
-        ] {
-            let mut count = 0;
-            let mut tree = Node::default();
-            for change in status
-                .changes
-                .iter()
-                .filter(|change| change.in_group(group))
-            {
-                count += 1;
-                let mut node = &mut tree;
-                let components: Vec<_> = change.path.components().collect();
-                let mut path = PathBuf::new();
-                for (index, component) in components.iter().enumerate() {
-                    path.push(component.as_os_str());
-                    node = node
-                        .children
-                        .entry((
-                            index + 1 == components.len(),
-                            component.as_os_str().to_string_lossy().into_owned(),
-                        ))
-                        .or_default();
-                    node.path = path.clone();
-                }
-                node.file = Some(change.clone());
-            }
-            if count > 0 {
-                panel.trees.push((group, label, count, tree));
-            }
-        }
-        panel.status = Some(status);
-        panel.rebuild();
-        panel
-    }
-    /// Takes the status tree from a freshly prepared panel. The selected
-    /// file, its diff and a diff still loading stay, so a refresh never drops
-    /// a click.
-    pub(super) fn take_tree(&mut self, prepared: GitPanel) {
-        let GitPanel {
-            root,
-            status,
-            trees,
+        Self {
+            root: Some(root),
+            status: Some(status),
             statuses,
-            rows,
-            collapsed,
-            ..
-        } = prepared;
-        self.request = None;
-        self.root = root;
-        self.status = status;
-        self.trees = trees;
-        self.statuses = statuses;
-        self.rows = rows;
-        self.collapsed = collapsed;
+            ..Self::default()
+        }
     }
-    fn rebuild(&mut self) {
-        fn walk(
-            node: &Node,
-            depth: usize,
-            group: ChangeGroup,
-            collapsed: &BTreeSet<(u8, PathBuf)>,
-            rows: &mut Vec<GitRow>,
-        ) {
-            for child in node.children.values() {
-                if let Some(change) = &child.file {
-                    rows.push(GitRow::File(group, change.clone(), depth));
-                } else {
-                    rows.push(GitRow::Folder(group, child.path.clone(), depth));
-                    if !collapsed.contains(&(group_id(group), child.path.clone())) {
-                        walk(child, depth + 1, group, collapsed, rows);
-                    }
-                }
-            }
-        }
-        let mut rows = Vec::new();
-        for (group, label, count, tree) in &self.trees {
-            rows.push(GitRow::Group(*group, label, *count));
-            if !self.collapsed.contains(&(group_id(*group), PathBuf::new())) {
-                walk(tree, 0, *group, &self.collapsed, &mut rows);
-            }
-        }
-        self.rows = std::sync::Arc::new(rows);
+    /// Refresh the file list without dropping an open diff or its in-flight request.
+    pub(super) fn take_status(&mut self, prepared: GitPanel) {
+        self.request = None;
+        self.root = prepared.root;
+        self.status = prepared.status;
+        self.statuses = prepared.statuses;
     }
 }
 impl Xylo {
@@ -193,16 +88,10 @@ impl Xylo {
             .flex_1()
             .min_w_0()
             .single_line()
-            .text_size(px(13.5))
+            .text_size(px(14.))
             .font_weight(FontWeight::MEDIUM)
-            .text_color(rgb(text_secondary()))
+            .text_color(rgb(text()))
             .child(title)
-            .when_some(
-                self.workspace
-                    .as_deref()
-                    .and_then(super::worktrees::branch_label),
-                |row, branch| row.child(format!("  ·  {branch}")),
-            )
             .into_any_element()
     }
     /// The open chat as plain text, oldest first, including the live turn.
@@ -284,55 +173,232 @@ impl Xylo {
             .conversations
             .iter()
             .any(|chat| chat.id == self.session);
-        if !saved && self.messages.is_empty() && !self.has_live_transcript() {
+        if !saved
+            && self.messages.is_empty()
+            && !self.has_live_transcript()
+            && self.workspace.is_none()
+        {
             return None;
         }
         let weak = cx.entity().downgrade();
         let session = self.session;
         let busy = self.chat_busy(session);
+        let separate_checkout = self.workspace.is_some();
         Some(
-            icons::menu_trigger(
-                "conversation-actions",
-                AppIcon::More,
-                "Conversation actions",
-            )
-            .dropdown_menu(move |menu, _, _| {
-                let rename = weak.clone();
-                let copy = weak.clone();
-                let export = weak.clone();
-                let archive = weak.clone();
-                let menu = if saved {
-                    menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
-                        let _ = rename
-                            .update(cx, |view, cx| view.start_header_rename(session, window, cx));
-                    }))
-                } else {
-                    menu
-                };
-                let menu = menu
-                    .item(
-                        PopupMenuItem::new("Copy conversation").on_click(move |_, _, cx| {
-                            if let Ok(text) = copy.update(cx, |view, _| view.conversation_text()) {
-                                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            }
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new("Export…").on_click(move |_, window, cx| {
-                            let _ =
-                                export.update(cx, |view, cx| view.export_conversation(window, cx));
-                        }),
-                    );
-                if !saved {
-                    return menu;
-                }
-                menu.separator()
-                    .item(sidebar::archive_item(busy, move |cx| {
-                        let _ = archive.update(cx, |view, cx| view.archive_chat(session, cx));
-                    }))
-            })
-            .into_any_element(),
+            icons::menu_trigger("conversation-actions", AppIcon::More, "Chat options")
+                .size(px(34.))
+                .dropdown_menu(move |menu, _, _| {
+                    let checkout = weak.clone();
+                    let menu = if separate_checkout {
+                        menu.item(
+                            PopupMenuItem::new("New chat in separate checkout…").on_click(
+                                move |_, _, cx| {
+                                    let _ = checkout.update(cx, |view, cx| {
+                                        let previous = view.session;
+                                        view.new_chat(cx);
+                                        if view.session != previous {
+                                            view.start_worktree_chat(cx);
+                                        }
+                                    });
+                                },
+                            ),
+                        )
+                    } else {
+                        menu
+                    };
+                    let rename = weak.clone();
+                    let copy = weak.clone();
+                    let export = weak.clone();
+                    let find = weak.clone();
+                    let archive = weak.clone();
+                    let menu = if saved {
+                        menu.item(PopupMenuItem::new("Rename chat").on_click(
+                            move |_, window, cx| {
+                                let _ = rename.update(cx, |view, cx| {
+                                    view.start_header_rename(session, window, cx)
+                                });
+                            },
+                        ))
+                    } else {
+                        menu
+                    };
+                    let menu = menu
+                        .item(
+                            PopupMenuItem::new("Find in chat").on_click(move |_, window, cx| {
+                                let _ =
+                                    find.update(cx, |view, cx| view.open_chat_search(window, cx));
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::new("Copy conversation").on_click(move |_, _, cx| {
+                                if let Ok(text) =
+                                    copy.update(cx, |view, _| view.conversation_text())
+                                {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                }
+                            }),
+                        )
+                        .item(PopupMenuItem::new("Export conversation…").on_click(
+                            move |_, window, cx| {
+                                let _ = export
+                                    .update(cx, |view, cx| view.export_conversation(window, cx));
+                            },
+                        ));
+                    if !saved {
+                        return menu;
+                    }
+                    menu.separator()
+                        .item(sidebar::archive_item(busy, move |cx| {
+                            let _ = archive.update(cx, |view, cx| view.archive_chat(session, cx));
+                        }))
+                })
+                .into_any_element(),
         )
+    }
+    fn chat_details_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let agents = self.subagent_count();
+        let changes = self
+            .git_panel
+            .status
+            .as_ref()
+            .map_or(0, |status| status.changes.len());
+        let jobs = self
+            .turns
+            .get(&self.session)
+            .map_or(0, |turn| turn.shell_jobs.len());
+        let mut content = div()
+            .id("chat-details")
+            .test_support()
+            .size_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .p(px(12.));
+        if agents > 0 {
+            content = content.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_2()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Subagents"),
+                    )
+                    .child(self.subagents_panel(cx)),
+            );
+        }
+        if changes > 0 {
+            content = content.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(self.chat_details_link(
+                        "chat-detail-changes",
+                        AppIcon::Changes,
+                        format!(
+                            "{changes} {} changed",
+                            if changes == 1 { "file" } else { "files" }
+                        ),
+                        "changes",
+                        cx,
+                    ))
+                    .children(self.changed_file_rows(Some(5), cx))
+                    .when(changes > 5, |section| {
+                        section.child(self.chat_details_link(
+                            "chat-detail-all-changes",
+                            AppIcon::ChevronRight,
+                            "View all files".into(),
+                            "changes",
+                            cx,
+                        ))
+                    }),
+            );
+        }
+        if jobs > 0 {
+            content = content.child(self.chat_details_link(
+                "chat-detail-commands",
+                AppIcon::Terminal,
+                format!("{jobs} {}", if jobs == 1 { "command" } else { "commands" }),
+                "jobs",
+                cx,
+            ));
+        }
+        if self.subagent_activity_loading() {
+            content = content.child(loading_caption("Loading saved results…"));
+        } else if self.subagent_activity_error().is_some() {
+            content =
+                content.child(
+                    div()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(muted()))
+                                .child("Saved results couldn’t be loaded."),
+                        )
+                        .child(pill("retry-subagent-results", "Retry").on_click(
+                            cx.listener(|view, _, _, cx| view.load_subagent_activity(cx)),
+                        )),
+                );
+        }
+        if agents == 0
+            && changes == 0
+            && jobs == 0
+            && !self.subagent_activity_loading()
+            && self.subagent_activity_error().is_none()
+        {
+            content = content.child(
+                div()
+                    .id("task-details-empty")
+                    .test_support()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(13.))
+                    .line_height(relative(1.5))
+                    .text_color(rgb(muted()))
+                    .child("Subagent results and changed files appear here as Xylo works."),
+            );
+        }
+        content.into_any_element()
+    }
+    fn chat_details_link(
+        &self,
+        id: &'static str,
+        glyph: AppIcon,
+        label: String,
+        target: &'static str,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        focus_ring(gpui_kit::base::Button::new(id))
+            .accessibility_label(label.clone())
+            .w_full()
+            .min_h(px(35.))
+            .py(px(4.))
+            .flex()
+            .items_center()
+            .justify_start()
+            .gap(px(9.))
+            .text_size(px(12.))
+            .text_color(rgb(text_secondary()))
+            .hover(|style| style.text_color(rgb(text())))
+            .child(icons::small(glyph).size(px(15.)))
+            .child(label)
+            .on_click(cx.listener(move |view, _, window, cx| {
+                view.settings.ui.work_panel = target.into();
+                view.activate_work_panel(window, cx);
+                cx.notify();
+            }))
+            .into_any_element()
     }
     /// Hides the work panel and returns any panel route to the chat.
     pub(super) fn close_work_panel(&mut self, cx: &mut Context<Self>) {
@@ -374,18 +440,17 @@ impl Xylo {
         }
         match result {
             Ok(status) => {
-                let collapsed = self.git_panel.collapsed.clone();
                 let expected_root = root.clone();
                 let prepared = cx
                     .background_executor()
-                    .spawn(async move { GitPanel::prepare(root, status, collapsed) });
+                    .spawn(async move { GitPanel::prepare(root, status) });
                 cx.spawn(async move |view, cx| {
                     let panel = prepared.await;
                     let _ = view.update(cx, |view, cx| {
                         if view.workspace.as_ref() == Some(&expected_root)
                             && view.git_panel.request == Some(request)
                         {
-                            view.git_panel.take_tree(panel);
+                            view.git_panel.take_status(panel);
                             cx.notify();
                         }
                     });
@@ -456,7 +521,10 @@ impl Xylo {
         match self.settings.ui.work_panel.as_str() {
             "changes" => self.refresh_git(cx),
             "terminal" => self.show_terminal(window, cx),
-            "subagents" => {}
+            "subagents" | "details" => {
+                self.refresh_git(cx);
+                self.load_subagent_activity(cx);
+            }
             _ => {
                 self.refresh_files(cx);
                 if self.git_panel.status.is_none() {
@@ -488,22 +556,35 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let chat = self.chat(cx);
         let open =
             self.settings.ui.work_panel_open || matches!(self.page, Page::Files | Page::Changes);
+        let total = f32::from(window.viewport_size().width);
+        let available = self.available_work_panel_width(total);
+        let panel_width = if available < 720. {
+            0.
+        } else {
+            self.effective_work_panel_width(total)
+        };
+        self.chat_width
+            .set(available - if open { panel_width } else { 0. });
+        let chat = self.chat(cx);
         if !open {
             return chat;
         }
-        let subagents = self.subagent_count();
         let selected = if self.page == Page::Files {
             "files"
         } else if self.page == Page::Changes {
             "changes"
-        } else if self.settings.ui.work_panel == "subagents" && subagents == 0 {
-            "files"
+        } else if self.settings.ui.work_panel == "subagents" {
+            "details"
         } else {
             &self.settings.ui.work_panel
         };
+        let compact_tabs = (if available < 720. {
+            available
+        } else {
+            panel_width
+        }) < 440.;
         let mut tabs = div()
             .h(px(52.))
             .flex_shrink_0()
@@ -514,15 +595,31 @@ impl Xylo {
             .bg(rgb(sidebar()))
             .border_b_1()
             .border_color(rgb(border()));
+        let change_count = self
+            .git_panel
+            .status
+            .as_ref()
+            .map_or(0, |status| status.changes.len());
+        let jobs = self
+            .turns
+            .get(&self.session)
+            .map_or(0, |turn| turn.shell_jobs.len());
         let tab_list = [
+            ("details", "Activity", AppIcon::Agent),
             ("changes", "Changes", AppIcon::Changes),
             ("files", "Files", AppIcon::Files),
             ("terminal", "Terminal", AppIcon::Terminal),
-            ("jobs", "Jobs", AppIcon::Terminal),
-            ("subagents", "Subagents", AppIcon::Agent),
+            ("jobs", "Commands", AppIcon::Terminal),
         ];
         for (key, label, glyph) in tab_list {
-            if key == "subagents" && subagents == 0 {
+            if key != selected
+                && match key {
+                    "changes" => change_count == 0,
+                    "jobs" => jobs == 0,
+                    "files" | "terminal" => true,
+                    _ => false,
+                }
+            {
                 continue;
             }
             let active = key == selected;
@@ -532,7 +629,7 @@ impl Xylo {
                 ))))
                 .accessibility_label(label)
                 .h(px(30.))
-                .px(px(10.))
+                .px(px(if compact_tabs { 8. } else { 10. }))
                 .rounded(px(8.))
                 .flex()
                 .items_center()
@@ -548,23 +645,7 @@ impl Xylo {
                 .cursor_pointer()
                 .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
                 .child(icons::small(glyph))
-                .child(label)
-                .when(key == "subagents", |tab| {
-                    tab.child(
-                        div()
-                            .min_w(px(18.))
-                            .h(px(18.))
-                            .px(px(5.))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(well()))
-                            .text_size(px(11.))
-                            .text_color(rgb(muted()))
-                            .child(subagents.to_string()),
-                    )
-                })
+                .when(!compact_tabs || active, |button| button.child(label))
                 .on_click(cx.listener(move |view, _, window, cx| {
                     view.page = Page::Chat;
                     view.settings_open = false;
@@ -596,7 +677,7 @@ impl Xylo {
                         panel_hint("Open a project to start its shell.").into_any_element()
                     }
                 }),
-            "subagents" => self.subagents_panel(cx),
+            "details" | "subagents" => self.chat_details_panel(cx),
             "jobs" => self.shell_jobs_panel(cx),
             _ => self.files_page(cx),
         };
@@ -614,7 +695,7 @@ impl Xylo {
             div()
                 .w_full()
                 .h_full()
-                .min_h(px(460.))
+                .min_h_0()
                 .child(chat)
                 .into_any_element()
         } else {
@@ -665,283 +746,327 @@ impl Xylo {
             ))
             .into_any_element()
     }
-    fn git_changes_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let rows = self.git_panel.rows.clone();
-        let weak = cx.entity().downgrade();
-        let tree = uniform_list("git-tree-rows", rows.len(), move |range, _, cx| {
-            weak.update(cx, |view, cx| {
-                range
-                    .filter_map(|index| {
-                        let row = rows.get(index)?.clone();
-                        let (group, path, depth, label, status, folder) = match &row {
-                            GitRow::Group(group, label, count) => (
-                                *group,
-                                PathBuf::new(),
-                                0,
-                                format!("{label}  {count}"),
-                                None,
-                                true,
-                            ),
-                            GitRow::Folder(group, path, depth) => (
-                                *group,
-                                path.clone(),
-                                *depth,
-                                path.file_name()?.to_string_lossy().into_owned(),
-                                None,
-                                true,
-                            ),
-                            GitRow::File(group, change, depth) => (
-                                *group,
-                                change.path.clone(),
-                                *depth,
-                                change.path.file_name()?.to_string_lossy().into_owned(),
-                                Some(if *group == ChangeGroup::Staged {
-                                    change.index
-                                } else if *group == ChangeGroup::Untracked {
-                                    'U'
-                                } else {
-                                    change.worktree
-                                }),
-                                false,
-                            ),
-                        };
-                        let collapsed = view
-                            .git_panel
-                            .collapsed
-                            .contains(&(group_id(group), path.clone()));
-                        let selected = view
-                            .git_panel
-                            .selected
-                            .as_ref()
-                            .is_some_and(|(p, g)| p == &path && *g == group);
-                        Some(
-                            button(("git-row", index), "")
-                                .accessibility_label(format!(
-                                    "{}{}",
-                                    if folder {
-                                        if collapsed { "Expand " } else { "Collapse " }
-                                    } else {
-                                        "Open diff "
-                                    },
-                                    label
-                                ))
-                                .w_full()
-                                .h(px(30.))
-                                .pl(px(8. + depth as f32 * 14.))
-                                .pr_2()
-                                .flex()
-                                .items_center()
-                                .justify_start()
-                                .gap_1()
-                                .text_xs()
-                                .bg(rgb(if selected {
-                                    crate::ui::selected()
-                                } else {
-                                    bg()
-                                }))
-                                .child(icons::small(if folder {
-                                    if collapsed {
-                                        AppIcon::ChevronRight
-                                    } else {
-                                        AppIcon::ChevronDown
-                                    }
-                                } else {
-                                    AppIcon::File
-                                }))
-                                .child(div().flex_1().min_w_0().single_line().child(label))
-                                .when_some(status, |row, status| {
-                                    row.child(
-                                        div()
-                                            .text_color(rgb(if status == 'D' {
-                                                danger()
-                                            } else {
-                                                muted()
-                                            }))
-                                            .child(status.to_string()),
-                                    )
-                                })
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    match &row {
-                                        GitRow::File(group, change, _) => {
-                                            view.open_git_change(*group, change.clone(), cx)
-                                        }
-                                        _ => {
-                                            let key = (group_id(group), path.clone());
-                                            if !view.git_panel.collapsed.remove(&key) {
-                                                view.git_panel.collapsed.insert(key);
-                                            }
-                                            view.git_panel.rebuild();
-                                        }
-                                    }
-                                    cx.notify();
-                                }))
-                                .into_any_element(),
-                        )
-                    })
-                    .collect()
-            })
+    fn changed_file_rows(&self, limit: Option<usize>, cx: &Context<Self>) -> Vec<AnyElement> {
+        self.git_panel
+            .status
+            .as_ref()
+            .into_iter()
+            .flat_map(|status| &status.changes)
+            .take(limit.unwrap_or(usize::MAX))
+            .enumerate()
+            .map(|(index, change)| self.changed_file_row(index, change, cx))
+            .collect()
+    }
+    fn changed_file_row(&self, index: usize, change: &GitChange, cx: &Context<Self>) -> AnyElement {
+        let change = change.clone();
+        let name = change
+            .path
+            .file_name()
             .unwrap_or_default()
-        })
-        .flex_1()
-        .min_h_0();
-        let mut explorer = div()
-            .id("git-changes-explorer")
-            .test_support()
-            .w(px(self.settings.ui.files_width.min(230.)))
-            .max_w(relative(0.45))
-            .min_w(px(130.))
+            .to_string_lossy()
+            .into_owned();
+        let parent = change
+            .path
+            .parent()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let status = change_label(&change);
+        focus_ring(gpui_kit::base::Button::new(("changed-file", index)))
+            .accessibility_label(format!("Review {}, {status}", change.path.display()))
+            .w_full()
+            .min_w_0()
+            .h(px(48.))
+            .px_2()
+            .rounded(px(8.))
+            .flex()
+            .items_center()
+            .justify_start()
+            .gap_2()
+            .text_color(rgb(text_secondary()))
+            .hover(|style| style.bg(rgb(hover())))
+            .child(icons::small(AppIcon::File).flex_shrink_0())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().single_line().text_size(px(13.)).child(name))
+                    .when(!parent.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .single_line()
+                                .text_size(px(11.))
+                                .text_color(rgb(muted()))
+                                .child(parent),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(11.))
+                    .text_color(rgb(muted()))
+                    .child(status),
+            )
+            .child(icons::small(AppIcon::ChevronRight).text_color(rgb(muted())))
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.page = Page::Chat;
+                view.settings.ui.work_panel = "changes".into();
+                view.open_git_change(preferred_change_group(&change), change.clone(), cx);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+    fn git_changes_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.git_panel.selected.as_ref();
+        let mut header = div()
+            .h(px(44.))
             .flex_shrink_0()
-            .h_full()
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(rgb(border()));
+        if let Some((path, group)) = selected {
+            header = header
+                .child(
+                    icons::icon_button("back-to-changed-files", AppIcon::Back, "All changed files")
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.git_panel.selected = None;
+                            view.git_panel.diff_request = None;
+                            view.git_panel.diff_lines.clear();
+                            view.git_panel.diff_source.clear();
+                            view.git_panel.diff_hunks.clear();
+                            view.git_panel.error = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .single_line()
+                        .text_size(px(13.))
+                        .child(
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                );
+            // A file can have both versions; keep each reachable without listing it twice.
+            if let Some(change) = self
+                .git_panel
+                .status
+                .as_ref()
+                .and_then(|status| status.changes.iter().find(|change| &change.path == path))
+                && change.in_group(ChangeGroup::Staged)
+                && change.in_group(ChangeGroup::Unstaged)
+            {
+                let change = change.clone();
+                let next = if *group == ChangeGroup::Staged {
+                    ChangeGroup::Unstaged
+                } else {
+                    ChangeGroup::Staged
+                };
+                header = header.child(
+                    pill(
+                        "switch-change-version",
+                        if next == ChangeGroup::Staged {
+                            "View staged"
+                        } else {
+                            "View working"
+                        },
+                    )
+                    .text_size(px(11.))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.open_git_change(next, change.clone(), cx)
+                    })),
+                );
+            }
+        } else {
+            let count = self
+                .git_panel
+                .status
+                .as_ref()
+                .map_or(0, |status| status.changes.len());
+            header = header
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("File changes"),
+                )
+                .when(count > 0, |header| {
+                    header.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(muted()))
+                            .child(count.to_string()),
+                    )
+                });
+        }
+        header = header.child(
+            icons::icon_button("refresh-git", AppIcon::Refresh, "Refresh changes")
+                .on_click(cx.listener(|view, _, _, cx| view.refresh_git(cx))),
+        );
+        let mut panel = div()
+            .id("file-changes-panel")
+            .test_support()
+            .size_full()
+            .min_h_0()
             .flex()
             .flex_col()
-            .border_r_1()
-            .border_color(rgb(border()))
-            .child(tree);
+            .child(header);
         if let Some(error) = &self.git_panel.error {
-            explorer = explorer.child(
+            let copy =
+                if error.contains("not a Git worktree") || error.contains("not a git repository") {
+                    "File history is unavailable for this folder.".to_owned()
+                } else {
+                    error.clone()
+                };
+            panel = panel.child(
                 div()
-                    .p_3()
-                    .text_xs()
-                    .text_color(rgb(muted()))
-                    .child(error.clone()),
-            );
-        } else if self.git_panel.request.is_some() && self.git_panel.rows.is_empty() {
-            explorer = explorer.child(
-                div()
-                    .id("git-status-loading")
+                    .id("file-changes-error")
                     .test_support()
-                    .aria_label("Reading Git status")
-                    .py_2()
-                    .child(crate::motion::skeleton_list(5)),
+                    .p_3()
+                    .text_size(px(12.))
+                    .text_color(rgb(muted()))
+                    .child(copy),
             );
-        } else if self.git_panel.request.is_some() {
-            explorer = explorer.child(loading_caption("Refreshing Git status…"));
         }
-        let weak = cx.entity().downgrade();
-        let diff = uniform_list(
-            "git-diff-lines",
-            self.git_panel.diff_lines.len(),
-            move |range, _, cx| {
+        if let Some((path, group)) = selected {
+            panel = panel.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(muted()))
+                    .child(format!(
+                        "{}{}",
+                        path.display(),
+                        if *group == ChangeGroup::Staged {
+                            " · Staged"
+                        } else {
+                            ""
+                        }
+                    )),
+            );
+            let indices = visible_diff_indices(&self.git_panel.diff_lines);
+            if self.git_panel.diff_request.is_some() {
+                panel = panel.child(div().p_3().child(loading_caption("Loading changes…")));
+            } else if indices.is_empty() && self.git_panel.error.is_none() {
+                panel = panel.child(panel_hint("No text changes in this version."));
+            }
+            if indices.is_empty() {
+                return panel.into_any_element();
+            }
+            let weak = cx.entity().downgrade();
+            let diff = uniform_list("git-diff-lines", indices.len(), move |range, _, cx| {
                 weak.update(cx, |view, cx| {
                     range
-                        .filter_map(|index| view.git_diff_line(index, cx))
+                        .filter_map(|index| view.git_diff_line(indices[index], cx))
                         .collect()
                 })
                 .unwrap_or_default()
-            },
-        )
-        .track_scroll(&self.diff_scroll)
-        .w_full()
-        .min_w(px(self.git_panel.diff_width))
-        .h_full()
-        .min_h_0();
-        let has_target = self.git_panel.selected.is_some() || self.git_panel.diff_request.is_some();
-        let source = div()
-            .id("git-diff-pane")
-            .test_support()
-            .flex_1()
-            .min_w_0()
+            })
+            .track_scroll(&self.diff_scroll)
+            .w_full()
+            .min_w(px(self.git_panel.diff_width))
             .h_full()
-            .flex()
-            .flex_col()
-            .when(!has_target, |pane| {
-                pane.child(panel_hint("Select a file to see its diff."))
-            })
-            .when(has_target, |pane| {
-                pane.child(
-                    div()
-                        .h(px(36.))
-                        .flex_shrink_0()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .single_line()
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(rgb(muted()))
-                        .when(self.git_panel.diff_request.is_some(), |header| {
-                            header.child(
-                                crate::motion::spinner(icons::SMALL).color(rgb(muted()).into()),
-                            )
-                        })
-                        .child(
-                            self.git_panel
-                                .selected
-                                .as_ref()
-                                .map(|(path, _)| path.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "Loading diff…".into()),
-                        ),
-                )
-            })
-            .when(
-                self.git_panel.diff_request.is_some() && self.git_panel.diff_lines.is_empty(),
-                |pane| {
-                    pane.child(
-                        div()
-                            .id("git-diff-loading")
-                            .test_support()
-                            .aria_label("Loading diff")
-                            .p_3()
-                            .child(crate::motion::skeleton_paragraph(6)),
-                    )
-                },
-            )
-            .child(
+            .min_h_0();
+            panel = panel.child(
                 div()
-                    .id("git-code-scroll")
+                    .id("git-diff-pane")
+                    .test_support()
                     .flex_1()
                     .min_h_0()
-                    .overflow_x_scroll()
-                    .child(diff),
-            );
-        // A clean tree has nothing to list or select: one line says so.
-        let clean = self.git_panel.status.is_some()
-            && self.git_panel.rows.is_empty()
-            && self.git_panel.request.is_none()
-            && self.git_panel.error.is_none();
-        let body = if clean {
-            panel_hint("No uncommitted changes.").into_any_element()
-        } else {
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .child(explorer)
-                .child(source)
-                .into_any_element()
-        };
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .min_h_0()
-            .child(
-                div()
-                    .h(px(40.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(rgb(border()))
+                    .min_w_0()
                     .child(
-                        div().flex_1().text_xs().child(
-                            self.git_panel
-                                .status
-                                .as_ref()
-                                .map(|status| status.branch.clone())
-                                .unwrap_or_else(|| "Git changes".into()),
-                        ),
-                    )
-                    .child(
-                        icons::icon_button("refresh-git", AppIcon::Refresh, "Refresh changes")
-                            .on_click(cx.listener(|view, _, _, cx| view.refresh_git(cx))),
+                        div()
+                            .id("git-code-scroll")
+                            .size_full()
+                            .overflow_x_scroll()
+                            .child(diff),
                     ),
-            )
-            .child(body)
-            .into_any_element()
+            );
+        } else {
+            let count = self
+                .git_panel
+                .status
+                .as_ref()
+                .map_or(0, |status| status.changes.len());
+            let empty = count == 0;
+            let weak = cx.entity().downgrade();
+            let rows = uniform_list("changed-file-rows", count, move |range, _, cx| {
+                weak.update(cx, |view, cx| {
+                    range
+                        .filter_map(|index| {
+                            let change = view.git_panel.status.as_ref()?.changes.get(index)?;
+                            Some(view.changed_file_row(index, change, cx))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+            })
+            .h_full()
+            .w_full();
+            panel = panel.child(div().id("changed-files-list").test_support().flex_1().min_h_0().p_2()
+                .when(!empty, |list| list.child(rows))
+                .when(empty && self.git_panel.request.is_some(), |list| list.child(loading_caption("Reading file changes…")))
+                .when(empty && self.git_panel.request.is_none() && self.git_panel.error.is_none(), |list| list.child(
+                    div().id("file-changes-empty").test_support().child(panel_hint("No changed files."))
+                ))
+                .when(self.git_panel.status.as_ref().is_some_and(|status| status.truncated), |list| list.child(panel_hint("Showing the first files. More changes are available in the project."))));
+        }
+        panel.into_any_element()
     }
+}
+
+fn preferred_change_group(change: &GitChange) -> ChangeGroup {
+    if change.index == '?' {
+        ChangeGroup::Untracked
+    } else if change.in_group(ChangeGroup::Unstaged) {
+        ChangeGroup::Unstaged
+    } else {
+        ChangeGroup::Staged
+    }
+}
+fn change_label(change: &GitChange) -> &'static str {
+    match if change.worktree != ' ' {
+        change.worktree
+    } else {
+        change.index
+    } {
+        '?' | 'A' => "New",
+        'D' => "Deleted",
+        'R' => "Renamed",
+        'C' => "Copied",
+        'U' => "Conflict",
+        _ => "Modified",
+    }
+}
+/// Filter patch transport metadata, keeping original indices for comments and hunk actions.
+fn visible_diff_indices(lines: &[String]) -> Vec<usize> {
+    let mut in_hunk = false;
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if line.starts_with("diff --git ") {
+                in_hunk = false;
+            }
+            if line.starts_with("@@ ") {
+                in_hunk = true;
+            }
+            (in_hunk || line.starts_with("Binary files ") || line == "GIT binary patch")
+                .then_some(index)
+        })
+        .collect()
 }
 
 /// A small muted line for an empty or idle pane in the narrow work panel.
@@ -996,6 +1121,6 @@ fn loading_caption(caption: &'static str) -> Div {
         .child(caption)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "work_panel/tests.rs"]
 mod tests;

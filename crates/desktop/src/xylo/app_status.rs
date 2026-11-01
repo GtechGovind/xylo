@@ -271,6 +271,6 @@ impl Xylo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "app_status/tests.rs"]
 mod tests;

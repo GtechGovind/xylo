@@ -110,6 +110,29 @@ fn window(
     })
 }
 impl Store {
+    /// Search all retained messages in one chat without loading their full bodies.
+    pub fn search_chat(&self, session: Uuid, query: &str) -> Result<Vec<(Uuid, String)>> {
+        ensure!(query.len() <= 512, "Search is limited to 512 bytes");
+        let matched = query.trim().to_lowercase();
+        self.call(move |conn| {
+            if matched.is_empty() { return Ok(Vec::new()); }
+            // Find in chat uses the same Unicode lowercase substring as loaded
+            // and live messages. FTS prefix matching is only for the global palette.
+            // Stream this session's indexed documents on the store worker; retain
+            // at most 100 bounded snippets, never load a full chat into the UI.
+            let mut statement=conn.prepare("SELECT message_id,content FROM history_search_documents WHERE session_id=?1 AND message_id IS NOT NULL ORDER BY id DESC")?;
+            let rows=statement.query_map([session.to_string()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?;
+            let mut matches = Vec::new();
+            for row in rows {
+                let (id, content) = row?;
+                if content.to_lowercase().contains(&matched) {
+                    matches.push((Uuid::parse_str(&id)?, content.chars().take(500).collect()));
+                    if matches.len() == 100 { break; }
+                }
+            }
+            Ok(matches)
+        })
+    }
     /// The best-ranked document of each matching conversation (a message or the
     /// title; ties go to the newest), with pages ordered by conversation
     /// (updated_at,id) rather than by an unstable floating-point rank cursor.

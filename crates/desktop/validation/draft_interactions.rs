@@ -90,6 +90,249 @@ mod xylo {
             }
         }
         #[gpui_kit::test]
+        fn ask_again_captures_only_original_payload_and_second_click_does_not_duplicate(
+            cx: &mut TestAppContext,
+        ) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(directory.path().join("profile")).unwrap();
+            let workspace = directory.path().join("project");
+            std::fs::create_dir(&workspace).unwrap();
+            let workspace = workspace.canonicalize().unwrap();
+            let (window, view) = open(cx, HostClient::spawn_at(paths));
+            wait(cx, &view, "settings", |view, _| view.settings_loaded);
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.set_workspace(workspace.clone(), window, cx)
+                })
+            })
+            .unwrap();
+            wait(cx, &view, "workspace activation", |view, _| {
+                view.workspace.as_ref() == Some(&workspace) && view.workspace_ready
+            });
+            let key = cx.update(|cx| view.read(cx).current_draft_key());
+            wait(cx, &view, "initial draft", |view, _| {
+                view.drafts.validation_revision(&key).is_some()
+            });
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.settings.provider = xylo_core::ProviderConfig {
+                        model: "isolated-queue-fixture".into(),
+                        ..Default::default()
+                    };
+                    view.composer.update(cx, |input, cx| {
+                        input.set_value("Unrelated unsent text", window, cx)
+                    });
+                    view.draft_changed(cx);
+                    let mut original =
+                        super::message(key.session_id, "user", "Ask precisely this".into());
+                    let image = xylo_core::ImageAttachment {
+                        id: Uuid::new_v4(),
+                        session_id: key.session_id,
+                        name: "original.png".into(),
+                        media_type: "image/png".into(),
+                        sha256: "a".repeat(64),
+                        bytes: 100,
+                        width: 2,
+                        height: 2,
+                        source: xylo_core::AttachmentSource::Picker,
+                        imported_at: 1,
+                    };
+                    let mut unrelated = image.clone();
+                    unrelated.id = Uuid::new_v4();
+                    unrelated.name = "current.png".into();
+                    view.add_draft_attachment(unrelated.clone(), cx);
+                    original.attachments = vec![image.clone()];
+                    let id = original.id;
+                    view.messages.push(original);
+                    view.retry_message(id, cx);
+                    let sent = view
+                        .drafts
+                        .validation_submission(&key)
+                        .expect("Explicit retry captured");
+                    assert_eq!(sent.prompt, "Ask precisely this");
+                    assert_eq!(sent.attachments, vec![image]);
+                    assert_eq!(view.draft_attachments(), vec![unrelated]);
+                    view.retry_message(id, cx);
+                    assert_eq!(
+                        view.drafts.validation_submission(&key).unwrap().turn_id,
+                        sent.turn_id
+                    );
+                    assert_eq!(
+                        view.composer.read(cx).value().as_ref(),
+                        "Unrelated unsent text"
+                    );
+                    view.drafts.validation_admission_late(&key);
+                    view.retry_message(id, cx);
+                    assert_eq!(
+                        view.drafts.validation_submission(&key).unwrap().turn_id,
+                        sent.turn_id,
+                        "Late admission retries retain the same idempotent turn"
+                    );
+                })
+            })
+            .unwrap();
+        }
+        #[gpui_kit::test]
+        fn reuse_waits_for_loading_draft_and_preserves_its_actual_contents(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(directory.path().join("profile")).unwrap();
+            let store = Store::open(&paths.database).unwrap();
+            let (window, view) = open(cx, HostClient::spawn_at(paths));
+            let key = cx.update(|cx| view.read(cx).current_draft_key());
+            wait(cx, &view, "initial draft", |view, _| view.drafts.validation_revision(&key).is_some());
+            let saved = save(&store, &key, "My saved work must survive");
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.composer.update(cx, |input, cx| input.set_value("", window, cx));
+                    let load = view.drafts.validation_begin_load(&key);
+                    let original = super::message(key.session_id, "user", "Reuse this message".into());
+                    let id = original.id;
+                    view.messages.push(original);
+                    view.reuse_message(id, window, cx);
+                    assert!(view.composer.read(cx).value().is_empty());
+                    // Deliver the outstanding load before any preservation receipt.
+                    view.draft_loaded(load, Ok(saved), window, cx);
+                    assert_eq!(view.composer.read(cx).value().as_ref(), "My saved work must survive");
+                });
+            }).unwrap();
+            wait(cx, &view, "reuse after preservation", |view, cx| view.composer.read(cx).value().as_ref() == "Reuse this message");
+            let backups = store.drafts_page(None, None, 100).unwrap();
+            assert!(backups.drafts.iter().any(|draft| draft.key != key && draft.preview == "My saved work must survive"));
+        }
+        #[gpui_kit::test]
+        fn message_reuse_preserves_text_and_image_drafts_durably_and_restore_is_reversible(
+            cx: &mut TestAppContext,
+        ) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(directory.path().join("profile")).unwrap();
+            let store = Store::open(&paths.database).unwrap();
+            let image_store =
+                xylo_services::attachments::AttachmentStore::new(paths.artifacts.clone()).unwrap();
+            let (window, view) = open(cx, HostClient::spawn_at(paths));
+            let key = cx.update(|cx| view.read(cx).current_draft_key());
+            wait(cx, &view, "initial draft", |view, _| {
+                view.drafts.validation_revision(&key).is_some()
+            });
+            const PNG: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x02\x00\x00\x00\x02\x08\x06\x00\x00\x00\x72\xb6\x0d\x24\x00\x00\x00\x11\x49\x44\x41\x54\x78\x9c\x63\x50\x70\x48\xf8\x0f\xc2\x0c\x30\x06\x00\x39\x74\x06\xfd\x20\x19\xfd\xfb\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+            let image = image_store
+                .import_bytes(
+                    key.session_id,
+                    "original.png",
+                    PNG,
+                    xylo_core::AttachmentSource::Picker,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .unwrap();
+            for attachment_only in [false, true] {
+                let text = if attachment_only {
+                    ""
+                } else {
+                    "Keep my current text"
+                };
+                let mut original =
+                    super::message(key.session_id, "user", "Original image question".into());
+                original.attachments = vec![image.clone()];
+                let id = original.id;
+                cx.update_window(window, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.composer
+                            .update(cx, |input, cx| input.set_value(text, window, cx));
+                        view.draft_changed(cx);
+                        if attachment_only {
+                            view.add_draft_attachment(image.clone(), cx);
+                        }
+                        view.messages.push(original);
+                        view.reuse_message(id, window, cx);
+                    })
+                })
+                .unwrap();
+                wait(cx, &view, "exact original payload", |view, cx| {
+                    view.composer.read(cx).value().as_ref() == "Original image question"
+                        && view.draft_attachments() == vec![image.clone()]
+                });
+                let backups = store.drafts_page(None, None, 100).unwrap();
+                let backup = backups
+                    .drafts
+                    .iter()
+                    .find(|draft| {
+                        draft.key != key
+                            && draft.preview == text
+                            && draft.attachment_count == usize::from(attachment_only)
+                    })
+                    .expect("Independent durable Saved drafts entry");
+                let saved = store.draft(&backup.key).unwrap();
+                assert_eq!(saved.text, text);
+                for copied in &saved.attachments {
+                    image_store
+                        .validate(backup.key.session_id, std::slice::from_ref(copied))
+                        .unwrap();
+                }
+                cx.update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    window.click("draft-restore-replaced", cx);
+                })
+                .unwrap();
+                wait(cx, &view, "restore exact previous payload", |view, cx| {
+                    view.composer.read(cx).value().as_ref() == text
+                        && view.draft_attachments().len() == usize::from(attachment_only)
+                });
+            }
+        }
+        #[gpui_kit::test]
+        fn missing_message_and_unavailable_original_image_keep_current_draft(
+            cx: &mut TestAppContext,
+        ) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(directory.path().join("profile")).unwrap();
+            let (window, view) = open(cx, HostClient::spawn_at(paths));
+            let key = cx.update(|cx| view.read(cx).current_draft_key());
+            wait(cx, &view, "initial draft", |view, _| {
+                view.drafts.validation_revision(&key).is_some()
+            });
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.composer
+                        .update(cx, |input, cx| input.set_value("Keep me", window, cx));
+                    view.draft_changed(cx);
+                    view.reuse_message(Uuid::new_v4(), window, cx);
+                    view.retry_message(Uuid::new_v4(), cx);
+                    assert_eq!(view.composer.read(cx).value().as_ref(), "Keep me");
+                    let mut original =
+                        super::message(key.session_id, "user", "Missing image".into());
+                    original.attachments.push(xylo_core::ImageAttachment {
+                        id: Uuid::new_v4(),
+                        session_id: key.session_id,
+                        name: "unavailable.png".into(),
+                        media_type: "image/png".into(),
+                        sha256: "a".repeat(64),
+                        bytes: 100,
+                        width: 2,
+                        height: 2,
+                        source: xylo_core::AttachmentSource::Picker,
+                        imported_at: 1,
+                    });
+                    let id = original.id;
+                    view.messages.push(original);
+                    view.reuse_message(id, window, cx);
+                })
+            })
+            .unwrap();
+            wait(cx, &view, "unavailable image feedback", |view, _| {
+                view.composer_hint()
+                    .is_some_and(|hint| hint.contains("original images could not"))
+            });
+            cx.update(|cx| {
+                let view = view.read(cx);
+                assert_eq!(view.composer.read(cx).value().as_ref(), "Keep me");
+                assert!(view.draft_attachments().is_empty());
+                assert!(!view.draft_send_pending());
+            });
+        }
+        #[gpui_kit::test]
         fn terminal_assistance_preserves_the_original_draft_and_requires_normal_send(
             cx: &mut TestAppContext,
         ) {
@@ -167,6 +410,145 @@ mod xylo {
                 })
             })
             .unwrap();
+        }
+        #[gpui_kit::test]
+        fn saved_draft_delete_and_undo_update_store_and_open_composer(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(directory.path().join("profile")).unwrap();
+            let store = Store::open(&paths.database).unwrap();
+            let key = DraftKey {
+                session_id: Uuid::new_v4(),
+                workspace: None,
+            };
+            save(&store, &key, "A draft worth keeping");
+            let host = HostClient::spawn_at(paths).unwrap();
+            let client = host.0.clone();
+            let (window, view) = open(cx, Ok(host));
+            wait(cx, &view, "settings", |view, _| view.settings_loaded);
+            cx.update_window(window, |_, _window, cx| {
+                view.update(cx, |view, cx| {
+                    view.session = key.session_id;
+                    view.draft_switch_deferred(cx);
+                    view.conversations.clear();
+                    view.load_subagent_activity(cx);
+                    assert!(
+                        view.subagent_activity_loading(),
+                        "A chat outside the loaded sidebar page must still request saved results"
+                    );
+                })
+            })
+            .unwrap();
+            wait(cx, &view, "saved draft", |view, cx| {
+                view.composer.read(cx).value().as_str() == "A draft worth keeping"
+            });
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| view.open_saved_drafts_dialog(window, cx))
+            })
+            .unwrap();
+            wait(cx, &view, "draft listing", |view, _| {
+                view.drafts.validation_list_request().is_none()
+            });
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("delete-saved-draft-0", cx);
+            })
+            .unwrap();
+            wait(cx, &view, "deleted draft", |view, cx| {
+                view.composer.read(cx).value().is_empty()
+                    && view.drafts.validation_list_request().is_none()
+            });
+            assert!(store.draft(&key).unwrap().is_empty());
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find(("open-saved-draft", 0usize)).is_none());
+                window.click("undo-delete-draft", cx);
+            })
+            .unwrap();
+            wait(cx, &view, "restored draft", |view, cx| {
+                view.composer.read(cx).value().as_str() == "A draft worth keeping"
+            });
+            assert_eq!(store.draft(&key).unwrap().text, "A draft worth keeping");
+            client.shutdown().unwrap();
+        }
+        #[gpui_kit::test]
+        fn saved_draft_dialog_keeps_rows_visible_through_delete_and_undo(cx: &mut TestAppContext) {
+            cx.executor().allow_parking();
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = directory.path().canonicalize().unwrap().join("project");
+            std::fs::create_dir(&workspace).unwrap();
+            let paths = AppPaths::at(directory.path().join("profile")).unwrap();
+            let store = Store::open(&paths.database).unwrap();
+            for text in [
+                "Explain this project using read-only inspection. Summarize its architecture and key entry points.",
+                "Review the composer layout and keyboard interactions.",
+            ] {
+                save(
+                    &store,
+                    &DraftKey {
+                        session_id: Uuid::new_v4(),
+                        workspace: Some(workspace.clone()),
+                    },
+                    text,
+                );
+            }
+            let host = HostClient::spawn_at(paths).unwrap();
+            let client = host.0.clone();
+            let (window, view) = open(cx, Ok(host));
+            wait(cx, &view, "settings", |view, _| view.settings_loaded);
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.set_workspace(workspace.clone(), window, cx);
+                    view.open_saved_drafts_dialog(window, cx);
+                })
+            })
+            .unwrap();
+            wait(cx, &view, "two saved drafts", |view, _| {
+                view.drafts.validation_summaries().len() == 2
+                    && view.drafts.validation_list_request().is_none()
+            });
+            for (count, action) in [
+                (2, "delete-saved-draft-0"),
+                (1, "delete-saved-draft-0"),
+                (0, "undo-delete-draft"),
+                (1, ""),
+            ] {
+                for (width, height) in [(1000., 680.), (420., 740.), (720., 480.)] {
+                    cx.update_window(window, |_, window, cx| {
+                        window.resize(size(px(width), px(height)));
+                        window.bounds_changed(cx);
+                        window.render_frame(cx);
+                        let page = window.find("drafts-page").bounds();
+                        let bottom = window.try_find("drafts-feedback").map(|node| node.bounds().top()).unwrap_or(page.bottom());
+                        for index in 0..count {
+                            let row = window.find(("open-saved-draft", index)).bounds();
+                            assert_eq!(row.size.height, px(56.));
+                            assert!(row.top() >= page.top() && row.bottom() <= bottom,
+                                "Draft {index} is clipped at {width}x{height}: row={row:?}, bottom={bottom:?}");
+                            let delete = window.find(format!("delete-saved-draft-{index}")).bounds();
+                            assert!(delete.right() <= page.right() && delete.top() >= row.top() && delete.bottom() <= row.bottom());
+                        }
+                        if count == 0 {
+                            let empty = window.find("drafts-notice").bounds();
+                            assert_eq!(empty.size.height, px(56.));
+                            assert!(empty.bottom() <= bottom, "Empty state overlaps Undo");
+                        }
+                        if let Some(feedback) = window.try_find("drafts-feedback") {
+                            assert!(feedback.bounds().bottom() <= page.bottom());
+                        }
+                    }).unwrap();
+                }
+                if !action.is_empty() {
+                    cx.update_window(window, |_, window, cx| window.click(action, cx))
+                        .unwrap();
+                    let next = if count == 0 { 1 } else { count - 1 };
+                    wait(cx, &view, "updated draft listing", |view, _| {
+                        view.drafts.validation_summaries().len() == next
+                            && view.drafts.validation_list_request().is_none()
+                    });
+                }
+            }
+            client.shutdown().unwrap();
         }
         #[gpui_kit::test]
         fn an_empty_drafts_list_says_so_where_the_first_row_would_be(cx: &mut TestAppContext) {
@@ -577,7 +959,10 @@ mod xylo {
             });
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| {
-                    view.settings.provider = xylo_core::ProviderConfig { model: "isolated-queue-fixture".into(), ..Default::default() };
+                    view.settings.provider = xylo_core::ProviderConfig {
+                        model: "isolated-queue-fixture".into(),
+                        ..Default::default()
+                    };
                     view.turns
                         .entry(key.session_id)
                         .or_default()
@@ -648,6 +1033,53 @@ mod xylo {
                 assert!(window.try_find(("remove-queued", 0usize)).is_none());
             })
             .unwrap();
+            cx.update_window(window, |_, window, cx| {
+                window.click("undo-remove-queued", cx);
+            })
+            .unwrap();
+            wait(cx, &view, "restored queue acknowledgement", |view, _| {
+                view.turn_queue
+                    .items
+                    .get(&key.session_id)
+                    .is_some_and(|items| items.len() == 1)
+            });
+            assert_eq!(
+                store.turn_queue(key.session_id).unwrap()[0].id,
+                rows[0].id,
+                "Undo must restore the original queue identity"
+            );
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find("undo-remove-queued").is_none());
+                window.click(("preview-queued", 0usize), cx);
+                window.render_frame(cx);
+                window.click("edit-queued-dialog", cx);
+            })
+            .unwrap();
+            wait(
+                cx,
+                &view,
+                "acknowledged queue correction replaces composer",
+                |view, cx| {
+                    view.composer.read(cx).value().as_ref()
+                        == "Queue this exact saved instruction αβ"
+                        && view
+                            .turn_queue
+                            .items
+                            .get(&key.session_id)
+                            .is_none_or(|items| items.is_empty())
+                },
+            );
+            assert!(store.turn_queue(key.session_id).unwrap().is_empty());
+            assert!(
+                store
+                    .drafts_page(key.workspace.clone(), None, 100)
+                    .unwrap()
+                    .drafts
+                    .iter()
+                    .any(|draft| draft.preview == "Keep my newer draft"),
+                "Correction must durably preserve the displaced draft"
+            );
             client.shutdown().unwrap();
         }
 

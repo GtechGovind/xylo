@@ -552,6 +552,6 @@ fn procedure_pill(state: &str) -> Div {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "learning/tests.rs"]
 mod tests;

@@ -331,12 +331,10 @@ impl Xylo {
     pub(super) fn artifacts_page(&self, cx: &mut Context<Self>) -> AnyElement {
         // The toolbar names the page; the body starts with its content.
         let mut view = div()
-            .id("artifact-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .px(px(24.))
-            .pt(px(8.))
-            .pb(px(24.))
+            .w_full()
+            .when(self.documents.source.is_none(), |view| {
+                view.max_w(px(820.)).mx_auto()
+            })
             .flex()
             .flex_col()
             .gap(px(12.))
@@ -421,6 +419,14 @@ impl Xylo {
                     })),
             );
         }
-        view.into_any_element()
+        div()
+            .id("artifact-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .px(px(24.))
+            .pt(px(8.))
+            .pb(px(24.))
+            .child(view)
+            .into_any_element()
     }
 }

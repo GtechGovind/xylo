@@ -437,7 +437,7 @@ impl Xylo {
                     }),
             ));
         }
-        let remove = settings_ui::danger_zone([settings_ui::setting_row(
+        let remove = settings_ui::removal_actions([settings_ui::setting_row(
             "Remove module",
             Some(
                 "It will no longer be available. Files it already created stay in Artifacts."

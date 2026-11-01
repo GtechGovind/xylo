@@ -1,5 +1,30 @@
 use super::*;
 #[test]
+fn release_checkout_finds_helper_but_installed_app_requires_bundled_copy() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let services = root.join("checkout/crates/services");
+    let helper = services.join("sandbox-helper/run.mjs");
+    std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+    std::fs::write(&helper, "fixture").unwrap();
+    let release = root.join("checkout/target/release/xylo-worker");
+    std::fs::create_dir_all(release.parent().unwrap()).unwrap();
+    assert_eq!(
+        resolve_helper_path(&release, &services, false).unwrap(),
+        helper
+    );
+    let installed = root.join("Xylo.app/Contents/MacOS/xylo-worker");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    assert!(resolve_helper_path(&installed, &services, false).is_err());
+    let bundled = root.join("Xylo.app/Contents/Resources/sandbox-helper/run.mjs");
+    std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+    std::fs::write(&bundled, "bundled fixture").unwrap();
+    assert_eq!(
+        resolve_helper_path(&installed, &services, false).unwrap(),
+        bundled
+    );
+}
+#[test]
 fn launcher_path_excludes_relative_project_and_package_directories() {
     let project = tempfile::tempdir().unwrap();
     let package = tempfile::tempdir().unwrap();

@@ -259,7 +259,7 @@ impl Xylo {
                     None,
                     self.environment_form(cx),
                 ))
-                .child(self.environment_danger_zone(index, record, cx));
+                .child(self.environment_removal_actions(index, record, cx));
         } else {
             page = page
                 .child(self.environment_form(cx))
@@ -729,7 +729,7 @@ impl Xylo {
         )
         .into_any_element()
     }
-    fn environment_danger_zone(
+    fn environment_removal_actions(
         &self,
         index: usize,
         record: &EnvironmentRecord,
@@ -794,7 +794,7 @@ impl Xylo {
             .inset()
             .into_any_element(),
         );
-        settings_ui::danger_zone(rows).into_any_element()
+        settings_ui::removal_actions(rows).into_any_element()
     }
     /// The setup form: kind, name, target, authentication and client.
     fn environment_form(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1208,6 +1208,6 @@ fn environment_capture_description(artifact: &EnvironmentOutputArtifact) -> Stri
     format!("{reason} · {} bytes saved", artifact.stored_bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "environments_view/tests.rs"]
 mod tests;

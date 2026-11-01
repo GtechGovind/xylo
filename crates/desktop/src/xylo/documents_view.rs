@@ -14,9 +14,10 @@ impl Xylo {
         }
         let epoch = self.documents.epoch;
         let generation = self.documents.generation;
-        let answer=window.prompt(PromptLevel::Warning,"Discard recovered document edits?",Some("Only the recovered edits for this document will be removed. The source file and saved copies will stay unchanged."),&[PromptButton::cancel("Cancel"),PromptButton::new("Discard edits and reopen")],cx);
+        let answer=self.confirm_explicit_action(
+            "Discard recovered document edits?",Some("Only the recovered edits for this document will be removed. The source file and saved copies will stay unchanged."),&[PromptButton::cancel("Cancel"),PromptButton::new("Discard edits and reopen")], window, cx);
         cx.spawn_in(window, async move |view, cx| {
-            if matches!(answer.await, Ok(1)) {
+            if answer.await {
                 let _ = view.update_in(cx, |view, window, cx| {
                     if epoch != view.documents.epoch
                         || generation != view.documents.generation
@@ -68,10 +69,12 @@ impl Xylo {
         if !self.documents.notice.is_empty() {
             panel = panel.child(notice(BadgeTone::Neutral, self.documents.notice.clone()));
         }
-        panel = panel.child(self.document_recovery_status(cx));
+        panel = panel.when(self.documents.source.is_some(), |panel| {
+            panel.child(self.document_recovery_status(cx))
+        });
         let Some(source) = &self.documents.source else {
             return panel
-                .child(self.document_saved_drafts(cx))
+                .children(self.document_saved_drafts(cx))
                 .into_any_element();
         };
         panel = panel.child(

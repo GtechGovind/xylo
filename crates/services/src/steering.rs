@@ -120,12 +120,11 @@ impl Store {
     /// Also purges finished guidance older than the retention window.
     pub fn recover_steering(&self) -> Result<usize> {
         self.call(|conn| {
-            purge_finished(conn)?;
-            Ok(conn.execute(
-                "UPDATE user_guidance SET state='cancelled',updated_at=?1,
-                 reason='Application restarted before guidance was added' WHERE state='queued'",
-                [now_ms()],
-            )?)
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            purge_finished(&tx)?;
+            tx.execute("UPDATE turn_queue SET state='queued',paused=1,reason='Application restarted before guidance was added',updated_at=?1 WHERE state='started' AND id IN(SELECT id FROM user_guidance WHERE state='queued')", [now_ms()])?;
+            let changed = tx.execute("UPDATE user_guidance SET state='cancelled',updated_at=?1,reason='Application restarted before guidance was added' WHERE state='queued'", [now_ms()])?;
+            tx.commit()?; Ok(changed)
         })
     }
 
@@ -230,6 +229,60 @@ impl Store {
         })
     }
 
+    /// Atomically consumes a queued snapshot into identified task guidance.
+    /// Its original submission is retained for receipt identity, but the current
+    /// composer draft is neither compared nor cleared by this conversion.
+    pub fn recover_queued_guidance(&self, session: Uuid, item: Uuid) -> Result<()> {
+        self.call(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let state: Option<String> = tx.query_row("SELECT state FROM user_guidance WHERE id=?1 AND session_id=?2", params![item.to_string(), session.to_string()], |row| row.get(0)).optional()?;
+            ensure!(state.as_deref() == Some("cancelled"), "Only cancelled guidance can return to the queue");
+            tx.execute("UPDATE turn_queue SET state='queued',paused=1,reason='The task ended before this message could be added',updated_at=?3 WHERE session_id=?1 AND id=?2 AND state='started'", params![session.to_string(), item.to_string(), now_ms()])?;
+            tx.execute("DELETE FROM user_guidance WHERE id=?1 AND session_id=?2 AND state='cancelled'", params![item.to_string(), session.to_string()])?;
+            tx.commit()?; Ok(())
+        })
+    }
+    pub fn steer_queued_turn(
+        &self,
+        session: Uuid,
+        item: Uuid,
+        turn: Uuid,
+    ) -> Result<SteeringOutcome> {
+        self.call(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(previous) = record(&tx, item)? {
+                ensure!(previous.request.session_id == session, "Guidance belongs to another chat");
+                if previous.state != SteeringState::Cancelled {
+                    ensure!(previous.request.turn_id == turn, "Guidance belongs to another task");
+                    let result = outcome(&tx, previous)?;
+                    tx.commit()?; return Ok(result);
+                }
+                tx.execute("DELETE FROM user_guidance WHERE id=?1 AND state='cancelled'", [item.to_string()])?;
+            }
+            let (turn_json, submission_json): (String, String) = tx.query_row(
+                "SELECT turn,submission FROM turn_queue WHERE session_id=?1 AND id=?2 AND state='queued'",
+                params![session.to_string(), item.to_string()], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?.context("This queued message is no longer available")?;
+            let queued: xylo_core::TurnRequest = serde_json::from_str(&turn_json)?;
+            let submission: DraftSubmission = serde_json::from_str(&submission_json)?;
+            ensure!(queued.session_id == session && submission.key.session_id == session && queued.attachments.is_empty(), "Send images in a new task");
+            let text = queued.prompt.trim();
+            ensure!(!text.is_empty() && text.len() <= MAX_STEERING_BYTES, "Keep guidance between 1 and 16384 bytes");
+            let workspace = submission.key.workspace.as_ref().and_then(|path| path.to_str()).context("Choose a project before guiding a task")?;
+            let scope: Option<String> = tx.query_row("SELECT json_extract(json,'$.workspace') FROM conversations WHERE id=?1", [session.to_string()], |row| row.get(0)).optional()?;
+            ensure!(scope.as_deref() == Some(workspace), "The active task belongs to another project");
+            let (count, bytes): (i64, i64) = tx.query_row("SELECT count(*),COALESCE(sum(length(CAST(text AS BLOB))),0) FROM user_guidance WHERE session_id=?1 AND turn_id=?2", params![session.to_string(), turn.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            ensure!(count < MAX_PER_TURN && bytes + text.len() as i64 <= MAX_TURN_BYTES, "This task has reached its guidance limit; start another turn");
+            let waiting: i64 = tx.query_row("SELECT count(*) FROM user_guidance WHERE state='queued'", [], |row| row.get(0))?;
+            ensure!(waiting < MAX_QUEUED, "Too much guidance is waiting to be delivered");
+            tx.execute("INSERT INTO user_guidance(id,session_id,turn_id,workspace,draft_revision,text,submission,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',?8,?8)", params![item.to_string(), session.to_string(), turn.to_string(), workspace, submission.expected_revision, text, submission_json, now_ms()])?;
+            tx.execute("UPDATE turn_queue SET state='started',updated_at=?3 WHERE session_id=?1 AND id=?2 AND state='queued'", params![session.to_string(), item.to_string(), now_ms()])?;
+            let result = outcome(&tx, record(&tx, item)?.context("Guidance was not saved")?)?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+
     pub fn steering(&self, id: Uuid) -> Result<Option<SteeringOutcome>> {
         self.call(move |conn| {
             record(conn, id)?
@@ -319,7 +372,7 @@ impl Store {
                     messages.push(json!({"role":"user","content":record.request.text,"name":name}));
                 }
                 let timestamp = now_ms();
-                let message = ChatMessage { reasoning: None,
+                let message = ChatMessage { activity_count: 0, activity_summary: None, turn_id: None, reasoning: None,
                     id:Uuid::new_v5(&id,b"steering-message"), session_id:session, role:"user".into(),
                     content:record.request.text.clone(), created_at:timestamp, attachments:Vec::new(), status: Default::default(),
                 };
@@ -371,6 +424,7 @@ impl Store {
             let mut outcomes = Vec::new();
             for id in ids {
                 tx.execute("UPDATE user_guidance SET state='cancelled',reason=?1,updated_at=?3 WHERE id=?2 AND state='queued'",params![reason,id,now_ms()])?;
+                tx.execute("UPDATE turn_queue SET state='queued',paused=1,reason=?3,updated_at=?4 WHERE session_id=?1 AND id=?2 AND state='started'", params![session.to_string(), id, reason, now_ms()])?;
                 outcomes.push(outcome(&tx,record(&tx,Uuid::parse_str(&id)?)?.context("Guidance disappeared")?)?);
             }
             tx.commit()?;

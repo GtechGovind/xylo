@@ -156,6 +156,31 @@ fn render(width: f32, output: &std::path::Path) {
                 .save(output.join(&name))
                 .unwrap();
             files.push(name);
+            if stem == "general" {
+                cx.update_window(handle, |_, window, cx| {
+                    window.scroll(
+                        "general-settings",
+                        ScrollDelta::Pixels(point(px(0.), px(-1200.))),
+                        cx,
+                    );
+                })
+                .unwrap();
+                settle(&mut cx, Duration::from_millis(200));
+                let name = format!("general-about-{theme}-{}.png", width as u32);
+                cx.capture_screenshot(handle)
+                    .unwrap()
+                    .save(output.join(&name))
+                    .unwrap();
+                files.push(name);
+                cx.update_window(handle, |_, window, cx| {
+                    window.scroll(
+                        "general-settings",
+                        ScrollDelta::Pixels(point(px(0.), px(1200.))),
+                        cx,
+                    );
+                })
+                .unwrap();
+            }
         }
     }
     std::fs::write(

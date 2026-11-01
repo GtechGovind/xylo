@@ -149,6 +149,8 @@ fn status_counts_only_live_jobs_in_the_active_conversation(cx: &mut TestAppConte
     cx.update_window(window, |_, _, cx| {
         view.update(cx, |view, _| {
             let job = xylo_core::ShellJob {
+                action_id: None,
+                background: true,
                 id: uuid::Uuid::new_v4(),
                 turn_id: uuid::Uuid::new_v4(),
                 command: "fixture".into(),
@@ -212,6 +214,67 @@ fn status_ignores_results_from_a_replaced_command_or_workspace(cx: &mut TestAppC
                 "A throttled refresh preserves the latest valid line"
             );
         })
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn custom_status_save_is_compact_aligned_and_responds_to_typing(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{Bounds, ScrollDelta, point, px, size};
+    cx.update(gpui_kit::init);
+    let (handle, view) = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(gpui_kit::WindowBounds::Windowed(Bounds::new(
+                    Default::default(),
+                    size(px(1000.), px(900.)),
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+            },
+        )
+        .unwrap()
+    });
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.navigate(crate::xylo::Page::Appearance, cx)
+        });
+        window.render_frame(cx);
+        window.scroll(
+            "general-settings",
+            ScrollDelta::Pixels(point(px(0.), px(-1200.))),
+            cx,
+        );
+        let save = window.find("save-status-command");
+        assert_eq!(save.disabled(), Some(true));
+        assert!(save.bounds().size.width < px(100.));
+        assert_eq!(save.bounds().size.height, px(32.));
+        assert!(window.try_find("check-app-updates").is_none());
+        view.update(cx, |view, cx| {
+            view.usage_ui
+                .command
+                .update(cx, |input, cx| input.focus(window, cx));
+        });
+        window.input("echo Ready", cx);
+        assert_ne!(window.find("save-status-command").disabled(), Some(true));
+        let input = window.find("status-command-control").bounds();
+        assert_eq!(input.size.height, px(32.));
+        assert!(
+            (f32::from(input.center().y - window.find("save-status-command").bounds().center().y))
+                .abs()
+                <= 1.
+        );
+        window.click("save-status-command", cx);
+        assert_eq!(
+            view.read(cx).settings.status_line_command.as_deref(),
+            Some("echo Ready")
+        );
+        window.render_frame(cx);
+        assert_eq!(window.find("save-status-command").disabled(), Some(true));
     })
     .unwrap();
 }

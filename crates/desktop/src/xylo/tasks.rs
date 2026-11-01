@@ -26,7 +26,13 @@ impl Xylo {
             .px(px(24.))
             .pt(px(8.))
             .pb(px(24.));
-        let mut column = div().max_w(px(820.)).flex().flex_col().gap(px(12.));
+        let mut column = div()
+            .w_full()
+            .max_w(px(820.))
+            .mx_auto()
+            .flex()
+            .flex_col()
+            .gap(px(12.));
         if !has_project {
             // Tasks run in a project, so without one there is nothing to fill in.
             column = column.child(
@@ -244,20 +250,20 @@ impl Xylo {
             )
             .into_any_element()
     }
-    /// Deleting a schedule cannot be undone, so it asks first.
+    /// Confirm schedule deletion in guarded modes; Full access acts immediately.
     fn confirm_delete_schedule(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        let answer = window.prompt(
-            PromptLevel::Warning,
+        let answer = self.confirm_explicit_action(
             "Delete this scheduled task?",
             Some("It stops running. Chats it already started stay."),
             &[
                 PromptButton::cancel("Keep task"),
                 PromptButton::new("Delete task"),
             ],
+            window,
             cx,
         );
         cx.spawn(async move |view, cx| {
-            if matches!(answer.await, Ok(1)) {
+            if answer.await {
                 let _ = view.update(cx, |view, cx| view.mutate_schedule(None, id, cx));
             }
         })
@@ -527,6 +533,6 @@ fn cadence_label(cron: &str, zone: &LocalZone) -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "tasks/tests.rs"]
 mod tests;

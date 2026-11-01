@@ -8,8 +8,6 @@ mod management;
 mod notifications;
 #[path = "xylo/plugins.rs"]
 mod plugins;
-#[path = "xylo/recovery.rs"]
-mod recovery;
 use notifications::NotificationUi;
 #[path = "xylo/drafts.rs"]
 mod drafts;
@@ -62,6 +60,10 @@ use editor_assist::EditorAssist;
 mod app_status;
 #[path = "xylo/chat.rs"]
 mod chat;
+#[path = "xylo/output_view.rs"]
+mod output_view;
+#[path = "xylo/turn_activity.rs"]
+mod turn_activity;
 use app_status::{HostHealth, StatusLine, product_error};
 #[path = "xylo/context_panel.rs"]
 mod context_panel;
@@ -214,6 +216,9 @@ impl Page {
 /// How long typing in the Memory search must pause before it searches.
 const MEMORY_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
+type InteractionInputs =
+    std::collections::HashMap<(Uuid, Uuid, usize), (Entity<TextareaState>, Subscription)>;
+
 pub struct Xylo {
     host: Option<HostClient>,
     /// Bounded test-only observation of the UI→worker dispatch boundary.
@@ -238,6 +243,13 @@ pub struct Xylo {
     mcp_forms: BTreeMap<Uuid, mcp_forms::Form>,
     mcp_commands: Vec<xylo_runtime::host::McpPromptCommand>,
     composer: Entity<TextareaState>,
+    interaction_inputs: std::cell::RefCell<InteractionInputs>,
+    interaction_pending: std::collections::HashSet<(Uuid, Uuid)>,
+    interaction_allowed_modes: std::collections::HashMap<(Uuid, Uuid), (Vec<PermissionMode>, bool)>,
+    chat_width: std::cell::Cell<f32>,
+    interaction_plan_feedback: std::cell::RefCell<std::collections::BTreeSet<(Uuid, Uuid)>>,
+    interaction_plan_modes:
+        std::cell::RefCell<std::collections::HashMap<(Uuid, Uuid), PermissionMode>>,
     editor: Entity<EditorState>,
     editor_path: Option<PathBuf>,
     editor_assist: Option<EditorAssist>,
@@ -341,6 +353,8 @@ pub struct Xylo {
     /// Focus target of the chat transcript; bare Escape acts on the task only
     /// while the composer or the transcript has focus.
     transcript_focus: FocusHandle,
+    composer_surface_focus: FocusHandle,
+    composer_focused: bool,
     native: NativeUi,
     worktrees: Vec<xylo_runtime::workspace::worktree::Worktree>,
     worktree_pending: Option<Uuid>,
@@ -354,6 +368,8 @@ pub struct Xylo {
     history_search: HistorySearchUi,
     drafts: DraftUi,
     turn_queue: TurnQueueUi,
+    output_view: output_view::OutputUi,
+    turn_activity: turn_activity::ActivityUi,
     attachments: AttachmentUi,
     image_generation: ImageGenerationUi,
     notifications: NotificationUi,
@@ -361,7 +377,6 @@ pub struct Xylo {
     extensions: extensions::ExtensionUi,
     environments: environments::EnvironmentUi,
     management_confirming: bool,
-    recovery: recovery::RecoveryUi,
 }
 impl Xylo {
     pub fn new(
@@ -375,8 +390,8 @@ impl Xylo {
         };
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("How can I help you today?")
-                .auto_grow(1, 8)
+                .placeholder("What would you like to work on?")
+                .auto_grow(2, 7)
         });
         let editor = cx.new(|cx| EditorState::new(window, cx).language("rust"));
         let secret = cx.new(|cx| {
@@ -387,6 +402,10 @@ impl Xylo {
         let subscriptions =
             vec![
                 cx.subscribe_in(&composer, window, |this, _, event, window, cx| {
+                    if matches!(event, InputEvent::Focus | InputEvent::Blur) {
+                        this.composer_focused = matches!(event, InputEvent::Focus);
+                        cx.notify();
+                    }
                     if matches!(event, InputEvent::Change) {
                         this.draft_changed(cx);
                     }
@@ -524,6 +543,12 @@ impl Xylo {
             mcp_forms: BTreeMap::new(),
             mcp_commands: Vec::new(),
             composer,
+            interaction_inputs: Default::default(),
+            interaction_pending: Default::default(),
+            interaction_allowed_modes: Default::default(),
+            chat_width: std::cell::Cell::new(800.),
+            interaction_plan_feedback: Default::default(),
+            interaction_plan_modes: Default::default(),
             editor,
             editor_path: None,
             editor_assist: None,
@@ -597,7 +622,7 @@ impl Xylo {
             connector_inspection_request: None,
             connector_loading: false,
             connector_error: None,
-            status: "Connecting…".into(),
+            status: "".into(),
             status_expiry: None,
             host_health,
             error,
@@ -633,6 +658,8 @@ impl Xylo {
             model_picker: model_picker::ModelPickerUi::new(window, cx),
             context_updated_at: BTreeMap::new(),
             transcript_focus: cx.focus_handle(),
+            composer_surface_focus: cx.focus_handle(),
+            composer_focused: false,
             native: NativeUi::new(),
             worktrees: Vec::new(),
             worktree_pending: None,
@@ -646,6 +673,8 @@ impl Xylo {
             history_search: HistorySearchUi::new(window, cx),
             drafts: DraftUi::new(window),
             turn_queue: TurnQueueUi::default(),
+            output_view: output_view::OutputUi::default(),
+            turn_activity: turn_activity::ActivityUi::default(),
             attachments: AttachmentUi::new(),
             image_generation: ImageGenerationUi::new(window, cx),
             notifications: NotificationUi::default(),
@@ -653,11 +682,9 @@ impl Xylo {
             extensions: extensions::ExtensionUi::new(window, cx),
             environments: environments::EnvironmentUi::new(window, cx),
             management_confirming: false,
-            recovery: recovery::RecoveryUi::new(window, cx),
         };
         view.subscribe_documents(window, cx);
         view.subscribe_environments(cx);
-        view.subscribe_recovery(cx);
         if let Some(host) = &view.host {
             let _ = host.foreground(window.is_window_active());
             let _ = host.list_conversations();
@@ -729,17 +756,28 @@ impl Xylo {
             .and_then(f);
         self.result(result, cx);
     }
-    fn engine_command(&mut self, command: WorkerCommand, cx: &mut Context<Self>) {
+    fn try_engine_command(
+        &mut self,
+        command: WorkerCommand,
+        _cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
         let session = self.session;
         #[cfg(test)]
         if let Some(probe) = &self.validation_worker_commands {
-            let result = probe
+            return probe
                 .try_send((session, command))
                 .map_err(|error| anyhow::anyhow!("Test worker dispatch: {error}"));
-            self.result(result, cx);
-            return;
         }
-        self.host_call(cx, |h| h.send_to(session, command));
+        self.host
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("The task service is unavailable. Restart Xylo to reconnect.")
+            })?
+            .send_to(session, command)
+    }
+    fn engine_command(&mut self, command: WorkerCommand, cx: &mut Context<Self>) {
+        let result = self.try_engine_command(command, cx);
+        self.result(result, cx);
     }
     fn set_input(
         input: &Entity<InputState>,
@@ -825,6 +863,10 @@ impl Xylo {
     }
     fn event(&mut self, event: HostEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let HostEvent::Engine(envelope) = &event {
+            if matches!(&envelope.payload, EngineEvent::ToolFinished {name, ..} if name == "schedule_wakeup")
+            {
+                self.refresh_schedules(cx);
+            }
             self.note_context_usage(envelope);
         }
         match event {
@@ -847,6 +889,8 @@ impl Xylo {
                 modes,
                 scheduled,
             } => {
+                self.interaction_allowed_modes
+                    .insert((session, action_id), (modes.clone(), scheduled));
                 if let Some(card) = self
                     .turns
                     .get_mut(&session)
@@ -863,6 +907,19 @@ impl Xylo {
                 action_id,
                 result,
             } => {
+                self.interaction_pending.remove(&(session, action_id));
+                if result.is_ok() {
+                    self.interaction_inputs
+                        .borrow_mut()
+                        .retain(|(owner, action, _), _| *owner != session || *action != action_id);
+                    self.interaction_plan_modes
+                        .borrow_mut()
+                        .remove(&(session, action_id));
+                    self.interaction_plan_feedback
+                        .borrow_mut()
+                        .remove(&(session, action_id));
+                    self.interaction_allowed_modes.remove(&(session, action_id));
+                }
                 if let Some(card) = self
                     .turns
                     .get_mut(&session)
@@ -872,30 +929,22 @@ impl Xylo {
                     card.approval = false;
                 }
                 // Rejected replies leave the draft and pending controls untouched.
-                if let Err(error) = result {
+                if let Err(error) = result
+                    && session == self.session
+                {
                     self.error = Some(error);
                 }
                 self.invalidate_live_history();
                 self.sync_history_list(cx);
             }
-            HostEvent::ActionReviews { request_id, result } => {
-                self.action_reviews_received(request_id, result, cx)
-            }
-            HostEvent::ActionReview { request_id, result } => {
-                self.action_review_received(request_id, *result, window, cx)
-            }
-            HostEvent::ActionResolved { request_id, result } => {
-                self.action_resolved(request_id, result, window, cx)
-            }
-            HostEvent::ActionResolution { request_id, result } => {
-                self.action_resolution_received(request_id, result, window, cx)
-            }
-            HostEvent::ActionReviewForm { request_id, result } => {
-                self.action_review_form_received(request_id, result, window, cx)
-            }
-            HostEvent::ActionReviewFormSaved { request_id, result } => {
-                self.action_review_form_saved(request_id, result, window, cx)
-            }
+            // Action records remain available through the runtime API. The desktop
+            // no longer opens a review workflow or blocks chats on their outcomes.
+            HostEvent::ActionReviews { .. }
+            | HostEvent::ActionReview { .. }
+            | HostEvent::ActionResolved { .. }
+            | HostEvent::ActionResolution { .. }
+            | HostEvent::ActionReviewForm { .. }
+            | HostEvent::ActionReviewFormSaved { .. } => {}
             HostEvent::DocumentDraftRelinked { request_id, result } => {
                 self.document_relinked(request_id, *result, window, cx)
             }
@@ -940,7 +989,7 @@ impl Xylo {
                 request_id,
                 session_id,
                 result,
-            } => self.turn_queue_result(request_id, session_id, result, cx),
+            } => self.turn_queue_result(request_id, session_id, result, window, cx),
             HostEvent::QueuedTurnStarted { session_id, item } => {
                 self.queued_turn_started(session_id, item, cx)
             }
@@ -971,6 +1020,11 @@ impl Xylo {
             } => {
                 self.image_preview(request_id, session_id, attachment_id, result, cx);
             }
+            HostEvent::ChatSearch {
+                request_id,
+                session,
+                result,
+            } => self.chat_search_received(request_id, session, result, cx),
             HostEvent::HistorySearch { request_id, result } => {
                 self.history_search_result(request_id, result, cx)
             }
@@ -1013,7 +1067,6 @@ impl Xylo {
                     self.load_file_page(None, cx);
                     self.persist_ui(cx);
                     self.sidebar_state.dirty = true;
-                    self.recovery_activate(window, cx);
                     if self.settings.ui.work_panel_open {
                         self.activate_work_panel(window, cx);
                     }
@@ -1129,6 +1182,38 @@ impl Xylo {
             HostEvent::OutputStyles { request_id, result } => {
                 self.output_styles_received(request_id, result, cx)
             }
+            HostEvent::SubagentActivity {
+                request_id,
+                session,
+                result,
+            } => self.subagent_activity_received(request_id, session, result, cx),
+            HostEvent::TurnActivity {
+                request_id,
+                session,
+                turn,
+                result,
+            } => self.activity_received(request_id, session, turn, result, cx),
+            HostEvent::TurnAction {
+                request_id,
+                session,
+                turn,
+                action,
+                result,
+            } => self.activity_action_received(request_id, session, turn, action, result, cx),
+            HostEvent::CommandOutput {
+                request_id,
+                session,
+                turn,
+                job,
+                result,
+            } => self.command_output_received(request_id, session, turn, job, result, cx),
+            HostEvent::CommandOutputCopy {
+                request_id,
+                session,
+                turn,
+                job,
+                result,
+            } => self.command_output_copy_received(request_id, session, turn, job, result, cx),
             HostEvent::StatusLine { request_id, result } => {
                 self.status_line_received(request_id, result, cx)
             }
@@ -1377,23 +1462,11 @@ impl Xylo {
         self.turns.get(&self.session).is_some_and(|t| t.running)
     }
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.recovery_blocks_submit() {
-            self.recovery.open = true;
-            self.error = Some("Review the interrupted action before continuing this chat. Your message stays in the composer.".into());
-            cx.notify();
-            return;
-        }
-        let blocked = if self.attachments.importing_for(self.session) {
-            Some("Wait for the images to finish importing, then send.")
-        } else if self.draft_flush_pending() {
-            Some("Drafts are being saved before Xylo closes. Choose Keep working to send.")
-        } else if self.memory_forms_flush_pending() {
-            Some("Wait for your memory changes to finish saving, then send.")
-        } else {
-            None
-        };
-        if let Some(reason) = blocked {
-            self.show_composer_hint(reason, cx);
+        // Sending expresses an intent to keep working. Cancel pending close/update
+        // continuations while their autosaves keep running in the background.
+        self.cancel_setup_close_intents(cx);
+        if self.attachments.importing_for(self.session) {
+            self.show_composer_hint("Wait for the images to finish importing, then send.", cx);
             return;
         }
         let command = self.composer.read(cx).value().trim().to_owned();
@@ -1480,15 +1553,11 @@ impl Xylo {
         cx.notify();
     }
     fn new_chat(&mut self, cx: &mut Context<Self>) {
-        if !self.recovery_before_switch(cx) {
-            return;
-        }
         if !self.draft_before_switch(cx) {
             return;
         }
         self.stash_history();
         self.session = Uuid::new_v4();
-        self.recovery_scope_changed(cx);
         self.draft_switch_deferred(cx);
         self.messages.clear();
         self.sidebar_state.note_new_chat(self.session);
@@ -1513,9 +1582,6 @@ impl Xylo {
     }
     fn set_workspace(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.as_ref() == Some(&path) {
-            return;
-        }
-        if !self.recovery_before_switch(cx) {
             return;
         }
         if self.editor_dirty {
@@ -1858,6 +1924,7 @@ impl Xylo {
 }
 impl Render for Xylo {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_output_dialog(window, cx);
         if self.page == Page::Chat && !self.settings_open && !self.updates.installing {
             self.refresh_usage(cx);
         }
@@ -1912,14 +1979,33 @@ impl Render for Xylo {
             .flex()
             .flex_col();
         let sidebar_hidden = !self.settings.ui.sidebar_visible && !self.settings_open;
+        let chat_toolbar = matches!(self.page, Page::Chat | Page::Files | Page::Changes);
+        let narrow_chat_toolbar = chat_toolbar && f32::from(window.viewport_size().width) < 750.;
         let mut toolbar = div()
-            .h(px(52.))
+            .id("chat-toolbar")
+            .test_support()
+            .h(px(if narrow_chat_toolbar {
+                54.
+            } else if chat_toolbar {
+                64.
+            } else {
+                52.
+            }))
+            .when(chat_toolbar, |bar| {
+                bar.border_b_1().border_color(rgb(border()))
+            })
             .flex_shrink_0()
             .pl(px(if sidebar_hidden { 12. } else { 20. }))
-            .pr(px(12.))
+            .pr(px(if narrow_chat_toolbar {
+                17.
+            } else if chat_toolbar {
+                28.
+            } else {
+                12.
+            }))
             .flex()
             .items_center()
-            .gap_2();
+            .gap(px(if narrow_chat_toolbar { 10. } else { 16. }));
         if sidebar_hidden {
             toolbar = toolbar
                 .child(
@@ -1930,11 +2016,41 @@ impl Render for Xylo {
                             cx.notify();
                         })),
                 )
-                .child(brand_mark(20.).ml(px(4.)).mr(px(2.)));
+                .when(!chat_toolbar, |bar| {
+                    bar.child(brand_mark(20.).ml(px(4.)).mr(px(2.)))
+                });
         }
-        toolbar = toolbar.child(self.toolbar_title());
+        toolbar = toolbar
+            .when(chat_toolbar && !narrow_chat_toolbar, |bar| {
+                bar.when_some(self.workspace.as_ref(), |bar, path| {
+                    bar.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(px(13.))
+                            .text_color(rgb(muted()))
+                            .child(icons::icon(AppIcon::Folder))
+                            .child(
+                                div().max_w(px(180.)).single_line().child(
+                                    path.file_name()
+                                        .unwrap_or(path.as_os_str())
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                ),
+                            ),
+                    )
+                    .child(div().w(px(1.)).h(px(18.)).bg(rgb(border_strong())))
+                })
+            })
+            .child(self.toolbar_title());
         // The chat's menu and work panel belong to the chat page only.
         if matches!(self.page, Page::Chat | Page::Files | Page::Changes) {
+            toolbar = toolbar.child(
+                icons::icon_button("chat-new", AppIcon::NewChat, "New chat")
+                    .size(px(34.))
+                    .on_click(cx.listener(|view, _, _, cx| view.new_chat(cx))),
+            );
             if let Some(actions) = self.conversation_actions(cx) {
                 toolbar = toolbar.child(actions);
             }
@@ -1945,9 +2061,9 @@ impl Render for Xylo {
                     "toggle-work-panel",
                     AppIcon::PanelToggle,
                     if work_open {
-                        "Hide work panel"
+                        "Close task details"
                     } else {
-                        "Show work panel"
+                        "Task details"
                     },
                 )
                 .when(work_open, |button| {
@@ -1967,6 +2083,7 @@ impl Render for Xylo {
                         return;
                     }
                     view.page = Page::Chat;
+                    view.settings.ui.work_panel = "details".into();
                     view.settings.ui.work_panel_open = true;
                     view.activate_work_panel(window, cx);
                     view.persist_ui(cx);
@@ -2031,25 +2148,6 @@ impl Render for Xylo {
             .on_action(
                 cx.listener(|view, _: &EscapePressed, window, cx| view.escape_pressed(window, cx)),
             )
-            .on_action(cx.listener(|view, _: &CyclePermissions, window, cx| {
-                if view
-                    .composer
-                    .read(cx)
-                    .focus_handle(cx)
-                    .contains_focused(window, cx)
-                {
-                    let index = PermissionMode::ALL
-                        .iter()
-                        .position(|mode| *mode == view.current_permission_mode())
-                        .unwrap_or(0);
-                    view.set_permission_mode(
-                        PermissionMode::ALL[(index + 1) % PermissionMode::ALL.len()],
-                        cx,
-                    );
-                } else {
-                    cx.propagate();
-                }
-            }))
             .on_action(cx.listener(|view, _: &FocusComposer, window, cx| {
                 view.navigate(Page::Chat, cx);
                 view.composer
@@ -2137,6 +2235,6 @@ fn truncate(text: &str, limit: usize) -> String {
 mod history;
 use history::ChatHistory;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "xylo/tests/mod.rs"]
 mod tests;

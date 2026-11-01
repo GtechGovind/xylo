@@ -127,15 +127,23 @@ impl Xylo {
     }
     pub(super) fn git_diff_line(&self, index: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
         let line = self.git_panel.diff_lines.get(index)?;
-        let addition = line.starts_with('+') && !line.starts_with("+++");
-        let deletion = line.starts_with('-') && !line.starts_with("---");
+        let coordinates = diff_line_numbers(
+            &self.git_panel.diff_lines,
+            &self.git_panel.diff_hunks,
+            index,
+        );
+        let addition = coordinates.is_some() && line.starts_with('+');
+        let deletion = coordinates.is_some() && line.starts_with('-');
         let mut row = div()
+            .id(("diff-line", index))
+            .test_support()
+            .group("diff-line")
+            .w_full()
             .h(px(26.))
-            .px_2()
             .flex()
             .items_center()
             .gap_2()
-            .font_family("monospace")
+            .font_family(mono(cx))
             .text_xs()
             .whitespace_nowrap()
             .bg(rgb(if addition {
@@ -145,13 +153,7 @@ impl Xylo {
             } else {
                 bg()
             }))
-            .text_color(rgb(if addition {
-                success()
-            } else if deletion {
-                danger()
-            } else {
-                text()
-            }));
+            .text_color(rgb(text()));
         if let Some(hunk) = self
             .git_panel
             .diff_hunks
@@ -172,9 +174,18 @@ impl Xylo {
                 "Stage"
             };
             let hunk_index = hunk.index;
+            let context = line.split("@@").nth(2).unwrap_or("").trim();
+            row = row
+                .px_2()
+                .bg(rgb(panel()))
+                .text_color(rgb(text_secondary()))
+                .child(format!("Lines {} → {}", hunk.old_start, hunk.new_start))
+                .when(!context.is_empty(), |row| row.child(context.to_owned()));
             row = row.child(
                 pill(("apply-hunk", index), label)
-                    .h(px(22.))
+                    .h(px(20.))
+                    .px_2()
+                    .text_size(px(11.))
                     .disabled(busy)
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.apply_git_hunk(hunk_index, operation, cx)
@@ -183,25 +194,106 @@ impl Xylo {
             if group == ChangeGroup::Unstaged {
                 row = row.child(
                     pill(("revert-hunk", index), "Revert")
-                        .h(px(22.))
+                        .h(px(20.))
+                        .px_2()
+                        .text_size(px(11.))
                         .disabled(busy)
                         .on_click(cx.listener(move |view, _, _, cx| {
                             view.apply_git_hunk(hunk_index, hunks::Operation::Revert, cx)
                         })),
                 );
             }
-        } else if addition || deletion || line.starts_with(' ') {
-            row = row.child(
-                pill(("comment-line", index), "Comment")
-                    .h(px(22.))
+        } else if let Some((old, new)) = coordinates {
+            let number = |value: Option<usize>| {
+                div()
+                    .w(px(40.))
+                    .flex_shrink_0()
+                    .text_right()
+                    .text_color(rgb(muted()))
+                    .child(value.map(|n| n.to_string()).unwrap_or_default())
+            };
+            row = row
+                .child(number(old))
+                .child(number(new))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .flex_shrink_0()
+                        .text_color(rgb(if addition {
+                            success()
+                        } else if deletion {
+                            danger()
+                        } else {
+                            muted()
+                        }))
+                        .child(if addition {
+                            "+"
+                        } else if deletion {
+                            "−"
+                        } else {
+                            ""
+                        }),
+                )
+                .child(
+                    icons::icon_button(
+                        ("comment-line", index),
+                        AppIcon::Add,
+                        format!(
+                            "Comment on line {} ({})",
+                            new.or(old).unwrap_or(1),
+                            if new.is_some() { "new" } else { "old" }
+                        ),
+                    )
+                    .h(px(20.))
+                    .w(px(20.))
+                    .px_0()
+                    .flex_shrink_0()
+                    .opacity(0.)
+                    .group_hover("diff-line", |style| style.opacity(1.))
+                    .focus(|style| style.opacity(1.))
                     .on_click(cx.listener(move |view, _, window, cx| {
                         view.comment_git_line(index, window, cx)
                     })),
+                )
+                .child(line.get(1..).unwrap_or(line).to_owned());
+        } else {
+            row = row.px_2().text_color(rgb(muted())).child(
+                if line == "\\ No newline at end of file" {
+                    "No newline at end of file".to_owned()
+                } else {
+                    line.clone()
+                },
             );
         }
-        Some(row.child(line.clone()).into_any_element())
+        Some(row.into_any_element())
     }
 }
-#[cfg(test)]
+
+/// Return source coordinates using the original patch indices, never visible row indices.
+fn diff_line_numbers(
+    lines: &[String],
+    hunks: &[hunks::Hunk],
+    index: usize,
+) -> Option<(Option<usize>, Option<usize>)> {
+    let hunk = hunks.iter().rev().find(|hunk| hunk.header_line < index)?;
+    let target = lines.get(index)?;
+    if !target.starts_with([' ', '+', '-']) {
+        return None;
+    }
+    let (mut old, mut new) = (hunk.old_start, hunk.new_start);
+    for line in &lines[hunk.header_line + 1..index] {
+        if line.starts_with([' ', '-']) {
+            old += 1;
+        }
+        if line.starts_with([' ', '+']) {
+            new += 1;
+        }
+    }
+    Some((
+        (!target.starts_with('+')).then_some(old),
+        (!target.starts_with('-')).then_some(new),
+    ))
+}
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "git_review/tests.rs"]
 mod tests;

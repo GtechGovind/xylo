@@ -759,6 +759,6 @@ fn review_groups(package: &ExtensionPackage) -> Vec<(ComponentKind, Vec<usize>)>
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "extensions/tests.rs"]
 mod tests;

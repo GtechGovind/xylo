@@ -443,3 +443,209 @@ fn attachment_snapshot_and_failed_commit_keep_user_input() {
             .is_none()
     );
 }
+
+#[test]
+fn undo_removal_preserves_identity_order_payload_and_pauses() {
+    let (_dir, store, key) = fixture();
+    let mut ids = Vec::new();
+    for text in ["first", "middle", "last"] {
+        let sub = draft(&store, &key, text);
+        let req = turn(&sub);
+        store.queue_turn(&req, &sub).unwrap();
+        ids.push(req.turn_id);
+    }
+    store.remove_queued_turn(key.session_id, ids[1]).unwrap();
+    store.restore_queued_turn(key.session_id, ids[1]).unwrap();
+    let items = store.turn_queue(key.session_id).unwrap();
+    assert_eq!(items.iter().map(|x| x.id).collect::<Vec<_>>(), ids);
+    assert_eq!(items[1].turn.prompt, "middle");
+    assert!(items[1].paused);
+    assert!(store.restore_queued_turn(Uuid::new_v4(), ids[1]).is_err());
+    assert!(store.restore_queued_turn(key.session_id, ids[1]).is_err());
+}
+
+#[test]
+fn undo_cannot_resurrect_started_message_or_exceed_capacity() {
+    let (_dir, store, key) = fixture();
+    let sub = draft(&store, &key, "started");
+    let req = turn(&sub);
+    store.queue_turn(&req, &sub).unwrap();
+    store
+        .admit_queued_turn(key.session_id, req.turn_id, &req)
+        .unwrap();
+    assert!(
+        store
+            .remove_queued_turn(key.session_id, req.turn_id)
+            .is_err()
+    );
+    assert!(
+        store
+            .restore_queued_turn(key.session_id, req.turn_id)
+            .is_err()
+    );
+    let sub = draft(&store, &key, "removed");
+    let removed = turn(&sub);
+    store.queue_turn(&removed, &sub).unwrap();
+    store
+        .remove_queued_turn(key.session_id, removed.turn_id)
+        .unwrap();
+    for _ in 0..MAX_SESSION {
+        let sub = draft(&store, &key, "next");
+        store.queue_turn(&turn(&sub), &sub).unwrap();
+    }
+    assert!(
+        store
+            .restore_queued_turn(key.session_id, removed.turn_id)
+            .is_err()
+    );
+    assert_eq!(
+        store.turn_queue(key.session_id).unwrap().len(),
+        MAX_SESSION as usize
+    );
+}
+
+#[test]
+fn pause_and_resume_queue_are_scoped_and_preserve_all_six_payloads() {
+    let (_dir, store, key) = fixture();
+    for index in 0..6 {
+        let submission = draft(&store, &key, &format!("Next {index}"));
+        store.queue_turn(&turn(&submission), &submission).unwrap();
+    }
+    let before = store.turn_queue(key.session_id).unwrap();
+    store.set_turn_queue_paused(Uuid::new_v4(), true).unwrap();
+    assert!(
+        store
+            .turn_queue(key.session_id)
+            .unwrap()
+            .iter()
+            .all(|item| !item.paused)
+    );
+    store.set_turn_queue_paused(key.session_id, true).unwrap();
+    let paused = store.turn_queue(key.session_id).unwrap();
+    assert_eq!(paused.len(), 6);
+    assert!(
+        paused
+            .iter()
+            .all(|item| item.paused && item.reason.is_some())
+    );
+    store.set_turn_queue_paused(key.session_id, false).unwrap();
+    let resumed = store.turn_queue(key.session_id).unwrap();
+    for (expected, actual) in before.iter().zip(&resumed) {
+        assert_eq!(expected.id, actual.id);
+        assert_eq!(expected.turn.prompt, actual.turn.prompt);
+        assert!(!actual.paused);
+        assert!(actual.reason.is_none());
+    }
+}
+
+#[test]
+fn queued_update_task_is_atomic_idempotent_and_preserves_unrelated_main_draft() {
+    let (_dir, store, key) = fixture();
+    store
+        .upsert_conversation(&xylo_core::Conversation {
+            id: key.session_id,
+            title: "Active task".into(),
+            workspace: key.workspace.clone().unwrap(),
+            updated_at: 1,
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
+        })
+        .unwrap();
+    let submission = draft(&store, &key, "Queued guidance");
+    let request = turn(&submission);
+    store.queue_turn(&request, &submission).unwrap();
+    let newer = draft(&store, &key, "Unrelated main draft");
+    let active_turn = Uuid::new_v4();
+    assert!(
+        store
+            .steer_queued_turn(Uuid::new_v4(), request.turn_id, active_turn)
+            .is_err()
+    );
+    assert_eq!(store.turn_queue(key.session_id).unwrap().len(), 1);
+    let result = store
+        .steer_queued_turn(key.session_id, request.turn_id, active_turn)
+        .unwrap();
+    assert_eq!(result.request.id, request.turn_id);
+    assert_eq!(result.request.text, "Queued guidance");
+    assert!(store.turn_queue(key.session_id).unwrap().is_empty());
+    assert_eq!(store.draft(&key).unwrap().text, newer.text);
+    assert_eq!(store.draft(&key).unwrap().revision, newer.expected_revision);
+    let duplicate = store
+        .steer_queued_turn(key.session_id, request.turn_id, active_turn)
+        .unwrap();
+    assert_eq!(duplicate.request, result.request);
+    assert!(
+        store
+            .steer_queued_turn(key.session_id, request.turn_id, Uuid::new_v4())
+            .is_err()
+    );
+    assert_eq!(store.draft(&key).unwrap().text, newer.text);
+}
+
+#[test]
+fn cancelled_queued_guidance_returns_to_queue_and_can_target_a_new_task() {
+    let (_dir, store, key) = fixture();
+    store
+        .upsert_conversation(&xylo_core::Conversation {
+            id: key.session_id,
+            title: "Active".into(),
+            workspace: key.workspace.clone().unwrap(),
+            updated_at: 1,
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
+        })
+        .unwrap();
+    let submission = draft(&store, &key, "Retain this guidance");
+    let request = turn(&submission);
+    store.queue_turn(&request, &submission).unwrap();
+    let newer = draft(&store, &key, "Unrelated main draft");
+    let active = Uuid::new_v4();
+    store
+        .steer_queued_turn(key.session_id, request.turn_id, active)
+        .unwrap();
+    store
+        .finish_pending_steering(key.session_id, Some(active), "Task ended")
+        .unwrap();
+    let restored = store.turn_queue(key.session_id).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert!(restored[0].paused);
+    assert_eq!(restored[0].turn.prompt, "Retain this guidance");
+    let next = Uuid::new_v4();
+    let retry = store
+        .steer_queued_turn(key.session_id, request.turn_id, next)
+        .unwrap();
+    assert_eq!(retry.request.turn_id, next);
+    assert!(store.turn_queue(key.session_id).unwrap().is_empty());
+    assert_eq!(store.draft(&key).unwrap().text, newer.text);
+}
+
+#[test]
+fn restart_recovers_unapplied_queued_guidance_without_replacing_main_draft() {
+    let (_dir, store, key) = fixture();
+    store
+        .upsert_conversation(&xylo_core::Conversation {
+            id: key.session_id,
+            title: "Active".into(),
+            workspace: key.workspace.clone().unwrap(),
+            updated_at: 1,
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
+        })
+        .unwrap();
+    let submission = draft(&store, &key, "Queued guidance");
+    let request = turn(&submission);
+    store.queue_turn(&request, &submission).unwrap();
+    let newer = draft(&store, &key, "Unrelated main draft");
+    store
+        .steer_queued_turn(key.session_id, request.turn_id, Uuid::new_v4())
+        .unwrap();
+    assert_eq!(store.recover_steering().unwrap(), 1);
+    let restored = store.turn_queue(key.session_id).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].id, request.turn_id);
+    assert!(restored[0].paused);
+    assert_eq!(store.draft(&key).unwrap().text, newer.text);
+}

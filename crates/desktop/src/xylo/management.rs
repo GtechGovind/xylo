@@ -6,7 +6,6 @@ impl Xylo {
         self.cancel_draft_flush(cx);
         self.cancel_memory_forms_flush(cx);
         self.cancel_document_drafts_flush(cx);
-        self.cancel_recovery_flush(cx);
     }
     pub(super) fn management_busy(&self) -> bool {
         self.plugins.active() || self.environments.active() || self.extensions.active()

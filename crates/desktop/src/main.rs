@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 extern crate gpui_kit as gpui;
+#[cfg(target_os = "macos")]
+mod app_icon;
 mod assets;
 mod icons;
 mod motion;
@@ -70,6 +72,10 @@ fn main() -> anyhow::Result<()> {
     application.on_reopen(show);
     application.run(move |cx| {
         cx.set_app_identity(xylo_core::APPLICATION_ID, xylo_core::APPLICATION_NAME);
+        #[cfg(target_os = "macos")]
+        if let Err(error) = app_icon::install() {
+            tracing::warn!(%error, "The macOS Dock icon could not be installed");
+        }
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Light, None, cx);
         cx.set_window_appearance(Some(WindowAppearance::Light));

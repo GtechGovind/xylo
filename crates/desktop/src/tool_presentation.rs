@@ -226,11 +226,14 @@ impl ToolPresentation {
             "file_edit" | "notebook_edit" => "Edit",
             "ask_user" => "Answer questions",
             "exit_plan_mode" => "Review plan",
-            "schedule_wakeup" => "Schedule wakeup",
+            "schedule_wakeup" => "Schedule follow-up",
+            "shell_output" => "Read command output",
+            "shell_jobs" => "Background commands",
+            "shell_kill" => "Stop command",
             "lsp" => "Inspect code",
             "search_project" => "Search",
             "run_command" | "shell_command" => "Run",
-            "agent_delegate" => "Delegate",
+            "agent_delegate" => "Start subtask",
             "image_generate" => "Generate image",
             "git_status" => "Git status",
             "git_diff" => "Git diff",
@@ -543,6 +546,6 @@ impl ToolPresentation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "tool_presentation/tests.rs"]
 mod tests;

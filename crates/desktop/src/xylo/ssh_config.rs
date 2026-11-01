@@ -130,6 +130,6 @@ pub(super) fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "ssh_config/tests.rs"]
 mod tests;

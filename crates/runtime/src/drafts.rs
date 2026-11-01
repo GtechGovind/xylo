@@ -72,3 +72,33 @@ pub(crate) fn admission_in_progress(id: uuid::Uuid) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// Make an independent Saved drafts entry, including independently owned images.
+pub async fn preserve(
+    store: Store,
+    artifacts: PathBuf,
+    mut write: DraftWrite,
+    validate: Vec<xylo_core::ImageAttachment>,
+) -> Result<DraftSave> {
+    tokio::task::spawn_blocking(move || {
+        let images = xylo_services::attachments::AttachmentStore::new(artifacts)?;
+        for image in &validate {
+            images.validate(image.session_id, std::slice::from_ref(image))?;
+        }
+        let cancel = CancellationToken::new();
+        let mut copied = Vec::with_capacity(write.attachments.len());
+        for image in &write.attachments {
+            let bytes = images.read_image(image.session_id, image)?;
+            copied.push(images.import_bytes(
+                write.key.session_id,
+                &image.name,
+                &bytes,
+                image.source,
+                &cancel,
+            )?);
+        }
+        write.attachments = copied;
+        store.save_draft(&write)
+    })
+    .await?
+}

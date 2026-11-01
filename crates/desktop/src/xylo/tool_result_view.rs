@@ -15,7 +15,7 @@ fn output_lines(lines: &[OutputLine], cx: &Context<Xylo>) -> AnyElement {
         .flex()
         .flex_col()
         .gap_1()
-        .text_size(px(11.))
+        .text_size(px(DETAIL_SIZE))
         .font_family(
             gpui_kit::component::Theme::global(cx)
                 .mono_font_family
@@ -52,7 +52,7 @@ fn output_lines(lines: &[OutputLine], cx: &Context<Xylo>) -> AnyElement {
 fn remaining(count: usize) -> AnyElement {
     div()
         .pt_1()
-        .text_size(px(10.))
+        .text_size(px(META_SIZE))
         .text_color(rgb(muted()))
         .child(format!("{count} more"))
         .into_any_element()
@@ -129,7 +129,7 @@ impl Xylo {
                                     .min_w_0()
                                     .flex_1()
                                     .single_line()
-                                    .text_size(px(11.))
+                                    .text_size(px(DETAIL_SIZE))
                                     .child(entry.name.clone()),
                             ),
                     );
@@ -175,7 +175,7 @@ impl Xylo {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .text_size(px(11.))
+                                    .text_size(px(DETAIL_SIZE))
                                     .text_color(rgb(muted()))
                                     .child(icons::small(AppIcon::File))
                                     .child(group.path.clone()),
@@ -204,7 +204,7 @@ impl Xylo {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(DETAIL_SIZE))
                             .font_family(
                                 gpui_kit::component::Theme::global(cx)
                                     .mono_font_family
@@ -230,9 +230,9 @@ impl Xylo {
                 if *truncated {
                     command_body = command_body.child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(px(META_SIZE))
                             .text_color(rgb(muted()))
-                            .child("Output shortened · Copy output for all of it"),
+                            .child("Output preview · View full output"),
                     );
                 }
                 body = body.child(command_body);
@@ -249,11 +249,11 @@ impl Xylo {
                         ),
                 )
             }
-            ToolBody::Diff(text) => body = body.child(diff_view(("tool-change", i), text)),
+            ToolBody::Diff(text) => body = body.child(diff_view(("tool-change", i), text, cx)),
             ToolBody::Message(text) => {
                 body = body.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(DETAIL_SIZE))
                         .text_color(rgb(muted()))
                         .child(text.clone()),
                 )
@@ -273,6 +273,11 @@ impl Xylo {
                 )
                 .when(has_output, |row| {
                     row.child(
+                        detail_action(("tool-full-output", i), "View full output").on_click(
+                            cx.listener(move |view, _, _, cx| view.open_tool_output(id, cx)),
+                        ),
+                    )
+                    .child(
                         detail_action(("tool-copy-output", i), "Copy output").on_click(
                             cx.listener(move |view, _, _, cx| view.copy_tool_result(id, cx)),
                         ),

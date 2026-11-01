@@ -368,7 +368,7 @@ mod xylo {
                 std::thread::sleep(Duration::from_millis(10));
             }
             let turn = TurnRequest {
-                        session_id: session,
+                session_id: session,
                 turn_id: Uuid::new_v4(),
                 prompt: "Durable image history".into(),
                 workspace: workspace.clone(),

@@ -21,6 +21,29 @@ mod ui;
 mod xylo {
     include!("../src/xylo.rs");
     impl Xylo {
+        pub(crate) fn capture_theme(
+            &mut self,
+            theme: &str,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            self.settings.theme = theme.into();
+            self.apply_theme(window, cx);
+            cx.notify();
+        }
+        pub(crate) fn capture_destination(&mut self, destination: &str, cx: &mut Context<Self>) {
+            let page = match destination {
+                "search" => Page::Search,
+                "schedules" => Page::Schedules,
+                "artifacts" => Page::Artifacts,
+                _ => Page::Chat,
+            };
+            self.navigate(page, cx);
+        }
+        pub(crate) fn capture_open_files(&mut self, cx: &mut Context<Self>) {
+            self.navigate(Page::Files, cx);
+            self.refresh_git(cx);
+        }
         pub(crate) fn capture_ready(&self) -> bool {
             self.settings_loaded
                 && self.workspace_ready
@@ -178,6 +201,12 @@ fn render() {
             view.read(cx).capture_healthy();
         })
         .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            cx.run_until_parked();
+            cx.advance_clock(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
         cx.capture_screenshot(handle)
             .expect("Native renderer available")
             .save(output.join(name))
@@ -191,8 +220,8 @@ fn render() {
     })
     .unwrap();
     save(&mut cx, "home.png");
-    cx.update_window(handle, |_, window, cx| {
-        window.click("toggle-work-panel", cx);
+    cx.update_window(handle, |_, _window, cx| {
+        view.update(cx, |view, cx| view.capture_open_files(cx));
     })
     .unwrap();
     wait(&mut cx, &|view| {
@@ -232,9 +261,9 @@ fn render() {
     wait(&mut cx, &|view| view.capture_git_ready());
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        let file = window.find(("git-row", 2usize));
-        assert_eq!(file.label(), Some("Open diff main.rs"));
-        window.click(("git-row", 2usize), cx);
+        let file = window.find(("changed-file", 0usize));
+        assert_eq!(file.label(), Some("Review src/main.rs, Modified"));
+        window.click(("changed-file", 0usize), cx);
     })
     .unwrap();
     wait(&mut cx, &|view| view.capture_diff_ready());
@@ -286,8 +315,27 @@ fn render() {
     save(&mut cx, "settings-light.png");
     std::fs::write(output.join("capture-scope.json"),serde_json::to_vec_pretty(&serde_json::json!({
         "scope":"Production native renderer with a real temporary Git repository and Host; no model turn, user project, connected-account simulation or physical desktop capture.",
-        "size":[1380,880],"files":["home.png","files.png","changes.png","settings.png","settings-general.png","settings-connections.png","settings-permissions.png","settings-skills.png","settings-memory.png","settings-light.png"]
+        "size":[1380,880],"files":["home.png","files.png","changes.png","settings.png","settings-general.png","settings-connections.png","settings-permissions.png","settings-skills.png","settings-memory.png","settings-light.png","search-light.png","search-dark.png","schedules-light.png","schedules-dark.png","artifacts-light.png","artifacts-dark.png"]
     })).unwrap()).unwrap();
+    for theme in ["light", "dark"] {
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| view.capture_theme(theme, window, cx));
+        })
+        .unwrap();
+        for destination in ["search", "schedules", "artifacts"] {
+            cx.update_window(handle, |_, _, cx| {
+                view.update(cx, |view, cx| view.capture_destination(destination, cx));
+            })
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                cx.run_until_parked();
+                cx.advance_clock(Duration::from_millis(5));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            save(&mut cx, &format!("{destination}-{theme}.png"));
+        }
+    }
     client.shutdown().unwrap();
     println!(
         "Native workspace and Settings captures: {}",

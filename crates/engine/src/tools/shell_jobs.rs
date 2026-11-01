@@ -229,9 +229,6 @@ impl ShellJobs {
     }
 
     fn publish(&self, job: &Job) {
-        if !job.background {
-            return;
-        }
         // Snapshot creation and delivery are one ordered operation per job.
         let _publication = job.publication.lock();
         let snapshot = {
@@ -396,7 +393,7 @@ impl ShellJobs {
                 state.snapshot.error = Some(format!("Saving shell log failed: {error}"));
             }
             state.output.append(&bytes);
-            let schedule = job.background && !state.update_pending;
+            let schedule = !state.update_pending;
             if schedule {
                 state.update_pending = true;
             }
@@ -521,6 +518,7 @@ pub(super) fn prepare(broker: &ToolBroker, args: &Value) -> Result<ExecutionCont
 
 pub(super) fn execute(
     broker: &ToolBroker,
+    action_id: Uuid,
     name: &str,
     args: &Value,
     access: builtin::Access,
@@ -572,12 +570,13 @@ pub(super) fn execute(
             let (output, truncated) = state
                 .output
                 .read(args.get("filter").and_then(Value::as_str));
-            json!({"job_id":id,"output":output,"running":state.snapshot.running,"exit_code":state.snapshot.exit_code,
+            json!({"job_id":id,"job_turn_id":state.snapshot.turn_id,"output":output,"running":state.snapshot.running,"exit_code":state.snapshot.exit_code,
                 "error":state.snapshot.error,"output_truncated":truncated,"log_path":state.snapshot.log_path})
         }
         "shell_command" | "run_command" => {
             return start(
                 broker,
+                action_id,
                 name,
                 args,
                 access,
@@ -591,6 +590,7 @@ pub(super) fn execute(
 
 fn start(
     broker: &ToolBroker,
+    action_id: Uuid,
     name: &str,
     args: &Value,
     access: builtin::Access,
@@ -696,6 +696,10 @@ fn start(
         options.mode(0o600);
     }
     let log = options.open(&log_path)?;
+    std::fs::write(
+        directory.join(format!("{id}.json")),
+        serde_json::to_vec(&(session, broker.request.turn_id))?,
+    )?;
     let job = Arc::new(Job {
         session,
         background,
@@ -709,6 +713,8 @@ fn start(
         publication: Mutex::new(()),
         state: Mutex::new(JobState {
             snapshot: ShellJob {
+                action_id: Some(action_id),
+                background,
                 id,
                 turn_id: broker.request.turn_id,
                 command: label,
@@ -811,7 +817,27 @@ fn start(
             json!({"status":"success","summary":{"job_id":id,"running":true,"log_path":log_path},"next_actions":["Use shell_output to wait for output or shell_kill to stop this job"],"artifacts":[]}),
         )
     } else {
-        let result = broker.runtime.block_on(run)?;
+        let result = match broker.runtime.block_on(run) {
+            Ok(result) => result,
+            Err(error)
+                if error
+                    .downcast_ref::<xylo_runtime::process::NotStarted>()
+                    .is_some() =>
+            {
+                return Err(error);
+            }
+            Err(error) => {
+                // Keep the retained output address without claiming the interrupted
+                // command completed, or that any writes were rolled back.
+                return Err(super::ObservedFailure(json!({
+                    "status":"outcome_unknown",
+                    "summary":{"job_id":id,"job_turn_id":broker.request.turn_id,
+                        "log_path":log_path,"error":format!("{error:#}")},
+                    "next_actions":[],"artifacts":[]
+                }))
+                .into());
+            }
+        };
         let mut capture = CwdCapture::new(marker);
         let mut errors = capture.push(result.stderr.as_bytes());
         errors.extend(capture.finish().0);
@@ -821,7 +847,7 @@ fn start(
         } else {
             "failed"
         };
-        let mut value = json!({"status":status,"exit_code":result.code,"summary":{"exit_code":result.code,"stdout":result.stdout,"stderr":stderr,"output_truncated":result.truncated,"log_path":log_path},"next_actions":[],"artifacts":[]});
+        let mut value = json!({"status":status,"exit_code":result.code,"summary":{"job_id":id,"exit_code":result.code,"stdout":result.stdout,"stderr":stderr,"output_truncated":result.truncated,"log_path":log_path},"next_actions":[],"artifacts":[]});
         if let Some(hint) = &job.state.lock().network_hint {
             value["summary"]["network_hint"] = json!(hint);
         }

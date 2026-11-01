@@ -184,6 +184,9 @@ fn failed_and_running_turn_receipts_appear_in_totals_without_double_counting() {
             .unwrap();
         store
             .append_message(&xylo_core::ChatMessage {
+                activity_count: 0,
+                activity_summary: None,
+                turn_id: None,
                 id: Uuid::new_v5(&turn, b"user-message"),
                 session_id: chat,
                 role: "user".into(),

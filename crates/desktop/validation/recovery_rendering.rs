@@ -1,4 +1,4 @@
-//! Actual Host/Store interrupted-write capture through the production controls.
+//! Normal chat capture with an interrupted write retained in the real Host/Store.
 //! This renders offscreen and never inspects a locked desktop or uses a model.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
@@ -40,10 +40,8 @@ mod xylo {
         ) {
             self.open_conversation(session, workspace, window, cx);
         }
-        pub(crate) fn capture_review_ready(&self, selected: bool) -> bool {
-            self.validation_review_ready()
-                && self.validation_review_items().len() == 1
-                && (!selected || self.validation_review_detail().is_some())
+        pub(crate) fn capture_chat_ready(&self) -> bool {
+            !self.history_loading() && !self.messages.is_empty()
         }
     }
 }
@@ -65,8 +63,11 @@ fn render() {
         time::{Duration, Instant},
     };
     let profile = recovery_fixture::seeded(1);
-    let delivery = Arc::new(recovery_fixture::Delivery::default());
-    let host = recovery_fixture::host(&profile, delivery);
+    let mut settings = xylo_core::AppSettings::default();
+    settings.last_workspace = Some(profile.workspace.clone());
+    settings.theme = "dark".into();
+    profile.store.save_settings(&settings).unwrap();
+    let host = recovery_fixture::host(&profile);
     let client = host.0.clone();
     let mut cx = HeadlessAppContext::with_platform(
         platform::current_platform(true).text_system(),
@@ -76,7 +77,7 @@ fn render() {
     cx.allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
-        Theme::change(ThemeMode::Light, None, cx);
+        Theme::change(ThemeMode::Dark, None, cx);
     });
     let (handle, view) = cx
         .update(|cx| {
@@ -119,26 +120,12 @@ fn render() {
         })
     })
     .unwrap();
-    wait(&mut cx, |cx| view.read(cx).capture_review_ready(false));
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        window.click("review-interrupted-actions", cx);
-        window.render_frame(cx);
-        window.click(("review-select-action", 0usize), cx);
-    })
-    .unwrap();
-    wait(&mut cx, |cx| view.read(cx).capture_review_ready(true));
+    wait(&mut cx, |cx| view.read(cx).capture_chat_ready());
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(window.find("sidebar-new-chat").visible());
-        assert!(window.find(("review-select-action", 0usize)).visible());
-        assert!(window.find("review-open-target").visible());
-        assert!(window.find(("review-artifact", 0usize)).visible());
-        assert_eq!(window.find("review-record-outcome").disabled(), Some(true));
-        assert!(window.find("review-record-outcome").visible());
-        let action = window.find(("review-select-action", 0usize));
-        let target = window.find("review-open-target");
-        assert!(target.bounds().origin.x > action.bounds().right());
+        assert!(window.find_all("review-interrupted-actions").is_empty());
+        assert!(window.find_all("action-review-panel").is_empty());
     })
     .unwrap();
     let output = capture_dir::fresh("recovery-rendering");
@@ -150,18 +137,7 @@ fn render() {
     screenshot.save(&image).unwrap();
     let compiled_sources = [
         ("xylo.rs", include_bytes!("../src/xylo.rs").as_slice()),
-        (
-            "recovery.rs",
-            include_bytes!("../src/xylo/recovery.rs").as_slice(),
-        ),
-        (
-            "recovery_forms.rs",
-            include_bytes!("../src/xylo/recovery_forms.rs").as_slice(),
-        ),
-        (
-            "recovery_view.rs",
-            include_bytes!("../src/xylo/recovery_view.rs").as_slice(),
-        ),
+        ("chat.rs", include_bytes!("../src/xylo/chat.rs").as_slice()),
         (
             "recovery_fixture.rs",
             include_bytes!("recovery_fixture.rs").as_slice(),
@@ -192,7 +168,7 @@ fn render() {
         lock.try_lock().is_ok()
     });
     println!(
-        "Native recovery layout capture: {} (actual Host/Store interrupted-write fixture, offscreen only)",
+        "Native uninterrupted chat layout capture: {} (actual Host/Store interrupted-write fixture, offscreen only)",
         image.canonicalize().unwrap().display()
     );
 }

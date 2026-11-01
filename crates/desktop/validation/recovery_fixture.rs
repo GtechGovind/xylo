@@ -1,12 +1,5 @@
-//! Shared offline fixture: real Store/Host, controlled delivery loss, no model.
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+//! Shared offline fixture: real Store/Host with interrupted writes, no model.
+use std::path::PathBuf;
 use uuid::Uuid;
 use xylo_core::{AppSettings, TurnRequest};
 use xylo_runtime::{
@@ -15,16 +8,6 @@ use xylo_runtime::{
 };
 use xylo_services::{ActionIntent, Store};
 
-#[derive(Default)]
-pub struct Delivery {
-    pub drop_next: AtomicBool,
-    pub drop_form_next: AtomicBool,
-    pub form_dropped: AtomicBool,
-    pub dropped: AtomicBool,
-    pub pause_pending: AtomicBool,
-    pub locked: AtomicBool,
-    pub release: AtomicBool,
-}
 pub struct Profile {
     pub directory: tempfile::TempDir,
     pub paths: AppPaths,
@@ -120,51 +103,6 @@ pub fn seed_action(profile: &mut Profile, name: &str, qualified: bool, index: us
     profile.actions.push(id);
     id
 }
-pub fn host(
-    profile: &Profile,
-    delivery: Arc<Delivery>,
-) -> (HostClient, async_channel::Receiver<HostEvent>) {
-    let (client, incoming) = HostClient::spawn_at(profile.paths.clone()).unwrap();
-    let (sender, receiver) = async_channel::bounded(256);
-    let database = profile.paths.database.clone();
-    std::thread::spawn(move || {
-        while let Ok(event) = incoming.recv_blocking() {
-            if matches!(event, HostEvent::ActionReviewFormSaved { .. })
-                && delivery.drop_form_next.swap(false, Ordering::SeqCst)
-            {
-                delivery.form_dropped.store(true, Ordering::SeqCst);
-                continue;
-            }
-            if matches!(event, HostEvent::ActionResolved { .. })
-                && delivery.drop_next.swap(false, Ordering::SeqCst)
-            {
-                delivery.dropped.store(true, Ordering::SeqCst);
-                continue;
-            }
-            if matches!(&event, HostEvent::ActionReviewFormSaved { result: Ok(saved), .. } if saved.snapshot.form.pending.is_some())
-                && delivery.pause_pending.swap(false, Ordering::SeqCst)
-            {
-                let control = delivery.clone();
-                let database = database.clone();
-                std::thread::spawn(move || {
-                    let connection = rusqlite::Connection::open(database).unwrap();
-                    connection.busy_timeout(Duration::from_secs(5)).unwrap();
-                    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
-                    control.locked.store(true, Ordering::SeqCst);
-                    while !control.release.load(Ordering::SeqCst) {
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    connection.execute_batch("ROLLBACK").unwrap();
-                });
-                while !delivery.locked.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-            let stopped = matches!(event, HostEvent::Stopped);
-            if sender.send_blocking(event).is_err() || stopped {
-                break;
-            }
-        }
-    });
-    (client, receiver)
+pub fn host(profile: &Profile) -> (HostClient, async_channel::Receiver<HostEvent>) {
+    HostClient::spawn_at(profile.paths.clone()).unwrap()
 }

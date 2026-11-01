@@ -1,4 +1,4 @@
-//! The chat page: one centred reading column (760 px) holding the history
+//! The chat page: one centred reading column (800 px) holding the history
 //! messages and the live turn (rendered by `transcript`), and the composer at
 //! the same width underneath. The transcript fades into the page above the
 //! composer and keeps a fixed bottom inset, so its last line is never hidden.
@@ -12,35 +12,39 @@ use super::*;
 use crate::icons::{self, AppIcon};
 use gpui_kit::base::Disableable;
 use gpui_kit::base::TestSupportExt;
+use gpui_kit::component::Sizable;
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+#[path = "chat/diff_preview.rs"]
+mod diff_preview;
 #[path = "chat/plan_card.rs"]
 mod plan_card;
 #[path = "chat/question_card.rs"]
 mod question_card;
 #[path = "chat/thinking.rs"]
 mod thinking;
+#[path = "chat/tokens.rs"]
+pub(super) mod tokens;
 #[path = "tool_result_view.rs"]
 mod tool_result_view;
 #[path = "chat/tools.rs"]
 mod tools;
+use tokens::*;
 #[path = "transcript.rs"]
 mod transcript;
 
 /// The composer's prompt on the home screen, where nothing has been said yet.
-const HOME_PLACEHOLDER: &str = "How can I help you today?";
+const HOME_PLACEHOLDER: &str = "What would you like to work on?";
 /// The composer's prompt inside a conversation.
-const REPLY_PLACEHOLDER: &str = "Reply to Xylo…";
-/// Width of the reading column, shared by the transcript and the composer.
-const COLUMN_WIDTH: f32 = 760.;
+const REPLY_PLACEHOLDER: &str = "Work with Xylo";
 /// Space kept under the last transcript row so the fade never covers it;
 /// at least [`FADE_HEIGHT`].
-const BOTTOM_INSET: f32 = 32.;
+const BOTTOM_INSET: f32 = 12.;
 /// Height of the fade between the transcript and the composer.
-const FADE_HEIGHT: f32 = 28.;
+const FADE_HEIGHT: f32 = 0.;
 const _: () = assert!(BOTTOM_INSET >= FADE_HEIGHT);
 /// Space under an answer, holding its overlaid action row (one 28 px icon
 /// button high) clear of the answer's last line.
-const ANSWER_GAP: f32 = 30.;
+const ANSWER_GAP: f32 = 54.;
 
 /// Placeholder messages while a conversation's first page loads: a request
 /// and a reply, twice, so the layout the reader is about to see is already
@@ -80,26 +84,8 @@ fn reply_status_label(status: MessageStatus) -> Option<&'static str> {
     match status {
         MessageStatus::Complete => None,
         MessageStatus::Interrupted => Some("Stopped · the reply ended early"),
-        MessageStatus::Failed => Some("Failed · the reply is incomplete"),
-        MessageStatus::Truncated => Some("Cut off · the answer reached the output limit"),
-    }
-}
-
-/// When an answer was written: the time today, the date before that.
-fn time_label(at_ms: i64, now_ms: i64) -> String {
-    use chrono::{Datelike, Local, TimeZone};
-    let (Some(at), Some(now)) = (
-        Local.timestamp_millis_opt(at_ms).single(),
-        Local.timestamp_millis_opt(now_ms).single(),
-    ) else {
-        return String::new();
-    };
-    if at.date_naive() == now.date_naive() {
-        at.format("%-I:%M %p").to_string()
-    } else if at.year() == now.year() {
-        at.format("%b %-d, %-I:%M %p").to_string()
-    } else {
-        at.format("%b %-d %Y, %-I:%M %p").to_string()
+        MessageStatus::Failed => Some("This reply ended with an error."),
+        MessageStatus::Truncated => Some("This reply reached the model’s length limit."),
     }
 }
 
@@ -157,8 +143,6 @@ struct Answer {
     /// The message id, or the live answer's key.
     id: Uuid,
     text: SharedString,
-    /// When it was written, in milliseconds.
-    at_ms: i64,
     /// Why it is incomplete (stopped, failed, cut off), if it is.
     note: Option<SharedString>,
     /// The answer that ends the conversation: its row is always shown.
@@ -205,37 +189,25 @@ fn message_action(
     label: &'static str,
     always: bool,
 ) -> gpui_kit::base::Button {
-    reveal_on_hover(icons::icon_button(id, glyph, label), always).focus(|style| style.opacity(1.))
+    reveal_on_hover(icons::icon_button(id, glyph, label).size(px(30.)), always)
+        .focus(|style| style.opacity(1.))
 }
 
 impl Xylo {
     pub(super) fn chat(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.recovery.open {
-            return self.recovery_panel(cx);
-        }
         if self.messages.is_empty()
             && !self.running()
             && !self.history_loading()
             && !self.has_live_transcript()
         {
-            let home = self.chat_home(cx);
-            if self.recovery_blocks_submit() {
-                return div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .child(self.recovery_banner(cx))
-                    .child(div().flex_1().min_h_0().child(home))
-                    .into_any_element();
-            }
-            return home;
+            return self.chat_home(cx);
         }
         self.sync_history_list(cx);
         let Some(history) = self.histories.get(&self.session) else {
             return div().into_any_element();
         };
         let state = history.list.clone();
-        let jump = self.running() && history.reader_scrolled_away();
+        let jump = history.reader_scrolled_away();
         let weak = cx.entity().downgrade();
         let list = list(state, move |index, window, cx| {
             weak.update(cx, |view, cx| view.chat_row(index, window, cx))
@@ -277,7 +249,7 @@ impl Xylo {
                         .justify_center()
                         .child(crate::motion::fade_slide_in(
                             "jump-to-latest-enter",
-                            pill("jump-to-latest", "Jump to latest")
+                            pill("jump-to-latest", "Latest")
                                 .accessibility_label("Jump to the latest output")
                                 .bg(rgb(panel()))
                                 .border_color(rgb(border_strong()))
@@ -288,11 +260,11 @@ impl Xylo {
                 )
             });
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .min_h_0()
-            .child(self.recovery_banner(cx))
             .child(pane)
             .child(self.history_later_footer(cx))
             .child(self.mcp_form_cards(cx))
@@ -301,8 +273,16 @@ impl Xylo {
                     .w_full()
                     .flex()
                     .justify_center()
-                    .px(px(28.))
-                    .pb(px(20.))
+                    .px(px(if self.chat_width.get() < 750. {
+                        16.
+                    } else {
+                        CHAT_INSET
+                    }))
+                    .pb(px(if self.chat_width.get() < 750. {
+                        8.
+                    } else {
+                        13.
+                    }))
                     .flex_shrink_0()
                     .child(self.prompt_box(cx)),
             )
@@ -378,6 +358,8 @@ impl Xylo {
             EngineEvent::ToolFinished { action_id, .. } => Some(*action_id),
             _ => None,
         };
+        let files_changed = matches!(&event, EngineEvent::ToolFinished { name, success: true, .. }
+            if matches!(name.as_str(), "file_write" | "file_edit" | "file_delete" | "apply_patch"));
         let completed = matches!(event, EngineEvent::Completed { .. });
         let usage_changed = matches!(
             event,
@@ -386,15 +368,13 @@ impl Xylo {
                 | EngineEvent::Error { .. }
                 | EngineEvent::ContextUsage { .. }
         );
-        let review_changed = matches!(
-            &event,
-            EngineEvent::Started
-                | EngineEvent::Completed { .. }
-                | EngineEvent::Cancelled
-                | EngineEvent::Error { .. }
-                | EngineEvent::ToolFinished { .. }
-        );
         self.turns.entry(session).or_default().apply(event);
+        if session == self.session
+            && self.settings.ui.work_panel_open
+            && (files_changed || completed)
+        {
+            self.refresh_git(cx);
+        }
         if let Some(action) = finished_tool
             && session == self.session
         {
@@ -423,10 +403,6 @@ impl Xylo {
                 history.stale = true;
             }
             let _ = self.host.as_ref().map(|h| h.list_conversations());
-        }
-        if session == self.session && review_changed {
-            self.recovery_activate(window, cx);
-            self.refresh_action_reviews(cx);
         }
         // A chat in the background is drawn only as its sidebar row, so its
         // events redraw the window only when that row's mark changes.
@@ -464,7 +440,24 @@ impl Xylo {
             return;
         }
         // A retried turn resumes under the same id; its partial reply is not history.
-        let reply = turn.reply().filter(|_| !turn.resend);
+        let reply = turn
+            .reply()
+            .or_else(|| {
+                turn.outcome
+                    .as_ref()
+                    .filter(|_| turn.request.is_some())
+                    .map(|outcome| {
+                        (
+                            String::new(),
+                            match outcome {
+                                crate::state::TurnOutcome::Completed => MessageStatus::Complete,
+                                crate::state::TurnOutcome::Stopped => MessageStatus::Interrupted,
+                                crate::state::TurnOutcome::Failed(_) => MessageStatus::Failed,
+                            },
+                        )
+                    })
+            })
+            .filter(|_| !turn.resend);
         let thinking = turn
             .segments
             .iter()
@@ -476,6 +469,10 @@ impl Xylo {
             .join("\n\n");
         let reasoning = (!thinking.is_empty()).then_some(thinking);
         let finished_at = turn.finished_at;
+        let activity_count = turn.tools.len().min(u32::MAX as usize) as u32;
+        let activity_summary =
+            (activity_count > 0).then(|| transcript::group_summary(turn.tools.iter()));
+        let turn_id = turn.request.as_ref().map(|request| request.turn_id);
         let answer = live_answer_key(session, turn);
         turn.archive();
         if let Some((text, status)) = reply {
@@ -484,6 +481,9 @@ impl Xylo {
                 // The answer keeps its identity, so a reading in progress
                 // still belongs to it.
                 reply.id = answer;
+                reply.turn_id = turn_id;
+                reply.activity_count = activity_count;
+                reply.activity_summary = activity_summary;
                 reply.status = status;
                 reply.reasoning = reasoning;
                 if let Some(at) = finished_at {
@@ -502,7 +502,8 @@ impl Xylo {
     /// its checkpoint and the host's user-message registration is idempotent,
     /// so the prompt is not repeated in the transcript.
     pub(super) fn retry_last_message(&mut self, cx: &mut Context<Self>) {
-        if self.running() || self.sending_turn() || self.recovery_blocks_submit() {
+        self.cancel_setup_close_intents(cx);
+        if self.running() || self.sending_turn() {
             return;
         }
         if let Err(error) = self.settings.provider.validate() {
@@ -528,54 +529,54 @@ impl Xylo {
         // The same prompt and images, with the connection fixed since the failure.
         request.provider = self.settings.provider.clone();
         request.permissions = self.settings.permissions;
-        self.engine_command(WorkerCommand::Run { turn: request }, cx);
+        if let Err(error) = self.try_engine_command(WorkerCommand::Run { turn: request }, cx) {
+            if let Some(turn) = self.turns.get_mut(&self.session) {
+                turn.resend = false;
+            }
+            tracing::warn!(%error, "Retry could not be dispatched");
+            self.show_composer_hint(
+                "The task could not be retried. Check the connection and try again.",
+                cx,
+            );
+        }
         self.invalidate_live_history();
         self.sync_history_list(cx);
         cx.notify();
     }
-    /// The prompt "Retry" under the latest answer asks again: the person's
-    /// last message, when it was text only and nothing else is in flight or
-    /// typed.
-    fn retry_prompt(&self, cx: &App) -> Option<&str> {
-        if self.running()
-            || self.sending_turn()
-            || !self.composer.read(cx).value().trim().is_empty()
-        {
-            return None;
-        }
-        self.messages
+    fn message_payload(&self, message_id: Uuid) -> Option<super::drafts::MessagePayload> {
+        let message = self
+            .messages
             .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .filter(|message| message.attachments.is_empty() && !message.content.trim().is_empty())
-            .map(|message| message.content.as_str())
+            .find(|message| message.id == message_id && message.role == "user")?;
+        Some(super::drafts::MessagePayload {
+            text: message.content.clone(),
+            attachments: message.attachments.clone(),
+        })
     }
-    /// Asks the latest question again through the normal send path, so drafts,
-    /// admission and the queue treat it like any other message.
-    fn retry_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(prompt) = self.retry_prompt(cx).map(str::to_owned) else {
+    pub(super) fn retry_message(&mut self, message_id: Uuid, cx: &mut Context<Self>) {
+        let Some(payload) = self.message_payload(message_id) else {
+            self.show_composer_hint(
+                "The original message is unavailable. Reload this chat and try again.",
+                cx,
+            );
             return;
         };
-        self.composer
-            .update(cx, |input, cx| input.set_value(prompt, window, cx));
-        self.draft_changed(cx);
-        self.submit(window, cx);
+        self.submit_message_payload(payload, cx);
     }
-    /// Puts a sent message back in the composer to edit and send again. A
-    /// draft already being typed is kept above it.
-    fn edit_message(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let draft = self.composer.read(cx).value().trim_end().to_owned();
-        let value = if draft.is_empty() {
-            text.to_owned()
-        } else {
-            format!("{draft}\n\n{text}")
+    pub(super) fn reuse_message(
+        &mut self,
+        message_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(payload) = self.message_payload(message_id) else {
+            self.show_composer_hint(
+                "The original message is unavailable. Reload this chat and try again.",
+                cx,
+            );
+            return;
         };
-        self.composer.update(cx, |input, cx| {
-            input.set_value(value, window, cx);
-            input.focus(window, cx);
-        });
-        self.draft_changed(cx);
-        cx.notify();
+        self.replace_composer_payload(payload, window, cx);
     }
     /// Whether the answer `answer` (a message id, or the live answer's key)
     /// is the one being read aloud: its speech is still being made or plays.
@@ -599,7 +600,7 @@ impl Xylo {
         let content = if index == 0 {
             self.history_header(cx)
         } else if let Some(message) = self.messages.get(index - 1) {
-            self.message_row(index, message, cx)
+            self.message_row(index, message, window, cx)
         } else {
             self.live_row(index - 1 - self.messages.len(), window, cx)
         };
@@ -608,9 +609,19 @@ impl Xylo {
             .w_full()
             .flex()
             .justify_center()
-            .px(px(28.))
-            .when(is_message && user, |row| row.pt(px(2.)).pb(px(10.)))
-            .when(is_message && !user, |row| row.pt(px(4.)))
+            .px(px(if self.chat_width.get() < 750. {
+                18.
+            } else {
+                CHAT_INSET
+            }))
+            .when(index == 0, |row| {
+                row.pt(px(if self.chat_width.get() < 750. {
+                    24.
+                } else {
+                    32.
+                }))
+            })
+            .when(is_message && user, |row| row.pb(px(28.)))
             .child(div().w_full().max_w(px(COLUMN_WIDTH)).child(content))
             .into_any_element()
     }
@@ -626,7 +637,10 @@ impl Xylo {
         div()
             .flex()
             .justify_center()
-            .py_2()
+            .when(
+                loading || history.is_some_and(|history| history.has_more),
+                |row| row.py_2(),
+            )
             .child(if loading {
                 div()
                     .id("history-loading-older")
@@ -635,7 +649,7 @@ impl Xylo {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .text_size(px(12.5))
+                    .text_size(px(DETAIL_SIZE))
                     .text_color(rgb(muted()))
                     .child(crate::motion::spinner_inline())
                     .child(if history.is_some_and(|history| history.loading_older()) {
@@ -648,7 +662,7 @@ impl Xylo {
                 secondary("older-messages", "Load earlier messages")
                     .h(px(30.))
                     .rounded_full()
-                    .text_size(px(12.5))
+                    .text_size(px(DETAIL_SIZE))
                     .on_click(cx.listener(|view, _, _, cx| view.load_older(cx)))
                     .into_any_element()
             } else {
@@ -660,6 +674,7 @@ impl Xylo {
         &self,
         index: usize,
         message: &ChatMessage,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if message.role == "user" {
@@ -686,19 +701,18 @@ impl Xylo {
                     .test_support()
                     .w_full()
                     .min_w_0()
-                    .child(self.answer_message(index, message, cx)),
+                    .child(self.answer_message(index, message, window, cx)),
             )
             .child(
                 div()
                     .absolute()
                     .left_0()
-                    .bottom_0()
+                    .bottom(px(12.))
                     .child(self.answer_actions(
                         index,
                         Answer {
                             id: message.id,
                             text: self.message_text(message),
-                            at_ms: message.created_at,
                             note: reply_status_label(message.status).map(SharedString::from),
                             latest: index == self.messages.len() && !self.has_live_transcript(),
                         },
@@ -717,21 +731,25 @@ impl Xylo {
     ) -> AnyElement {
         let content = self.message_text(message);
         let copy_text = content.clone();
-        let edit_text = content.clone();
+        let message_id = message.id;
         let bubble = div()
             .id(("message-body", index))
             .test_support()
             .min_w_0()
-            .max_w(relative(0.8))
+            .max_w(relative(if self.chat_width.get() < 750. {
+                0.92
+            } else {
+                0.85
+            }))
             .flex()
             .flex_col()
             .gap_2()
-            .px(px(14.))
-            .py(px(8.))
-            .rounded(px(18.))
+            .px(px(19.))
+            .py(px(13.))
+            .rounded(px(22.))
             .bg(rgb(well()))
             .text_size(px(15.))
-            .line_height(relative(1.5))
+            .line_height(relative(1.6))
             .text_color(rgb(text()))
             .when(self.history_message_highlight(message.id), |row| {
                 row.border_1().border_color(rgb(brand()))
@@ -757,23 +775,30 @@ impl Xylo {
                     },
                 ),
             )
-            .when(!message.content.trim().is_empty(), |row| {
-                row.child(
-                    message_action(("edit-message", index), AppIcon::Edit, "Edit", false).on_click(
-                        cx.listener(move |view, _, window, cx| {
-                            view.edit_message(&edit_text, window, cx)
-                        }),
-                    ),
-                )
-            });
+            .when(
+                !message.content.trim().is_empty() || !message.attachments.is_empty(),
+                |row| {
+                    row.child(
+                        message_action(
+                            ("edit-message", index),
+                            AppIcon::Edit,
+                            "Use as new message",
+                            false,
+                        )
+                        .on_click(cx.listener(
+                            move |view, _, window, cx| view.reuse_message(message_id, window, cx),
+                        )),
+                    )
+                },
+            );
         div()
             .w_full()
             .flex()
-            .justify_end()
+            .flex_col()
             .items_end()
             .gap(px(4.))
-            .child(actions)
             .child(bubble)
+            .child(actions)
             .into_any_element()
     }
     /// An answer from history: text on the page.
@@ -781,6 +806,7 @@ impl Xylo {
         &self,
         index: usize,
         message: &ChatMessage,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         div()
@@ -790,26 +816,40 @@ impl Xylo {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_2()
-            .text_size(px(15.))
-            .line_height(relative(1.7))
+            .gap(px(0.))
+            .text_size(px(if self.chat_width.get() < 750. {
+                14.
+            } else {
+                15.
+            }))
+            .line_height(relative(RESPONSE_LINE_HEIGHT))
             .text_color(rgb(text()))
             .when(self.history_message_highlight(message.id), |row| {
                 row.border_1().border_color(rgb(brand()))
             })
-            .when_some(message.reasoning.clone(), |row, reasoning| {
-                row.child(self.thinking_block(
-                    Uuid::new_v5(&message.id, b"thinking"),
-                    reasoning.into(),
-                    cx,
-                ))
-            })
+            .child(self.saved_activity(message, cx))
+            .when_some(
+                message.reasoning.clone().filter(|_| {
+                    message.turn_id.is_none()
+                        || message.activity_count == 0
+                        || self.saved_activity_is_open(message)
+                }),
+                |row, reasoning| {
+                    row.child(self.thinking_block(
+                        Uuid::new_v5(&message.id, b"thinking"),
+                        reasoning.into(),
+                        window,
+                        cx,
+                    ))
+                },
+            )
             .when(!message.content.is_empty(), |row| {
                 row.child(
                     TextView::markdown(
                         SharedString::from(message.id.to_string()),
                         self.message_text(message),
                     )
+                    .style(response_style())
                     .selectable(true),
                 )
             })
@@ -824,7 +864,6 @@ impl Xylo {
         let Answer {
             id: answer,
             text,
-            at_ms,
             note,
             latest,
         } = answer;
@@ -832,27 +871,44 @@ impl Xylo {
         let reading = self.reading_answer(answer);
         // Another answer (or a recording) is using the speaker.
         let speech_busy = (self.speech.busy() || self.speech.playing) && !reading;
-        let retry = latest && self.retry_prompt(cx).is_some();
+        let retry_message = latest
+            .then(|| {
+                self.messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "user")
+                    .map(|message| message.id)
+            })
+            .flatten()
+            .filter(|_| !self.running() && !self.sending_turn());
+        let retry = retry_message.is_some();
         // A status note (stopped, failed, cut off) is always shown.
-        let show_time = latest || note.is_some();
         // The glyph sits 6 px inside its hit area; pull the row left so the
         // first icon lines up with the answer text.
         div()
             .id(("message-actions", index))
-            .ml(px(-6.))
+            .gap(px(2.))
             .flex()
             .items_center()
             .child(
-                message_action(("copy-message", index), AppIcon::Copy, "Copy", latest).on_click(
-                    move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.to_string()))
-                    },
-                ),
+                message_action(
+                    ("copy-message", index),
+                    AppIcon::Copy,
+                    "Copy response",
+                    true,
+                )
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.to_string()))
+                }),
             )
             .when(retry, |row| {
                 row.child(
-                    message_action(("retry-message", index), AppIcon::Retry, "Retry", true)
-                        .on_click(cx.listener(|view, _, window, cx| view.retry_answer(window, cx))),
+                    message_action(("retry-message", index), AppIcon::Retry, "Ask again", true)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            if let Some(id) = retry_message {
+                                view.retry_message(id, cx);
+                            }
+                        })),
                 )
             })
             .child(
@@ -868,34 +924,22 @@ impl Xylo {
                     } else {
                         "Read aloud"
                     },
-                    latest || reading,
+                    true,
                 )
                 .disabled(speech_busy)
                 .on_click(cx.listener(move |view, _, _, cx| view.read_aloud(answer, &text, cx))),
             )
-            .child(reveal_on_hover(
-                div()
-                    .id(("message-time", index))
-                    .pl(px(6.))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .single_line()
-                    .text_size(px(12.))
-                    .text_color(rgb(faint()))
-                    .child(time_label(at_ms, now_ms()))
-                    .when_some(note, |row, note| {
-                        row.child("·").child(
-                            div()
-                                .id(("message-status", index))
-                                .test_support()
-                                .text_color(rgb(muted()))
-                                .child(note),
-                        )
-                    }),
-                show_time,
-            ))
-            .children(self.answer_usage(answer, index))
+            .when_some(note, |row, note| {
+                row.child(
+                    div()
+                        .id(("message-status", index))
+                        .test_support()
+                        .pl(px(6.))
+                        .text_size(px(13.))
+                        .text_color(rgb(muted()))
+                        .child(note),
+                )
+            })
             .into_any_element()
     }
     /// Records the decision immediately so the card responds before the worker
@@ -959,7 +1003,6 @@ impl Xylo {
     fn approval_shortcut_applies(&self, window: &Window, cx: &App) -> bool {
         self.page == Page::Chat
             && !self.settings_open
-            && !self.recovery.open
             && !self.model_picker.open
             && !self.history_search.is_open()
             && self.has_live_transcript()
@@ -992,15 +1035,16 @@ impl Xylo {
             .and_then(|turn| turn.pending_approvals().next().map(|t| t.id));
         match pending {
             Some(id) => self.decide_action(id, false, false, cx),
-            None if self.running() || self.sending_turn() => {
-                self.engine_command(WorkerCommand::Cancel, cx)
-            }
+            None if self.running() || self.sending_turn() => self.request_stop(cx),
             None => {}
         }
     }
     /// ⌘.: stops the task from anywhere, but denies a pending action only
     /// when its card is in front of the person (as ⌘⇧↩ allows only then).
     pub(super) fn deny_or_stop_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_output(cx) {
+            return;
+        }
         let pending = self
             .turns
             .get(&self.session)
@@ -1014,9 +1058,6 @@ impl Xylo {
         self.messages.is_empty()
             && !self.running()
             && !self.history_loading()
-            && !self.recovery.open
-            && !self.recovery_blocks_submit()
-            && !self.draft_flush_pending()
             && !self.draft_needs_attention()
             && self.composer.read(cx).value().is_empty()
             && self.workspace.is_some()
@@ -1057,7 +1098,7 @@ impl Xylo {
             .items_center()
             .justify_center()
             .gap(px(6.))
-            .text_size(px(12.5))
+            .text_size(px(DETAIL_SIZE))
             .text_color(rgb(muted()));
         match (&project_name, self.workspace_ready) {
             (None, _) => {
@@ -1065,28 +1106,10 @@ impl Xylo {
             }
             (Some(name), ready) => {
                 context = context
-                    .child(icons::small(AppIcon::Folder).text_color(rgb(icons::rest_color())))
-                    .child(name.clone())
+                    .child("A fresh start in")
+                    .child(div().text_color(rgb(text())).child(format!("{name}.")))
                     .when(!ready, |context| context.child("· loading project…"));
             }
-        }
-        if self.workspace.is_some()
-            && !self
-                .conversations
-                .iter()
-                .any(|chat| chat.id == self.session)
-        {
-            context = context.child(
-                secondary(
-                    "new-worktree-chat",
-                    if self.worktree_pending == Some(self.session) {
-                        "Creating worktree…"
-                    } else {
-                        "Work in a new worktree"
-                    },
-                )
-                .on_click(cx.listener(|view, _, _, cx| view.start_worktree_chat(cx))),
-            );
         }
         if !configured {
             context = context.child("·").child("No model set up");
@@ -1103,7 +1126,7 @@ impl Xylo {
                 )
                 .h(px(26.))
                 .px(px(8.))
-                .text_size(px(12.5))
+                .text_size(px(DETAIL_SIZE))
                 .text_color(rgb(accent_text()))
                 .on_click(cx.listener(|view, _, window, cx| {
                     if view.workspace.is_none() {
@@ -1114,80 +1137,66 @@ impl Xylo {
                 })),
             );
         }
-        div()
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .px(px(28.))
-            .pb(px(96.))
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(COLUMN_WIDTH))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(22.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(14.))
-                            .child(brand_glyph(30.))
-                            .child(display(greeting())),
-                    )
-                    .child(self.prompt_box(cx))
-                    .child(context)
-                    .when(self.can_populate_chat_starter(cx), |body| {
-                        body.child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .justify_center()
-                                .gap_2()
-                                .pt(px(6.))
-                                .children([
-                                    (AppIcon::Skills, "Explain this project", "Explain this project using read-only inspection. Summarize its architecture, key entry points, and how to run its tests. Do not edit files."),
-                                    (AppIcon::Changes, "Review my changes", "Review the current project changes using read-only inspection. Look for bugs, regressions, and missing tests. Do not edit files."),
-                                    (AppIcon::Plan, "Plan before editing", "Inspect this project and help me plan a change before making any edits. Ask what I want to change, then propose a plan and wait for my approval before editing files."),
-                                ].into_iter().enumerate().map(|(index, (glyph, label, prompt))| {
-                                    chip_with(("chat-home-starter", index), Some(icons::small(glyph)), label)
-                                        .on_click(cx.listener(move |view, _, window, cx| {
-                                            view.populate_chat_starter(prompt, window, cx);
-                                        }))
-                                })),
-                        )
-                    }),
-            )
+        div().size_full().min_h_0().flex().flex_col()
+            .child(div().flex_1().min_h_0().w_full().flex().flex_col().items_center().justify_center().px(px(if self.chat_width.get() < 750. { 18. } else { CHAT_INSET })).pb(px(30.))
+                .child(brand_glyph(34.).mb(px(12.)).text_color(rgb(muted())))
+                .child(div().text_size(px(28.)).text_center().font_weight(FontWeight::MEDIUM).mb(px(8.)).child("What would you like to work on?"))
+                .child(div().mb(px(24.)).child(context))
+                .when(self.can_populate_chat_starter(cx), |body| body.child(div().flex().flex_wrap().justify_center().gap(px(8.)).children([
+                    (AppIcon::Skills, "Explain this project", "Explain this project using read-only inspection. Summarize its architecture, key entry points, and how to run its tests. Do not edit files."),
+                    (AppIcon::Changes, "Review my changes", "Review the current project changes using read-only inspection. Look for bugs, regressions, and missing tests. Do not edit files."),
+                    (AppIcon::Plan, "Plan a change", "Inspect this project and help me plan a change before making any edits. Ask what I want to change, then propose a plan and wait for my approval before editing files."),
+                ].into_iter().enumerate().map(|(index, (glyph, label, prompt))| {
+                    chip_with(("chat-home-starter", index), Some(icons::small(glyph)), label)
+                        .min_h(px(34.)).rounded(px(8.)).bg(rgb(panel())).border_1().border_color(rgb(border_strong())).text_size(px(13.))
+                        .on_click(cx.listener(move |view, _, window, cx| view.populate_chat_starter(prompt, window, cx)))
+                })))))
+            .child(div().w_full().flex().justify_center().px(px(if self.chat_width.get() < 750. { 16. } else { CHAT_INSET })).pb(px(if self.chat_width.get() < 750. {8.} else {13.})).flex_shrink_0().child(self.prompt_box(cx)))
             .into_any_element()
     }
+
     /// The composer's "+" menu: attach files or images, or transcribe an
     /// audio file into the message. Pasting and saved drafts live where they
     /// already work (⌘V and the sidebar).
     fn composer_context_actions(&self, cx: &Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
-        icons::menu_trigger("composer-context-actions", AppIcon::Add, "Add context")
-            .tooltip("Add files or audio")
-            .disabled(self.attachments.importing_for(self.session))
-            .dropdown_menu(move |menu, _, _| {
-                let attach = weak.clone();
-                let transcribe = weak.clone();
-                menu.item(PopupMenuItem::new("Attach files or images…").on_click(
-                    move |_, window, cx| {
-                        let _ = attach.update(cx, |view, cx| view.attachment_picker(window, cx));
-                    },
-                ))
-                .item(PopupMenuItem::new("Transcribe audio file…").on_click(
-                    move |_, window, cx| {
-                        let _ = transcribe
-                            .update(cx, |view, cx| view.transcribe_audio_file(window, cx));
-                    },
-                ))
-            })
-            .into_any_element()
+        icons::menu_trigger(
+            "composer-context-actions",
+            AppIcon::Add,
+            "Add files or audio",
+        )
+        .tooltip("Add files or audio")
+        .size(px(CONTROL_SIZE))
+        .disabled(self.attachments.importing_for(self.session))
+        .dropdown_menu(move |menu, _, _| {
+            let attach = weak.clone();
+            let transcribe = weak.clone();
+            let reference = weak.clone();
+            let drafts = weak.clone();
+            menu.item(
+                PopupMenuItem::new("Add files or images…").on_click(move |_, window, cx| {
+                    let _ = attach.update(cx, |view, cx| view.attachment_picker(window, cx));
+                }),
+            )
+            .item(
+                PopupMenuItem::new("Reference a project file…").on_click(move |_, window, cx| {
+                    let _ = reference.update(cx, |view, cx| view.attachment_picker(window, cx));
+                }),
+            )
+            .item(
+                PopupMenuItem::new("Saved drafts").on_click(move |_, window, cx| {
+                    let _ = drafts.update(cx, |view, cx| view.open_saved_drafts_dialog(window, cx));
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("Transcribe an audio file…").on_click(move |_, window, cx| {
+                    let _ =
+                        transcribe.update(cx, |view, cx| view.transcribe_audio_file(window, cx));
+                }),
+            )
+        })
+        .into_any_element()
     }
     /// Picks an audio file and transcribes it on this computer; the text then
     /// waits above the composer to be inserted.
@@ -1313,7 +1322,7 @@ impl Xylo {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .text_size(px(12.5))
+                .text_size(px(DETAIL_SIZE))
                 .text_color(rgb(muted()))
                 .child(crate::motion::spinner_inline())
                 .child(
@@ -1340,7 +1349,7 @@ impl Xylo {
         cx.notify();
     }
     /// The composer's prompt for the page as it is now: the home greeting
-    /// before anything is said, "Reply to Xylo…" inside a conversation.
+    /// before anything is said, "Message Xylo…" inside a conversation.
     fn composer_placeholder(&self) -> &'static str {
         if self.messages.is_empty() && !self.has_live_transcript() && !self.draft_send_pending() {
             HOME_PLACEHOLDER
@@ -1371,183 +1380,232 @@ impl Xylo {
         });
     }
 
+    pub(super) fn request_stop(&mut self, cx: &mut Context<Self>) {
+        if !(self.running() || self.sending_turn())
+            || self
+                .turns
+                .get(&self.session)
+                .is_some_and(|turn| turn.cancel_requested)
+        {
+            return;
+        }
+        self.turns.entry(self.session).or_default().cancel_requested = true;
+        if let Err(error) = self.try_engine_command(WorkerCommand::Cancel, cx) {
+            self.turns.entry(self.session).or_default().cancel_requested = false;
+            self.error = Some(format!("Couldn’t stop this task. {error}"));
+        }
+        self.invalidate_live_history();
+        cx.notify();
+    }
+    fn chat_status_announcement(&self) -> AnyElement {
+        let label = self
+            .turns
+            .get(&self.session)
+            .map(|turn| {
+                if turn.running {
+                    if matches!(turn.phase, Some(TurnPhase::Retrying { .. }))
+                        && !turn.cancel_requested
+                    {
+                        "Reconnecting…".into()
+                    } else {
+                        transcript::phase_label(turn)
+                    }
+                } else {
+                    match turn.outcome {
+                        Some(crate::state::TurnOutcome::Completed) => "Task finished".into(),
+                        Some(crate::state::TurnOutcome::Stopped) => "Task stopped".into(),
+                        Some(crate::state::TurnOutcome::Failed(_)) => "Task couldn’t finish".into(),
+                        None => String::new(),
+                    }
+                }
+            })
+            .unwrap_or_default();
+        // A separate stable live node changes only with task state, never with
+        // streamed tokens, command lines, elapsed time or retry countdowns.
+        div()
+            .id("chat-status-announcement")
+            .role(gpui_kit::Role::Status)
+            .aria_label(label)
+            .a11y_synthetic_children(|builder| {
+                builder
+                    .parent_node()
+                    .set_live(gpui_kit::accesskit::Live::Polite)
+            })
+            .h(px(0.))
+            .overflow_hidden()
+            .into_any_element()
+    }
+    fn current_task_row(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if !(self.running() || self.sending_turn()) {
+            return None;
+        }
+        let turn = self.turns.get(&self.session);
+        let stopping = turn.is_some_and(|turn| turn.cancel_requested);
+        let label = if stopping {
+            "Stopping…".into()
+        } else {
+            turn.filter(|turn| turn.running)
+                .map(transcript::phase_label)
+                .unwrap_or_else(|| "Sending…".into())
+        };
+        Some(
+            div()
+                .id("current-task-status")
+                .test_support()
+                .w_full()
+                .h(px(44.))
+                .px(px(3.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(crate::motion::spinner(px(14.)).color(rgb(muted()).into()))
+                .child(
+                    div()
+                        .id("turn-activity")
+                        .test_support()
+                        .flex_1()
+                        .min_w_0()
+                        .single_line()
+                        .text_size(px(13.))
+                        .text_color(rgb(text_secondary()))
+                        .child(label),
+                )
+                .children(turn.map(|turn| {
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(muted()))
+                        .child(transcript::duration_label(turn.elapsed_ms()))
+                }))
+                .child(
+                    focus_ring(gpui_kit::base::Button::new("cancel-task"))
+                        .accessibility_label(if stopping {
+                            "Stopping task"
+                        } else {
+                            "Stop the task"
+                        })
+                        .min_h(px(32.))
+                        .px(px(9.))
+                        .rounded(px(8.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_size(px(12.))
+                        .text_color(rgb(muted()))
+                        .hover(|style| style.bg(rgb(hover_panel())))
+                        .child(icons::small(AppIcon::Stop).size(px(12.)))
+                        .child(if stopping { "Stopping" } else { "Stop" })
+                        .disabled(stopping)
+                        .on_click(cx.listener(|view, _, _, cx| view.request_stop(cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn chat_followup_status(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let next = self
+            .schedules
+            .iter()
+            .filter(|task| {
+                task.enabled
+                    && task
+                        .wakeup
+                        .as_ref()
+                        .is_some_and(|wakeup| wakeup.session_id == self.session)
+            })
+            .min_by_key(|task| task.next_run)?;
+        let session = self.session;
+        Some(
+            div()
+                .id("chat-followup-status")
+                .test_support()
+                .w_full()
+                .min_h(px(36.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_size(px(13.))
+                .text_color(rgb(muted()))
+                .child(icons::small(AppIcon::Scheduled))
+                .child(format!(
+                    "Next check at {}",
+                    next.next_run
+                        .with_timezone(&chrono::Local)
+                        .format("%-I:%M %p")
+                ))
+                .child(
+                    button("stop-chat-followups", "Stop follow-ups")
+                        .text_size(px(12.))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.host_call(cx, |host| host.stop_wakeups(session))
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
     fn prompt_box(&self, cx: &mut Context<Self>) -> AnyElement {
         let paste = cx.entity().downgrade();
-        let model = if !self.settings.model_ready() {
-            "Select model".to_string()
-        } else {
+        let model = if self.settings.model_ready() {
             self.settings.provider.model.clone()
+        } else {
+            "Select model".into()
         };
         let draft_empty = self.composer.read(cx).value().trim().is_empty();
         let has_attachments = !self.draft_attachments().is_empty();
         let running = self.running();
-        let stoppable = running || self.sending_turn();
-        div()
-            .w_full()
-            .max_w(px(COLUMN_WIDTH))
+        let pending = self.draft_send_pending();
+        let disabled = pending
+            || self.attachments.importing_for(self.session)
+            || self
+                .pending_guidance_text()
+                .is_some_and(|text| text == self.composer.read(cx).value().as_str())
+            || (draft_empty && !has_attachments);
+        div().w_full().max_w(px(COLUMN_WIDTH))
+            .child(self.chat_status_announcement())
+            .children(self.current_task_row(cx))
+            .children(self.chat_followup_status(cx))
             .child(self.pending_messages(cx))
-            .children(self.speech_strip(cx))
-            .child(
-                div()
-                    .id("image-drop-target")
-                    .test_support()
-                    .w_full()
-                    .rounded(px(18.))
-                    .bg(rgb(panel()))
-                    .border_1()
-                    .border_color(rgb(border_strong()))
-                    .shadow_sm()
-                    .flex()
-                    .flex_col()
-                    .px(px(14.))
-                    .pt(px(12.))
-                    .pb(px(10.))
-                    .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
-                        view.attach_image_paths(paths.paths().to_vec(), AttachmentSource::Drop, cx)
-                    }))
-                    .child(
-                        div().text_size(px(15.)).child(
-                            Textarea::new(&self.composer)
-                                .on_paste(move |item, _, cx| {
-                                    paste.update(cx, |view, cx| view.attachment_paste_item(item, cx)).unwrap_or(false)
-                                })
-                                .aria_label("Message")
-                                .appearance(false)
-                                .bordered(false)
-                                .disabled(self.draft_flush_pending()),
-                        ),
-                    )
-                    .when(
-                        has_attachments || self.attachments.importing_for(self.session),
-                        |surface| surface.child(div().pb_2().child(self.attachment_strip(cx))),
-                    )
-                    // While images import, the strip's own progress row says so.
-                    .when(
-                        !self.attachments.notice.is_empty()
-                            && !self.attachments.importing_for(self.session),
-                        |surface| {
-                            surface.child(
-                                div().pb_2().child(subtitle(self.attachments.notice.clone())),
-                            )
-                        },
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .when(running && (!draft_empty || has_attachments), |row| row.flex_wrap())
-                            .min_h(px(32.))
-                            .child(self.composer_context_actions(cx))
-                            .child(self.composer_permissions(cx))
-                            .when(self.schedules.iter().any(|task| task.enabled && task.wakeup.as_ref().is_some_and(|wakeup| wakeup.session_id == self.session)), |row| row.child(secondary("stop-conversation-wakeups", "Stop wakeups").on_click(cx.listener(|this, _, _, cx| { let session = this.session; this.host_call(cx, |host| host.stop_wakeups(session)); }))))
-                            .child(div().flex_1().min_w_0())
-                            .children(self.composer_context(cx))
-                            .child(self.unified_model_control(model, cx))
-                            .child(self.speech_capture_button(cx))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .flex_shrink_0()
-                                    .when(running && !draft_empty, |row| {
-                                        row.child(pill("steer-prompt", "Steer")
-                                            .accessibility_label("Steer current task")
-                                            .border_color(rgb(border_strong()))
-                                            .disabled(self.pending_guidance_text().is_some() || self.draft_send_pending() || has_attachments || self.attachments.importing_for(self.session) || self.draft_flush_pending())
-                                            .tooltip(|_,cx| cx.new(|_| XyloTooltip("Update the active task at its next safe step. Images can be queued for the next turn.".into())).into())
-                                            .on_click(cx.listener(|view,_,window,cx| view.steer_composer(window,cx))))
-                                    })
-                                    .when(stoppable, |row| {
-                                        row.child(
-                                            stop_button("cancel-task", "Stop the task")
-                                                .tooltip(|_, cx| cx.new(|_| XyloTooltip("Stop".into())).into())
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.engine_command(WorkerCommand::Cancel, cx)
-                                                })),
-                                        )
-                                    })
-                                    .when(!running || !draft_empty || has_attachments, |row| {
-                                        row.child({
-                                            let pending = self.draft_send_pending();
-                                            let disabled = pending
-                                                || self.attachments.importing_for(self.session)
-                                                || self.draft_flush_pending()
-                                                || self.pending_guidance_text().is_some_and(|text| text == self.composer.read(cx).value().as_str())
-                                                || (!running && draft_empty && !has_attachments);
-                                            send_button(
-                                                "send-prompt",
-                                                if pending {
-                                                    "Sending message"
-                                                } else if running {
-                                                    "Queue message"
-                                                } else {
-                                                    "Send message"
-                                                },
-                                                disabled,
-                                            )
-                                            .when(running, |button| button.w(px(66.)).rounded_full())
-                                            .tooltip({ let queued = running; move |_, cx| cx.new(|_| XyloTooltip(if queued { "Queue for after this task finishes" } else { "Send message" }.into())).into() })
-                                            .child(if pending {
-                                                crate::motion::spinner(icons::SMALL)
-                                                    .color(rgb(brand_foreground()).into())
-                                                    .into_any_element()
-                                            } else if running {
-                                                div().text_size(px(12.5)).font_weight(FontWeight::MEDIUM).child("Queue").into_any_element()
-                                            } else {
-                                                icons::icon(AppIcon::Send).into_any_element()
-                                            })
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.submit(window, cx)
-                                            }))
-                                        })
-                                    }),
-                            ),
-                    ),
-            )
+            .when(self.draft_needs_attention(), |surface| surface.child(div().px(px(8.)).py(px(6.)).child(self.draft_status_footer(cx))))
+            .child(div().id("image-drop-target").test_support().relative().w_full().rounded(px(COMPOSER_RADIUS))
+                .track_focus(&self.composer_surface_focus).tab_stop(false).in_focus(|style| style.border_color(rgb(brand())))
+                .bg(rgb(panel())).border_1().border_color(rgb(border_strong())).shadow(vec![BoxShadow::new(px(0.),px(1.),hsla(0.,0.,0.,1./15.)).blur_radius(px(2.))])
+                .flex().flex_col().px(px(12.)).pt(px(15.)).pb(px(10.))
+                .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| view.attach_image_paths(paths.paths().to_vec(), AttachmentSource::Drop, cx)))
+                .children(self.speech_strip(cx))
+                .when(has_attachments || self.attachments.importing_for(self.session), |surface| surface.child(div().px(px(7.)).pb(px(12.)).child(self.attachment_strip(cx))))
+                .when(!self.attachments.notice.is_empty() && !self.attachments.importing_for(self.session), |surface| surface.child(div().px(px(7.)).pb(px(12.)).child(subtitle(self.attachments.notice.clone()))))
+                .child(div().id("composer-input-frame").test_support().min_h(px(COMPOSER_INPUT_MIN_HEIGHT)).max_h(px(180.)).px(px(3.)).text_size(px(BODY_SIZE)).line_height(relative(1.6))
+                    .child(Textarea::new(&self.composer).xsmall().text_size(px(BODY_SIZE)).line_height(relative(1.6))
+                        .on_paste(move |item, _, cx| paste.update(cx, |view, cx| view.attachment_paste_item(item, cx)).unwrap_or(false))
+                        .aria_label("Message").appearance(false).bordered(false)))
+                .child(div().id("composer-controls").test_support().flex().items_center().gap(px(4.)).mt(px(8.)).min_h(px(36.))
+                    .child(self.composer_context_actions(cx))
+                    .child(self.composer_permissions(cx))
+                    .child(div().flex_1().min_w_0())
+                    .child(self.unified_model_control(model, cx))
+                    .child(self.speech_capture_button(cx))
+                    .when(running, |row| row.child(pill("steer-prompt", "Update task").accessibility_label("Update current task")
+                        .h(px(32.)).px(px(9.)).text_size(px(12.)).when(self.chat_width.get() < 520., |button| button.absolute().right(px(6.)).top(px(-35.)).bg(rgb(well()))).border_1().border_color(rgb(border_strong()))
+                        .disabled(draft_empty || self.pending_guidance_text().is_some() || pending || has_attachments || self.attachments.importing_for(self.session))
+                        .tooltip(|_,cx| cx.new(|_| XyloTooltip("Apply this message to the current task at its next step. Send images with the next message.".into())).into())
+                        .on_click(cx.listener(|view,_,window,cx| view.steer_composer(window,cx)))))
+                    .child(send_button("send-prompt", if pending { "Sending message" } else if running { "Send next" } else { "Send message" }, disabled)
+                        .styles(|states| states.disabled(|style| style.opacity(1.)))
+                        .size(px(PRIMARY_CONTROL_SIZE)).when(running, |button| button.w(px(102.)).px(px(10.)).rounded_full())
+                        .tooltip(move |_, cx| cx.new(|_| XyloTooltip(if running { "Send after the current task finishes." } else { "Send message" }.into())).into())
+                        .child(if pending { crate::motion::spinner(icons::SMALL).color(rgb(brand_foreground()).into()).into_any_element() }
+                            else if running { div().flex().items_center().gap(px(6.)).text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("Send next").child(icons::icon(AppIcon::Send).size(px(18.))).into_any_element() }
+                            else { icons::icon(AppIcon::Send).size(px(18.)).into_any_element() })
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))))))
             .child(self.composer_status(cx))
-            .when_some(self.composer_hint(), |surface, hint| {
-                surface.child(
-                    div()
-                        .id("composer-hint")
-                        .test_support()
-                        .pt_1()
-                        .px_2()
-                        .text_size(px(12.))
-                        .text_color(rgb(muted()))
-                        .child(hint.to_owned()),
-                )
-            })
-            .when(self.draft_needs_attention(), |surface| {
-                surface.child(div().pt_1().child(self.draft_status_footer(cx)))
-            })
+            .when_some(self.composer_hint(), |surface, hint| surface.child(div().id("composer-hint").test_support().pt_1().px_2().text_size(px(12.)).text_color(rgb(muted())).child(hint.to_owned())))
             .into_any_element()
     }
 }
 use crate::state::ToolCard;
 
-/// Time-of-day greeting addressed to the person, as the home screen title.
-fn greeting() -> String {
-    use chrono::Timelike;
-    let hour = chrono::Local::now().hour();
-    let salutation = match hour {
-        5..=11 => "Good morning",
-        12..=16 => "Good afternoon",
-        17..=21 => "Good evening",
-        _ => "Hello",
-    };
-    let name = super::sidebar::person_name();
-    if name == "You" {
-        salutation.to_owned()
-    } else {
-        format!("{salutation}, {name}")
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "chat/tests.rs"]
 mod tests;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "chat/transcript_flow_tests.rs"]
 mod transcript_flow_tests;

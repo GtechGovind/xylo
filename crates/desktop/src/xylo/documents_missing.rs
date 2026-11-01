@@ -107,9 +107,10 @@ impl Xylo {
         };
         let epoch = self.documents.epoch;
         let generation = self.documents.generation;
-        let answer=window.prompt(PromptLevel::Warning,"Use this original's new location?",Some("The file matches the saved original exactly. Your saved edits will move to this location in Xylo. No original file or saved copy will be changed."),&[PromptButton::cancel("Keep reviewing"),PromptButton::new("Use this original")],cx);
+        let answer=self.confirm_explicit_action(
+            "Use this original's new location?",Some("The file matches the saved original exactly. Your saved edits will move to this location in Xylo. No original file or saved copy will be changed."),&[PromptButton::cancel("Keep reviewing"),PromptButton::new("Use this original")], window, cx);
         cx.spawn_in(window, async move |view, cx| {
-            if matches!(answer.await, Ok(1)) {
+            if answer.await {
                 let _ = view.update(cx, |view, cx| {
                     if epoch != view.documents.epoch
                         || generation != view.documents.generation
@@ -218,9 +219,10 @@ impl Xylo {
             return;
         };
         let epoch = self.documents.epoch;
-        let answer=window.prompt(PromptLevel::Warning,"Keep the previous original location?",Some("Your recovered edits stay saved. Cancelling this location proposal does not move or change any file. If its saved result changed elsewhere, Xylo will keep both records and ask you to review."),&[PromptButton::cancel("Keep reviewing"),PromptButton::new("Keep previous location")],cx);
+        let answer=self.confirm_explicit_action(
+            "Keep the previous original location?",Some("Your recovered edits stay saved. Cancelling this location proposal does not move or change any file. If its saved result changed elsewhere, Xylo will keep both records and ask you to review."),&[PromptButton::cancel("Keep reviewing"),PromptButton::new("Keep previous location")], window, cx);
         cx.spawn_in(window, async move |view, cx| {
-            if matches!(answer.await, Ok(1)) {
+            if answer.await {
                 let _ = view.update(cx, |view, cx| {
                     if view.documents.epoch == epoch
                         && view.documents.pending_relink == Some(request)

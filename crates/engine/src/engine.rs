@@ -372,12 +372,12 @@ impl AgentEngine {
         if !untitled || request.prompt.trim().is_empty() {
             return Ok(());
         }
-        let mut conversation = request.prompt.trim().to_owned();
         let reply = crate::provider_guard::context_excerpt(reply.trim(), TITLE_REPLY_BYTES);
-        if !reply.is_empty() {
-            conversation.push_str("\n\n");
-            conversation.push_str(&reply);
-        }
+        let conversation = json!({
+            "user_request": request.prompt.trim(),
+            "assistant_response": reply,
+        })
+        .to_string();
         let title_request = ModelRequest {
             messages: vec![
                 Message::system(crate::prompts::title()),
@@ -395,7 +395,14 @@ impl AgentEngine {
         .await;
         cancel.cancel();
         let title = match reply {
-            Ok(Ok(reply)) => clean_title(&reply.message.content),
+            Ok(Ok(reply)) => clean_title(&reply.message.content).filter(|title| {
+                let matches = title_matches_request_script(title, &request.prompt);
+                if !matches {
+                    // Keep the prompt-derived title, without retrying or delaying the turn.
+                    tracing::warn!(session_id = %request.session_id, "Ignored generated title with an unexpected writing system");
+                }
+                matches
+            }),
             Ok(Err(error)) => {
                 tracing::debug!(%error, "Title generation failed");
                 None
@@ -770,6 +777,23 @@ fn clean_title(reply: &str) -> Option<String> {
         .collect();
     let title = title.trim();
     (!title.is_empty()).then(|| title.to_owned())
+}
+
+/// A conservative fallback for requests whose letters are entirely ASCII.
+/// This is not language detection: multilingual requests remain supported, and
+/// the prompt instructs the model to preserve their language. Never replace an
+/// English/ASCII request's existing title with unrelated non-Latin lettering.
+fn title_matches_request_script(title: &str, request: &str) -> bool {
+    let ascii_request = request.chars().any(|c| c.is_ascii_alphabetic())
+        && request
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .all(|c| c.is_ascii());
+    !ascii_request
+        || title
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .all(|c| c.is_ascii())
 }
 
 /// Only application-owned endpoints with an explicit internal capability marker

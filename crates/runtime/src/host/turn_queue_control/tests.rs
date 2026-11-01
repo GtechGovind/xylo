@@ -272,3 +272,111 @@ async fn generic_stop_refuses_multiple_owners_without_marking_either_worker() {
             .all(|worker| !worker.queue_stopped.load(Ordering::Acquire))
     );
 }
+
+#[tokio::test]
+async fn updating_a_finished_task_keeps_the_queued_snapshot_and_main_draft() {
+    let (_dir, host, events) = super::super::tests::state();
+    let (turn, submission) = queued(&host);
+    host.store.queue_turn(&turn, &submission).unwrap();
+    let current = host.store.draft(&submission.key).unwrap();
+    host.store
+        .save_draft(&xylo_services::DraftWrite {
+            key: submission.key.clone(),
+            expected_revision: current.revision,
+            mutation_id: Uuid::new_v4(),
+            text: "Unrelated main draft".into(),
+            attachments: vec![],
+        })
+        .unwrap();
+    let request = Uuid::new_v4();
+    host.handle_steer_queued_turn(request, turn.session_id, turn.turn_id)
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.recv().await.unwrap(), HostEvent::TurnQueue { request_id, result: Err(_), .. } if request_id == request)
+    );
+    assert_eq!(
+        host.store.turn_queue(turn.session_id).unwrap()[0].id,
+        turn.turn_id
+    );
+    assert_eq!(
+        host.store.draft(&submission.key).unwrap().text,
+        "Unrelated main draft"
+    );
+}
+
+#[tokio::test]
+async fn queued_update_task_dispatches_durable_guidance_without_touching_current_draft() {
+    let (_dir, host, events) = super::super::tests::state();
+    let (turn, sub) = queued(&host);
+    host.store.register_user_turn(&turn).unwrap();
+    host.store
+        .save_checkpoint(turn.session_id, turn.turn_id, &serde_json::json!([]))
+        .unwrap();
+    let mut queued = turn.clone();
+    queued.turn_id = Uuid::new_v4();
+    host.store.queue_turn(&queued, &sub).unwrap();
+    let current = host.store.draft(&sub.key).unwrap();
+    host.store
+        .save_draft(&xylo_services::DraftWrite {
+            key: sub.key.clone(),
+            expected_revision: current.revision,
+            mutation_id: Uuid::new_v4(),
+            text: "Unrelated main draft".into(),
+            attachments: vec![],
+        })
+        .unwrap();
+    let (mut incoming, _exit) =
+        crate::host::tests::draft::mock_worker(&host, turn.session_id, 2).await;
+    {
+        let workers = host.workers.lock().await;
+        let worker = &workers[&turn.session_id];
+        worker.active.store(true, Ordering::Release);
+        *worker.run_turn.lock() = Some(turn.turn_id);
+    }
+    let request = Uuid::new_v4();
+    host.handle_steer_queued_turn(request, turn.session_id, queued.turn_id)
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.recv().await.unwrap(), HostEvent::SteeringResult { result: Ok(ref outcome), .. } if outcome.request.id == queued.turn_id)
+    );
+    assert!(
+        matches!(events.recv().await.unwrap(), HostEvent::TurnQueue { request_id, result: Ok(ref rows), .. } if request_id == request && rows.is_empty())
+    );
+    let WorkerCommand::SteerDurable { guidance } = incoming.recv().await.unwrap().payload else {
+        panic!("Expected durable guidance")
+    };
+    assert_eq!(guidance.id, queued.turn_id);
+    assert_eq!(guidance.turn_id, turn.turn_id);
+    host.store
+        .apply_steering(turn.session_id, turn.turn_id, &serde_json::json!([]))
+        .unwrap();
+    assert_eq!(
+        host.store.draft(&sub.key).unwrap().text,
+        "Unrelated main draft"
+    );
+    assert!(host.store.turn_queue(turn.session_id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn resume_idle_queue_starts_first_message_through_normal_admission() {
+    let (_dir, host, events) = super::super::tests::state();
+    let (turn, sub) = queued(&host);
+    host.store.queue_turn(&turn, &sub).unwrap();
+    host.store
+        .set_turn_queue_paused(turn.session_id, true)
+        .unwrap();
+    let (mut incoming, _exit) =
+        crate::host::tests::draft::mock_worker(&host, turn.session_id, 2).await;
+    host.handle_set_turn_queue_paused(Uuid::new_v4(), turn.session_id, false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(super::super::tests::next_event(&events).await, HostEvent::QueuedTurnStarted { ref item, .. } if item.id == turn.turn_id)
+    );
+    assert!(
+        matches!(incoming.recv().await.unwrap().payload, WorkerCommand::RunAuthorized { turn: ref actual, .. } if actual.turn_id == turn.turn_id)
+    );
+    assert!(host.store.turn_queue(turn.session_id).unwrap().is_empty());
+}

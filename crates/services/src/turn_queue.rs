@@ -164,13 +164,48 @@ impl Store {
     pub fn queued_turn(&self, session: Uuid, id: Uuid) -> Result<Option<QueuedTurn>> {
         self.call(move|conn|{conn.query_row("SELECT turn,paused,reason FROM turn_queue WHERE session_id=?1 AND id=?2 AND state='queued'",params![session.to_string(),id.to_string()],read_item).optional()?.map(decode).transpose()})
     }
-    /// Keep a small immutable-ID tombstone, discarding the removed snapshot.
+    /// Retain removed snapshots for reversible removal during tombstone retention.
     pub fn remove_queued_turn(&self, session: Uuid, id: Uuid) -> Result<()> {
-        self.call(move|conn|{let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let state:Option<String>=tx.query_row("SELECT state FROM turn_queue WHERE session_id=?1 AND id=?2",params![session.to_string(),id.to_string()],|r|r.get(0)).optional()?;
-            ensure!(state.is_some(),"Queued message does not belong to this chat");
-            ensure!(state.as_deref()!=Some("started"),"Message already started; stop the active task");
-            tx.execute("UPDATE turn_queue SET state='removed',turn=NULL,submission=NULL,reason=NULL,updated_at=?3 WHERE session_id=?1 AND id=?2",params![session.to_string(),id.to_string(),xylo_core::now_ms()])?;tx.commit()?;Ok(())})
+        self.call(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM turn_queue WHERE session_id=?1 AND id=?2",
+                    params![session.to_string(), id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            ensure!(
+                state.is_some(),
+                "Queued message does not belong to this chat"
+            );
+            ensure!(
+                state.as_deref() != Some("started"),
+                "Message already started; stop the active task"
+            );
+            tx.execute(
+                "UPDATE turn_queue SET state='removed',updated_at=?3 WHERE session_id=?1 AND id=?2",
+                params![session.to_string(), id.to_string(), xylo_core::now_ms()],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+    /// Restore the same durable row, preserving its original order and identity.
+    pub fn restore_queued_turn(&self, session: Uuid, id: Uuid) -> Result<()> {
+        self.call(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let state: Option<String> = tx.query_row("SELECT state FROM turn_queue WHERE session_id=?1 AND id=?2 AND turn IS NOT NULL", params![session.to_string(), id.to_string()], |r| r.get(0)).optional()?;
+            ensure!(state.as_deref() == Some("removed"), "Removed message is unavailable or already started");
+            let admitted: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1)", [Uuid::new_v5(&id,b"user-message").to_string()], |r| r.get(0))?;
+            ensure!(!admitted, "Message already started");
+            let count: i64 = tx.query_row("SELECT count(*) FROM turn_queue WHERE state='queued' AND session_id=?1", [session.to_string()], |r| r.get(0))?;
+            let global: i64 = tx.query_row("SELECT count(*) FROM turn_queue WHERE state='queued'", [], |r| r.get(0))?;
+            ensure!(count < MAX_SESSION && global < MAX_GLOBAL, "The message queue is full; remove a message before undoing");
+            tx.execute("UPDATE turn_queue SET state='queued',paused=1,reason='Restored message; review and resume the queue',updated_at=?3 WHERE session_id=?1 AND id=?2", params![session.to_string(), id.to_string(), xylo_core::now_ms()])?;
+            tx.commit()?;
+            Ok(())
+        })
     }
     /// Register the immutable user input and consume its queue receipt in one
     /// commit. The host must reserve worker capacity before calling this method.
@@ -217,6 +252,23 @@ impl Store {
                 ensure!(registered.role=="user" && registered.session_id==snapshot.session_id && registered.content==snapshot.prompt && registered.attachments==snapshot.attachments,"Admitted message differs from queued input");
             }
             tx.execute("UPDATE turn_queue SET state='started',turn=NULL,submission=NULL,reason=NULL,updated_at=?3 WHERE session_id=?1 AND id=?2",params![session.to_string(),id.to_string(),xylo_core::now_ms()])?;tx.commit()?;Ok(())})
+    }
+    pub fn set_turn_queue_paused(&self, session: Uuid, paused: bool) -> Result<()> {
+        self.call(move |conn| {
+            conn.execute(
+                "UPDATE turn_queue SET paused=?2,reason=?3 WHERE session_id=?1 AND state='queued'",
+                params![
+                    session.to_string(),
+                    paused,
+                    if paused {
+                        Some("Paused · Messages will wait until you resume.")
+                    } else {
+                        None
+                    }
+                ],
+            )?;
+            Ok(())
+        })
     }
     pub fn pause_turn_queue(&self, session: Uuid, reason: &str) -> Result<()> {
         let reason = bounded_reason(Some(reason.to_owned()))?;

@@ -1,6 +1,8 @@
 //! Bounded, revision-correlated composer state. All persistence goes through the
 //! host; no SQLite/filesystem work occurs on this thread.
 use super::*;
+#[path = "drafts/saved.rs"]
+mod saved;
 use xylo_runtime::drafts::{
     DraftAdmission, DraftCursor, DraftKey, DraftPage, DraftSave, DraftSnapshot, DraftSubmission,
     DraftSummary, DraftWrite, MAX_DRAFT_ATTACHMENTS, MAX_DRAFT_BYTES,
@@ -10,7 +12,7 @@ use xylo_runtime::drafts::{
 pub(super) fn draft_admission_failure(error: &str) -> String {
     let error = error.to_ascii_lowercase();
     let cause = if error.contains("required application component is missing") {
-        "Xylo is missing required task components. Rebuild or reinstall the complete app, then retry."
+        "Xylo’s task runner is missing. Reopen the complete Xylo app to send."
     } else if error.contains("plan usage is not authorized") {
         "ChatGPT has not authorized plan usage for this connection. In Providers, reconnect and allow plan usage before retrying."
     } else if error.contains("official public responses api") {
@@ -18,7 +20,7 @@ pub(super) fn draft_admission_failure(error: &str) -> String {
     } else if error.contains("provider credential is not configured")
         || error.contains("credential is missing")
     {
-        "The saved provider credential is unavailable. Reconnect this connection in Providers before retrying."
+        "Xylo can’t access your saved connection details. Reconnect in Providers."
     } else if error.contains("keyring")
         || error.contains("credential store")
         || error.contains("secure storage")
@@ -56,7 +58,7 @@ pub(super) fn draft_admission_failure(error: &str) -> String {
     } else if error.contains("cancelled before admission")
         || error.contains("draft was not admitted")
     {
-        "The task stopped before the message was admitted. Send again when ready."
+        "Your message wasn’t sent. Send again when ready."
     } else if error.contains("database")
         || error.contains("disk is full")
         || error.contains("read-only")
@@ -66,7 +68,7 @@ pub(super) fn draft_admission_failure(error: &str) -> String {
         || error.contains("queue is full")
         || error.contains("disconnected")
     {
-        "Xylo's task service is unavailable or busy. Restart Xylo, then retry."
+        "Xylo couldn’t start the task. Restart Xylo, then send again."
     } else {
         "The message could not start. Check the connection in Providers, or restart Xylo and retry."
     };
@@ -81,6 +83,19 @@ const ADMISSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2
 pub(super) enum DraftFlushAction {
     Quit,
     Update,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MessagePayload {
+    pub(super) text: String,
+    pub(super) attachments: Vec<ImageAttachment>,
+}
+struct PayloadReplacement {
+    id: Uuid,
+    source: DraftKey,
+    backup: DraftKey,
+    generation: u64,
+    previous: MessagePayload,
+    replacement: MessagePayload,
 }
 struct SaveAttempt {
     id: Uuid,
@@ -146,9 +161,39 @@ pub(super) struct DraftUi {
     notice: String,
     /// Why the last Enter did nothing, shown under the composer.
     composer_hint: Option<&'static str>,
+    replacement: Option<PayloadReplacement>,
+    deferred_replacement: Option<(DraftKey, u64, MessagePayload)>,
+    restore: Option<(DraftKey, MessagePayload)>,
+    saved: saved::SavedDraftUi,
     scroll: UniformListScrollHandle,
 }
 impl DraftUi {
+    #[cfg(all(test, feature = "validation"))]
+    pub(super) fn validation_begin_load(&mut self, key: &DraftKey) -> Uuid {
+        let load = Uuid::new_v4();
+        self.entries.insert(
+            key.clone(),
+            Entry {
+                load: Some(load),
+                ..Default::default()
+            },
+        );
+        load
+    }
+    #[cfg(all(test, feature = "validation"))]
+    pub(super) fn validation_admission_late(&mut self, key: &DraftKey) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.late = entry.send.take();
+        }
+    }
+    #[cfg(all(test, feature = "validation"))]
+    pub(super) fn validation_submission(&self, key: &DraftKey) -> Option<TurnRequest> {
+        self.entries
+            .get(key)?
+            .send
+            .as_ref()
+            .map(|send| send.turn.clone())
+    }
     #[cfg(test)]
     #[allow(dead_code)]
     pub(super) fn validation_list_request(&self) -> Option<Uuid> {
@@ -219,11 +264,236 @@ impl DraftUi {
             has_more: false,
             notice: String::new(),
             composer_hint: None,
+            replacement: None,
+            deferred_replacement: None,
+            restore: None,
+            saved: Default::default(),
             scroll: UniformListScrollHandle::new(),
         }
     }
 }
 impl Xylo {
+    /// Preserve the current draft as an independently owned Saved drafts entry.
+    /// The composer changes only after the host confirms the backup, and only
+    /// if the user has not typed or switched chats in the meantime.
+    pub(super) fn replace_composer_payload(
+        &mut self,
+        payload: MessagePayload,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.draft_changed(cx);
+        let source = self.current_draft_key();
+        if self.drafts.active.as_ref() != Some(&source)
+            || self.drafts.replacement.is_some()
+            || self.attachments.has_import_for(&source)
+        {
+            self.show_composer_hint("Wait for the current draft operation to finish.", cx);
+            return;
+        }
+        let Some(entry) = self.drafts.entries.get(&source) else {
+            return;
+        };
+        if self.drafts.oversize
+            || entry.send.is_some()
+            || entry.guidance.is_some()
+            || entry.conflict.is_some()
+        {
+            self.show_composer_hint(
+                "Finish the current draft operation before replacing it.",
+                cx,
+            );
+            return;
+        }
+        if entry.load.is_some() || entry.revision.is_none() {
+            self.drafts.deferred_replacement = Some((source.clone(), entry.generation, payload));
+            if entry.load.is_none() {
+                self.load_draft_key(&source, cx);
+            }
+            self.show_composer_hint("Loading your saved draft before replacing it…", cx);
+            return;
+        }
+        let previous = MessagePayload {
+            text: entry.text.clone(),
+            attachments: entry.attachments.clone(),
+        };
+        if previous == payload {
+            return;
+        }
+        let backup = DraftKey {
+            session_id: Uuid::new_v4(),
+            workspace: source.workspace.clone(),
+        };
+        let pending = PayloadReplacement {
+            id: Uuid::new_v4(),
+            source,
+            backup: backup.clone(),
+            generation: entry.generation,
+            previous: previous.clone(),
+            replacement: payload.clone(),
+        };
+        let write = DraftWrite {
+            key: backup,
+            expected_revision: 0,
+            mutation_id: Uuid::new_v4(),
+            text: previous.text,
+            attachments: previous.attachments,
+        };
+        let result = self
+            .host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
+            .and_then(|host| host.preserve_draft(pending.id, write, payload.attachments));
+        match result {
+            Ok(()) => {
+                self.drafts.replacement = Some(pending);
+                self.show_composer_hint("Saving your current draft before replacing it…", cx);
+            }
+            Err(_) => {
+                self.show_composer_hint(
+                    "Your draft could not be preserved. It is still here; try again.",
+                    cx,
+                );
+            }
+        }
+    }
+    fn payload_preserved(
+        &mut self,
+        result: Result<DraftSave, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.draft_changed(cx);
+        let Some(pending) = self.drafts.replacement.take() else {
+            return;
+        };
+        let valid = matches!(&result, Ok(DraftSave::Saved(saved)) if saved.key == pending.backup && saved.text == pending.previous.text && saved.attachments.len() == pending.previous.attachments.len());
+        if !valid {
+            self.show_composer_hint("The draft or original images could not be preserved. Your current draft is still here.", cx);
+            return;
+        }
+        if self.current_draft_key() != pending.source
+            || self.attachments.has_import_for(&pending.source)
+            || self
+                .drafts
+                .entries
+                .get(&pending.source)
+                .is_none_or(|entry| {
+                    entry.generation != pending.generation
+                        || entry.load.is_some()
+                        || entry.revision.is_none()
+                        || entry.text != pending.previous.text
+                        || entry.attachments != pending.previous.attachments
+                        || entry.conflict.is_some()
+                        || entry.send.is_some()
+                        || entry.guidance.is_some()
+                })
+        {
+            self.show_composer_hint("Your draft changed. The previous version is in Saved drafts; try again to replace this version.", cx);
+            return;
+        }
+        let entry = self.drafts.entries.get_mut(&pending.source).unwrap();
+        entry.attachments = pending.replacement.attachments;
+        self.composer.update(cx, |input, cx| {
+            input.set_value(pending.replacement.text, window, cx);
+            input.focus(window, cx);
+        });
+        // Attachment-only changes must also advance the generation and save.
+        entry.generation = entry.generation.wrapping_add(1);
+        entry.dirty = true;
+        self.draft_changed(cx);
+        self.drafts.restore = Some((pending.source.clone(), pending.previous));
+        self.persist_draft_key(&pending.source, cx);
+        self.show_composer_hint(
+            "Previous draft saved in Saved drafts. Restore it at any time below.",
+            cx,
+        );
+    }
+    pub(super) fn submit_message_payload(
+        &mut self,
+        payload: MessagePayload,
+        cx: &mut Context<Self>,
+    ) {
+        self.draft_changed(cx);
+        let key = self.current_draft_key();
+        if self.running()
+            || self.draft_send_pending()
+            || self.worktree_pending == Some(self.session)
+        {
+            return;
+        }
+        let Some(workspace) = self.workspace.clone() else {
+            self.show_composer_hint("Open a project before asking again.", cx);
+            return;
+        };
+        if self.settings.provider.validate().is_err() {
+            self.show_composer_hint("Check your provider connection before asking again.", cx);
+            return;
+        }
+        let Some(entry) = self.drafts.entries.get_mut(&key) else {
+            return;
+        };
+        if entry.send.is_some() || entry.guidance.is_some() || entry.conflict.is_some() {
+            return;
+        }
+        if let Some(late) = entry.late.as_ref() {
+            if late.text != payload.text || late.turn.attachments != payload.attachments {
+                self.show_composer_hint(
+                    "Wait for the previous message acknowledgement before asking again.",
+                    cx,
+                );
+                return;
+            }
+            let mut retry = entry.late.take().unwrap();
+            retry.dispatched = false;
+            entry.send = Some(retry);
+            self.dispatch_draft_submission(&key, cx);
+            return;
+        }
+        entry.send = Some(Submission {
+            queued: false,
+            id: Uuid::new_v4(),
+            sent_at: now_ms(),
+            generation: entry.generation.wrapping_sub(1),
+            text: payload.text.clone(),
+            turn: TurnRequest {
+                session_id: key.session_id,
+                turn_id: Uuid::new_v4(),
+                prompt: payload.text.trim().to_owned(),
+                workspace,
+                provider: self.settings.turn_provider(),
+                permissions: self.settings.permissions,
+                attachments: payload.attachments,
+            },
+            dispatched: false,
+        });
+        // Persist the current draft; admission compares the explicit payload and
+        // cannot clear a different current draft. Never rewrite the composer.
+        self.persist_draft_key(&key, cx);
+        let ready = self.drafts.entries.get(&key).is_some_and(|entry| {
+            entry.revision.is_some()
+                && !entry.dirty
+                && entry.save.is_none()
+                && entry.error.is_none()
+        });
+        if ready {
+            self.dispatch_draft_submission(&key, cx);
+        }
+        cx.notify();
+    }
+    fn retry_draft_admission(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.current_draft_key();
+        if let Some(entry) = self.drafts.entries.get_mut(&key)
+            && entry.send.is_none()
+            && let Some(mut retry) = entry.late.take()
+        {
+            retry.dispatched = false;
+            entry.send = Some(retry);
+            entry.send_error = None;
+            self.advance_draft_key(&key, window, cx);
+            cx.notify();
+        }
+    }
     /// Open terminal assistance as an ordinary, editable saved draft. Preserve
     /// the original chat (including attachments), and use the normal send,
     /// provider, permission and cancellation flow when the user submits it.
@@ -236,12 +506,11 @@ impl Xylo {
         if prompt.trim().is_empty() || prompt.len() > MAX_DRAFT_BYTES {
             return;
         }
-        if !self.recovery_before_switch(cx) || !self.draft_before_switch(cx) {
+        if !self.draft_before_switch(cx) {
             return;
         }
         self.stash_history();
         self.session = Uuid::new_v4();
-        self.recovery_scope_changed(cx);
         self.messages.clear();
         self.page = Page::Chat;
         self.settings_open = false;
@@ -327,7 +596,7 @@ impl Xylo {
             workspace: self.workspace.clone(),
         }
     }
-    fn ensure_draft_entry(&mut self, key: &DraftKey, cx: &mut Context<Self>) -> bool {
+    fn ensure_draft_entry(&mut self, key: &DraftKey, _cx: &mut Context<Self>) -> bool {
         if self.drafts.entries.contains_key(key) {
             return true;
         }
@@ -351,9 +620,8 @@ impl Xylo {
             if let Some(key) = removable {
                 self.drafts.entries.remove(&key);
             } else {
-                self.error = Some("Save your pending drafts before opening another chat.".into());
-                cx.notify();
-                return false;
+                // Unsaved drafts stay cached even when the clean-entry budget is full.
+                break;
             }
         }
         self.drafts.entries.insert(key.clone(), Entry::default());
@@ -371,23 +639,6 @@ impl Xylo {
         }
         if let Some(key) = self.drafts.active.clone() {
             self.persist_draft_key(&key, cx);
-        }
-        if self.drafts.entries.len() >= MAX_CACHED_DRAFTS
-            && !self.drafts.entries.iter().any(|(key, entry)| {
-                Some(key) != self.drafts.active.as_ref()
-                    && !self.attachments.has_import_for(key)
-                    && !entry.dirty
-                    && entry.save.is_none()
-                    && entry.retry.is_none()
-                    && entry.send.is_none()
-                    && entry.guidance.is_none()
-                    && entry.load.is_none()
-                    && entry.conflict.is_none()
-            })
-        {
-            self.error = Some("Save your pending drafts before opening another chat.".into());
-            cx.notify();
-            return false;
         }
         true
     }
@@ -496,9 +747,9 @@ impl Xylo {
                 let entry = self.drafts.entries.get_mut(&key).unwrap();
                 entry.generation = entry.generation.wrapping_add(1);
                 entry.dirty = true;
+                self.cancel_draft_flush(cx);
                 self.cancel_memory_forms_flush(cx);
                 self.cancel_document_drafts_flush(cx);
-                self.cancel_recovery_flush(cx);
             }
             self.drafts.oversize = true;
             self.error =
@@ -535,9 +786,9 @@ impl Xylo {
         entry.dirty = true;
         let had_error = entry.error.take().is_some() | entry.send_error.take().is_some();
         let needs_load = entry.revision.is_none() && entry.load.is_none();
+        self.cancel_draft_flush(cx);
         self.cancel_memory_forms_flush(cx);
         self.cancel_document_drafts_flush(cx);
-        self.cancel_recovery_flush(cx);
         if needs_load {
             self.load_draft_key(&key, cx);
         }
@@ -582,6 +833,9 @@ impl Xylo {
         }
     }
     fn persist_draft_key(&mut self, key: &DraftKey, cx: &mut Context<Self>) {
+        if self.drafts.saved.busy(key) {
+            return;
+        }
         if self.drafts.oversize && self.drafts.active.as_ref() == Some(key) {
             return;
         }
@@ -640,6 +894,10 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.drafts.saved.loading(id) {
+            self.saved_draft_loaded(result, cx);
+            return;
+        }
         let Some(key) = self
             .drafts
             .entries
@@ -682,6 +940,28 @@ impl Xylo {
         }
         self.advance_draft_key(&key, window, cx);
         self.advance_draft_flush(window, cx);
+        if self
+            .drafts
+            .deferred_replacement
+            .as_ref()
+            .is_some_and(|(source, _, _)| source == &key)
+        {
+            let (_, generation, payload) = self.drafts.deferred_replacement.take().unwrap();
+            if self.current_draft_key() == key
+                && self.drafts.entries.get(&key).is_some_and(|entry| {
+                    entry.generation == generation
+                        && entry.revision.is_some()
+                        && entry.error.is_none()
+                })
+            {
+                self.replace_composer_payload(payload, window, cx);
+            } else {
+                self.show_composer_hint(
+                    "Your current draft was kept. Try reusing the message again when ready.",
+                    cx,
+                );
+            }
+        }
         cx.notify();
     }
     pub(super) fn draft_saved(
@@ -691,6 +971,19 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.drafts.saved.saving(id) {
+            self.saved_draft_written(result, window, cx);
+            return;
+        }
+        if self
+            .drafts
+            .replacement
+            .as_ref()
+            .is_some_and(|pending| pending.id == id)
+        {
+            self.payload_preserved(result, window, cx);
+            return;
+        }
         let Some(key) = self
             .drafts
             .entries
@@ -723,6 +1016,7 @@ impl Xylo {
                     entry.revision = Some(snapshot.revision);
                     entry.dirty = entry.generation != attempt.generation;
                 }
+                self.turn_queue.draft_saved(&snapshot);
                 entry.error = None;
             }
             Ok(DraftSave::Conflict(snapshot)) if snapshot.key == key => {
@@ -830,7 +1124,7 @@ impl Xylo {
             .as_ref()
             .is_some_and(|guidance| !guidance.dispatched || guidance.text == entry.text)
         {
-            Some("Wait for the steering message to reach the task, then send.")
+            Some("Wait for the task update to arrive, then send.")
         } else if entry.conflict.is_some() {
             Some("Choose which draft to keep before sending.")
         } else {
@@ -941,10 +1235,7 @@ impl Xylo {
         if !queued && let Some(turn) = self.turns.get_mut(&key.session_id) {
             turn.abandon_admission();
         }
-        entry.send_error = Some(
-            "Xylo did not confirm this message in time. Your draft is still here; retry when ready."
-                .into(),
-        );
+        entry.send_error = Some("Your message hasn’t been confirmed. Your draft is safe.".into());
         self.invalidate_live_history();
         self.advance_draft_flush(window, cx);
         cx.notify();
@@ -1039,11 +1330,10 @@ impl Xylo {
                     entry.dirty = entry.text != receipt.draft.text
                         || entry.attachments != receipt.draft.attachments;
                 }
-                if !send.queued {
-                    self.turns.entry(key.session_id).or_default().request = Some(send.turn.clone());
-                }
+                let admitted_request = (!send.queued).then(|| send.turn.clone());
                 let mut user = message(key.session_id, "user", send.turn.prompt);
                 user.id = Uuid::new_v5(&send.turn.turn_id, b"user-message");
+                user.turn_id = Some(send.turn.turn_id);
                 user.attachments = send.turn.attachments;
                 if !send.queued
                     && self.session == key.session_id
@@ -1060,6 +1350,9 @@ impl Xylo {
                     }
                     self.messages.push(user);
                     self.page = Page::Chat;
+                }
+                if let Some(request) = admitted_request {
+                    self.turns.entry(key.session_id).or_default().request = Some(request);
                 }
                 // Only real worker events own running/terminal state. A very
                 // fast completed turn can precede this admission receipt.
@@ -1078,12 +1371,8 @@ impl Xylo {
                 }
                 let message = draft_admission_failure(&error);
                 tracing::warn!(request_id=%id, reason=%message, "Draft admission failed");
-                if is_current {
-                    self.error = Some(message);
-                    entry.error = None;
-                } else {
-                    entry.send_error = Some(message);
-                }
+                entry.send_error = Some(message);
+                entry.error = None;
             }
         }
         self.persist_draft_key(&key, cx);
@@ -1275,11 +1564,8 @@ impl Xylo {
             .map(|guidance| guidance.text.clone())
     }
     pub(super) fn steer_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.running()
-            || self.attachments.importing_for(self.session)
-            || self.draft_flush_pending()
-            || self.recovery_blocks_submit()
-        {
+        self.cancel_setup_close_intents(cx);
+        if !self.running() || self.attachments.importing_for(self.session) {
             return;
         }
         self.submit_persisted_steering(window, cx);
@@ -1292,7 +1578,11 @@ impl Xylo {
             .is_some_and(|entry| entry.send.is_some())
     }
     pub(super) fn draft_needs_attention(&self) -> bool {
-        self.drafts.flush.is_some()
+        self.drafts
+            .restore
+            .as_ref()
+            .is_some_and(|(key, _)| self.drafts.active.as_ref() == Some(key))
+            || self.drafts.flush.is_some()
             || self
                 .drafts
                 .active
@@ -1354,10 +1644,78 @@ impl Xylo {
                     .on_click(cx.listener(|view, _, _, cx| view.persist_all_drafts(cx))),
             );
         }
+        if entry.is_some_and(|entry| {
+            entry.send_error.is_some() && entry.send.is_none() && entry.late.is_none()
+        }) {
+            row = row
+                .child(pill("draft-send-again", "Try again").on_click(
+                    cx.listener(|view, _, window, cx| view.submit_persisted_draft(window, cx)),
+                ))
+                .child(
+                    icons::icon_button(
+                        "dismiss-send-error",
+                        icons::AppIcon::Close,
+                        "Dismiss send error",
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        if let Some(entry) = view
+                            .drafts
+                            .active
+                            .as_ref()
+                            .and_then(|key| view.drafts.entries.get_mut(key))
+                        {
+                            entry.send_error = None;
+                        }
+                        cx.notify();
+                    })),
+                );
+        }
         if entry.is_some_and(|entry| entry.late.is_some() && entry.send.is_none()) {
+            row = row.child(button("draft-send-retry", "Retry message").on_click(
+                cx.listener(|view, _, window, cx| view.retry_draft_admission(window, cx)),
+            ));
+        }
+        if self
+            .drafts
+            .restore
+            .as_ref()
+            .is_some_and(|(key, _)| self.drafts.active.as_ref() == Some(key))
+        {
+            row = row
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(muted()))
+                        .child("Previous draft saved."),
+                )
+                .child(
+                    button("draft-restore-replaced", "Restore")
+                        .accessibility_label("Restore previous draft")
+                        .text_size(px(12.))
+                        .h(px(27.))
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            if let Some((key, payload)) = view.drafts.restore.clone()
+                                && view.current_draft_key() == key
+                            {
+                                view.replace_composer_payload(payload, window, cx);
+                            }
+                        })),
+                );
+        }
+        if self
+            .drafts
+            .restore
+            .as_ref()
+            .is_some_and(|(key, _)| self.drafts.active.as_ref() == Some(key))
+        {
             row = row.child(
-                button("draft-send-retry", "Retry")
-                    .on_click(cx.listener(|view, _, window, cx| view.submit(window, cx))),
+                button("draft-dismiss-restore", "Dismiss")
+                    .text_size(px(12.))
+                    .h(px(27.))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.drafts.restore = None;
+                        cx.notify();
+                    })),
             );
         }
         if self.drafts.flush.is_some() {
@@ -1505,6 +1863,32 @@ impl Xylo {
         self.drafts.notice.clear();
         self.request_drafts(false, cx);
     }
+    pub(super) fn open_saved_drafts_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt;
+        let page = self.page;
+        self.open_saved_drafts(cx);
+        self.page = page;
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (content, width) = weak
+                .update(cx, |view, cx| {
+                    let width = if view.drafts.summaries.is_empty() && view.workspace.is_none() {
+                        480.
+                    } else {
+                        720.
+                    };
+                    (view.drafts_content(true, cx), width)
+                })
+                .unwrap_or_else(|_| (div().into_any_element(), 480.));
+            dialog
+                .title("Saved drafts")
+                .width(px(width))
+                .rounded(px(16.))
+                .bg(rgb(panel()))
+                .border_color(rgb(border_strong()))
+                .child(content)
+        });
+    }
     fn request_drafts(&mut self, more: bool, cx: &mut Context<Self>) {
         if self.drafts.list_request.is_some() {
             return;
@@ -1596,9 +1980,6 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.recovery_before_switch(cx) {
-            return;
-        }
         if self.editor_dirty {
             self.error = Some("Save your changes before opening another draft.".into());
             cx.notify();
@@ -1623,6 +2004,9 @@ impl Xylo {
         }
     }
     pub(super) fn drafts_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        self.drafts_content(false, cx)
+    }
+    fn drafts_content(&self, in_dialog: bool, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
         let count = self.drafts.summaries.len();
         let rows = uniform_list("draft-results", count, move |range, _, cx| {
@@ -1647,8 +2031,22 @@ impl Xylo {
             .unwrap_or_default()
         })
         .track_scroll(&self.drafts.scroll)
-        .flex_1()
+        .size_full()
         .min_h_0();
+        // The list owns its viewport; the dialog grows around the scope and
+        // feedback rows. Optional Undo must never consume a draft row's height.
+        let rows = div()
+            .id("drafts-list-viewport")
+            .test_support()
+            .min_h_0()
+            .w_full()
+            .overflow_hidden()
+            .when(in_dialog, |list| {
+                list.h(px(DRAFT_ROW_HEIGHT * count.min(5) as f32))
+                    .flex_shrink_0()
+            })
+            .when(!in_dialog, |list| list.flex_1())
+            .child(rows);
         let unscoped = self.drafts.list_scope == Some(None);
         let project = self.workspace.as_deref().map(|root| {
             root.file_name()
@@ -1659,11 +2057,11 @@ impl Xylo {
         let mut page = div()
             .id("drafts-page")
             .test_support()
-            .size_full()
+            .w_full()
             .min_h_0()
-            .px(px(24.))
+            .when(!in_dialog, |page| page.h_full().px(px(24.)).pb(px(16.)))
+            .when(in_dialog, |page| page.flex_shrink_0())
             .pt(px(8.))
-            .pb(px(16.))
             .flex()
             .flex_col()
             .gap(px(12.))
@@ -1672,6 +2070,7 @@ impl Xylo {
             page = page.child(
                 segments()
                     .self_start()
+                    .flex_shrink_0()
                     .child(
                         segment("drafts-in-project", format!("In {project}"), !unscoped).on_click(
                             cx.listener(|view, _, _, cx| view.show_drafts_scope(false, cx)),
@@ -1685,27 +2084,55 @@ impl Xylo {
             );
         }
         let loading = self.drafts.list_request.is_some() && count == 0;
-        if loading {
-            page = page.child(crate::motion::skeleton_list(4));
-        } else if !self.drafts.notice.is_empty() {
+        if count == 0 {
+            let notice = if loading {
+                "Loading saved drafts…"
+            } else if self.drafts.notice.is_empty() {
+                "No saved drafts yet."
+            } else {
+                &self.drafts.notice
+            };
             // Empty and failed states sit where the first row would, with the
             // rows' padding, as one muted line.
             page = page.child(
                 div()
                     .id("drafts-notice")
                     .test_support()
-                    .aria_label(self.drafts.notice.clone())
+                    .aria_label(notice.to_owned())
                     .h(px(DRAFT_ROW_HEIGHT))
+                    .flex_shrink_0()
                     .px(px(12.))
                     .flex()
                     .items_center()
                     .text_size(px(13.))
                     .text_color(rgb(muted()))
                     .single_line()
-                    .child(self.drafts.notice.clone()),
+                    .child(notice.to_owned()),
             );
+        } else {
+            page = page.child(rows);
         }
-        page.child(rows).into_any_element()
+        page.when(!self.drafts.saved.notice.is_empty(), |page| {
+            page.child(crate::motion::fade_on_change(
+                "drafts-feedback-motion",
+                &self.drafts.saved.notice,
+                div()
+                    .id("drafts-feedback")
+                    .test_support()
+                    .min_h(px(32.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(subtitle(self.drafts.saved.notice.clone()).flex_1())
+                    .when(self.drafts.saved.can_undo(), |row| {
+                        row.child(pill("undo-delete-draft", "Undo").on_click(
+                            cx.listener(|view, _, _, cx| view.undo_saved_draft_delete(cx)),
+                        ))
+                    }),
+            ))
+        })
+        .into_any_element()
     }
     /// One saved draft: its first line, then project, age and attachments.
     fn draft_row(&self, index: usize, draft: DraftSummary, cx: &mut Context<Self>) -> AnyElement {
@@ -1733,38 +2160,70 @@ impl Xylo {
                 if draft.attachment_count == 1 { "" } else { "s" }
             ));
         }
-        focus_ring(gpui_kit::base::Button::new(("open-saved-draft", index)))
-            .accessibility_label(format!("Continue draft: {first_line}"))
+        let delete = draft.clone();
+        let busy = self.drafts.saved.busy(&draft.key);
+        div()
             .w_full()
             .h(px(DRAFT_ROW_HEIGHT))
-            .px(px(12.))
-            .rounded(px(10.))
             .flex()
-            .flex_col()
-            .items_start()
-            .justify_center()
-            .gap(px(2.))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(hover())))
+            .items_center()
+            .gap(px(4.))
             .child(
-                div()
-                    .w_full()
-                    .single_line()
-                    .text_size(px(13.5))
-                    .text_color(rgb(text()))
-                    .child(first_line),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .single_line()
-                    .text_size(px(12.))
+                icons::small(icons::AppIcon::Drafts)
                     .text_color(rgb(muted()))
-                    .child(details.join(" · ")),
+                    .ml(px(8.))
+                    .flex_shrink_0(),
             )
-            .on_click(cx.listener(move |view, _, window, cx| {
-                view.open_saved_draft_summary(draft.clone(), window, cx);
-            }))
+            .child(
+                focus_ring(gpui_kit::base::Button::new(("open-saved-draft", index)))
+                    .accessibility_label(format!("Continue draft: {first_line}"))
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(DRAFT_ROW_HEIGHT))
+                    .px(px(12.))
+                    .rounded(px(10.))
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .justify_center()
+                    .gap(px(2.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(hover())))
+                    .child(
+                        div()
+                            .w_full()
+                            .single_line()
+                            .text_size(px(13.5))
+                            .text_color(rgb(text()))
+                            .child(first_line),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .single_line()
+                            .text_size(px(12.))
+                            .text_color(rgb(muted()))
+                            .child(details.join(" · ")),
+                    )
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        use gpui_kit::component::WindowExt;
+                        if window.has_active_dialog(cx) {
+                            window.close_dialog(cx);
+                        }
+                        view.open_saved_draft_summary(draft.clone(), window, cx);
+                    })),
+            )
+            .child(
+                icons::icon_button(
+                    SharedString::from(format!("delete-saved-draft-{index}")),
+                    icons::AppIcon::Delete,
+                    "Delete draft",
+                )
+                .disabled(busy)
+                .on_click(
+                    cx.listener(move |view, _, _, cx| view.delete_saved_draft(delete.clone(), cx)),
+                ),
+            )
             .into_any_element()
     }
 }
@@ -1860,6 +2319,9 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.queued_guidance_result(id, &result, cx) {
+            return;
+        }
         let Some(key) = self
             .drafts
             .entries
@@ -1949,6 +2411,7 @@ impl Xylo {
                         }
                         let mut user = message(key.session_id, "user", outcome.request.text);
                         user.id = Uuid::new_v5(&outcome.request.id, b"steering-message");
+                        user.turn_id = Some(outcome.request.turn_id);
                         if self.session == key.session_id
                             && self.workspace == key.workspace
                             && !self.messages.iter().any(|message| message.id == user.id)
@@ -2004,9 +2467,9 @@ impl TextShape {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "drafts/admission_feedback_tests.rs"]
 mod admission_feedback_tests;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "drafts/text_shape_tests.rs"]
 mod text_shape_tests;

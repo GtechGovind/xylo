@@ -527,6 +527,6 @@ fn asset_description(kind: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "assets/tests.rs"]
 mod tests;

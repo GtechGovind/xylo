@@ -8,6 +8,24 @@ pub(super) struct TurnQueueUi {
     requests: BTreeMap<Uuid, Uuid>,
     operations: BTreeMap<Uuid, (Uuid, Uuid)>,
     notice: BTreeMap<Uuid, String>,
+    show_all: BTreeSet<Uuid>,
+    edits: BTreeMap<Uuid, QueuedTurn>,
+    undo: BTreeMap<Uuid, Uuid>,
+    removals: BTreeSet<Uuid>,
+    restores: BTreeSet<Uuid>,
+    recovered: BTreeMap<Uuid, QueuedTurn>,
+    guidance: BTreeMap<Uuid, QueuedTurn>,
+}
+impl TurnQueueUi {
+    /// Only retire a transfer's recovery link once the composer payload is durable.
+    pub(super) fn draft_saved(&mut self, draft: &xylo_runtime::drafts::DraftSnapshot) {
+        self.recovered.retain(|_, item| {
+            item.turn.session_id != draft.key.session_id
+                || draft.key.workspace.as_ref() != Some(&item.turn.workspace)
+                || item.turn.prompt != draft.text
+                || item.turn.attachments != draft.attachments
+        });
+    }
 }
 impl Xylo {
     pub(super) fn refresh_turn_queue(&mut self, session: Uuid, cx: &mut Context<Self>) {
@@ -34,9 +52,11 @@ impl Xylo {
         id: Uuid,
         session: Uuid,
         result: Result<Vec<QueuedTurn>, String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let expected = self.turn_queue.requests.remove(&id) == Some(session);
+        let removed = self.turn_queue.operations.get(&id).copied();
         let operation = self
             .turn_queue
             .operations
@@ -45,6 +65,12 @@ impl Xylo {
         if !id.is_nil() && !expected && !operation {
             return;
         }
+        let edit = self.turn_queue.edits.remove(&id);
+        let succeeded = result
+            .as_ref()
+            .is_ok_and(|items| items.iter().all(|item| item.turn.session_id == session));
+        let removal = self.turn_queue.removals.remove(&id);
+        let restore = self.turn_queue.restores.remove(&id);
         match result {
             Ok(items) if items.iter().all(|item| item.turn.session_id == session) => {
                 self.turn_queue.notice.remove(&session);
@@ -60,6 +86,52 @@ impl Xylo {
                     "The message queue could not be updated. Your saved messages are retained."
                         .into(),
                 );
+            }
+        }
+        if !succeeded && let Some((_, item)) = removed {
+            self.turn_queue.guidance.remove(&item);
+        }
+        if succeeded
+            && restore
+            && let Some((owned, item)) = removed
+            && owned == session
+            && self.turn_queue.undo.get(&session) == Some(&item)
+        {
+            self.turn_queue.undo.remove(&session);
+        }
+        if let Some(item) = edit {
+            self.turn_queue.recovered.insert(item.id, item.clone());
+            if self.session == session && self.workspace.as_ref() == Some(&item.turn.workspace) {
+                self.replace_composer_payload(
+                    drafts::MessagePayload {
+                        text: item.turn.prompt,
+                        attachments: item.turn.attachments,
+                    },
+                    window,
+                    cx,
+                );
+                if !succeeded {
+                    self.turn_queue.notice.insert(session, "This message may already have started. Its text was recovered as a draft; review before sending.".into());
+                }
+            } else {
+                self.turn_queue.notice.insert(
+                    session,
+                    "Return to this chat to recover the message for editing.".into(),
+                );
+            }
+        } else if succeeded
+            && removal
+            && let Some((_, item)) = removed
+        {
+            if self
+                .turn_queue
+                .items
+                .get(&session)
+                .is_none_or(|items| !items.iter().any(|x| x.id == item))
+            {
+                self.turn_queue.undo.insert(session, item);
+            } else if self.turn_queue.undo.get(&session) == Some(&item) {
+                self.turn_queue.undo.remove(&session);
             }
         }
         cx.notify();
@@ -107,22 +179,30 @@ impl Xylo {
         if let Some(items) = self.turn_queue.items.get_mut(&session) {
             items.retain(|queued| queued.id != item.id);
         }
-        self.turn_queue.notice.remove(&session);
-        self.turns.entry(session).or_default().request = Some(item.turn.clone());
+        if self.turn_queue.recovered.contains_key(&item.id) {
+            self.turn_queue.notice.insert(session, "This message already started. Its text is retained for review as a draft; sending it again creates a new task.".into());
+        } else {
+            self.turn_queue.notice.remove(&session);
+        }
         if self.session == session && self.workspace.as_ref() == Some(&item.turn.workspace) {
             self.archive_finished_turn(session);
-            let mut user = message(session, "user", item.turn.prompt);
+            let mut user = message(session, "user", item.turn.prompt.clone());
             user.id = Uuid::new_v5(&item.turn.turn_id, b"user-message");
-            user.attachments = item.turn.attachments;
+            user.turn_id = Some(item.turn.turn_id);
+            user.attachments = item.turn.attachments.clone();
             if !self.messages.iter().any(|existing| existing.id == user.id) {
                 self.messages.push(user);
             }
         } else if let Some(history) = self.histories.get_mut(&session) {
             history.stale = true;
         }
+        self.turns.entry(session).or_default().request = Some(item.turn);
         cx.notify();
     }
     fn manage_queued_turn(&mut self, item: Uuid, send: bool, cx: &mut Context<Self>) {
+        if send {
+            self.cancel_setup_close_intents(cx);
+        }
         let session = self.session;
         if send && self.running() {
             return;
@@ -149,6 +229,9 @@ impl Xylo {
                 .requests
                 .retain(|_, owned| *owned != session);
             self.turn_queue.operations.insert(id, (session, item));
+            if !send {
+                self.turn_queue.removals.insert(id);
+            }
         } else {
             self.turn_queue
                 .notice
@@ -156,23 +239,248 @@ impl Xylo {
         }
         cx.notify();
     }
+    fn edit_queued_turn(&mut self, item: QueuedTurn, cx: &mut Context<Self>) {
+        self.manage_queued_turn(item.id, false, cx);
+        if let Some((&request, _)) = self
+            .turn_queue
+            .operations
+            .iter()
+            .find(|(_, owned)| **owned == (self.session, item.id))
+        {
+            self.turn_queue.edits.insert(request, item);
+        }
+    }
+    fn undo_queued_turn(&mut self, item: Uuid, cx: &mut Context<Self>) {
+        let Some(host) = &self.host else {
+            return;
+        };
+        let id = Uuid::new_v4();
+        if host.restore_queued_turn(id, self.session, item).is_ok() {
+            self.turn_queue.operations.insert(id, (self.session, item));
+            self.turn_queue.restores.insert(id);
+        }
+        cx.notify();
+    }
+    pub(super) fn queued_guidance_result(
+        &mut self,
+        id: Uuid,
+        result: &Result<xylo_runtime::steering::SteeringOutcome, String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(item) = self.turn_queue.guidance.get(&id).cloned() else {
+            return false;
+        };
+        let session = item.turn.session_id;
+        match result {
+            Ok(outcome)
+                if outcome.request.id == id
+                    && outcome.request.session_id == session
+                    && outcome.request.text == item.turn.prompt.trim()
+                    && outcome.draft.key.workspace.as_ref() == Some(&item.turn.workspace) =>
+            {
+                match outcome.receipt.state {
+                    xylo_core::SteeringState::Queued => {}
+                    xylo_core::SteeringState::Applied => {
+                        self.turn_queue.guidance.remove(&id);
+                        let mut user = message(session, "user", outcome.request.text.clone());
+                        user.id = Uuid::new_v5(&id, b"steering-message");
+                        user.turn_id = Some(outcome.request.turn_id);
+                        if self.session == session
+                            && self.workspace.as_ref() == Some(&item.turn.workspace)
+                        {
+                            if !self.messages.iter().any(|message| message.id == user.id) {
+                                self.messages.push(user);
+                            }
+                        } else if let Some(history) = self.histories.get_mut(&session) {
+                            history.stale = true;
+                        }
+                    }
+                    xylo_core::SteeringState::Cancelled => {
+                        self.turn_queue.guidance.remove(&id);
+                        self.turn_queue.notice.insert(session, outcome.receipt.reason.clone().unwrap_or_else(|| "The message was not added to the task; it remains in the queue.".into()));
+                        self.refresh_turn_queue(session, cx);
+                    }
+                }
+            }
+            Err(error) => {
+                self.turn_queue.guidance.remove(&id);
+                self.turn_queue.notice.insert(session, error.clone());
+            }
+            _ => return true,
+        }
+        self.invalidate_live_history();
+        self.sync_history_list(cx);
+        cx.notify();
+        true
+    }
+    fn steer_queued_turn(&mut self, item: Uuid, cx: &mut Context<Self>) {
+        let Some(host) = &self.host else {
+            return;
+        };
+        let request = Uuid::new_v4();
+        if host.steer_queued_turn(request, self.session, item).is_ok() {
+            if let Some(snapshot) = self
+                .turn_queue
+                .items
+                .get(&self.session)
+                .and_then(|items| items.iter().find(|queued| queued.id == item))
+                .cloned()
+            {
+                self.turn_queue.guidance.insert(item, snapshot);
+            }
+            self.turn_queue
+                .operations
+                .insert(request, (self.session, item));
+        }
+        cx.notify();
+    }
+    fn set_queue_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
+        let Some(host) = &self.host else {
+            return;
+        };
+        let request = Uuid::new_v4();
+        if host
+            .set_turn_queue_paused(request, self.session, paused)
+            .is_ok()
+        {
+            self.turn_queue.requests.insert(request, self.session);
+        }
+        cx.notify();
+    }
+    fn preview_queued_turn(
+        &mut self,
+        item: QueuedTurn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_kit::component::WindowExt;
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let item = item.clone();
+            let content = weak
+                .update(cx, |view, cx| {
+                    let mut preview =
+                        message(item.turn.session_id, "user", item.turn.prompt.clone());
+                    preview.attachments = item.turn.attachments.clone();
+                    let edit = item.clone();
+                    let id = item.id;
+                    div()
+                        .id("queued-message-dialog")
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_size(px(15.))
+                                .whitespace_normal()
+                                .child(item.turn.prompt.clone()),
+                        )
+                        .child(view.message_images(&preview, cx))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(primary("edit-queued-dialog", "Edit message").on_click(
+                                    cx.listener(move |view, _, window, cx| {
+                                        window.close_dialog(cx);
+                                        view.edit_queued_turn(edit.clone(), cx);
+                                    }),
+                                ))
+                                .child(
+                                    secondary(
+                                        "send-queued-dialog",
+                                        if view.running() {
+                                            "Update task"
+                                        } else {
+                                            "Send now"
+                                        },
+                                    )
+                                    .disabled(
+                                        view.running()
+                                            && (!item.turn.attachments.is_empty()
+                                                || item.turn.prompt.len()
+                                                    > xylo_core::MAX_STEERING_BYTES),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |view, _, window, cx| {
+                                            window.close_dialog(cx);
+                                            if view.running() {
+                                                view.steer_queued_turn(id, cx);
+                                            } else {
+                                                view.manage_queued_turn(id, true, cx);
+                                            }
+                                        },
+                                    )),
+                                )
+                                .child(button("remove-queued-dialog", "Remove").on_click(
+                                    cx.listener(move |view, _, window, cx| {
+                                        window.close_dialog(cx);
+                                        view.manage_queued_turn(id, false, cx);
+                                    }),
+                                )),
+                        )
+                        .into_any_element()
+                })
+                .unwrap_or_else(|_| div().into_any_element());
+            dialog
+                .title("Next message")
+                .width(px(720.))
+                .rounded(px(16.))
+                .bg(rgb(panel()))
+                .border_color(rgb(border()))
+                .child(content)
+        });
+    }
     pub(super) fn pending_messages(&self, cx: &mut Context<Self>) -> AnyElement {
         let items = self.turn_queue.items.get(&self.session);
         let guidance = self.pending_guidance_text();
         let notice = self.turn_queue.notice.get(&self.session);
-        if items.is_none_or(|items| items.is_empty()) && guidance.is_none() && notice.is_none() {
+        if items.is_none_or(|items| items.is_empty())
+            && guidance.is_none()
+            && !self
+                .turn_queue
+                .guidance
+                .values()
+                .any(|item| item.turn.session_id == self.session)
+            && notice.is_none()
+            && !self.turn_queue.undo.contains_key(&self.session)
+            && !self
+                .turn_queue
+                .recovered
+                .values()
+                .any(|item| item.turn.session_id == self.session)
+        {
             return div().into_any_element();
         }
         let mut rows = div()
             .id("composer-pending")
             .test_support()
             .w_full()
-            .max_h(px(156.))
+            .max_h(px(135.))
+            .flex_shrink_0()
             .overflow_y_scroll()
-            .mb_2()
             .flex()
             .flex_col()
-            .gap_1();
+            .gap(px(0.));
+        for item in self
+            .turn_queue
+            .guidance
+            .values()
+            .filter(|item| item.turn.session_id == self.session)
+        {
+            rows = rows.child(
+                div()
+                    .id(ElementId::Name(
+                        format!("pending-queued-guidance-{}", item.id).into(),
+                    ))
+                    .test_support()
+                    .text_size(px(12.))
+                    .text_color(rgb(muted()))
+                    .child(format!("Updating task… {}", item.turn.prompt)),
+            );
+        }
         if let Some(text) = guidance {
             rows = rows.child(
                 div()
@@ -189,18 +497,23 @@ impl Xylo {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .child(div().single_line().child(text)),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(rgb(muted()))
                             .child("Steering…"),
                     ),
             );
         }
-        for (index, item) in items.into_iter().flatten().enumerate() {
+        for (index, item) in items
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(|(index, _)| *index == 0 || self.turn_queue.show_all.contains(&self.session))
+        {
             let id = item.id;
             let pending = self
                 .turn_queue
@@ -216,31 +529,29 @@ impl Xylo {
             } else {
                 item.turn.prompt.clone()
             };
-            rows =
-                rows.child(
+            rows = rows.child(
+                div().flex_shrink_0().flex().flex_col().gap_1().child(
                     div()
                         .id(("queued-message", index))
                         .flex()
                         .items_center()
                         .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(10.))
-                        .bg(rgb(panel()))
-                        .border_1()
-                        .border_color(rgb(border()))
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(muted()))
-                                .child(format!("{}", index + 1)),
-                        )
+                        .min_h(px(34.))
+                        .flex_shrink_0()
+                        .child(div().text_size(px(12.)).text_color(rgb(muted())).child("↳"))
                         .child(
                             div()
                                 .id(("queued-message-text", index))
+                                .cursor_pointer()
+                                .on_click({
+                                    let item = item.clone();
+                                    cx.listener(move |view, _, window, cx| {
+                                        view.preview_queued_turn(item.clone(), window, cx);
+                                    })
+                                })
                                 .flex_1()
                                 .min_w_0()
-                                .text_size(px(12.))
+                                .text_size(px(13.))
                                 .child(div().single_line().child(title.clone()))
                                 .tooltip(move |_, cx| {
                                     cx.new(|_| XyloTooltip(title.clone().into())).into()
@@ -249,7 +560,7 @@ impl Xylo {
                         .when(
                             image_count > 0 && !item.turn.prompt.trim().is_empty(),
                             |row| {
-                                row.child(div().text_size(px(11.)).text_color(rgb(muted())).child(
+                                row.child(div().text_size(px(12.)).text_color(rgb(muted())).child(
                                     format!(
                                         "{image_count} image{}",
                                         if image_count == 1 { "" } else { "s" }
@@ -257,12 +568,7 @@ impl Xylo {
                                 ))
                             },
                         )
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(muted()))
-                                .child(if item.paused { "Paused" } else { "Queued" }),
-                        )
+                        .child(div().text_size(px(12.)).text_color(rgb(muted())).child(""))
                         .when(!self.running(), |row| {
                             row.child(
                                 button(("send-queued", index), "Send")
@@ -274,6 +580,18 @@ impl Xylo {
                             )
                         })
                         .child(
+                            button(("preview-queued", index), "⋯")
+                                .aria_label("Review queued message")
+                                .min_h(px(28.))
+                                .px(px(7.))
+                                .on_click({
+                                    let item = item.clone();
+                                    cx.listener(move |view, _, window, cx| {
+                                        view.preview_queued_turn(item.clone(), window, cx);
+                                    })
+                                }),
+                        )
+                        .child(
                             icons::icon_button(
                                 ("remove-queued", index),
                                 AppIcon::Close,
@@ -284,8 +602,81 @@ impl Xylo {
                                 move |view, _, _, cx| view.manage_queued_turn(id, false, cx),
                             )),
                         ),
-                );
+                ),
+            );
         }
+        let mut outer = div()
+            .mx(px(if self.chat_width.get() < 520. {
+                3.
+            } else {
+                10.
+            }))
+            .flex_shrink_0()
+            .mb(px(-13.))
+            .pt(px(9.))
+            .px(px(12.))
+            .pb(px(20.))
+            .rounded_t(px(16.))
+            .bg(rgb(well()))
+            .border_1()
+            .border_color(rgb(border_strong()))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .id("next-messages-header")
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .child(
+                        subtitle(format!("Next messages · {}", items.map_or(0, Vec::len)))
+                            .text_size(px(12.))
+                            .flex_1(),
+                    )
+                    .child(
+                        button(
+                            "pause-queue",
+                            if items.into_iter().flatten().any(|item| item.paused) {
+                                "Resume"
+                            } else {
+                                "Pause"
+                            },
+                        )
+                        .min_h(px(28.))
+                        .text_size(px(12.))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            let paused = view
+                                .turn_queue
+                                .items
+                                .get(&view.session)
+                                .is_some_and(|items| items.iter().any(|item| item.paused));
+                            view.set_queue_paused(!paused, cx);
+                        })),
+                    )
+                    .when(items.is_some_and(|x| x.len() > 1), |row| {
+                        row.child(
+                            button(
+                                "show-all-queued",
+                                if self.turn_queue.show_all.contains(&self.session) {
+                                    "Show less".to_string()
+                                } else {
+                                    "Show all".to_string()
+                                },
+                            )
+                            .min_h(px(28.))
+                            .px(px(7.))
+                            .text_size(px(12.))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if !view.turn_queue.show_all.remove(&view.session) {
+                                    view.turn_queue.show_all.insert(view.session);
+                                }
+                                cx.notify();
+                            })),
+                        )
+                    }),
+            )
+            .child(rows);
         // The host pauses the queue when a task stops or fails; say why and let
         // the user resume it from the first message.
         let paused = items
@@ -299,7 +690,7 @@ impl Xylo {
                 .reason
                 .clone()
                 .unwrap_or_else(|| "The queue is paused.".into());
-            rows = rows.child(
+            outer = outer.child(
                 div()
                     .id("queue-paused")
                     .test_support()
@@ -307,7 +698,12 @@ impl Xylo {
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .child(div().flex_1().min_w_0().child(subtitle(reason).text_xs()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(subtitle(reason).text_size(px(13.))),
+                    )
                     .when_some(first, |row, first| {
                         let pending = self
                             .turn_queue
@@ -315,7 +711,7 @@ impl Xylo {
                             .values()
                             .any(|entry| *entry == (self.session, first));
                         row.child(
-                            button("resume-queue", "Resume queue")
+                            button("resume-queue", "Resume next messages")
                                 .text_xs()
                                 .disabled(pending)
                                 .on_click(cx.listener(move |view, _, _, cx| {
@@ -326,8 +722,141 @@ impl Xylo {
             );
         }
         if let Some(notice) = notice {
-            rows = rows.child(subtitle(notice.clone()).text_xs());
+            outer = outer.child(
+                subtitle(notice.clone())
+                    .id("queue-notice")
+                    .test_support()
+                    .text_xs(),
+            );
         }
-        rows.into_any_element()
+        let mut recovery_rows = div()
+            .id("queue-edit-recovery")
+            .test_support()
+            .max_h(px(100.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        for item in self
+            .turn_queue
+            .recovered
+            .values()
+            .filter(|item| item.turn.session_id == self.session)
+        {
+            let payload = drafts::MessagePayload {
+                text: item.turn.prompt.clone(),
+                attachments: item.turn.attachments.clone(),
+            };
+            recovery_rows = recovery_rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .single_line()
+                            .text_size(px(12.))
+                            .text_color(rgb(muted()))
+                            .child(if item.turn.prompt.is_empty() {
+                                "Image message".into()
+                            } else {
+                                item.turn.prompt.clone()
+                            }),
+                    )
+                    .child(
+                        button(
+                            ElementId::Name(format!("recover-queue-edit-{}", item.id).into()),
+                            "Recover draft",
+                        )
+                        .min_h(px(32.))
+                        .flex_shrink_0()
+                        .on_click(cx.listener(
+                            move |view, _, window, cx| {
+                                view.replace_composer_payload(payload.clone(), window, cx)
+                            },
+                        )),
+                    ),
+            );
+        }
+        if self
+            .turn_queue
+            .recovered
+            .values()
+            .any(|item| item.turn.session_id == self.session)
+        {
+            outer = outer.child(recovery_rows);
+        }
+        if let Some(&item) = self.turn_queue.undo.get(&self.session) {
+            outer = outer.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(subtitle("Message removed"))
+                    .child(
+                        button("undo-remove-queued", "Undo")
+                            .min_h(px(32.))
+                            .on_click(
+                                cx.listener(move |view, _, _, cx| view.undo_queued_turn(item, cx)),
+                            ),
+                    ),
+            );
+        }
+        outer.into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "validation"))]
+impl Xylo {
+    pub(super) fn validation_recovered_queue_ids(&self) -> Vec<Uuid> {
+        self.turn_queue.recovered.keys().copied().collect()
+    }
+    pub(super) fn validation_track_queued_guidance(&mut self, item: QueuedTurn) {
+        self.turn_queue.guidance.insert(item.id, item);
+    }
+    pub(super) fn validation_queue_edit_ack(
+        &mut self,
+        item: QueuedTurn,
+        result: Result<Vec<QueuedTurn>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let request = Uuid::new_v4();
+        let session = item.turn.session_id;
+        self.turn_queue
+            .operations
+            .insert(request, (session, item.id));
+        self.turn_queue.removals.insert(request);
+        self.turn_queue.edits.insert(request, item);
+        self.turn_queue_result(request, session, result, window, cx);
+    }
+    pub(super) fn validation_queue_restore_ack(
+        &mut self,
+        session: Uuid,
+        item: Uuid,
+        result: Result<Vec<QueuedTurn>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let request = Uuid::new_v4();
+        self.turn_queue.undo.insert(session, item);
+        self.turn_queue.operations.insert(request, (session, item));
+        self.turn_queue.restores.insert(request);
+        self.turn_queue_result(request, session, result, window, cx);
+    }
+    pub(super) fn validation_recovered_queue_edit(
+        &self,
+        session: Uuid,
+    ) -> Option<drafts::MessagePayload> {
+        self.turn_queue
+            .recovered
+            .values()
+            .find(|item| item.turn.session_id == session)
+            .map(|item| drafts::MessagePayload {
+                text: item.turn.prompt.clone(),
+                attachments: item.turn.attachments.clone(),
+            })
     }
 }

@@ -29,17 +29,20 @@ fn consecutive_identical_finished_calls_share_one_row_with_a_count() {
             CallRun {
                 first: 0,
                 last: 0,
-                count: 1
+                count: 1,
+                members: vec![0]
             },
             CallRun {
                 first: 1,
                 last: 2,
-                count: 2
+                count: 2,
+                members: vec![1, 2]
             },
             CallRun {
                 first: 3,
                 last: 3,
-                count: 1
+                count: 1,
+                members: vec![3]
             },
         ]
     );
@@ -69,4 +72,18 @@ fn each_kind_of_call_has_a_semantic_icon() {
     assert_eq!(tool_icon("search_project"), AppIcon::Search);
     assert_eq!(tool_icon("agent_delegate"), AppIcon::Agent);
     assert_eq!(tool_icon("something_new"), AppIcon::Tool);
+}
+
+#[test]
+fn grouped_calls_keep_distinct_ranges_and_noncontiguous_members() {
+    let mut first = call("file_read", "a.rs", Some(true));
+    first.input["start_line"] = serde_json::json!(1);
+    let mut last = call("file_read", "a.rs", Some(true));
+    last.input["start_line"] = serde_json::json!(200);
+    let tools = [first, call("file_read", "helper.rs", Some(true)), last];
+    let runs = merge_identical(&tools, &[0, 2]);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].members, vec![0, 2]);
+    assert_eq!(tools[runs[0].members[0]].input["start_line"], 1);
+    assert_eq!(tools[runs[0].members[1]].input["start_line"], 200);
 }

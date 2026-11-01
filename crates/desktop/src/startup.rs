@@ -35,6 +35,6 @@ impl Command {
         Ok(Self::Launch { data, debug })
     }
 }
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "startup/tests.rs"]
 mod tests;

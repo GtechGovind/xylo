@@ -21,6 +21,9 @@ fn message(store: &Store, session: Uuid, text: &str) -> Uuid {
     let id = Uuid::new_v4();
     store
         .append_message(&ChatMessage {
+            activity_count: 0,
+            activity_summary: None,
+            turn_id: None,
             reasoning: None,
             attachments: Vec::new(),
             id,
@@ -218,5 +221,70 @@ fn writes_after_reopen_remain_searchable() {
             store.search_history(needle, None, 10).unwrap().items.len(),
             1
         );
+    }
+}
+
+#[test]
+fn chat_search_covers_unloaded_messages_and_never_other_chats() {
+    let (directory, store, session) = setup();
+    let old = message(&store, session, "ancientneedle beyond the visible page");
+    for _ in 0..130 {
+        message(&store, session, "newer ordinary message");
+    }
+    let other = Uuid::new_v4();
+    store
+        .upsert_conversation(&Conversation {
+            id: other,
+            title: "Other".into(),
+            workspace: directory.path().into(),
+            updated_at: 8,
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
+        })
+        .unwrap();
+    message(&store, other, "ancientneedle in another chat");
+    let hits = store.search_chat(session, "ancientneedle").unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, old);
+    assert!(hits[0].1.contains("ancientneedle"));
+    assert!(store.search_chat(session, "").unwrap().is_empty());
+    assert!(store.search_chat(session, &"x".repeat(513)).is_err());
+}
+
+#[test]
+fn find_in_chat_matches_loaded_substrings_before_and_after_pagination() {
+    let (_directory, store, session) = setup();
+    let old = message(&store, session, "Authentication FAILED — CAFÉ 100% [ready]");
+    for _ in 0..130 {
+        message(&store, session, "Later ordinary text");
+    }
+    let visible = store.messages(session, 5).unwrap();
+    assert!(!visible.iter().any(|message| message.id == old));
+    for query in [
+        "entication",
+        "FAILED",
+        "café",
+        "100%",
+        "[ready]",
+        "tion failed",
+        "  entication  ",
+    ] {
+        let before = store.search_chat(session, query).unwrap();
+        assert_eq!(before.len(), 1, "{query}");
+        assert_eq!(before[0].0, old);
+        let loaded = store.messages(session, 200).unwrap();
+        let local: Vec<_> = loaded
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .to_lowercase()
+                    .contains(&query.trim().to_lowercase())
+            })
+            .map(|message| message.id)
+            .collect();
+        assert_eq!(local, vec![old]);
+        assert_eq!(store.search_chat(session, query).unwrap(), before);
     }
 }

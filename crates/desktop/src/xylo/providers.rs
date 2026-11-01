@@ -553,9 +553,9 @@ impl Xylo {
             .child(self.provider_model_list());
         if let Some(connection) = saved_connection {
             let busy = self.provider_discovery.loading();
-            page = page.child(settings_ui::danger_zone([settings_ui::setting_row(
+            page = page.child(settings_ui::removal_actions([settings_ui::setting_row(
                 "Remove provider",
-                Some("Its models and saved key are removed from Xylo.".into()),
+                Some("Remove this connection and its saved API key from Xylo.".into()),
                 Some(
                     settings_ui::destructive_button("provider-remove", "Remove")
                         .disabled(busy)
@@ -565,6 +565,7 @@ impl Xylo {
                         .into_any_element(),
                 ),
             )
+            .inset()
             .into_any_element()]));
         }
         page.into_any_element()
@@ -656,6 +657,7 @@ impl Xylo {
                 "Xylo needs a model provider before it can start a conversation.",
                 Some(add("add-provider", cx).into_any_element()),
             ));
+            return page.into_any_element();
         } else {
             let rows: Vec<AnyElement> = providers
                 .into_iter()
@@ -1293,6 +1295,6 @@ impl Xylo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "validation")))]
 #[path = "providers/tests.rs"]
 mod tests;

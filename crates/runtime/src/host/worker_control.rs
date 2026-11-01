@@ -32,7 +32,7 @@ pub(super) const IDLE_WORKER_TTL: Duration = Duration::from_secs(5 * 60);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Replies to control commands arrive quickly; older entries are forgotten.
 const CONTROL_LEDGER_CAPACITY: usize = 128;
-const FORCED_STOP_NOTICE: &str = "The task did not stop in time, so Xylo ended it. Actions it had started are listed for review.";
+const FORCED_STOP_NOTICE: &str = "The task did not stop in time, so Xylo ended it.";
 // Revisions remain ordered when a chat receives a replacement worker.
 static NEXT_PERMISSION_REVISION: AtomicU64 = AtomicU64::new(1);
 const LOST_DECISION: &str = "The task is no longer running, so this decision was not applied.";

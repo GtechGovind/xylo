@@ -24,7 +24,7 @@ fn mapped_missing_component_reason_survives_the_actual_banner_formatter() {
         "A required application component is missing. Reinstall the complete application.",
     );
     assert_eq!(super::super::product_error(&message), message);
-    assert!(message.contains("Rebuild") || message.contains("rebuild"));
+    assert!(message.contains("Reopen"));
 }
 
 #[test]
@@ -186,8 +186,10 @@ fn missing_worker_feedback_explains_setup_without_discarding_the_draft(cx: &mut 
         let entry = &view.drafts.entries[&key];
         let request = entry.send.as_ref().unwrap().id;
         let original = entry.text.clone();
+        view.error = None;
         view.draft_admitted(request, Err("A required application component is missing. Reinstall the complete application.".into()), window, cx);
-        assert!(view.error.as_deref().unwrap().contains("missing required task components"), "The missing component needs actionable feedback, not a generic send failure");
+        assert!(view.error.is_none(), "Send feedback belongs beside the composer");
+        assert!(view.drafts.entries[&key].send_error.as_deref().unwrap().contains("task runner is missing"));
         assert_eq!(view.drafts.entries[&key].text, original);
         assert_eq!(view.composer.read(cx).value().as_str(), original);
         assert!(!view.draft_send_pending());
@@ -276,13 +278,13 @@ fn enter_explains_why_it_cannot_send(cx: &mut TestAppContext) {
     });
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |view, cx| {
-            view.drafts.flush = Some(super::DraftFlushAction::Quit);
+            view.worktree_pending = Some(view.session);
             view.submit(window, cx);
             assert!(
                 view.composer_hint()
-                    .is_some_and(|hint| hint.contains("Keep working"))
+                    .is_some_and(|hint| hint.contains("worktree"))
             );
-            view.drafts.flush = None;
+            view.worktree_pending = None;
             view.composer
                 .update(cx, |input, cx| input.set_value("typing", window, cx));
             view.draft_changed(cx);

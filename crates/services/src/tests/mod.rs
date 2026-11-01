@@ -52,6 +52,9 @@ fn history_and_checkpoint_survive_reopen() {
     let (directory, store, session) = database();
     let turn = Uuid::new_v4();
     let message = ChatMessage {
+        activity_count: 0,
+        activity_summary: None,
+        turn_id: None,
         reasoning: None,
         attachments: Vec::new(),
         id: Uuid::new_v4(),
@@ -89,6 +92,9 @@ fn history_pages_preserve_append_order_with_tied_timestamps_and_concurrent_appen
     for index in 1..=6 {
         store
             .append_message(&ChatMessage {
+                activity_count: 0,
+                activity_summary: None,
+                turn_id: None,
                 reasoning: None,
                 attachments: Vec::new(),
                 id: Uuid::new_v4(),
@@ -112,6 +118,9 @@ fn history_pages_preserve_append_order_with_tied_timestamps_and_concurrent_appen
     assert!(newest.has_more);
     store
         .append_message(&ChatMessage {
+            activity_count: 0,
+            activity_summary: None,
+            turn_id: None,
             reasoning: None,
             attachments: Vec::new(),
             id: Uuid::new_v4(),

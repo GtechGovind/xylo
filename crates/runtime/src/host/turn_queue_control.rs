@@ -95,11 +95,25 @@ impl HostClient {
     ) -> Result<()> {
         self.enqueue(HostCommand::QueueDraft(request_id, turn, submission))
     }
+    pub fn steer_queued_turn(&self, request_id: Uuid, session: Uuid, item: Uuid) -> Result<()> {
+        self.enqueue(HostCommand::SteerQueuedTurn(request_id, session, item))
+    }
+    pub fn set_turn_queue_paused(
+        &self,
+        request_id: Uuid,
+        session: Uuid,
+        paused: bool,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::SetTurnQueuePaused(request_id, session, paused))
+    }
     pub fn list_turn_queue(&self, request_id: Uuid, session: Uuid) -> Result<()> {
         self.enqueue(HostCommand::ListTurnQueue(request_id, session))
     }
     pub fn remove_queued_turn(&self, request_id: Uuid, session: Uuid, item: Uuid) -> Result<()> {
         self.enqueue(HostCommand::RemoveQueuedTurn(request_id, session, item))
+    }
+    pub fn restore_queued_turn(&self, request_id: Uuid, session: Uuid, item: Uuid) -> Result<()> {
+        self.enqueue(HostCommand::RestoreQueuedTurn(request_id, session, item))
     }
     pub fn run_queued_turn(&self, request_id: Uuid, session: Uuid, item: Uuid) -> Result<()> {
         self.enqueue(HostCommand::RunQueuedTurn(request_id, session, item))
@@ -313,6 +327,126 @@ impl HostState {
             }
         }
     }
+    pub(super) async fn handle_steer_queued_turn(
+        &self,
+        request_id: Uuid,
+        session: Uuid,
+        item: Uuid,
+    ) -> Result<()> {
+        let result = async {
+            let _guard = self.turn_queue.gate(session).await?;
+            let (commands, stop, turn) = {
+                let workers = self.workers.lock().await;
+                let worker = workers
+                    .get(&session)
+                    .context("This task has ended; send a new message to continue")?;
+                ensure!(
+                    worker.active.load(Ordering::Acquire) && !worker.stop.is_cancelled(),
+                    "This task has ended"
+                );
+                let turn =
+                    (*worker.run_turn.lock()).context("This task is not ready for guidance")?;
+                (worker.commands.clone(), worker.stop.clone(), turn)
+            };
+            let permit = tokio::time::timeout(Duration::from_millis(100), commands.reserve_owned())
+                .await
+                .context("This task is busy; your queued message is retained")?
+                .context("This task stopped before guidance could be sent")?;
+            ensure!(
+                !stop.is_cancelled(),
+                "This task stopped before guidance could be sent"
+            );
+            let store = self.store.clone();
+            let outcome =
+                tokio::task::spawn_blocking(move || store.steer_queued_turn(session, item, turn))
+                    .await??;
+            self.events
+                .send(HostEvent::SteeringResult {
+                    request_id: item,
+                    result: Ok(outcome.clone()),
+                })
+                .await?;
+            if outcome.receipt.state == SteeringState::Queued {
+                let active = {
+                    let workers = self.workers.lock().await;
+                    workers.get(&session).is_some_and(|worker| {
+                        worker.active.load(Ordering::Acquire)
+                            && *worker.run_turn.lock() == Some(turn)
+                            && !worker.stop.is_cancelled()
+                    })
+                };
+                if active {
+                    permit.send(Envelope::new(
+                        Uuid::new_v4(),
+                        Some(session),
+                        0,
+                        WorkerCommand::SteerDurable {
+                            guidance: outcome.request,
+                        },
+                    ));
+                } else {
+                    crate::steering::finish(
+                        self.store.clone(),
+                        session,
+                        Some(turn),
+                        "The task ended before this guidance could be applied".into(),
+                    )
+                    .await?;
+                    // Restore the exact queued snapshot when its active target
+                    // vanished during admission; the current draft stays intact.
+                    let store = self.store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        store.recover_queued_guidance(session, item)
+                    })
+                    .await??;
+                    anyhow::bail!("The task ended; your message remains in the queue");
+                }
+            }
+            Ok(())
+        }
+        .await;
+        self.emit_turn_queue(
+            request_id,
+            session,
+            result.err().map(|error: anyhow::Error| error.to_string()),
+        )
+        .await
+    }
+    pub(super) async fn handle_set_turn_queue_paused(
+        self: &Arc<Self>,
+        request_id: Uuid,
+        session: Uuid,
+        paused: bool,
+    ) -> Result<()> {
+        let result = async {
+            let _guard = self.turn_queue.gate(session).await?;
+            let store = self.store.clone();
+            tokio::task::spawn_blocking(move || store.set_turn_queue_paused(session, paused))
+                .await??;
+            if !paused
+                && !self
+                    .workers
+                    .lock()
+                    .await
+                    .get(&session)
+                    .is_some_and(|worker| worker.active.load(Ordering::Acquire))
+            {
+                let store = self.store.clone();
+                let rows = tokio::task::spawn_blocking(move || store.turn_queue(session)).await??;
+                if let Some(first) = rows.first() {
+                    self.run_queue_locked(session, first.id, true).await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        self.emit_turn_queue(
+            request_id,
+            session,
+            result.err().map(|error: anyhow::Error| error.to_string()),
+        )
+        .await
+    }
     pub(super) async fn handle_remove_queued_turn(
         &self,
         request_id: Uuid,
@@ -326,6 +460,25 @@ impl HostState {
                 .map_err(|_| anyhow::anyhow!("Too many queue operations are pending"))?;
             let store = self.store.clone();
             tokio::task::spawn_blocking(move || store.remove_queued_turn(session, item)).await?
+        }
+        .await;
+        self.emit_turn_queue(
+            request_id,
+            session,
+            result.err().map(|error: anyhow::Error| error.to_string()),
+        )
+        .await
+    }
+    pub(super) async fn handle_restore_queued_turn(
+        &self,
+        request_id: Uuid,
+        session: Uuid,
+        item: Uuid,
+    ) -> Result<()> {
+        let result = async {
+            let _guard = self.turn_queue.gate(session).await?;
+            let store = self.store.clone();
+            tokio::task::spawn_blocking(move || store.restore_queued_turn(session, item)).await?
         }
         .await;
         self.emit_turn_queue(

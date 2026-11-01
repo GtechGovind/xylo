@@ -1315,7 +1315,7 @@ impl ToolBroker {
                 match name {
                     "shell_command" | "run_command" | "shell_output" | "shell_kill"
                     | "shell_jobs" => {
-                        shell_jobs::execute(self, name, &arguments, access, shell_context)?
+                        shell_jobs::execute(self, id, name, &arguments, access, shell_context)?
                     }
                     "ask_user" | "exit_plan_mode" | "schedule_wakeup" => {
                         interaction::execute(self, id, name, &arguments)?

@@ -881,6 +881,10 @@ pub struct RateLimits {
 /// the complete log is kept on disk at `log_path`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShellJob {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<Uuid>,
+    #[serde(default = "background_job_default")]
+    pub background: bool,
     pub id: Uuid,
     pub turn_id: Uuid,
     pub command: String,
@@ -890,6 +894,10 @@ pub struct ShellJob {
     pub exit_code: Option<i32>,
     pub output: String,
     pub error: Option<String>,
+}
+
+fn background_job_default() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -953,6 +961,14 @@ pub struct ConversationPage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Actual journaled actions, absent from older history and simple replies.
+    #[serde(default, skip_serializing_if = "is_zero_activity")]
+    pub activity_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_summary: Option<String>,
+    /// Optional for messages saved before activity associations were retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<Uuid>,
     pub id: Uuid,
     pub session_id: Uuid,
     pub role: String,
@@ -965,6 +981,10 @@ pub struct ChatMessage {
     /// Provider reasoning shown only when the reader opens Thinking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+}
+
+fn is_zero_activity(count: &u32) -> bool {
+    *count == 0
 }
 
 fn is_complete(status: &MessageStatus) -> bool {

@@ -41,7 +41,7 @@ jobs:
       - name: Pinned Rust toolchain
         run: rustup show active-toolchain
       - name: Build application binaries
-        run: cargo build --release --workspace --bins --locked
+        run: cargo build --release --locked -p xylo -p xylo-worker -p xylo-helper -p xylo-cli --bins
       - name: Install pinned packager
         run: cargo install cargo-packager --version 0.11.8 --locked
       - name: Package, sign and notarize when configured

@@ -113,8 +113,8 @@ impl Xylo {
         if self.documents.drafts.entries.contains_key(&key) {
             return;
         }
-        // Do not evict an unacknowledged write or unresolved conflict.
-        if self.documents.drafts.entries.len() >= 16 {
+        // Evict clean entries; pending edits remain cached without blocking navigation.
+        while self.documents.drafts.entries.len() >= 16 {
             if let Some(removable) = self
                 .documents
                 .drafts
@@ -124,6 +124,7 @@ impl Xylo {
                     Some(*key) != self.documents.drafts.active.as_ref()
                         && !entry.dirty
                         && entry.save.is_none()
+                        && entry.retry.is_none()
                         && entry.load.is_none()
                         && entry.conflict.is_none()
                         && entry.error.is_none()
@@ -132,9 +133,7 @@ impl Xylo {
             {
                 self.documents.drafts.entries.remove(&removable);
             } else {
-                self.documents.notice =
-                    "Save pending document edits before opening another document.".into();
-                return;
+                break;
             }
         }
         let id = Uuid::new_v4();
@@ -251,7 +250,6 @@ impl Xylo {
             self.documents.drafts.flush = None;
             self.cancel_draft_flush(cx);
             self.cancel_memory_forms_flush(cx);
-            self.cancel_recovery_flush(cx);
             return;
         }
         entry.state = state;
@@ -263,7 +261,6 @@ impl Xylo {
         self.documents.drafts.flush = None;
         self.cancel_draft_flush(cx);
         self.cancel_memory_forms_flush(cx);
-        self.cancel_recovery_flush(cx);
         self.documents.drafts.debounce = Some(cx.spawn(async move |view, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(300))
@@ -423,11 +420,27 @@ impl Xylo {
             cx.notify();
             return false;
         }
-        if self.documents.drafts.active.is_some() && !self.documents.drafts.ready() {
-            self.documents.notice="Your document edits are being saved. Resolve any recovery warning before switching.".into();
+        let uncaptured_or_conflicted = self.documents.drafts.active.as_ref().is_some_and(|key| {
+            self.documents.drafts.entries.get(key).is_none_or(|entry| {
+                entry.revision.is_none()
+                    || entry.load.is_some()
+                    || entry.conflict.is_some()
+                    || entry
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.starts_with("These edits are too large"))
+            })
+        });
+        let effect_waiting_for_save = (self.documents.pending_copy.is_some()
+            || self.documents.pending_relink.is_some())
+            && !self.documents.drafts.ready();
+        if uncaptured_or_conflicted || effect_waiting_for_save {
+            self.documents.notice = "Finish the pending document change before switching.".into();
             cx.notify();
             return false;
         }
+        // Ordinary edits are already retained by document key. Their save receipts
+        // update that entry even after another project or document is opened.
         true
     }
     pub(in super::super) fn document_after_workspace_switch(
@@ -689,55 +702,66 @@ impl Xylo {
         })
         .into_any_element()
     }
-    pub(in super::super) fn document_saved_drafts(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(in super::super) fn document_saved_drafts(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let rows = self.documents.drafts.list.clone();
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(subtitle("Recent documents and recovered edits"))
-            .child(
-                uniform_list(
-                    "document-recent",
-                    rows.len(),
-                    cx.processor(move |_, range: std::ops::Range<usize>, _window, cx| {
-                        range
-                            .map(|index| {
-                                let draft = rows[index].clone();
-                                let path = draft.key.source;
-                                let label = format!(
-                                    "{} · {} edits{}",
-                                    path.file_name().unwrap_or_default().to_string_lossy(),
-                                    draft.edits,
-                                    if draft.has_pending_copy {
-                                        " · copy needs checking"
-                                    } else {
-                                        ""
-                                    }
-                                );
-                                button(("document-resume", index), label)
-                                    .w_full()
-                                    .justify_start()
-                                    .on_click(cx.listener(move |view, _, window, cx| {
-                                        view.document_resume_saved(path.clone(), window, cx)
-                                    }))
-                                    .into_any_element()
-                            })
-                            .collect()
-                    }),
+        if rows.is_empty() {
+            return None;
+        }
+        let height = px(32. * rows.len().min(5) as f32);
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(subtitle("Recent documents and recovered edits"))
+                .child(
+                    uniform_list(
+                        "document-recent",
+                        rows.len(),
+                        cx.processor(move |_, range: std::ops::Range<usize>, _window, cx| {
+                            range
+                                .map(|index| {
+                                    let draft = rows[index].clone();
+                                    let path = draft.key.source;
+                                    let label = format!(
+                                        "{} · {} edits{}",
+                                        path.file_name().unwrap_or_default().to_string_lossy(),
+                                        draft.edits,
+                                        if draft.has_pending_copy {
+                                            " · copy needs checking"
+                                        } else {
+                                            ""
+                                        }
+                                    );
+                                    button(("document-resume", index), label)
+                                        .h(px(32.))
+                                        .single_line()
+                                        .w_full()
+                                        .justify_start()
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.document_resume_saved(path.clone(), window, cx)
+                                        }))
+                                        .into_any_element()
+                                })
+                                .collect()
+                        }),
+                    )
+                    .h(height),
                 )
-                .h(px(180.)),
-            )
-            .when(self.documents.drafts.has_more, |panel| {
-                panel.child(
-                    button("document-recent-more", "More documents")
-                        .disabled(self.documents.drafts.list_request.is_some())
-                        .on_click(
-                            cx.listener(|view, _, _, cx| view.document_list_drafts(true, cx)),
-                        ),
-                )
-            })
-            .into_any_element()
+                .when(self.documents.drafts.has_more, |panel| {
+                    panel.child(
+                        button("document-recent-more", "More documents")
+                            .disabled(self.documents.drafts.list_request.is_some())
+                            .on_click(
+                                cx.listener(|view, _, _, cx| view.document_list_drafts(true, cx)),
+                            ),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 }
 

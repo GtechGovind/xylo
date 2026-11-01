@@ -14,7 +14,7 @@ The sidebar is `settings_sidebar` with `settings_nav_item` rows, built in
 | Settings sidebar width | 220 px | `SIDEBAR_WIDTH` |
 | Sidebar row | 32 px, 7 px radius, active row filled with `selected()` | `NAV_ROW_HEIGHT` |
 | Sidebar group gap | 16 px; group header 28 px, 12 px muted | |
-| Content column | left-aligned, max 680 px | `CONTENT_MAX_WIDTH` |
+| Content column | centered in the content pane, max 680 px | `CONTENT_MAX_WIDTH` |
 | Content gutter | 48 px left and right | `CONTENT_GUTTER` |
 | Space above the header | 32 px | `CONTENT_TOP` |
 | Space between sections | 32 px (also header to first section) | `SECTION_GAP` |
@@ -52,7 +52,7 @@ settings_page(id, "Providers")            breadcrumb (sub-pages only)
   .breadcrumb(breadcrumb([crumb(..)], ..)) description
   .action(primary_button(..))             ── 32 px ──
   .child(section(title, desc, rows([..])))  section …
-  .child(danger_zone([..]))                 Danger zone (last)
+  .child(removal_actions([..]))                 Removal actions (last)
 ```
 
 Sub-pages show a breadcrumb ("Providers / ChatGPT") above the title; there
@@ -128,7 +128,7 @@ available (accent), Disabled (neutral), Error (danger).
 ## Empty states and destructive actions
 
 `empty_state(icon, title, description, Some(primary_button(..)))`: one line
-each, one action. Irreversible actions live in `danger_zone` at the end of the
+each, one action. Removal actions live in `removal_actions` at the end of the
 page; their handler confirms with `Xylo::confirm_destructive` (Cancel first)
 before acting.
 

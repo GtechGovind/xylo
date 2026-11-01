@@ -42,6 +42,8 @@ mod extension_receipts;
 mod usage;
 pub use usage::*;
 
+mod turn_activity;
+pub use turn_activity::*;
 mod turn_queue;
 pub use turn_queue::*;
 
