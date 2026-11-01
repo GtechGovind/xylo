@@ -1,4 +1,6 @@
 //! Read-only Git inspection for the native workspace; never runs on the UI thread.
+pub mod hunks;
+
 use anyhow::{Context, Result, ensure};
 use std::{
     path::{Path, PathBuf},
@@ -149,23 +151,15 @@ pub(super) fn metadata_link(source: &Path, target: &Path) -> Result<()> {
     }
     Ok(())
 }
-/// A native read view never loads repository executable configuration. Merely
-/// disabling external diff/textconv is insufficient: clean/process filters and
-/// info/attributes can execute commands too. Only Git data is linked into this
-/// neutral metadata snapshot; global/user config and environment are absent.
-pub async fn run_read(
-    root: &Path,
-    args: &[String],
-    timeout: Duration,
-    cancel: tokio_util::sync::CancellationToken,
-) -> Result<crate::process::ProcessResult> {
-    ensure!(
-        matches!(
-            args.first().map(String::as_str),
-            Some("status" | "diff" | "branch" | "rev-parse")
-        ),
-        "Unsupported native Git read command"
-    );
+/// A neutral metadata view stays alive for the complete native command.
+struct NativeGit {
+    command: tokio::process::Command,
+    root: PathBuf,
+    worktree: PathBuf,
+    git_directory: PathBuf,
+    _overlay: tempfile::TempDir,
+}
+fn prepare_native(root: &Path) -> Result<NativeGit> {
     let root = root.canonicalize()?;
     let git = trusted_git(&root)?;
     let (worktree, directory) = resolve_git_directory(&root)?;
@@ -246,7 +240,7 @@ pub async fn run_read(
         .env("HOME", overlay.path())
         .env("GIT_DIR", overlay.path())
         .env("GIT_COMMON_DIR", overlay.path())
-        .env("GIT_WORK_TREE", worktree)
+        .env("GIT_WORK_TREE", &worktree)
         .env(
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
@@ -270,6 +264,38 @@ pub async fn run_read(
         "-c",
         "core.quotePath=false",
     ]);
+    Ok(NativeGit {
+        command,
+        root,
+        worktree,
+        git_directory: directory,
+        _overlay: overlay,
+    })
+}
+
+/// A native read view never loads repository executable configuration. Merely
+/// disabling external diff/textconv is insufficient: clean/process filters and
+/// info/attributes can execute commands too. Only Git data is linked into this
+/// neutral metadata snapshot; global/user config and environment are absent.
+pub async fn run_read(
+    root: &Path,
+    args: &[String],
+    timeout: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<crate::process::ProcessResult> {
+    ensure!(
+        matches!(
+            args.first().map(String::as_str),
+            Some("status" | "diff" | "branch" | "rev-parse")
+        ),
+        "Unsupported native Git read command"
+    );
+    let NativeGit {
+        mut command,
+        root,
+        _overlay,
+        ..
+    } = prepare_native(root)?;
     if matches!(args.first().map(String::as_str), Some("status" | "diff")) {
         command
             .arg(&args[0])

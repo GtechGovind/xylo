@@ -1,4 +1,6 @@
 //! Application-owned contracts. Community engine types must not cross this boundary.
+mod review_prompts;
+pub use review_prompts::{ReviewKind, review_prompt};
 mod branding;
 pub use branding::{APPLICATION_ID, APPLICATION_NAME, CREDENTIAL_SERVICE};
 mod documents;
