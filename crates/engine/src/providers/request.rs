@@ -178,6 +178,7 @@ pub(super) fn body(
             _ => {}
         }
     }
+    super::thinking::apply(&provider.config, reasoning, max_tokens, &mut body);
     Ok(body)
 }
 

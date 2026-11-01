@@ -139,11 +139,30 @@ impl AgentEngine {
     }
 
     fn provider(&self, config: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
-        let provider = self.configured_provider(config)?;
-        Ok(match &self.provider_layer {
+        let wrap = |provider| match &self.provider_layer {
             Some(layer) => layer(provider),
             None => provider,
-        })
+        };
+        let primary = wrap(self.configured_provider(config)?);
+        let Some(model) = config
+            .fallback_model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty() && *model != config.model)
+        else {
+            return Ok(primary);
+        };
+        let mut alternative = config.clone();
+        alternative.model = model.to_owned();
+        alternative.fallback_model = None;
+        alternative.reasoning_options = None;
+        alternative.default_reasoning_effort = None;
+        alternative.reasoning_effort = None;
+        alternative.served_context_tokens = None;
+        Ok(Arc::new(crate::providers::fallback::WithFallback {
+            primary,
+            alternative: wrap(self.configured_provider(&alternative)?),
+            name: model.to_owned(),
+        }))
     }
 
     fn configured_provider(&self, config: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
@@ -555,6 +574,20 @@ impl AgentEngine {
                 if outcome.stopped_early {
                     tracing::warn!(session_id=%request.session_id, "Turn reached its step limit");
                 }
+                let start = outcome
+                    .messages
+                    .iter()
+                    .rposition(|message| {
+                        message.role == Role::User
+                            && message.content == user_message(&request).content
+                    })
+                    .unwrap_or(0);
+                let thinking = outcome.messages[start..]
+                    .iter()
+                    .filter_map(|message| message.reasoning.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let reasoning = (!thinking.is_empty()).then_some(thinking);
                 let (store, value) = (self.store.clone(), serde_json::to_value(&outcome.messages)?);
                 let (text, usage) = (outcome.text.clone(), outcome.usage.clone());
                 // An answer the output limit still cut off is kept as far as
@@ -565,7 +598,9 @@ impl AgentEngine {
                     MessageStatus::Complete
                 };
                 blocking(move || {
-                    store.complete_turn_as(session, turn, &value, &text, &usage, status)
+                    store.complete_turn_with_reasoning(
+                        session, turn, &value, &text, &usage, status, reasoning,
+                    )
                 })
                 .await?;
                 learning_turn.completed = true; // Receipt and evidence job committed atomically.

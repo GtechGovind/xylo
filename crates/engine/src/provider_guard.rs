@@ -205,6 +205,13 @@ fn admission_error(error: anyhow::Error) -> ModelError {
 }
 
 impl ModelProvider for GuardedProvider {
+    fn fallback(&self) -> Option<(String, Arc<dyn ModelProvider>)> {
+        let (name, inner) = self.inner.fallback()?;
+        let mut guard = self.clone();
+        guard.inner = inner;
+        Some((name, Arc::new(guard)))
+    }
+
     fn stream(&self, mut request: ModelRequest, cancel: CancellationToken) -> EventStream {
         request.max_tokens = request.max_tokens.min(self.output_tokens).max(1);
         let this = self.clone();

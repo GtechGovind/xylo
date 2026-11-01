@@ -157,3 +157,100 @@ fn missing_rows_fail_closed() {
     assert!(store.checkpoint(session).is_err());
     assert!(store.checkpoint(Uuid::new_v4()).unwrap().is_none());
 }
+
+#[test]
+fn fallback_metadata_survives_same_turn_rewrites_but_cannot_escape_its_turn() {
+    let (_directory, store, session) = store_with_session();
+    let turn = Uuid::new_v4();
+    store
+        .save_checkpoint(session, turn, &json!([{"role":"user","content":"Work"}]))
+        .unwrap();
+    store
+        .select_checkpoint_fallback(session, turn, "alternative")
+        .unwrap();
+    store
+        .save_checkpoint(
+            session,
+            turn,
+            &json!([{"role":"user","content":"Condensed"}]),
+        )
+        .unwrap();
+    assert_eq!(
+        store.checkpoint_fallback(session, turn).unwrap().as_deref(),
+        Some("alternative")
+    );
+    assert_eq!(
+        store
+            .checkpoint(session)
+            .unwrap()
+            .unwrap()
+            .fallback_model
+            .as_deref(),
+        Some("alternative")
+    );
+    let next = Uuid::new_v4();
+    assert!(store.checkpoint_fallback(session, next).unwrap().is_none());
+    assert!(
+        store
+            .select_checkpoint_fallback(session, next, "wrong")
+            .is_err()
+    );
+    store
+        .save_checkpoint(
+            session,
+            next,
+            &json!([{"role":"user","content":"Fresh turn"}]),
+        )
+        .unwrap();
+    assert!(store.checkpoint_fallback(session, next).unwrap().is_none());
+    assert!(store.checkpoint_fallback(session, turn).unwrap().is_none());
+    assert!(
+        store
+            .select_checkpoint_fallback(session, turn, "stale")
+            .is_err()
+    );
+    assert!(
+        store
+            .checkpoint(session)
+            .unwrap()
+            .unwrap()
+            .fallback_model
+            .is_none()
+    );
+}
+
+#[test]
+fn a_database_missing_fallback_metadata_is_rejected_or_reset_without_migration() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("xylo.db");
+    {
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(&crate::schema::SCHEMA.replace(",fallback_model TEXT", ""))
+            .unwrap();
+        old.pragma_update(None, "user_version", crate::schema::VERSION)
+            .unwrap();
+        old.execute("INSERT INTO conversations VALUES('old','{}',0)", [])
+            .unwrap();
+    }
+    assert!(
+        Store::open_existing(&path).is_err(),
+        "Workers cannot accept an old checkpoint schema even at the current version"
+    );
+    let old = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        old.query_row("SELECT COUNT(*) FROM conversations", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(old);
+    let fresh = Store::open(&path).unwrap();
+    assert!(fresh.reset_notice().unwrap().reason.contains("tables"));
+    assert!(fresh.conversations(10).unwrap().is_empty());
+    assert!(
+        fresh
+            .checkpoint_fallback(Uuid::new_v4(), Uuid::new_v4())
+            .unwrap()
+            .is_none()
+    );
+}

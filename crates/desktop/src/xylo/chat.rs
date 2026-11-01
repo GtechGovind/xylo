@@ -13,6 +13,8 @@ use crate::icons::{self, AppIcon};
 use gpui_kit::base::Disableable;
 use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+#[path = "chat/thinking.rs"]
+mod thinking;
 #[path = "tool_result_view.rs"]
 mod tool_result_view;
 #[path = "chat/tools.rs"]
@@ -311,7 +313,7 @@ impl Xylo {
         cx: &mut Context<Self>,
     ) {
         self.log(match &event {
-            EngineEvent::Delta { .. } => String::new(),
+            EngineEvent::Delta { .. } | EngineEvent::ThinkingDelta { .. } => String::new(),
             EngineEvent::ToolStarted { name, .. } => format!("Tool started: {name}"),
             EngineEvent::ToolFinished { name, success, .. } => {
                 format!("Tool finished: {name}, success={success}")
@@ -427,6 +429,16 @@ impl Xylo {
         }
         // A retried turn resumes under the same id; its partial reply is not history.
         let reply = turn.reply().filter(|_| !turn.resend);
+        let thinking = turn
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                crate::state::Segment::Thinking(text) => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let reasoning = (!thinking.is_empty()).then_some(thinking);
         let finished_at = turn.finished_at;
         let answer = live_answer_key(session, turn);
         turn.archive();
@@ -437,6 +449,7 @@ impl Xylo {
                 // still belongs to it.
                 reply.id = answer;
                 reply.status = status;
+                reply.reasoning = reasoning;
                 if let Some(at) = finished_at {
                     reply.created_at = at;
                 }
@@ -748,6 +761,13 @@ impl Xylo {
             .text_color(rgb(text()))
             .when(self.history_message_highlight(message.id), |row| {
                 row.border_1().border_color(rgb(brand()))
+            })
+            .when_some(message.reasoning.clone(), |row, reasoning| {
+                row.child(self.thinking_block(
+                    Uuid::new_v5(&message.id, b"thinking"),
+                    reasoning.into(),
+                    cx,
+                ))
             })
             .when(!message.content.is_empty(), |row| {
                 row.child(

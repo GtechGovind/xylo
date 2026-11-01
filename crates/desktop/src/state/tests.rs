@@ -481,3 +481,23 @@ fn a_new_turn_archives_the_previous_transcript_and_keeps_helpers() {
     assert_eq!(state.earlier_subagents.len(), 1);
     assert_eq!(state.outcome, None);
 }
+
+#[test]
+fn thinking_stays_separate_from_answer_text_and_survives_completion() {
+    let mut state = TurnState::default();
+    state.apply(EngineEvent::Started);
+    state.apply(EngineEvent::ThinkingDelta {
+        text: "Consider ".into(),
+    });
+    state.apply(EngineEvent::ThinkingDelta {
+        text: "this".into(),
+    });
+    delta(&mut state, "Answer");
+    state.apply(EngineEvent::Completed {
+        text: "Answer".into(),
+        usage: Usage::default(),
+    });
+    assert_eq!(state.transcript_text(), "Answer");
+    assert!(matches!(&state.segments[0], Segment::Thinking(text) if text == "Consider this"));
+    assert_eq!(state.reply().unwrap().0, "Answer");
+}

@@ -295,7 +295,7 @@ impl Xylo {
                     turn_id: Uuid::new_v4(),
                     prompt: entry.text.clone(),
                     workspace: self.workspace.clone().unwrap_or_default(),
-                    provider: self.settings.provider.clone(),
+                    provider: self.settings.turn_provider(),
                     permissions: self.settings.permissions,
                     attachments: vec![],
                     approved_rules: Vec::new(),
@@ -826,7 +826,7 @@ impl Xylo {
                 turn_id: Uuid::new_v4(),
                 prompt: entry.text.trim().to_owned(),
                 workspace,
-                provider: self.settings.provider.clone(),
+                provider: self.settings.turn_provider(),
                 permissions: self.settings.permissions,
                 attachments: entry.attachments.clone(),
                 // The host fills the project's standing approvals at admission.

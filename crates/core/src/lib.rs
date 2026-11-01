@@ -11,6 +11,7 @@ mod attachments;
 pub use attachments::*;
 mod image_generation;
 pub use image_generation::*;
+mod provider_controls;
 mod steering;
 pub use steering::*;
 
@@ -87,6 +88,9 @@ pub struct ProviderConfig {
     pub managed_local: bool,
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
+    /// An alternative model on this same authorized connection.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -107,6 +111,7 @@ impl Default for ProviderConfig {
             discovery_url: None,
             managed_local: false,
             headers: Default::default(),
+            fallback_model: None,
         }
     }
 }
@@ -129,7 +134,8 @@ impl ProviderConfig {
         if !matches!(
             self.family,
             ApiFamily::OpenAiChat | ApiFamily::OpenAiResponses | ApiFamily::Azure
-        ) {
+        ) && self.native_reasoning_efforts().is_empty()
+        {
             return Vec::new();
         }
         if let Some(options) = &self.reasoning_options {
@@ -140,6 +146,12 @@ impl ProviderConfig {
                 }
             }
             return supported;
+        }
+        if !matches!(
+            self.family,
+            ApiFamily::OpenAiChat | ApiFamily::OpenAiResponses | ApiFamily::Azure
+        ) {
+            return self.native_reasoning_efforts();
         }
         let model = self.model.to_ascii_lowercase();
         let is = |name: &str| {
@@ -327,6 +339,9 @@ pub struct AppSettings {
     pub ui: UiPreferences,
     #[serde(default)]
     pub secret_storage: SecretStorage,
+    /// Default alternative model ID, used on the active authorized connection.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -427,6 +442,7 @@ impl Default for AppSettings {
             telemetry_export: false,
             ui: UiPreferences::default(),
             secret_storage: SecretStorage::default(),
+            fallback_model: None,
         }
     }
 }
@@ -659,6 +675,8 @@ pub enum NoteKind {
     StallWarning,
     /// The turn crossed 75% or 90% of its step limit.
     StepBudget,
+    /// The turn continued on its configured alternative model.
+    Fallback,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -747,6 +765,10 @@ pub enum EngineEvent {
         #[serde(default)]
         kind: ErrorKind,
     },
+    /// Visible provider reasoning, separate from the answer.
+    ThinkingDelta {
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -818,6 +840,9 @@ pub struct ChatMessage {
     pub attachments: Vec<ImageAttachment>,
     #[serde(default, skip_serializing_if = "is_complete")]
     pub status: MessageStatus,
+    /// Provider reasoning shown only when the reader opens Thinking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 fn is_complete(status: &MessageStatus) -> bool {

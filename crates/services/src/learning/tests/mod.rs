@@ -334,6 +334,7 @@ async fn freeform_correction_requires_explicit_review_and_preserves_versions_and
 fn correction_source_cannot_be_assistant_external_content_or_unquoted_or_sensitive_data() {
     let (_directory, store, service, session, scope) = setup();
     let message = ChatMessage {
+        reasoning: None,
         attachments: Vec::new(),
         id: Uuid::new_v4(),
         session_id: session,

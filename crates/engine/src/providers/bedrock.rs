@@ -555,9 +555,15 @@ fn map_error(status: u16, body: &str) -> ModelError {
             retry_after: None,
             message,
         }
+    } else if (500..=599).contains(&status) {
+        ModelError::Unavailable {
+            status,
+            retry_after: None,
+            message,
+        }
     } else {
         ModelError::Provider {
-            retryable: matches!(status, 408 | 424 | 500..=599),
+            retryable: matches!(status, 408 | 424),
             retry_after: None,
             message,
         }
@@ -565,8 +571,9 @@ fn map_error(status: u16, body: &str) -> ModelError {
 }
 
 fn with_retry_after(mut error: ModelError, delay: Option<Duration>) -> ModelError {
-    if let ModelError::RateLimited { retry_after, .. } | ModelError::Provider { retry_after, .. } =
-        &mut error
+    if let ModelError::RateLimited { retry_after, .. }
+    | ModelError::Unavailable { retry_after, .. }
+    | ModelError::Provider { retry_after, .. } = &mut error
     {
         *retry_after = delay;
     }

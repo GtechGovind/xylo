@@ -88,6 +88,8 @@ pub enum Segment {
     /// Assistant text streamed between tool batches. Shared so an unchanged
     /// segment hands the markdown view the same string every frame.
     Text(SharedString),
+    /// Provider reasoning, disclosed separately from the answer.
+    Thinking(SharedString),
     /// Consecutive top-level tool calls, in start order.
     Tools(Vec<Uuid>),
     /// A helper agent started by an `agent_delegate` call with this id.
@@ -368,6 +370,14 @@ impl TurnState {
                 self.phase_since = now_ms();
             }
             EngineEvent::Delta { text } => self.push_text(&text),
+            EngineEvent::ThinkingDelta { text } => {
+                if let Some(Segment::Thinking(previous)) = self.segments.last_mut() {
+                    *previous = format!("{previous}{text}").into();
+                } else {
+                    self.segments.push(Segment::Thinking(text.into()));
+                }
+                self.touch(self.segments.len());
+            }
             EngineEvent::Status { text } => self.status = Some(text),
             EngineEvent::HarnessNote { kind, text } => {
                 self.segments.push(Segment::Note {
@@ -679,6 +689,7 @@ fn delegate_summary(card: &ToolCard) -> Option<SharedString> {
 
 pub fn message(session_id: Uuid, role: &str, content: String) -> ChatMessage {
     ChatMessage {
+        reasoning: None,
         id: Uuid::new_v4(),
         session_id,
         role: role.into(),
