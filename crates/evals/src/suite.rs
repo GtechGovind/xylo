@@ -12,6 +12,8 @@
 //! To add a task, write a constructor returning a [`Task`] and list it in
 //! [`builtin`]; see the crate README.
 
+mod project_discovery;
+
 use crate::{
     runner::Trial,
     scripted::{ChildScript, Script, Step},
@@ -26,6 +28,7 @@ use xylo_engine::{FinishReason, ToolCall};
 pub fn builtin() -> Vec<Task> {
     vec![
         tool_loop(),
+        project_discovery::scoped_instructions(),
         code_tool_safety(),
         shell_working_directory(),
         web_fetch(),

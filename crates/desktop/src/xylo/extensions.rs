@@ -474,7 +474,11 @@ impl Xylo {
     /// Loads installed packages unless they are already known.
     pub(super) fn ensure_extensions_loaded(&mut self, cx: &mut Context<Self>) {
         if !self.extensions.loaded {
-            self.extension_request("extension_snapshot", json!({}), cx);
+            self.extension_request(
+                "extension_snapshot",
+                json!({"workspace":self.workspace}),
+                cx,
+            );
         }
     }
     /// "Plugins / Native modules" above the native modules sub-page.

@@ -3,6 +3,7 @@
 //! Layout comes from [`super::settings_ui`]; see `SETTINGS_DESIGN.md`.
 use super::*;
 use crate::icons::AppIcon;
+use anyhow::Context as _;
 use gpui_kit::TestSupportExt;
 use xylo_runtime::settings_files::{PermissionDecision, PermissionRule};
 
@@ -316,6 +317,7 @@ impl Xylo {
             return;
         }
         self.connector_pending = None;
+        self.connector_signing_in = false;
         match result {
             Ok(receipt) => {
                 let invalidated = receipt
@@ -331,6 +333,8 @@ impl Xylo {
                         .sort_by(|left, right| left.name.cmp(&right.name));
                 }
                 self.connector_error = None;
+                self.mcp_commands
+                    .retain(|command| Some(command.connector_id) != invalidated);
                 if self.connector_inspected.is_some_and(|id| {
                     Some(id) == invalidated || !self.connectors.iter().any(|config| config.id == id)
                 }) {
@@ -905,25 +909,29 @@ impl Xylo {
         let busy = self.connector_pending.is_some();
         let transport = settings_ui::segmented(
             "transport",
-            [("stdio", "Local command"), ("http", "Remote server")]
-                .into_iter()
-                .map(|(value, label)| {
-                    let view = cx.entity().downgrade();
-                    settings_ui::SelectOption::new(
-                        label,
-                        self.connector_transport == value,
-                        move |_, cx| {
-                            let _ = view.update(cx, |view, cx| {
-                                if view.connector_pending.is_none() {
-                                    view.connector_transport = value.into();
-                                    cx.notify();
-                                }
-                            });
-                        },
-                    )
-                    .id(SharedString::from(format!("transport-{value}")))
-                })
-                .collect(),
+            [
+                ("stdio", "Local command"),
+                ("http", "Remote server"),
+                ("sse", "Legacy SSE"),
+            ]
+            .into_iter()
+            .map(|(value, label)| {
+                let view = cx.entity().downgrade();
+                settings_ui::SelectOption::new(
+                    label,
+                    self.connector_transport == value,
+                    move |_, cx| {
+                        let _ = view.update(cx, |view, cx| {
+                            if view.connector_pending.is_none() {
+                                view.connector_transport = value.into();
+                                cx.notify();
+                            }
+                        });
+                    },
+                )
+                .id(SharedString::from(format!("transport-{value}")))
+            })
+            .collect(),
         );
         let mut fields = vec![
             settings_ui::field("Type", transport, None).into_any_element(),
@@ -1029,12 +1037,12 @@ impl Xylo {
     }
     /// A saved connection; the row opens its edit page.
     fn connection_item(&self, index: usize, connection: &ConnectorConfig) -> settings_ui::ListItem {
-        let kind = if connection.transport == "http" {
+        let kind = if connection.transport != "stdio" {
             "Remote server"
         } else {
             "Local command"
         };
-        let target = if connection.transport == "http" {
+        let target = if connection.transport != "stdio" {
             connection.endpoint.clone()
         } else {
             connection
@@ -1084,6 +1092,22 @@ impl Xylo {
         {
             page = page.child(settings_ui::inline_error(error));
         }
+        if self.connector_signing_in
+            && let Some(request) = self.connector_pending
+        {
+            page = page.child(
+                settings_ui::text_button("connector-cancel-sign-in", "Cancel sign-in").on_click(
+                    cx.listener(move |view, _, _, cx| {
+                        if let Some(host) = &view.host
+                            && let Err(error) = host.cancel_capability(request)
+                        {
+                            view.connector_error = Some(error.to_string());
+                        }
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
         let list = if self.connectors.is_empty() {
             settings_ui::empty_state(
                 AppIcon::Connectors,
@@ -1095,17 +1119,48 @@ impl Xylo {
             settings_ui::list_container(self.connectors.iter().enumerate().map(
                 |(index, connection)| {
                     let id = connection.id;
+                    let mut actions = div().flex().gap_2();
+                    if connection.transport != "stdio" {
+                        actions = actions.child(
+                            settings_ui::text_button(("connector-sign-in", index), "Sign in")
+                                .disabled(busy)
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    let request = Uuid::new_v4();
+                                    match view
+                                        .host
+                                        .as_ref()
+                                        .context("Application service unavailable")
+                                        .and_then(|host| host.connector_sign_in(request, id, None))
+                                    {
+                                        Ok(()) => {
+                                            view.connector_pending = Some(request);
+                                            view.connector_signing_in = true;
+                                            view.connector_pending_save = false;
+                                            view.connector_error = None;
+                                        }
+                                        Err(error) => {
+                                            view.connector_error = Some(error.to_string())
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                        );
+                    }
                     self.connection_item(index, connection)
                         .trailing(
-                            settings_ui::busy(
-                                settings_ui::text_button(
-                                    ("connector-tools", index),
-                                    "Inspect tools",
+                            actions.child(
+                                settings_ui::busy(
+                                    settings_ui::text_button(
+                                        ("connector-tools", index),
+                                        "Inspect tools",
+                                    ),
+                                    self.connector_loading && self.connector_inspected == Some(id),
+                                )
+                                .on_click(
+                                    cx.listener(move |view, _, _, cx| {
+                                        view.inspect_connector(id, cx)
+                                    }),
                                 ),
-                                self.connector_loading && self.connector_inspected == Some(id),
-                            )
-                            .on_click(
-                                cx.listener(move |view, _, _, cx| view.inspect_connector(id, cx)),
                             ),
                         )
                         .on_click(cx.listener(move |view, _, window, cx| {
@@ -1123,6 +1178,29 @@ impl Xylo {
         };
         if let Some(inspection) = self.connector_inspection_section(cx) {
             page = page.child(inspection);
+        }
+        if !self.mcp_commands.is_empty() {
+            page = page.child(settings_ui::section(
+                "MCP commands",
+                Some("Choose a prompt to put its command in the chat composer.".into()),
+                settings_ui::list_container(self.mcp_commands.iter().enumerate().map(
+                    |(index, command)| {
+                        let command = command.command.clone();
+                        settings_ui::list_item(("mcp-command", index), None, command.clone(), None)
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                if view.composer.read(cx).value().is_empty() {
+                                    view.composer.update(cx, |input, cx| {
+                                        input.set_value(command.clone(), window, cx);
+                                        input.focus(window, cx);
+                                    });
+                                    view.draft_changed(cx);
+                                    view.navigate(Page::Chat, cx);
+                                }
+                            }))
+                            .into_any_element()
+                    },
+                )),
+            ));
         }
         page.child(self.web_search_settings_section(cx))
             .into_any_element()

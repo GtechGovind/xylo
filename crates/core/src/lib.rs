@@ -565,6 +565,11 @@ pub enum WorkerCommand {
     KillJob {
         job_id: Uuid,
     },
+    RespondMcpElicitation {
+        request_id: Uuid,
+        action: McpFormAction,
+        content: Option<Value>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -807,6 +812,12 @@ pub enum EngineEvent {
     WorkspaceChanged {
         workspace: PathBuf,
         branch: Option<String>,
+    },
+    McpElicitation {
+        request: McpFormRequest,
+    },
+    McpElicitationClosed {
+        request_id: Uuid,
     },
 }
 
@@ -1053,3 +1064,6 @@ mod tests;
 
 /// Public headless CLI and SDK protocol.
 pub mod stdio;
+
+mod mcp;
+pub use mcp::*;

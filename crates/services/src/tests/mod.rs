@@ -570,6 +570,7 @@ fn native_tool_catalogues_declare_mutations_and_bounded_pages() {
 #[tokio::test]
 async fn oauth_rejects_wrong_state_before_network_exchange() {
     let config = OAuthConfig {
+        resource: None,
         authorization_endpoint: "https://provider.example/authorize".into(),
         token_endpoint: "https://provider.example/token".into(),
         client_id: "public-desktop-client".into(),

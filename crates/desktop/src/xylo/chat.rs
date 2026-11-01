@@ -291,6 +291,7 @@ impl Xylo {
             .child(self.recovery_banner(cx))
             .child(pane)
             .child(self.history_later_footer(cx))
+            .child(self.mcp_form_cards(cx))
             .child(
                 div()
                     .w_full()
@@ -315,8 +316,19 @@ impl Xylo {
         if let EngineEvent::WorkspaceChanged { workspace, .. } = &event {
             self.chat_worktree_changed(session, workspace.clone(), window, cx);
         }
+        match &event {
+            EngineEvent::McpElicitation { request } => {
+                self.mcp_form_open(session, request.clone(), window, cx)
+            }
+            EngineEvent::McpElicitationClosed { request_id } => {
+                self.mcp_forms.remove(request_id);
+            }
+            _ => {}
+        }
         self.log(match &event {
-            EngineEvent::Delta { .. }
+            EngineEvent::McpElicitation { .. }
+            | EngineEvent::McpElicitationClosed { .. }
+            | EngineEvent::Delta { .. }
             | EngineEvent::ThinkingDelta { .. }
             | EngineEvent::ShellJobUpdated { .. } => String::new(),
             EngineEvent::CustomToolRequested {

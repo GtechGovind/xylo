@@ -48,3 +48,4 @@ mod tests;
 pub mod settings_files;
 
 pub mod hooks;
+mod instruction_sources;

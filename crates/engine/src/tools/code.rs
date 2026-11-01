@@ -395,11 +395,18 @@ impl Sink for Collect {
 }
 
 /// In-process ripgrep search with deterministic paging and independent context.
-pub(crate) fn search(
+#[cfg(test)]
+fn search(root: &Path, base: &Path, args: &Value, cancel: &CancellationToken) -> Result<Value> {
+    search_touched(root, base, args, cancel, |_| {})
+}
+
+/// Reports files actually inspected so scoped instructions can follow search access.
+pub(crate) fn search_touched(
     root: &Path,
     base: &Path,
     args: &Value,
     cancel: &CancellationToken,
+    mut touched: impl FnMut(&Path),
 ) -> Result<Value> {
     let query = text(args, "query")?;
     ensure!(!query.is_empty(), "query is empty");
@@ -502,6 +509,7 @@ pub(crate) fn search(
         {
             continue;
         }
+        touched(entry.path());
         if sink.matches == 0 {
             continue;
         }

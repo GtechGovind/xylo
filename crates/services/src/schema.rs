@@ -33,6 +33,8 @@ CREATE TABLE checkpoints(session_id TEXT PRIMARY KEY REFERENCES conversations(id
 CREATE TABLE checkpoint_messages(session_id TEXT NOT NULL REFERENCES checkpoints(session_id),position INTEGER NOT NULL,json TEXT NOT NULL,PRIMARY KEY(session_id,position)) WITHOUT ROWID;
 CREATE TABLE completed_turns(session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,json TEXT NOT NULL,completed_at INTEGER NOT NULL,PRIMARY KEY(session_id,turn_id));
 
+CREATE TABLE instruction_sources(session_id TEXT NOT NULL,workspace TEXT NOT NULL,path TEXT NOT NULL,outside INTEGER NOT NULL CHECK(outside IN(0,1)),PRIMARY KEY(session_id,workspace,path));
+
 CREATE TABLE actions(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,action_key TEXT NOT NULL,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL,UNIQUE(session_id,turn_id,action_key));
 CREATE INDEX actions_state ON actions(state);
 CREATE INDEX actions_name_time ON actions(json_extract(intent,'$.name'),updated_at DESC);
@@ -51,6 +53,9 @@ CREATE TABLE extension_action_bindings(action_id TEXT PRIMARY KEY REFERENCES act
 CREATE TABLE extension_execution_receipts(id TEXT PRIMARY KEY,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL);
 
 CREATE TABLE connectors(id TEXT PRIMARY KEY,name TEXT NOT NULL,json TEXT NOT NULL);
+CREATE TABLE project_mcp_consents(workspace TEXT NOT NULL,fingerprint TEXT NOT NULL,PRIMARY KEY(workspace,fingerprint));
+CREATE TABLE connector_prompts(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,json TEXT NOT NULL);
+CREATE TABLE connector_catalog_state(id TEXT PRIMARY KEY,generation INTEGER NOT NULL,available INTEGER NOT NULL CHECK(available IN(0,1)));
 CREATE TABLE connector_tools(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,json TEXT NOT NULL,updated_at INTEGER NOT NULL);
 
 CREATE TABLE memories(id TEXT PRIMARY KEY,scope TEXT NOT NULL,content TEXT NOT NULL,json TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,embedding_model TEXT);

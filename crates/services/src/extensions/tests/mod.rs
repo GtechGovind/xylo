@@ -614,3 +614,5 @@ fn updates_remove_the_replaced_version_and_never_reuse_a_partial_snapshot() {
         .collect();
     assert!(leftovers.is_empty());
 }
+
+mod project_discovery;

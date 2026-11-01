@@ -464,3 +464,60 @@ async fn integrated_settings_hooks_follow_worktrees_and_keep_terminal_controls()
         assert!(execution.take_hook_notes().iter().any(|(_, text)| text.contains("checkout hook note")));
     }).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn integrated_worktree_instructions_persist_exposure_and_reach_parent_boundary() {
+    let (dir, broker, mut events) = fixture(PermissionMode::FullAccess);
+    initialize(dir.path());
+    let home = std::env::var_os("HOME").unwrap();
+    let outside = tempfile::Builder::new()
+        .prefix("xylo-worktree-guide-")
+        .tempdir_in(home)
+        .unwrap();
+    let guide = outside.path().join("guide.md");
+    std::fs::write(&guide, "Imported checkout instruction marker").unwrap();
+    std::fs::write(
+        dir.path().join("CLAUDE.md"),
+        format!("@{}\n", guide.display()),
+    )
+    .unwrap();
+    git(dir.path(), &["add", "CLAUDE.md"]);
+    git(dir.path(), &["commit", "-m", "checkout instructions"]);
+    approve_integration(broker.clone(), &mut events, |execution| {
+        let entered = execution
+            .execute(
+                "enter-provenance",
+                "worktree_enter",
+                json!({"name":"instruction-scope"}),
+            )
+            .unwrap();
+        assert!(entered.contains("Imported checkout instruction marker"));
+        assert_eq!(
+            execution.exposure().unwrap(),
+            xylo_core::MemoryOrigin::ToolOutput
+        );
+        let root = execution.workspace_root();
+        std::fs::create_dir_all(root.join(".xylo/rules")).unwrap();
+        std::fs::write(
+            root.join(".xylo/rules/checkout.md"),
+            "---\npaths: [file.txt]\n---\nLazy checkout rule marker\n",
+        )
+        .unwrap();
+        execution
+            .execute(
+                "read-checkout-rule",
+                "file_read",
+                json!({"path":"file.txt"}),
+            )
+            .unwrap();
+        assert!(
+            execution
+                .take_instruction_notes()
+                .join("\n")
+                .contains("Lazy checkout rule marker"),
+            "rebound tools must deliver scoped notes to the original loop broker"
+        );
+        assert!(execution.take_instruction_notes().is_empty());
+    })
+    .await;
+}

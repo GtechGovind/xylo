@@ -24,6 +24,10 @@ pub(super) fn tool_icon(name: &str) -> AppIcon {
         "git_status" | "git_diff" | "git_log" | "git_commit" => AppIcon::Branch,
         "web_fetch" | "web_search" | "browser" => AppIcon::Web,
         crate::state::PLAN_TOOL => AppIcon::Plan,
+        "connector_resources"
+        | "connector_resource_read"
+        | "connector_prompts"
+        | "connector_prompt_get" => AppIcon::Connectors,
         "image_generate" => AppIcon::Image,
         "memory_search" | "memory_remember" => AppIcon::Memory,
         "extension_skill" => AppIcon::Skills,

@@ -132,6 +132,7 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
         xylo_core::now_ms(),
         broker.window().prompt_budget(),
     );
+    broker.record_instruction_sources(&context.instruction_sources)?;
     context.set_skills_index(broker.project_skill_context().unwrap_or_default());
     *broker.workspace.prompt.lock() = Some(crate::prompts::system(&context));
     broker

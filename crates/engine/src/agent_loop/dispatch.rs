@@ -70,6 +70,10 @@ pub(crate) trait ToolExecutor: Send + Sync {
     fn schemas(&self) -> Vec<ToolSchema>;
     /// Registered tools that are not offered directly (found via search).
     fn deferred_count(&self) -> usize;
+    /// Newly applicable path-scoped project instructions.
+    fn take_instruction_notes(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// `None` when `name` is not a tool this loop may call.
     fn access(&self, name: &str, arguments: &Value) -> Option<Access>;
     /// Runs one call and returns the model-facing result text.
@@ -96,13 +100,15 @@ pub(crate) trait ToolExecutor: Send + Sync {
 }
 
 /// Exact names other agents use for Xylo's tools.
-const ALIASES: [(&str, &str); 20] = [
+const ALIASES: [(&str, &str); 22] = [
     ("WebFetch", "web_fetch"),
     ("WebSearch", "web_search"),
     ("webfetch", "web_fetch"),
     ("websearch", "web_search"),
     ("enterworktree", "worktree_enter"),
     ("exitworktree", "worktree_exit"),
+    ("readmcpresource", "connector_resource_read"),
+    ("listmcpresources", "connector_resources"),
     ("read", "file_read"),
     ("write", "file_write"),
     ("edit", "file_edit"),

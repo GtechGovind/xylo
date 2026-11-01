@@ -12,6 +12,9 @@
 //! closes stdin and waits briefly for the server to exit), and only then is the
 //! sandboxed process group killed. The first lines a local server writes to
 //! stderr are kept and attached to connection errors.
+mod handler;
+mod legacy;
+mod metadata;
 use crate::{CredentialVault, Store};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::{Stream, StreamExt};
@@ -178,12 +181,29 @@ impl StderrState {
     }
 }
 
-type Client = RunningService<RoleClient, ()>;
+/// Opaque authority of one atomic catalog read. It binds reviewed definitions
+/// to the durable generation, connector configuration, local scope, and trust.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorCatalogAuthority {
+    id: Uuid,
+    generation: i64,
+    fingerprint: String,
+    trusted: bool,
+}
+/// Definitions and their authority must stay together through classification,
+/// approval, and queued dispatch, even when another process refreshes the catalog.
+pub struct ConnectorCatalogSnapshot {
+    pub tools: Vec<ToolDefinition>,
+    pub authority: ConnectorCatalogAuthority,
+}
+
+type Client = RunningService<RoleClient, handler::Handler>;
 struct Session {
     client: Option<Client>,
     fingerprint: String,
     touched: Instant,
     process: Option<LocalProcess>,
+    route: Arc<std::sync::RwLock<Option<handler::Route>>>,
 }
 impl Session {
     /// Closes the client gracefully within [`CLOSE_GRACE`], then kills the
@@ -212,6 +232,9 @@ struct Pool {
     configuration_gates: Mutex<HashMap<Uuid, Weak<Mutex<()>>>>,
     idle_timeout_ms: AtomicU64,
     reaper_started: AtomicBool,
+    forms: Arc<handler::Forms>,
+    revision: Arc<AtomicU64>,
+    catalog_failure: Arc<AtomicBool>,
 }
 impl Pool {
     fn idle_timeout(&self) -> Duration {
@@ -278,6 +301,7 @@ impl Pool {
 pub struct ConnectorBroker {
     pool: Arc<Pool>,
     local_scope: Option<ConnectorLaunchScope>,
+    route: Option<handler::Route>,
 }
 impl ConnectorBroker {
     /// A busy pool may still hold a local process and must retain its checkout.
@@ -302,9 +326,35 @@ impl ConnectorBroker {
                 configuration_gates: Mutex::new(HashMap::new()),
                 idle_timeout_ms: AtomicU64::new(duration_ms(MCP_IDLE_TIMEOUT)),
                 reaper_started: AtomicBool::new(false),
+                forms: Arc::default(),
+                revision: Arc::default(),
+                catalog_failure: Arc::default(),
             }),
             local_scope: None,
+            route: None,
         }
+    }
+    /// Routes server forms only to the active chat; absent routes decline requests.
+    pub fn with_chat(
+        mut self,
+        events: tokio::sync::mpsc::Sender<xylo_core::EngineEvent>,
+        cancel: CancellationToken,
+    ) -> Self {
+        self.route = Some(handler::Route { events, cancel });
+        self
+    }
+    /// Responds to a pending form; no model-facing tool can call this API.
+    pub fn answer_form(
+        &self,
+        id: Uuid,
+        action: xylo_core::McpFormAction,
+        content: Option<Value>,
+    ) -> Result<()> {
+        self.pool.forms.answer(id, action, content)
+    }
+    /// Advances on invalidation and successful catalog replacement.
+    pub fn catalog_revision(&self) -> u64 {
+        self.pool.revision.load(Ordering::Acquire)
     }
     /// Changes how long unused connections stay open. Applies to every clone.
     pub fn with_idle_timeout(self, idle: Duration) -> Self {
@@ -370,6 +420,7 @@ impl ConnectorBroker {
                     fingerprint: String::new(),
                     touched: Instant::now(),
                     process: None,
+                    route: Arc::default(),
                 }))
             })
             .clone())
@@ -385,9 +436,26 @@ impl ConnectorBroker {
             !cancel.is_cancelled(),
             "Connector initialization cancelled before dispatch"
         );
+        if let Ok(mut route) = session.route.write() {
+            *route = self.route.clone();
+        }
         let fingerprint = Self::fingerprint(config, local_scope)?;
-        if session.fingerprint == fingerprint
-            && session.client.as_ref().is_some_and(|c| !c.is_closed())
+        let secret = if let Some(reference) = &config.credential_ref {
+            Some(super::oauth::connector_access_token(&self.pool.vault, reference, cancel).await?)
+        } else {
+            None
+        };
+        let live_fingerprint = format!(
+            "{fingerprint}:{}",
+            hex::encode(Sha256::digest(
+                secret.as_deref().unwrap_or_default().as_bytes()
+            ))
+        );
+        if session.fingerprint == live_fingerprint
+            && session
+                .client
+                .as_ref()
+                .is_some_and(|client| !client.is_closed())
         {
             session.touched = Instant::now();
             return Ok(());
@@ -395,15 +463,16 @@ impl ConnectorBroker {
         if let Err(error) = session.close().await {
             tracing::debug!("Closing replaced MCP connection: {error:#}");
         }
-        let secret = if let Some(reference) = config.credential_ref.clone() {
-            let vault = self.pool.vault.clone();
-            Some(
-                tokio::task::spawn_blocking(move || vault.get(&reference))
-                    .await??
-                    .context("Connector credential is missing")?,
-            )
-        } else {
-            None
+        let handler = handler::Handler {
+            store: self.pool.store.clone(),
+            config: config.clone(),
+            fingerprint,
+            route: session.route.clone(),
+            forms: self.pool.forms.clone(),
+            revision: self.pool.revision.clone(),
+            catalog_failure: self.pool.catalog_failure.clone(),
+            refreshing: Arc::default(),
+            notifications: Arc::default(),
         };
         let stderr = StderrTail::default();
         let connect = async {
@@ -450,11 +519,21 @@ impl ConnectorBroker {
                         pid: transport.id(),
                         _temporary: prepared.temporary,
                     };
-                    let client =
-                        ().serve(transport)
-                            .await
-                            .context("Initialize sandboxed local MCP server")?;
+                    let client = handler
+                        .clone()
+                        .serve(transport)
+                        .await
+                        .context("Initialize sandboxed local MCP server")?;
                     Ok((client, Some(owned)))
+                }
+                "sse" => {
+                    let transport = legacy::connect(&config.endpoint, secret.as_deref()).await?;
+                    let client = handler
+                        .clone()
+                        .serve(transport)
+                        .await
+                        .context("Initialize legacy MCP server")?;
+                    Ok((client, None))
                 }
                 "http" | "streamable_http" => {
                     validate_endpoint(&config.endpoint)?;
@@ -471,7 +550,8 @@ impl ConnectorBroker {
                         .retry(reqwest::retry::never())
                         .redirect(reqwest::redirect::Policy::none())
                         .build()?;
-                    let client = ()
+                    let client = handler
+                        .clone()
                         .serve(StreamableHttpClientTransport::with_client(
                             BoundedHttpClient(http),
                             transport,
@@ -492,11 +572,19 @@ impl ConnectorBroker {
         };
         let (client, process) = match connected {
             Ok(connected) => connected,
-            Err(error) => return Err(stderr.annotate(error, secret.as_deref()).await),
+            Err(error) => {
+                let mut message = format!("{:#}", stderr.annotate(error, secret.as_deref()).await);
+                if let Some(scope) = local_scope {
+                    for value in scope.environment.values().filter(|value| !value.is_empty()) {
+                        message = message.replace(value, "[REDACTED]");
+                    }
+                }
+                return Err(anyhow!(message));
+            }
         };
         session.client = Some(client);
         session.process = process;
-        session.fingerprint = fingerprint;
+        session.fingerprint = live_fingerprint;
         session.touched = Instant::now();
         self.pool.start_reaper();
         Ok(())
@@ -530,6 +618,7 @@ impl ConnectorBroker {
         let mut session = tokio::select! {_ = cancel.cancelled()=>bail!("Connector discovery cancelled"),s=slot.lock()=>s};
         self.ensure_connected(&mut session, config, cancel, local_scope)
             .await?;
+        let generation = catalog_generation(&self.pool.store, config.id)?;
         let list = async {
             let client = session.client.as_ref().context("MCP client unavailable")?;
             let mut cursor = None;
@@ -570,13 +659,30 @@ impl ConnectorBroker {
                 return Err(error);
             }
         };
+        let has_prompts = session
+            .client
+            .as_ref()
+            .and_then(|client| client.peer_info())
+            .is_some_and(|info| info.capabilities.prompts.is_some());
         session.touched = Instant::now();
         drop(session);
         let store = self.pool.store.clone();
         let id = config.id;
         let json = serde_json::to_string(&result)?;
         let fingerprint = Self::fingerprint(config, local_scope)?;
-        tokio::task::spawn_blocking(move || save_catalog(&store, id, fingerprint, json)).await??;
+        tokio::task::spawn_blocking(move || {
+            save_catalog_generation(&store, id, fingerprint, json, generation)
+        })
+        .await??;
+        self.pool.revision.fetch_add(1, Ordering::AcqRel);
+        drop(_permit);
+        if has_prompts {
+            let mut broker = self.clone();
+            broker.local_scope = local_scope.cloned();
+            let _ = broker
+                .metadata(config, "prompts/list", serde_json::json!({}), cancel)
+                .await;
+        }
         Ok(result)
     }
     /// Records `tools` as `config`'s discovered catalog for this broker's
@@ -604,20 +710,36 @@ impl ConnectorBroker {
         config: &ConnectorConfig,
         scope: Option<&ConnectorLaunchScope>,
     ) -> Result<Vec<ToolDefinition>> {
-        use rusqlite::OptionalExtension;
+        Ok(self.catalog_snapshot_with_scope(config, scope)?.tools)
+    }
+    /// Atomically reads persisted definitions and the authority used to review them.
+    pub fn catalog_snapshot(&self, config: &ConnectorConfig) -> Result<ConnectorCatalogSnapshot> {
+        self.catalog_snapshot_with_scope(config, self.local_scope.as_ref())
+    }
+    fn catalog_snapshot_with_scope(
+        &self,
+        config: &ConnectorConfig,
+        scope: Option<&ConnectorLaunchScope>,
+    ) -> Result<ConnectorCatalogSnapshot> {
+        ensure!(
+            !self.pool.catalog_failure.load(Ordering::Acquire),
+            "MCP catalog persistence failed; restart after repairing storage"
+        );
         let id = config.id;
+        let trusted = config.trusted;
         let fingerprint = Self::fingerprint(config, scope)?;
         self.pool.store.call(move |conn| {
-            let json: Option<String> = conn
-                .query_row(
-                    "SELECT json FROM connector_tools WHERE id=?1 AND fingerprint=?2",
-                    rusqlite::params![id.to_string(), fingerprint],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            Ok(match json {
-                Some(json) => serde_json::from_str(&json)?,
-                None => Vec::new(),
+            // One statement means the schema and generation share one SQLite
+            // snapshot; never pair a newer generation with an older definition.
+            let (generation, unavailable, json): (i64, bool, Option<String>) = conn.query_row(
+                "SELECT COALESCE((SELECT generation FROM connector_catalog_state WHERE id=?1),0), EXISTS(SELECT 1 FROM connector_catalog_state WHERE id=?1 AND available=0), (SELECT json FROM connector_tools WHERE id=?1 AND fingerprint=?2)",
+                rusqlite::params![id.to_string(), fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            ensure!(!unavailable, "MCP tool catalog is unavailable after a change; rediscover tools before calling");
+            Ok(ConnectorCatalogSnapshot {
+                tools: json.map(|json| serde_json::from_str(&json)).transpose()?.unwrap_or_default(),
+                authority: ConnectorCatalogAuthority { id, generation, fingerprint, trusted },
             })
         })
     }
@@ -632,6 +754,27 @@ impl ConnectorBroker {
         arguments: Value,
         cancel: &CancellationToken,
     ) -> Result<Value> {
+        let snapshot = self.catalog_snapshot(config)?;
+        self.call_reviewed(config, name, arguments, cancel, &snapshot.authority)
+            .await
+    }
+    /// Uses the authority captured with the definitions used for classification.
+    /// Recheck after connection admission so replacement by any pool/process
+    /// requires new classification and approval before this call can dispatch.
+    pub async fn call_reviewed(
+        &self,
+        config: &ConnectorConfig,
+        name: &str,
+        arguments: Value,
+        cancel: &CancellationToken,
+        authority: &ConnectorCatalogAuthority,
+    ) -> Result<Value> {
+        ensure!(
+            authority.id == config.id
+                && authority.trusted == config.trusted
+                && authority.fingerprint == Self::fingerprint(config, self.local_scope.as_ref())?,
+            "MCP configuration or scope changed after review; review the call again"
+        );
         let args = arguments
             .as_object()
             .context("Tool arguments must be a JSON object")?
@@ -645,6 +788,15 @@ impl ConnectorBroker {
         let mut session = tokio::select! {_ = cancel.cancelled()=>bail!("Connector call cancelled"),s=slot.lock()=>s};
         self.ensure_connected(&mut session, config, cancel, self.local_scope.as_ref())
             .await?;
+        ensure!(
+            !self.pool.catalog_failure.load(Ordering::Acquire),
+            "MCP catalog persistence failed; restart after repairing storage"
+        );
+        ensure_catalog_available(&self.pool.store, config.id)?;
+        ensure!(
+            self.catalog_snapshot(config)?.authority == *authority,
+            "MCP catalog changed after review; discover and review the call again"
+        );
         let result = Self::call_tool(&session, name, args, cancel).await;
         let result = match result {
             Ok(result) => result,
@@ -747,14 +899,10 @@ impl ConnectorBroker {
 }
 
 /// Persists one connector's discovered catalog under its fingerprint.
+#[cfg(any(test, feature = "test-support"))]
 fn save_catalog(store: &Store, id: Uuid, fingerprint: String, json: String) -> Result<()> {
-    store.call(move |conn| {
-        conn.execute(
-            "INSERT INTO connector_tools(id,fingerprint,json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,json=excluded.json,updated_at=excluded.updated_at",
-            rusqlite::params![id.to_string(), fingerprint, json, xylo_core::now_ms()],
-        )?;
-        Ok(())
-    })
+    let generation = catalog_generation(store, id)?;
+    save_catalog_generation(store, id, fingerprint, json, generation)
 }
 
 /// MCP tool annotations are hints from the server. A tool counts as read-only
@@ -1161,3 +1309,17 @@ pub(crate) fn validate_endpoint(endpoint: &str) -> Result<url::Url> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod completeness_tests;
+
+#[cfg(test)]
+mod refresh_failure_tests;
+
+mod catalog;
+use catalog::{
+    catalog_generation, ensure_catalog_available, invalidate_catalog, save_catalog_generation,
+};
+
+#[cfg(test)]
+mod shared_authority_tests;

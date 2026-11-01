@@ -71,6 +71,9 @@ impl ToolExecutor for BrokerTools {
             .then(|| self.broker.refreshed_system_prompt())
             .flatten()
     }
+    fn take_instruction_notes(&self) -> Vec<String> {
+        self.broker.take_instruction_notes()
+    }
     fn schemas(&self) -> Vec<ToolSchema> {
         self.broker
             .initial_definitions()

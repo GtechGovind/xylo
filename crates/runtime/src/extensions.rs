@@ -142,7 +142,11 @@ pub async fn execute(
     tokio::task::spawn_blocking(move || {
         ensure!(!cancel.is_cancelled(), "Extension request cancelled");
         match name.as_str() {
-            "extension_snapshot" => {}
+            "extension_snapshot" => {
+                if let Some(workspace) = args["workspace"].as_str() {
+                    service.discover_workspace(std::path::Path::new(workspace))?;
+                }
+            }
             // Reads only the cached directory: cheap enough for every keystroke.
             "extension_directory" => {
                 let query = directory_query(&args)?;

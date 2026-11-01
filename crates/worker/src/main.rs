@@ -364,6 +364,15 @@ async fn main() -> Result<()> {
                 let reply = steering::answer(store.clone(), active.as_ref(), guidance).await;
                 send(&output, &sequence, request_id, Some(session), reply).await?;
             }
+            WorkerCommand::RespondMcpElicitation {
+                request_id: form,
+                action,
+                content,
+            } => {
+                if let Some(session) = &session {
+                    let _ = session.answer_mcp_form(form, action, content);
+                }
+            }
             WorkerCommand::Approve {
                 action_id,
                 allow,
