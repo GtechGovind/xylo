@@ -63,6 +63,9 @@ fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
         "file_write" | "file_edit" | "notebook_edit" | "write_file" | "edit_file" => {
             ("Edited", "file", "files")
         }
+        "shell_output" => ("Read", "job output", "job outputs"),
+        "shell_kill" => ("Stopped", "shell job", "shell jobs"),
+        "shell_jobs" => ("Listed", "shell job", "shell jobs"),
         "web_fetch" | "web_search" | "browser" => ("Fetched", "page", "pages"),
         "memory_search" | "memory_remember" => ("Used memory", "time", "times"),
         "extension_skill" => ("Used", "skill", "skills"),

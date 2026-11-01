@@ -28,6 +28,7 @@ mod permissions;
 mod portable;
 mod read_state;
 mod risk;
+pub mod shell_jobs;
 use crate::{prompts, provider_guard::EffectiveWindow};
 use anyhow::{Context, Result, bail, ensure};
 pub(crate) use code::shell_name;
@@ -205,6 +206,10 @@ impl ToolBroker {
         cancel: CancellationToken,
     ) -> Result<Self> {
         let artifacts = config.artifacts.clone();
+        if let Some(data) = artifacts.parent() {
+            session.shell_jobs.configure(request.session_id, data);
+        }
+        session.shell_jobs.turn_events(request.session_id, &events);
         let capabilities = CapabilityService::new(config.clone())?;
         let image_generation = image_generation::Configuration::load(&artifacts);
         let mut definitions = builtin::definitions();
@@ -342,6 +347,10 @@ impl ToolBroker {
     }
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    pub(crate) fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
+        self.session.shell_jobs.take_notes(self.request.session_id)
     }
 
     pub fn definitions(&self) -> &[ToolDefinition] {
@@ -632,8 +641,16 @@ impl ToolBroker {
             !(name.starts_with("plugin_") && arguments.get("capabilities").is_some()),
             "Plugins run only with the grants reviewed in Settings; remove `capabilities`"
         );
+        let shell_context = matches!(name, "shell_command" | "run_command")
+            .then(|| shell_jobs::prepare(self, &arguments))
+            .transpose()?;
         let reach = if self.custom_tools.iter().any(|tool| tool.name == name) {
             Reach::Outside(std::path::PathBuf::from("SDK client"))
+        } else if let Some(path) = shell_context
+            .as_ref()
+            .and_then(|context| context.outside.as_ref())
+        {
+            Reach::Outside(path.clone())
         } else {
             self.reach(name, &arguments)
         };
@@ -655,6 +672,7 @@ impl ToolBroker {
             origin,
             reach: &reach,
             workspace: &self.request.workspace,
+            cwd: shell_context.as_ref().map(|context| context.cwd.as_path()),
             network,
             untrusted_input: exposure.is_some_and(MemoryOrigin::untrusted),
         };
@@ -686,7 +704,6 @@ impl ToolBroker {
         }
         let access = builtin::Access {
             outside: matches!(reach, Reach::Outside(_)),
-            sandboxed: mode.sandboxed(),
             network: network.is_some(),
         };
         let component_snapshot = if name == "extension_component" && definition.writes {
@@ -715,13 +732,19 @@ impl ToolBroker {
         } else {
             None
         };
-        let presentation = self.presentation(
+        let mut presentation = self.presentation(
             name,
             &arguments,
             access,
             skill_snapshot.as_ref(),
             component_snapshot.as_ref(),
         )?;
+        if let Some(context) = &shell_context {
+            presentation["cwd"] = json!(context.cwd);
+            if let Some(scope) = &context.outside {
+                presentation["outside_scope"] = json!(scope);
+            }
+        }
         let id = Uuid::new_v4();
         // Native clients can close inherited descriptors and outlive a crashed
         // worker. Only proven in-process writes qualify for generic review.
@@ -864,7 +887,13 @@ impl ToolBroker {
             } else if let Some(memory_origin) = memory_origin {
                 builtin::remember(self, &arguments, memory_origin)?
             } else if builtin::handles(name) {
-                builtin::execute(self, name, &arguments, access)?
+                match name {
+                    "shell_command" | "run_command" | "shell_output" | "shell_kill"
+                    | "shell_jobs" => {
+                        shell_jobs::execute(self, name, &arguments, access, shell_context)?
+                    }
+                    _ => builtin::execute(self, name, &arguments, access)?,
+                }
             } else {
                 let operation = async {
                     let _reservation = if let Some(demand) = xylo_resources::capability_demand(name)
@@ -2095,6 +2124,11 @@ const FETCHING_GIT: &[&str] = &["fetch", "pull", "clone", "ls-remote", "submodul
 /// is lexical and conservative; anything it cannot read counts as leaving
 /// the project.
 fn command_stays_in_project(name: &str, arguments: &Value, workspace: &std::path::Path) -> bool {
+    // Directory overrides can grant outside access. Keep their output untrusted
+    // in the durable journal, including later calls inheriting that directory.
+    if arguments.get("cwd").is_some() {
+        return false;
+    }
     let words: Vec<String> = if name == "shell_command" {
         let Some(command) = arguments.get("command").and_then(Value::as_str) else {
             return false;

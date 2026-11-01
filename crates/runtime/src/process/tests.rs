@@ -150,3 +150,157 @@ async fn cancellation_terminates_child() {
     .await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn guarded_sandbox_kills_descendants_when_its_owner_pipe_closes() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let prepared = xylo_services::sandbox::prepare_coding(
+        "/bin/sh",
+        &["-c".into(), "echo ready; sleep 300".into()],
+        dir.path(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    let xylo_services::sandbox::PreparedSandbox {
+        mut command,
+        temporary,
+        ..
+    } = prepared;
+    command
+        .env("XYLO_SANDBOX_PARENT_GUARD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn().unwrap();
+    let owner = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(20), output.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(line.trim(), "ready");
+    drop(owner);
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!status.success());
+    let mut remaining = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), output.read_to_end(&mut remaining))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(temporary);
+}
+
+#[tokio::test]
+async fn managed_sandbox_approved_cwd_only_grants_the_explicit_scope() {
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sibling = tempfile::tempdir().unwrap();
+    let cwd = outside.path().canonicalize().unwrap();
+    let mut prepared = xylo_services::sandbox::prepare_coding_with_scope(
+        "/bin/sh",
+        &[
+            "-c".into(),
+            format!(
+                "printf approved > permitted; printf denied > '{}'",
+                sibling.path().join("denied").display()
+            ),
+        ],
+        project.path(),
+        Some(&cwd),
+        &[],
+        xylo_services::sandbox::Network::None,
+    )
+    .unwrap();
+    prepared.command.env("XYLO_SANDBOX_CWD", &cwd);
+    let result = run_prepared_observed(
+        prepared.command,
+        &cwd,
+        Some(Duration::from_secs(20)),
+        CancellationToken::new(),
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("permitted")).unwrap_or_default(),
+        "approved",
+        "{}",
+        result.stderr
+    );
+    assert!(!sibling.path().join("denied").exists());
+    assert_ne!(result.code, Some(0));
+    assert!(xylo_services::sandbox::read_start_status(&prepared.status_file).is_none());
+}
+
+#[tokio::test]
+async fn managed_sandbox_refuses_an_outside_cwd_without_a_scope() {
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let cwd = outside.path().canonicalize().unwrap();
+    let mut prepared = xylo_services::sandbox::prepare_coding(
+        "/bin/sh",
+        &["-c".into(), "touch forbidden".into()],
+        project.path(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    prepared.command.env("XYLO_SANDBOX_CWD", &cwd);
+    let _ = run_prepared_observed(
+        prepared.command,
+        &cwd,
+        Some(Duration::from_secs(20)),
+        CancellationToken::new(),
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(!cwd.join("forbidden").exists());
+    assert!(xylo_services::sandbox::read_start_status(&prepared.status_file).is_some());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_sandbox_refuses_a_replaced_approved_cwd() {
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let replaced = outside.path().join("reviewed");
+    std::fs::create_dir(&replaced).unwrap();
+    let cwd = replaced.canonicalize().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut prepared = xylo_services::sandbox::prepare_coding(
+        "/bin/sh",
+        &["-c".into(), "touch forbidden".into()],
+        project.path(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    prepared
+        .command
+        .env("XYLO_SANDBOX_CWD", &cwd)
+        .env("XYLO_SANDBOX_WRITE_ROOT", &cwd);
+    std::fs::remove_dir(&cwd).unwrap();
+    std::os::unix::fs::symlink(other.path(), &cwd).unwrap();
+    let _ = run_prepared_observed(
+        prepared.command,
+        &cwd,
+        Some(Duration::from_secs(20)),
+        CancellationToken::new(),
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(!other.path().join("forbidden").exists());
+    assert!(xylo_services::sandbox::read_start_status(&prepared.status_file).is_some());
+}

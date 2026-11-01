@@ -313,7 +313,9 @@ impl Xylo {
         cx: &mut Context<Self>,
     ) {
         self.log(match &event {
-            EngineEvent::Delta { .. } | EngineEvent::ThinkingDelta { .. } => String::new(),
+            EngineEvent::Delta { .. }
+            | EngineEvent::ThinkingDelta { .. }
+            | EngineEvent::ShellJobUpdated { .. } => String::new(),
             EngineEvent::CustomToolRequested {
                 name, action_id, ..
             } => format!("Custom tool requested: {name} ({action_id})"),

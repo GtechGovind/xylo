@@ -327,6 +327,10 @@ impl AgentLoop {
                 return Err(ModelError::Interrupted.into());
             }
             self.apply_guidance(messages).await?;
+            for (kind, text) in self.tools.take_notes() {
+                messages.push(application_note(&text));
+                self.show_note(kind, text).await?;
+            }
             if let Some((cell, _)) = &self.permissions {
                 let mode = cell.get();
                 if announced != Some(mode) {

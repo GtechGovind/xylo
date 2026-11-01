@@ -17,6 +17,7 @@ fn decide(mode: PermissionMode, name: &str, arguments: Value, writes: bool) -> V
             origin: Origin::Model,
             reach: &Reach::Project,
             workspace: &workspace,
+            cwd: None,
             network: arguments
                 .get("network")
                 .and_then(Value::as_bool)
@@ -367,6 +368,7 @@ async fn approve_for_me_reads_outside_unasked_unless_risky_and_always_asks_to_wr
                 origin: Origin::Model,
                 reach: &Reach::Outside(std::path::PathBuf::from(path)),
                 workspace: &workspace,
+                cwd: None,
                 network: None,
                 untrusted_input: false,
             },
@@ -407,6 +409,7 @@ async fn approve_for_me_reads_outside_unasked_unless_risky_and_always_asks_to_wr
             origin: Origin::Model,
             reach: &Reach::Outside(outside.path().join("notes.txt")),
             workspace: &workspace,
+            cwd: None,
             network: None,
             untrusted_input: false,
         },

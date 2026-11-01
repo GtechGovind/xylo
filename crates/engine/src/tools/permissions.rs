@@ -19,7 +19,7 @@
 //!   project, every connector call, the desktop, network access and every
 //!   writing tool except the [`PROJECT_WRITES`] (file edits, memory and skill
 //!   proposals). Risky in-process edits therefore ask in both presets.
-//! - **Full access** asks for nothing; commands run without the sandbox.
+//! - **Full access** asks for nothing; coding commands retain their sandbox.
 //! - **Read only** refuses every write (network access included) and treats
 //!   reads like "Ask for approval".
 //!
@@ -102,6 +102,7 @@ pub struct ToolSession {
     connectors: Arc<OnceLock<ConnectorBroker>>,
     pub(crate) reads: Arc<super::read_state::ReadState>,
     pub(crate) lsp: Arc<OnceLock<xylo_runtime::lsp::AgentService>>,
+    pub(super) shell_jobs: super::shell_jobs::ShellJobs,
 }
 
 impl ToolSession {
@@ -115,7 +116,18 @@ impl ToolSession {
             connectors: Arc::default(),
             reads: Arc::default(),
             lsp: Arc::default(),
+            shell_jobs: super::shell_jobs::ShellJobs::default(),
         }
+    }
+
+    /// Delivers shell updates beyond a single model turn.
+    pub fn set_job_events(&self, events: super::shell_jobs::JobEvents) {
+        self.shell_jobs.set_events(events);
+    }
+
+    /// Stops a job only when it belongs to this conversation.
+    pub fn kill_job(&self, session: Uuid, job: Uuid) -> Result<()> {
+        self.shell_jobs.kill(session, job)
     }
 
     /// Where approval decisions are delivered.
@@ -146,6 +158,7 @@ impl ToolSession {
         if let Some(lsp) = self.lsp.get() {
             lsp.shutdown().await;
         }
+        self.shell_jobs.shutdown().await;
         if let Some(connectors) = self.connectors.get() {
             connectors.shutdown().await;
         }
@@ -238,7 +251,10 @@ pub(crate) struct Call<'a> {
     pub(crate) writes: bool,
     pub(crate) origin: Origin,
     pub(crate) reach: &'a Reach,
+    /// The project boundary, independent of a command's working directory.
     pub(crate) workspace: &'a Path,
+    /// The immutable command directory captured before approval and hooks.
+    pub(crate) cwd: Option<&'a Path>,
     /// The justification of a command that asked for internet access.
     pub(crate) network: Option<&'a str>,
     /// The conversation has read content from outside the project. Only
@@ -274,6 +290,23 @@ pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
         };
     }
 
+    if SANDBOXED_COMMANDS.contains(&call.name)
+        && let Reach::Outside(path) = call.reach
+    {
+        return match mode {
+            PermissionMode::ReadOnly => Verdict::Refuse(
+                "Outside shell commands require write permission; this task is read-only".into(),
+            ),
+            PermissionMode::FullAccess => Verdict::Allow,
+            _ => Verdict::Ask(format!(
+                "Run in the sandbox with read and write access to {}{}",
+                path.display(),
+                call.network
+                    .map(|why| format!("; network access: {why}"))
+                    .unwrap_or_default()
+            )),
+        };
+    }
     if call.origin == Origin::Hook {
         return Verdict::Allow;
     }
@@ -333,7 +366,11 @@ fn approve_for_me(call: &Call) -> Verdict {
             );
         }
     }
-    match risk::assess(call.name, call.arguments, call.workspace) {
+    match risk::assess(
+        call.name,
+        call.arguments,
+        call.cwd.unwrap_or(call.workspace),
+    ) {
         Some(reason) => Verdict::Ask(reason),
         None => Verdict::Allow,
     }
@@ -352,17 +389,36 @@ fn network(mode: PermissionMode, call: &Call, justification: &str) -> Verdict {
             "{} requires write permission; this task is read-only",
             call.name
         )),
+        PermissionMode::AskForApproval | PermissionMode::ApproveForMe
+            if call
+                .arguments
+                .get("allow_local_binding")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            Verdict::Ask(format!(
+                "Local listening and localhost access: {justification}"
+            ))
+        }
         PermissionMode::AskForApproval => Verdict::Ask(format!("Network access: {justification}")),
         PermissionMode::ApproveForMe => {
-            match risk::routine_fetch(call.name, call.arguments, call.workspace) {
+            match risk::routine_fetch(
+                call.name,
+                call.arguments,
+                call.cwd.unwrap_or(call.workspace),
+            ) {
                 Fetch::Routine => Verdict::Allow,
                 Fetch::Configured(reason) => Verdict::Ask(reason),
                 // Anything beyond a plain download may run project or
                 // dependency code (build scripts, tests, install hooks)
                 // with the internet open.
                 Fetch::Other => Verdict::Ask(
-                    risk::assess(call.name, call.arguments, call.workspace)
-                        .unwrap_or_else(|| format!("Network access: {justification}")),
+                    risk::assess(
+                        call.name,
+                        call.arguments,
+                        call.cwd.unwrap_or(call.workspace),
+                    )
+                    .unwrap_or_else(|| format!("Network access: {justification}")),
                 ),
             }
         }
@@ -378,6 +434,7 @@ const SANDBOXED_COMMANDS: &[&str] = &["run_command", "shell_command"];
 /// assessment flags them, as "Approve for me" does: no sandbox sees them, so
 /// an edit to `.envrc`, a CI workflow or `.cargo/config.toml` asks.
 const PROJECT_WRITES: &[&str] = &[
+    "shell_kill",
     "file_write",
     "file_edit",
     "notebook_edit",
@@ -440,6 +497,28 @@ const RULE_LABEL_CHARS: usize = 160;
 /// The "always allow" rule for `call`, if one may cover it. A memory write
 /// after untrusted input has none: each one is reviewed.
 pub(crate) fn approval_rule_for(call: &Call) -> Option<(String, String)> {
+    if SANDBOXED_COMMANDS.contains(&call.name)
+        && (matches!(call.reach, Reach::Outside(_))
+            || (call.network.is_some()
+                && matches!(
+                    risk::routine_fetch(
+                        call.name,
+                        call.arguments,
+                        call.cwd.unwrap_or(call.workspace)
+                    ),
+                    Fetch::Configured(_)
+                )))
+    {
+        return None;
+    }
+    if call
+        .arguments
+        .get("allow_local_binding")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return None;
+    }
     if call.name == "memory_remember" && call.untrusted_input {
         return None;
     }

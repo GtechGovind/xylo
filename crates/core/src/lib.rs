@@ -547,6 +547,10 @@ pub enum WorkerCommand {
         key: WorkerCredential,
     },
     Shutdown,
+    /// Stops one shell job owned by this conversation.
+    KillJob {
+        job_id: Uuid,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -677,6 +681,10 @@ pub enum NoteKind {
     StepBudget,
     /// The turn continued on its configured alternative model.
     Fallback,
+    /// A background shell job finished.
+    ShellJob,
+    /// A shell working directory was reset to its project.
+    WorkingDirectory,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -775,6 +783,25 @@ pub enum EngineEvent {
         name: String,
         arguments: Value,
     },
+    /// An update from a shell job, including after the turn has ended.
+    ShellJobUpdated {
+        job: ShellJob,
+    },
+}
+
+/// Live state of a conversation-owned shell job. The output is a bounded tail;
+/// the complete log is kept on disk at `log_path`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShellJob {
+    pub id: Uuid,
+    pub turn_id: Uuid,
+    pub command: String,
+    pub cwd: PathBuf,
+    pub log_path: PathBuf,
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    pub output: String,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -822,6 +849,7 @@ pub enum MessageStatus {
 }
 
 /// Stable keyset pagination in most-recently-updated order; IDs break timestamp ties.
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConversationCursor {
     pub updated_at: i64,
