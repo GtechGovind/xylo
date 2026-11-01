@@ -833,7 +833,10 @@ impl ContextBudget {
                     ));
                 }
             }
-            let replacement = Message::assistant(notes);
+            // Observations remain input after their call/result envelopes are
+            // removed. An assistant replacement at the end of the request is
+            // a prefill, which Anthropic rejects (including its final newline).
+            let replacement = Message::user(notes);
             let replacement_cost = self.message_cost(&replacement);
             if replacement_cost < costs[index..end].iter().sum::<usize>() {
                 view.splice(index..end, [replacement]);

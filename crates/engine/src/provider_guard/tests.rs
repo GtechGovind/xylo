@@ -225,6 +225,29 @@ fn completed_rounds_with_large_arguments_fit_without_changing_durable_history() 
 }
 
 #[test]
+fn condensing_the_final_tool_round_keeps_its_observations_as_input() {
+    let budget = ContextBudget::new(&config(2));
+    let messages = vec![
+        Message::user("Read the project and continue working"),
+        Message::assistant_with_tool_calls(
+            "Reading the project.",
+            vec![ToolCall::new("read", "file_read", noise(6000))],
+        ),
+        Message::tool_result("read", "Observed project contents\n"),
+    ];
+    let (view, costs) = budget.fit(messages.clone(), &[], 512).unwrap();
+    assert_eq!(view.len(), 2, "the completed round must be condensed");
+    assert_eq!(view[0], messages[0]);
+    let observation = &view[1];
+    assert_eq!(observation.role, Role::User);
+    assert!(observation.content.contains("Observed project contents"));
+    assert!(observation.tool_calls.is_empty());
+    assert!(observation.tool_call_id.is_none());
+    assert_eq!(costs, budget.costs(&view));
+    assert_eq!(messages[2].content, "Observed project contents\n");
+}
+
+#[test]
 fn unfinished_tool_round_is_never_discarded_to_fit() {
     let budget = ContextBudget::new(&config(2));
     let call = Message::assistant_with_tool_calls(
