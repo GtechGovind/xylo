@@ -171,8 +171,7 @@ fn tool_risk(name: &str) -> Option<&'static str> {
 /// Whether a command that asked for internet access only downloads
 /// dependencies or repository history with a well-known tool. Every simple
 /// command of a shell line must qualify or be a harmless local step; changing
-/// directory is not one, since a fetch must read the project root's own
-/// configuration.
+/// directory is not one: configuration is reviewed for the captured cwd.
 pub(crate) fn routine_fetch(name: &str, arguments: &Value, workspace: &Path) -> Fetch {
     let Some(commands) = fetch_commands(name, arguments) else {
         return Fetch::Other;
@@ -239,9 +238,10 @@ fn fetch_commands(name: &str, arguments: &Value) -> Option<Vec<Vec<String>>> {
 
 /// Project files each fetch tool reads that can run code or redirect where
 /// it downloads from: cargo credential providers and source replacement,
-/// npm's `git` and registry settings, yarn and pnpm hooks. Fetches run at
-/// the project root (no `cd`, `--prefix` or `-C` qualifies), so the root is
-/// the only project directory these tools consult.
+/// npm's `git` and registry settings, yarn and pnpm hooks. Ancestors are
+/// checked too: these tools discover project/workspace configuration above
+/// their working directory. Conservatively reviewing extra ancestor files
+/// avoids interpreting package-manager-specific workspace boundaries.
 const FETCH_CONFIGURATION: &[(&str, &[&str])] = &[
     ("cargo", &[".cargo/config", ".cargo/config.toml"]),
     (
@@ -277,9 +277,12 @@ const GIT_RISKY_SETTINGS: &[&str] = &[
 /// routine, if it does.
 fn project_configuration(program: &str, workspace: &Path) -> Option<String> {
     match program {
-        "git" => git_configuration(workspace),
+        "git" => git_configuration(repository_directory(workspace).unwrap_or(workspace)),
         "go" => {
-            let work = std::fs::read_to_string(workspace.join("go.work")).ok()?;
+            let directory = workspace
+                .ancestors()
+                .find(|directory| directory.join("go.work").exists())?;
+            let work = std::fs::read_to_string(directory.join("go.work")).ok()?;
             work.lines()
                 .any(|line| line.trim_start().starts_with("replace"))
                 .then(|| "go.work replaces modules, so the download is redirected".into())
@@ -289,7 +292,11 @@ fn project_configuration(program: &str, workspace: &Path) -> Option<String> {
             .find(|(tool, _)| *tool == program)?
             .1
             .iter()
-            .find(|file| workspace.join(file).exists())
+            .find(|file| {
+                workspace
+                    .ancestors()
+                    .any(|directory| directory.join(file).exists())
+            })
             .map(|file| {
                 format!("{file} can run code or redirect downloads for {program}; review it first")
             }),
@@ -492,6 +499,12 @@ const GIT_FETCH: Options = Options {
     ],
 };
 
+/// Finds the closest repository Git discovers from a command directory.
+fn repository_directory(cwd: &Path) -> Option<&Path> {
+    cwd.ancestors()
+        .find(|directory| directory.join(".git").exists())
+}
+
 /// Whether one simple command only downloads, without running project or
 /// dependency code or any program the command names: build scripts, tests,
 /// install scripts, source builds and plugins all ask even when they would
@@ -523,12 +536,14 @@ fn fetches(words: &[String], workspace: &Path) -> bool {
         // select another configuration or program, so none qualify.
         "git" => {
             matches!(first, Some("fetch" | "pull" | "clone"))
-                && workspace.join(".git").exists()
+                && repository_directory(workspace).is_some()
                 && after(1).is_some_and(|words| match words.split_first() {
                     // The rest are refspecs or the clone's directory.
                     Some((repository, rest)) => {
-                        remote(repository, workspace)
-                            && rest.iter().all(|word| !word.contains("::"))
+                        remote(
+                            repository,
+                            repository_directory(workspace).unwrap_or(workspace),
+                        ) && rest.iter().all(|word| !word.contains("::"))
                     }
                     None => true,
                 })

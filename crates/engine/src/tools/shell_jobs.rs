@@ -151,6 +151,7 @@ struct Job {
     session: Uuid,
     background: bool,
     state: Mutex<JobState>,
+    publication: Mutex<()>,
     cancel: CancellationToken,
     changed: Notify,
     finished: AtomicBool,
@@ -159,6 +160,7 @@ struct Job {
 struct State {
     jobs: VecDeque<Arc<Job>>,
     cwd: HashMap<Uuid, PathBuf>,
+    outside: HashMap<(Uuid, PathBuf), Vec<PathBuf>>,
     notes: HashMap<Uuid, Vec<(NoteKind, String)>>,
     data: HashMap<Uuid, PathBuf>,
     fallback_events: HashMap<Uuid, tokio::sync::mpsc::WeakSender<EngineEvent>>,
@@ -205,8 +207,6 @@ impl ShellJobs {
         let mut state = self.state.lock();
         let notes = state.notes.entry(session).or_default();
         notes.push((kind, text));
-        let excess = notes.len().saturating_sub(RETAINED_JOBS);
-        notes.drain(..excess);
         if Self::save_notes(&state, session).is_err() {
             tracing::warn!("Could not persist shell completion notes");
         }
@@ -232,6 +232,8 @@ impl ShellJobs {
         if !job.background {
             return;
         }
+        // Snapshot creation and delivery are one ordered operation per job.
+        let _publication = job.publication.lock();
         let snapshot = {
             let state = job.state.lock();
             let mut snapshot = state.snapshot.clone();
@@ -263,10 +265,24 @@ impl ShellJobs {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<PathBuf>(&bytes).ok())
         });
+        let outside = self
+            .state
+            .lock()
+            .outside
+            .get(&(session, root.clone()))
+            .cloned()
+            .unwrap_or_default();
         let valid = stored
             .as_ref()
             .and_then(|path| path.canonicalize().ok())
-            .filter(|path| path.is_dir() && path.starts_with(&root));
+            .filter(|path| {
+                path.is_dir()
+                    && (path.starts_with(&root)
+                        || outside.iter().any(|scope| {
+                            path.starts_with(scope)
+                                && scope.canonicalize().is_ok_and(|actual| actual == *scope)
+                        }))
+            });
         if stored.is_some() && valid.is_none() {
             self.note(session, NoteKind::WorkingDirectory, "The shell working directory is no longer inside the approved workspace. It was reset to the project root.".into());
         }
@@ -275,11 +291,32 @@ impl ShellJobs {
         Ok(cwd)
     }
 
+    #[cfg(test)]
     fn update_cwd(&self, session: Uuid, root: &Path, data: &Path, requested: &Path) -> Result<()> {
+        self.update_scoped_cwd(session, root, data, requested, None)
+    }
+
+    fn update_scoped_cwd(
+        &self,
+        session: Uuid,
+        root: &Path,
+        data: &Path,
+        requested: &Path,
+        outside: Option<&Path>,
+    ) -> Result<()> {
         let root = root.canonicalize()?;
         self.configure(session, data);
         let cwd = match requested.canonicalize() {
-            Ok(path) if path.is_dir() && path.starts_with(&root) => path,
+            Ok(path)
+                if path.is_dir()
+                    && (path.starts_with(&root)
+                        || outside.is_some_and(|scope| {
+                            path.starts_with(scope)
+                                && scope.canonicalize().is_ok_and(|actual| actual == scope)
+                        })) =>
+            {
+                path
+            }
             _ => {
                 self.note(session, NoteKind::WorkingDirectory,
                     "The shell left the approved workspace. Its working directory was reset to the project root.".into());
@@ -383,6 +420,7 @@ impl ShellJobs {
         result: &Result<xylo_runtime::process::ProcessResult>,
         root: &Path,
         data: &Path,
+        outside: Option<&Path>,
     ) {
         let cwd = {
             let mut state = job.state.lock();
@@ -406,7 +444,7 @@ impl ShellJobs {
             cwd
         };
         if let Some(cwd) = cwd
-            && let Err(error) = self.update_cwd(job.session, root, data, &cwd)
+            && let Err(error) = self.update_scoped_cwd(job.session, root, data, &cwd, outside)
         {
             job.state.lock().snapshot.error =
                 Some(format!("Saving working directory failed: {error}"));
@@ -429,11 +467,65 @@ impl ShellJobs {
     }
 }
 
+/// One directory and filesystem scope reviewed before hooks or approval waits.
+pub(super) struct ExecutionContext {
+    pub(super) root: PathBuf,
+    pub(super) cwd: PathBuf,
+    pub(super) outside: Option<PathBuf>,
+}
+
+pub(super) fn prepare(broker: &ToolBroker, args: &Value) -> Result<ExecutionContext> {
+    let root = broker.request.workspace.canonicalize()?;
+    let jobs = &broker.session.shell_jobs;
+    let session = broker.request.session_id;
+    let current = jobs.cwd(
+        session,
+        &root,
+        broker
+            .artifacts
+            .parent()
+            .context("Application data directory missing")?,
+    )?;
+    let cwd = match args.get("cwd") {
+        Some(Value::String(path)) => current
+            .join(path)
+            .canonicalize()
+            .context("Requested working directory unavailable")?,
+        Some(_) => anyhow::bail!("cwd must be a directory path"),
+        None => current,
+    };
+    ensure!(cwd.is_dir(), "cwd must be a directory");
+    let outside = if cwd.starts_with(&root) {
+        None
+    } else {
+        // A fresh explicit request grants only that directory. An inherited
+        // cwd retains its previously reviewed scope, never a shell-text path.
+        let scope = if args.get("cwd").is_some() {
+            None
+        } else {
+            jobs.state
+                .lock()
+                .outside
+                .get(&(session, root.clone()))
+                .and_then(|scopes| {
+                    scopes
+                        .iter()
+                        .filter(|scope| cwd.starts_with(scope))
+                        .max_by_key(|scope| scope.components().count())
+                        .cloned()
+                })
+        };
+        Some(scope.unwrap_or_else(|| cwd.clone()))
+    };
+    Ok(ExecutionContext { root, cwd, outside })
+}
+
 pub(super) fn execute(
     broker: &ToolBroker,
     name: &str,
     args: &Value,
     access: builtin::Access,
+    context: Option<ExecutionContext>,
 ) -> Result<Value> {
     let jobs = &broker.session.shell_jobs;
     let session = broker.request.session_id;
@@ -484,26 +576,56 @@ pub(super) fn execute(
             json!({"job_id":id,"output":output,"running":state.snapshot.running,"exit_code":state.snapshot.exit_code,
                 "error":state.snapshot.error,"output_truncated":truncated,"log_path":state.snapshot.log_path})
         }
-        "shell_command" | "run_command" => return start(broker, name, args, access),
+        "shell_command" | "run_command" => {
+            return start(
+                broker,
+                name,
+                args,
+                access,
+                context.context("Reviewed shell directory missing")?,
+            );
+        }
         _ => anyhow::bail!("Unknown shell job tool"),
     };
     Ok(json!({"status":"success","summary":value,"next_actions":[],"artifacts":[]}))
 }
 
-fn start(broker: &ToolBroker, name: &str, args: &Value, access: builtin::Access) -> Result<Value> {
+fn start(
+    broker: &ToolBroker,
+    name: &str,
+    args: &Value,
+    access: builtin::Access,
+    context: ExecutionContext,
+) -> Result<Value> {
     ensure!(
         !cfg!(windows),
         "Commands are not supported on Windows yet; nothing was run"
     );
     let jobs = broker.session.shell_jobs.clone();
     let session = broker.request.session_id;
-    let root = broker.request.workspace.clone();
+    let ExecutionContext { root, cwd, outside } = context;
+    if !cwd.canonicalize().is_ok_and(|actual| actual == cwd) {
+        return Err(code::unapplied(
+            "Reviewed shell directory changed; request approval again",
+        ));
+    }
+    if let Some(scope) = &outside {
+        if !access.outside || !scope.canonicalize().is_ok_and(|actual| actual == *scope) {
+            return Err(code::unapplied(
+                "Outside working directory was not approved or changed",
+            ));
+        }
+        let mut state = jobs.state.lock();
+        let scopes = state.outside.entry((session, root.clone())).or_default();
+        if !scopes.contains(scope) {
+            scopes.push(scope.clone());
+        }
+    }
     let data = broker
         .artifacts
         .parent()
         .context("Application data directory missing")?
         .to_path_buf();
-    let cwd = jobs.cwd(session, &root, &data)?;
     let background = args
         .get("run_in_background")
         .and_then(Value::as_bool)
@@ -543,11 +665,11 @@ fn start(broker: &ToolBroker, name: &str, args: &Value, access: builtin::Access)
     } else {
         Network::None
     };
-    let mut prepared = sandbox::prepare_coding_with_network(
+    let mut prepared = sandbox::prepare_coding_with_scope(
         &program.to_string_lossy(),
         &argv,
         &root,
-        &[],
+        outside.as_deref(),
         std::slice::from_ref(&data),
         network,
     )
@@ -585,6 +707,7 @@ fn start(broker: &ToolBroker, name: &str, args: &Value, access: builtin::Access)
         },
         changed: Notify::new(),
         finished: AtomicBool::new(false),
+        publication: Mutex::new(()),
         state: Mutex::new(JobState {
             snapshot: ShellJob {
                 id,
@@ -665,7 +788,7 @@ fn start(broker: &ToolBroker, name: &str, args: &Value, access: builtin::Access)
             task_job.state.lock().network_hint = Some(hint.clone());
             task_jobs.append(&task_job, false, format!("\n{hint}\n").as_bytes());
         }
-        task_jobs.finish(&task_job, &result, &root, &data);
+        task_jobs.finish(&task_job, &result, &root, &data, outside.as_deref());
         drop(temporary);
         result
     };

@@ -110,8 +110,16 @@ try {
   if (!statusFile) throw new Error('Missing status file');
   const control = dirname(statusFile);
   const workspace = realpathSync(spec.workspace);
-  const cwd = guardParent && process.env.XYLO_SANDBOX_CWD ? realpathSync(process.env.XYLO_SANDBOX_CWD) : workspace;
-  if (cwd !== workspace && !cwd.startsWith(workspace + sep)) throw new Error('Shell working directory is outside the workspace');
+  // Only the trusted coding launcher may grant one explicitly reviewed root.
+  // Canonical identity must still match when the helper starts after approval.
+  const requestedCwd = guardParent ? process.env.XYLO_SANDBOX_CWD : undefined;
+  const cwd = requestedCwd ? realpathSync(requestedCwd) : workspace;
+  if (requestedCwd && cwd !== requestedCwd) throw new Error('Reviewed shell working directory changed');
+  const requestedWriteRoot = guardParent ? process.env.XYLO_SANDBOX_WRITE_ROOT : undefined;
+  const writeRoot = requestedWriteRoot ? realpathSync(requestedWriteRoot) : undefined;
+  if (writeRoot && writeRoot !== requestedWriteRoot) throw new Error('Approved outside directory changed');
+  const writable = [workspace, ...(writeRoot ? [writeRoot] : [])];
+  if (!writable.some(root => cwd === root || cwd.startsWith(root.endsWith(sep) ? root : root + sep))) throw new Error('Shell working directory is outside the approved scope');
   if (typeof spec.program !== 'string' || !spec.program) throw new Error('Invalid program');
   if (!Array.isArray(spec.args) || !spec.args.every(a => typeof a === 'string')) throw new Error('Invalid argument array');
   const allowed = [...(spec.read_roots ?? []), ...(spec.toolchain_read_roots ?? [])].map(p => realpathSync(p));
@@ -124,9 +132,9 @@ try {
     network: { allowedDomains: spec.allowed_domains ?? [], deniedDomains: [], allowLocalBinding: guardParent && process.env.XYLO_SANDBOX_LOCAL_BINDING === '1' },
     filesystem: {
       denyRead: [homedir(), control, ...(spec.protected_paths ?? [])],
-      allowRead: [workspace, ...allowed, helperDirectory, process.execPath],
-      allowWrite: [workspace, spec.temporary],
-      denyWrite: [join(workspace, '.git'), join(workspace, '.agents'), join(workspace, '.claude'), join(workspace, '.codex'), control, ...allowed, ...(spec.protected_paths ?? []), ...(spec.trusted_paths ?? [])],
+      allowRead: [...writable, ...allowed, helperDirectory, process.execPath],
+      allowWrite: [...writable, spec.temporary],
+      denyWrite: [...writable.flatMap(root => ['.git', '.agents', '.claude', '.codex'].map(name => join(root, name))), control, ...allowed, ...(spec.protected_paths ?? []), ...(spec.trusted_paths ?? [])],
     },
   }, networkDecision(network === 'unrestricted'));
   const wrapped = await manager.wrapWithSandbox([process.execPath, childEntry, spec.program, ...spec.args].map(quote).join(' '));

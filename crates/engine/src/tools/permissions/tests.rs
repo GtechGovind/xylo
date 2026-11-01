@@ -87,6 +87,7 @@ fn verdict(
             origin: Origin::Model,
             reach: &reach,
             workspace: &workspace,
+            cwd: None,
             network: None,
             untrusted_input: false,
         },
@@ -309,6 +310,7 @@ fn enabled_hooks_run_in_every_mode() {
                 origin: Origin::Hook,
                 reach: &Reach::Project,
                 workspace: &workspace,
+                cwd: None,
                 network: None,
                 untrusted_input: false,
             },
@@ -336,6 +338,7 @@ fn network_verdict(mode: PermissionMode, name: &str, arguments: Value) -> Verdic
             origin: Origin::Model,
             reach: &Reach::Project,
             workspace,
+            cwd: None,
             network: Some("Install the project's dependencies"),
             untrusted_input: false,
         },
@@ -418,6 +421,7 @@ fn project_verdict(mode: PermissionMode, name: &str, arguments: Value, writes: b
             origin: Origin::Model,
             reach: &Reach::Project,
             workspace: workspace.path(),
+            cwd: None,
             network: None,
             untrusted_input: false,
         },
@@ -575,6 +579,7 @@ fn approve_for_me_asks_for_git_fetches_that_can_run_programs() {
             origin: Origin::Model,
             reach: &Reach::Project,
             workspace: plain.path(),
+            cwd: None,
             network: Some("Fetch"),
             untrusted_input: false,
         },
@@ -594,6 +599,7 @@ fn memory_writes_after_untrusted_input_are_reviewed_without_standing_rules() {
         origin: Origin::Model,
         reach: &Reach::Project,
         workspace: &workspace,
+        cwd: None,
         network: None,
         untrusted_input,
     };
@@ -623,6 +629,7 @@ fn local_listening_always_asks_even_for_a_routine_download() {
         origin: Origin::Model,
         reach: &Reach::Project,
         workspace: Path::new("/tmp"),
+        cwd: None,
         network: Some("Run a local server"),
         untrusted_input: false,
     };
@@ -643,4 +650,65 @@ fn local_listening_always_asks_even_for_a_routine_download() {
         approval_rule_for(&call).is_none(),
         "An ordinary remembered network rule must not authorize local access"
     );
+}
+
+#[test]
+fn outside_shell_scope_never_inherits_network_or_generic_rules() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let arguments = json!({"command":"cargo fetch","cwd":outside.path(),"network":true,"justification":"Download dependencies"});
+    let reach = Reach::Outside(outside.path().into());
+    let call = Call {
+        name: "shell_command",
+        arguments: &arguments,
+        writes: true,
+        origin: Origin::Model,
+        reach: &reach,
+        workspace: root.path(),
+        cwd: Some(outside.path()),
+        network: Some("Download dependencies"),
+        untrusted_input: false,
+    };
+    for mode in [PermissionMode::AskForApproval, PermissionMode::ApproveForMe] {
+        let Verdict::Ask(reason) = decide(mode, &call) else {
+            panic!("outside network command did not ask");
+        };
+        assert!(reason.contains(outside.path().to_str().unwrap()));
+        assert!(reason.contains("network"));
+        assert!(approval_rule_for(&call).is_none());
+    }
+    assert!(matches!(
+        decide(PermissionMode::ReadOnly, &call),
+        Verdict::Refuse(_)
+    ));
+}
+
+#[test]
+fn ancestor_configuration_disables_remembered_routine_network_rule() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().join("sub");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::create_dir(root.path().join(".cargo")).unwrap();
+    std::fs::write(
+        root.path().join(".cargo/config.toml"),
+        "[net]\noffline = true\n",
+    )
+    .unwrap();
+    let arguments = json!({"command":"cargo fetch","network":true});
+    let call = Call {
+        name: "shell_command",
+        arguments: &arguments,
+        writes: true,
+        origin: Origin::Model,
+        reach: &Reach::Project,
+        workspace: root.path(),
+        cwd: Some(&cwd),
+        network: Some("Download dependencies"),
+        untrusted_input: false,
+    };
+    assert!(matches!(
+        decide(PermissionMode::ApproveForMe, &call),
+        Verdict::Ask(_)
+    ));
+    assert!(approval_rule_for(&call).is_none());
 }

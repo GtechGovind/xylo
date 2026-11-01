@@ -132,14 +132,14 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         def(
             "run_command",
             "Run a program directly with an argument array (no shell) in the workspace sandbox, which has no internet access unless network is true. Set run_in_background to return a job_id immediately. Non-zero exit codes are returned with stdout and stderr",
-            json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200},"run_in_background":{"type":"boolean"},"allow_local_binding":{"type":"boolean","description":"Allow local development servers to listen and access localhost; requires network:true and justification"},"network":NETWORK_PARAMETER.clone(),"justification":JUSTIFICATION_PARAMETER.clone()}),
+            json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200},"run_in_background":{"type":"boolean"},"cwd":{"type":"string","description":"Optional working directory, relative to current cwd or absolute. Outside directories require approval for that directory and descendants; shell text cannot grant outside access."},"allow_local_binding":{"type":"boolean","description":"Allow local development servers to listen and access localhost; requires network:true and justification"},"network":NETWORK_PARAMETER.clone(),"justification":JUSTIFICATION_PARAMETER.clone()}),
             &["program", "args"],
             true,
         ),
         def(
             "shell_command",
             "Run a command line through bash in the conversation working directory (cd persists) in the workspace sandbox, which has no internet access unless network is true. Use for pipes, redirection, chained commands and shell built-ins. Set run_in_background for servers and long tasks: returns job_id immediately; monitor with shell_output. Foreground returns exit_code, stdout and stderr",
-            json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200},"run_in_background":{"type":"boolean"},"allow_local_binding":{"type":"boolean","description":"Allow local development servers to listen and access localhost; requires network:true and justification"},"network":NETWORK_PARAMETER.clone(),"justification":JUSTIFICATION_PARAMETER.clone()}),
+            json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":1200},"run_in_background":{"type":"boolean"},"cwd":{"type":"string","description":"Optional working directory, relative to current cwd or absolute. Outside directories require approval for that directory and descendants; shell text cannot grant outside access."},"allow_local_binding":{"type":"boolean","description":"Allow local development servers to listen and access localhost; requires network:true and justification"},"network":NETWORK_PARAMETER.clone(),"justification":JUSTIFICATION_PARAMETER.clone()}),
             &["command"],
             true,
         ),

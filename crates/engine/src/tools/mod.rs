@@ -603,7 +603,16 @@ impl ToolBroker {
             !(name.starts_with("plugin_") && arguments.get("capabilities").is_some()),
             "Plugins run only with the grants reviewed in Settings; remove `capabilities`"
         );
-        let reach = self.reach(name, &arguments);
+        let shell_context = matches!(name, "shell_command" | "run_command")
+            .then(|| shell_jobs::prepare(self, &arguments))
+            .transpose()?;
+        let reach = match shell_context
+            .as_ref()
+            .and_then(|context| context.outside.as_ref())
+        {
+            Some(path) => Reach::Outside(path.clone()),
+            None => self.reach(name, &arguments),
+        };
         let network = if matches!(name, "run_command" | "shell_command") {
             builtin::network_request(&arguments)?
         } else {
@@ -615,24 +624,14 @@ impl ToolBroker {
         let exposure = (name == "memory_remember")
             .then(|| self.exposure())
             .transpose()?;
-        let permission_workspace = if matches!(name, "shell_command" | "run_command") {
-            self.session.shell_jobs.cwd(
-                self.request.session_id,
-                &self.request.workspace,
-                self.artifacts
-                    .parent()
-                    .context("Application data directory missing")?,
-            )?
-        } else {
-            self.request.workspace.clone()
-        };
         let call = Call {
             name,
             arguments: &arguments,
             writes: definition.writes,
             origin,
             reach: &reach,
-            workspace: &permission_workspace,
+            workspace: &self.request.workspace,
+            cwd: shell_context.as_ref().map(|context| context.cwd.as_path()),
             network,
             untrusted_input: exposure.is_some_and(MemoryOrigin::untrusted),
         };
@@ -681,13 +680,19 @@ impl ToolBroker {
         } else {
             None
         };
-        let presentation = self.presentation(
+        let mut presentation = self.presentation(
             name,
             &arguments,
             access,
             skill_snapshot.as_ref(),
             component_snapshot.as_ref(),
         )?;
+        if let Some(context) = &shell_context {
+            presentation["cwd"] = json!(context.cwd);
+            if let Some(scope) = &context.outside {
+                presentation["outside_scope"] = json!(scope);
+            }
+        }
         let id = Uuid::new_v4();
         // Native clients can close inherited descriptors and outlive a crashed
         // worker. Only proven in-process writes qualify for generic review.
@@ -827,7 +832,9 @@ impl ToolBroker {
             } else if builtin::handles(name) {
                 match name {
                     "shell_command" | "run_command" | "shell_output" | "shell_kill"
-                    | "shell_jobs" => shell_jobs::execute(self, name, &arguments, access)?,
+                    | "shell_jobs" => {
+                        shell_jobs::execute(self, name, &arguments, access, shell_context)?
+                    }
                     _ => builtin::execute(self, name, &arguments, access)?,
                 }
             } else {
@@ -2036,6 +2043,11 @@ const FETCHING_GIT: &[&str] = &["fetch", "pull", "clone", "ls-remote", "submodul
 /// is lexical and conservative; anything it cannot read counts as leaving
 /// the project.
 fn command_stays_in_project(name: &str, arguments: &Value, workspace: &std::path::Path) -> bool {
+    // Directory overrides can grant outside access. Keep their output untrusted
+    // in the durable journal, including later calls inheriting that directory.
+    if arguments.get("cwd").is_some() {
+        return false;
+    }
     let words: Vec<String> = if name == "shell_command" {
         let Some(command) = arguments.get("command").and_then(Value::as_str) else {
             return false;
