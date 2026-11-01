@@ -30,3 +30,32 @@ fn incomplete_response_retains_its_specific_safe_reason() {
     let value = serde_json::json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}});
     assert!(stream_error(&value, &[], "response.incomplete", None).contains("max_output_tokens"));
 }
+
+#[test]
+fn thinking_replay_diagnostics_keep_public_fields_but_hide_reflected_content() {
+    let value = serde_json::json!({"error":{"message":"messages.1.content.0: Invalid `signature` in `thinking` block. Set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\" with `thinking-binding-controls-2026-08-01` in `anthropic-beta`. The `system` prompt differs. Reflected prompt: \"private user instructions\". Signature value: \"opaque-private-signature\". Bearer fixture-secret"}});
+    let reason = reason(&value, &["fixture-secret".into()]).unwrap();
+    for field in [
+        "signature",
+        "thinking.block_binding.prefix_mismatch_behavior",
+        "drop_block",
+        "thinking-binding-controls-2026-08-01",
+        "anthropic-beta",
+        "system",
+    ] {
+        assert!(
+            reason.contains(field),
+            "Missing public diagnostic field {field}: {reason}"
+        );
+    }
+    for private in [
+        "private user instructions",
+        "opaque-private-signature",
+        "fixture-secret",
+    ] {
+        assert!(
+            !reason.contains(private),
+            "Reflected private data must stay redacted"
+        );
+    }
+}

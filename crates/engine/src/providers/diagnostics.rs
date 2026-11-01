@@ -18,6 +18,9 @@ pub(super) fn identifier(value: &str, redactions: &[String]) -> Option<String> {
 fn field(value: &str) -> bool {
     [
         "input",
+        "messages",
+        "system",
+        "thinking",
         "tools",
         "reasoning",
         "instructions",
@@ -68,7 +71,19 @@ fn readable(value: &str, redactions: &[String]) -> String {
                 }
                 inner.push(next);
             }
-            if field(&inner) {
+            // Public protocol identifiers explain how to repair a rejected
+            // request. Keep this allowlist exact; quoted prompt text, signature
+            // values and arbitrary header values must still be hidden.
+            if field(&inner)
+                || matches!(
+                    inner.as_str(),
+                    "signature"
+                        | "redacted_thinking"
+                        | "drop_block"
+                        | "anthropic-beta"
+                        | "thinking-binding-controls-2026-08-01"
+                )
+            {
                 quoted.push_str(&inner);
             } else {
                 quoted.push_str("[redacted]");
