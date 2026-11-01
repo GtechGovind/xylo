@@ -47,6 +47,7 @@ mod steering_control;
 mod turn_queue_control;
 mod update_control;
 mod worker_control;
+mod worktree_control;
 use worker_control::{SessionSequences, WorkerHandle, effective_mode, retire_idle_workers};
 
 #[derive(Clone)]
@@ -299,6 +300,12 @@ pub enum HostEvent {
     },
     /// A conversation's title changed (user rename or generated title).
     ConversationRenamed(Conversation),
+    Worktrees(Vec<crate::workspace::worktree::Worktree>),
+    ChatWorktree {
+        session: Uuid,
+        workspace: PathBuf,
+        branch: Option<String>,
+    },
     Stopped,
 }
 
@@ -371,6 +378,9 @@ enum HostCommand {
     SetConversationPinned(Uuid, bool),
     SetConversationArchived(Uuid, bool),
     RemoveProvider(ProviderConfig),
+    CreateChatWorktree(Uuid, PathBuf),
+    ListWorktrees(Option<PathBuf>),
+    RemoveWorktree(PathBuf, bool),
     Shutdown,
 }
 
@@ -381,6 +391,18 @@ pub struct HostClient {
 }
 
 impl HostClient {
+    /// Creates an isolated checkout for a new chat after an explicit UI action.
+    pub fn create_chat_worktree(&self, session: Uuid, repo: PathBuf) -> Result<()> {
+        self.enqueue(HostCommand::CreateChatWorktree(session, repo))
+    }
+    /// Lists retained worktrees for Settings.
+    pub fn list_worktrees(&self, repo: Option<PathBuf>) -> Result<()> {
+        self.enqueue(HostCommand::ListWorktrees(repo))
+    }
+    /// Removes a managed checkout; force requires a separate user confirmation.
+    pub fn remove_worktree(&self, path: PathBuf, force: bool) -> Result<()> {
+        self.enqueue(HostCommand::RemoveWorktree(path, force))
+    }
     pub fn spawn() -> Result<(Self, Receiver<HostEvent>)> {
         Self::spawn_at(AppPaths::discover()?)
     }
@@ -519,6 +541,7 @@ impl HostClient {
                     }
                     if memory_setup_needed {state.events.send(HostEvent::Status("Semantic search needs setup in Downloads. Your saved memories remain searchable.".into())).await?;}
                     if recovered > 0 {state.events.send(HostEvent::Status(format!("Recovered {recovered} interrupted actions; uncertain writes require review"))).await?;}
+                    if let Err(error) = state.cleanup_archived_worktrees().await { tracing::warn!(%error, "Retained worktree cleanup needs review"); }
                     state.send_conversations().await?;
                     let scheduling_state=state.clone();
                     let scheduling=tokio::spawn(async move{scheduling_state.schedule_loop().await;});
@@ -1623,6 +1646,11 @@ impl HostState {
                         .await??;
                 self.events.send(HostEvent::HistoryPage(page)).await?;
             }
+            HostCommand::CreateChatWorktree(session, repo) => {
+                self.create_chat_worktree(session, repo).await?
+            }
+            HostCommand::ListWorktrees(repo) => self.list_worktrees(repo).await?,
+            HostCommand::RemoveWorktree(path, force) => self.remove_worktree(path, force).await?,
             HostCommand::Conversations => self.send_conversations().await?,
             HostCommand::ApprovalRules(workspace) => {
                 let result = self.approval_rules(&workspace).await;

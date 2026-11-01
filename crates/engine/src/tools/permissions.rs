@@ -100,6 +100,8 @@ pub struct ToolSession {
     permissions: PermissionCell,
     vault: CredentialVault,
     connectors: Arc<OnceLock<ConnectorBroker>>,
+    pub(super) workspaces: Arc<Mutex<HashMap<Uuid, Arc<super::worktree::LiveWorkspace>>>>,
+    workspace_uses: super::worktree::WorkspaceUses,
 }
 
 impl ToolSession {
@@ -111,7 +113,20 @@ impl ToolSession {
             permissions,
             vault,
             connectors: Arc::default(),
+            workspaces: Arc::default(),
+            workspace_uses: Default::default(),
         }
+    }
+
+    /// Keeps a checkout alive for a background job or delegated agent. Retain
+    /// this guard until the process and all its descendants have stopped.
+    pub fn retain_workspace(&self, session: Uuid, root: &Path) -> super::worktree::WorkspaceLease {
+        self.workspace_uses.retain(session, root)
+    }
+
+    /// Whether owned work still depends on this checkout.
+    pub fn workspace_in_use(&self, session: Uuid, root: &Path) -> bool {
+        self.workspace_uses.in_use(session, root)
     }
 
     /// Where approval decisions are delivered.
@@ -251,6 +266,13 @@ pub(crate) enum Verdict {
 
 /// Decides whether a call runs, asks or is refused under `mode`.
 pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
+    if matches!(call.name, "worktree_enter" | "worktree_exit") {
+        return if mode == PermissionMode::ReadOnly {
+            Verdict::Refuse("Worktree changes require write permission".into())
+        } else {
+            Verdict::Ask("Changes this chat’s checkout using native Git outside the sandbox, with no network or repository executable configuration".into())
+        };
+    }
     if call.origin == Origin::Hook {
         return Verdict::Allow;
     }
@@ -416,6 +438,9 @@ const RULE_LABEL_CHARS: usize = 160;
 /// The "always allow" rule for `call`, if one may cover it. A memory write
 /// after untrusted input has none: each one is reviewed.
 pub(crate) fn approval_rule_for(call: &Call) -> Option<(String, String)> {
+    if matches!(call.name, "worktree_enter" | "worktree_exit") {
+        return None;
+    }
     if call.name == "memory_remember" && call.untrusted_input {
         return None;
     }

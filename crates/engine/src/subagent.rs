@@ -18,7 +18,6 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -44,8 +43,6 @@ pub(crate) struct Delegation {
     pub cancel: CancellationToken,
     pub timeout: Duration,
     pub runtime: tokio::runtime::Handle,
-    /// The parent's project, for the child's environment and instructions.
-    pub workspace: PathBuf,
     /// The live permission mode, shared with the parent.
     pub permissions: PermissionCell,
 }
@@ -102,8 +99,9 @@ impl Delegation {
         }
         let mode = self.permissions.get();
         let window = self.budget.window();
+        let workspace = child.workspace_root();
         let context = crate::prompts::PromptContext::detect(
-            &self.workspace,
+            &workspace,
             mode,
             xylo_core::now_ms(),
             window.prompt_budget(),

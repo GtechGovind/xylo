@@ -17,6 +17,7 @@ pub(super) fn tool_icon(name: &str) -> AppIcon {
         "run_command" | "shell_command" | "terminal" => AppIcon::Terminal,
         "search_project" | "grep" | "glob" | "find" => AppIcon::Search,
         "files_list" | "find_files" => AppIcon::Folder,
+        "worktree_enter" | "worktree_exit" => AppIcon::Branch,
         "git_status" | "git_diff" | "git_log" | "git_commit" => AppIcon::Branch,
         "web_fetch" | "web_search" | "browser" => AppIcon::Web,
         crate::state::PLAN_TOOL => AppIcon::Plan,

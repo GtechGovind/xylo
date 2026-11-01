@@ -165,3 +165,10 @@ async fn parallel_children_are_classified_apart_from_the_parent() {
     assert_eq!(result.metrics.child_calls, 4);
     assert_eq!(trial.trace.child_conversations().len(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worktree_approval_task_passes_offline() {
+    let task = find("worktree-approval").unwrap();
+    let (_, result) = graded(&task).await;
+    assert!(result.passed, "{}", explain(&result));
+}

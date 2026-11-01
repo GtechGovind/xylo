@@ -691,6 +691,9 @@ impl WorkerReader {
             return self.route_reply(envelope, active_request).await;
         }
         match &envelope.payload {
+            EngineEvent::WorkspaceChanged { workspace, .. } => {
+                *self.worker.workspace.lock() = Some(workspace.clone());
+            }
             EngineEvent::ProviderCredentialRequested {
                 request_id,
                 generation,

@@ -39,6 +39,10 @@ pub(crate) enum Access {
 /// The tools a loop may call. Execution is blocking and exactly-once per
 /// call id: the implementation journals every dispatch.
 pub(crate) trait ToolExecutor: Send + Sync {
+    /// A refreshed project prompt after an approved checkout change.
+    fn refreshed_system_prompt(&self) -> Option<String> {
+        None
+    }
     /// Tools offered directly to the model right now. Re-read before every
     /// model call, because the permission mode can change mid-task.
     fn schemas(&self) -> Vec<ToolSchema>;
@@ -70,7 +74,9 @@ pub(crate) trait ToolExecutor: Send + Sync {
 }
 
 /// Exact names other agents use for Xylo's tools.
-const ALIASES: [(&str, &str); 9] = [
+const ALIASES: [(&str, &str); 11] = [
+    ("enterworktree", "worktree_enter"),
+    ("exitworktree", "worktree_exit"),
     ("read", "file_read"),
     ("write", "file_write"),
     ("edit", "file_edit"),

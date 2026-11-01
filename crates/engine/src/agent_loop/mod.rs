@@ -683,7 +683,10 @@ impl AgentLoop {
         tools: &[ToolSchema],
         pressure: Pressure,
     ) -> anyhow::Result<(Vec<Message>, ContextUsage)> {
-        let system = vec![Message::system(&self.system)];
+        let refreshed = self.tools.refreshed_system_prompt();
+        let system = vec![Message::system(
+            refreshed.as_deref().unwrap_or(&self.system),
+        )];
         let assemble = |history: &[Message]| {
             let mut view = system.clone();
             view.extend_from_slice(history);

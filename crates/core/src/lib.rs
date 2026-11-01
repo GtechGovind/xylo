@@ -747,6 +747,11 @@ pub enum EngineEvent {
         #[serde(default)]
         kind: ErrorKind,
     },
+    /// The conversation selected a different managed checkout.
+    WorkspaceChanged {
+        workspace: PathBuf,
+        branch: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

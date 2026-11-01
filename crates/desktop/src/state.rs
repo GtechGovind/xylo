@@ -347,6 +347,7 @@ impl TurnState {
             self.flush_text();
         }
         match event {
+            EngineEvent::WorkspaceChanged { .. } => return,
             EngineEvent::Ready { .. }
             | EngineEvent::TitleUpdated { .. }
             | EngineEvent::Steering { .. }

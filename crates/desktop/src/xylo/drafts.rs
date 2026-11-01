@@ -392,6 +392,32 @@ impl Xylo {
         }
         true
     }
+    /// Carries unsent content into this chat's selected checkout. The original
+    /// scoped draft stays saved, and loading a different target draft uses the
+    /// normal conflict UI rather than overwriting either version.
+    pub(super) fn carry_draft_to_checkout(&mut self, previous: &DraftKey, cx: &mut Context<Self>) {
+        let Some(source) = self.drafts.entries.get(previous) else {
+            return;
+        };
+        if source.text.is_empty() && source.attachments.is_empty() {
+            return;
+        }
+        let text = source.text.clone();
+        let attachments = source.attachments.clone();
+        let target = self.current_draft_key();
+        if !self.ensure_draft_entry(&target, cx) {
+            return;
+        }
+        let entry = self.drafts.entries.get_mut(&target).unwrap();
+        if !entry.text.is_empty() || !entry.attachments.is_empty() {
+            return;
+        }
+        entry.text = text;
+        entry.attachments = attachments;
+        entry.generation = entry.generation.wrapping_add(1);
+        entry.dirty = true;
+    }
+
     /// Call after changing session/workspace, including new chat and startup.
     /// The stored window handle lets callers without a Window defer safely.
     pub(super) fn draft_switch_deferred(&mut self, cx: &mut Context<Self>) {
@@ -768,6 +794,10 @@ impl Xylo {
     /// Parent submit routes here after its running-task/permission UI decisions.
     /// The captured prompt remains visible until authoritative durable admission.
     pub(super) fn submit_persisted_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.worktree_pending == Some(self.session) {
+            self.show_composer_hint("Wait for the worktree to finish opening.", cx);
+            return;
+        }
         self.draft_changed(cx);
         if self.drafts.oversize {
             self.show_composer_hint("Shorten this message before sending it.", cx);

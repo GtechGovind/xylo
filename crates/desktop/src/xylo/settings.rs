@@ -770,6 +770,11 @@ impl Xylo {
                 self.approval_rules_section(cx),
             ))
             .child(settings_ui::section(
+                "Worktrees",
+                Some("Isolated checkouts retained by chats. Removal preserves Git branches.".into()),
+                self.worktree_settings(cx),
+            ))
+            .child(settings_ui::section(
                 "Security",
                 Some("Switching removes saved keys and tokens; you'll reconnect providers and connections afterwards.".into()),
                 settings_ui::rows([settings_ui::setting_row(

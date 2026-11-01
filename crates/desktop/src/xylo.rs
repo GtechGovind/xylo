@@ -16,6 +16,8 @@ mod drafts;
 use drafts::{DraftFlushAction, DraftUi};
 #[path = "xylo/turn_queue.rs"]
 mod turn_queue;
+#[path = "xylo/worktrees.rs"]
+mod worktrees;
 use turn_queue::TurnQueueUi;
 #[path = "xylo/attachments.rs"]
 mod attachments;
@@ -323,6 +325,8 @@ pub struct Xylo {
     /// while the composer or the transcript has focus.
     transcript_focus: FocusHandle,
     native: NativeUi,
+    worktrees: Vec<xylo_runtime::workspace::worktree::Worktree>,
+    worktree_pending: Option<Uuid>,
     documents: documents::DocumentUi,
     assets: AssetsUi,
     account: AccountUi,
@@ -600,6 +604,8 @@ impl Xylo {
             context_updated_at: BTreeMap::new(),
             transcript_focus: cx.focus_handle(),
             native: NativeUi::new(),
+            worktrees: Vec::new(),
+            worktree_pending: None,
             documents: documents::DocumentUi::new(window, cx),
             assets: AssetsUi::default(),
             account: AccountUi::default(),
@@ -1199,6 +1205,7 @@ impl Xylo {
                 }
             }
             HostEvent::Error(error) => {
+                self.worktree_pending = None;
                 self.quit_after_save = None;
                 self.error = Some(error.clone());
                 self.log(format!("ERROR {error}"));
@@ -1209,6 +1216,12 @@ impl Xylo {
             HostEvent::ApprovalRules { workspace, result } => {
                 self.approval_rules_received(workspace, result, cx)
             }
+            HostEvent::Worktrees(trees) => self.worktrees = trees,
+            HostEvent::ChatWorktree {
+                session,
+                workspace,
+                branch: _,
+            } => self.chat_worktree_changed(session, workspace, window, cx),
             HostEvent::ConversationRenamed(conversation) => self.conversation_renamed(conversation),
             HostEvent::Engine(envelope) => {
                 // Engine events always name their chat; one without a session
