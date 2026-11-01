@@ -949,12 +949,19 @@ pub fn read_guard_exit_code(path: &std::path::Path) -> Option<i32> {
         .flatten()
 }
 
-/// Waits for the trusted watchdog's fork fence, not merely the helper's exit.
-pub async fn wait_for_guard_cleanup(path: &Path) -> Result<()> {
-    // No handshake means the helper never gained authority to dispatch.
-    if !path.exists() {
-        return Ok(());
+/// No positive proof exists that a spawned helper retired its descendants.
+#[derive(Debug)]
+pub struct CleanupUnknown(pub String);
+impl std::fmt::Display for CleanupUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Owned process cleanup is unconfirmed: {}", self.0)
     }
+}
+impl std::error::Error for CleanupUnknown {}
+
+/// Waits for the trusted watchdog's fork fence, not merely the helper's exit.
+/// A missing handshake after spawn is not proof that no command was dispatched.
+pub async fn wait_for_guard_cleanup(path: &Path) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let state = std::fs::read(path)
@@ -963,14 +970,19 @@ pub async fn wait_for_guard_cleanup(path: &Path) -> Result<()> {
             match state.as_ref().and_then(|value| value["state"].as_str()) {
                 Some("done") => return Ok(()),
                 Some("failed") => {
-                    anyhow::bail!(
-                        "Owned process group cleanup failed; side effects may have occurred"
+                    return Err(CleanupUnknown(
+                        "watchdog reported failure; descendants may remain".into(),
                     )
+                    .into());
                 }
                 _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
             }
         }
     })
     .await
-    .context("Owned process group cleanup did not finish")?
+    .map_err(|_| {
+        CleanupUnknown(
+            "missing or incomplete watchdog acknowledgment; descendants may remain".into(),
+        )
+    })?
 }

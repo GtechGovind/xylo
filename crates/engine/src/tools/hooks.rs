@@ -197,13 +197,20 @@ impl ToolBroker {
                     .parent()
                     .map(|p| vec![p.to_owned()])
                     .unwrap_or_default();
-                match self.runtime.block_on(hooks::run(
+                let ownership = xylo_runtime::workspace::worktree::retain_process_workspace(
+                    &self.request.workspace,
+                )?;
+                let result = self.runtime.block_on(hooks::run(
                     &command,
                     &input,
                     &self.request.workspace,
                     &protected,
                     self.cancel.child_token(),
-                )) {
+                ));
+                if let Some(ownership) = ownership {
+                    ownership.release_after(&result)?;
+                }
+                match result {
                     Ok(value) => {
                         self.store.finish_action(intent.id, &value)?;
                         value

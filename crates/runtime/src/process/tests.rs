@@ -447,19 +447,20 @@ async fn managed_sandbox_refuses_an_outside_cwd_without_a_scope() {
         &[],
     )
     .unwrap();
-    prepared.command.env("XYLO_SANDBOX_CWD", &cwd);
-    let _ = run_prepared_observed(
-        prepared.command,
+    prepared
+        .command
+        .env("XYLO_SANDBOX_CWD", &cwd)
+        .env("XYLO_SANDBOX_PARENT_GUARD", "1");
+    let error = run_prepared_sandboxed(
+        prepared,
         &cwd,
-        Some(Duration::from_secs(20)),
+        Duration::from_secs(20),
         CancellationToken::new(),
-        None,
-        true,
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert!(error.is::<NotStarted>(), "{error:#}");
     assert!(!cwd.join("forbidden").exists());
-    assert!(xylo_services::sandbox::read_start_status(&prepared.status_file).is_some());
 }
 
 #[cfg(unix)]
@@ -482,21 +483,20 @@ async fn managed_sandbox_refuses_a_replaced_approved_cwd() {
     prepared
         .command
         .env("XYLO_SANDBOX_CWD", &cwd)
-        .env("XYLO_SANDBOX_WRITE_ROOT", &cwd);
+        .env("XYLO_SANDBOX_WRITE_ROOT", &cwd)
+        .env("XYLO_SANDBOX_PARENT_GUARD", "1");
     std::fs::remove_dir(&cwd).unwrap();
     std::os::unix::fs::symlink(other.path(), &cwd).unwrap();
-    let _ = run_prepared_observed(
-        prepared.command,
+    let error = run_prepared_sandboxed(
+        prepared,
         &cwd,
-        Some(Duration::from_secs(20)),
+        Duration::from_secs(20),
         CancellationToken::new(),
-        None,
-        true,
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert!(error.is::<NotStarted>(), "{error:#}");
     assert!(!other.path().join("forbidden").exists());
-    assert!(xylo_services::sandbox::read_start_status(&prepared.status_file).is_some());
 }
 
 #[tokio::test]

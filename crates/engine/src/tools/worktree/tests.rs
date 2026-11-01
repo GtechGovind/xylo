@@ -44,6 +44,49 @@ async fn worktree_exit_retains_host_inspection_checkout_and_switches_back() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worktree_exit_retains_unknown_shell_cleanup_after_job_owner_is_dropped() {
+    let (dir, broker, mut events) = fixture(PermissionMode::FullAccess);
+    initialize(dir.path());
+    let main = broker.workspace_root().canonicalize().unwrap();
+    approve_integration(broker, &mut events, move |execution| {
+        execution
+            .execute(
+                "enter-inspection",
+                "worktree_enter",
+                json!({"name":"host-inspection"}),
+            )
+            .unwrap();
+        let root = execution.workspace_root();
+        let ownership = worktree::retain_process_workspace(&root).unwrap().unwrap();
+        let outcome: anyhow::Result<()> = Err(xylo_services::sandbox::CleanupUnknown(
+            "injected missing acknowledgment".into(),
+        )
+        .into());
+        ownership.release_after(&outcome).unwrap();
+        assert!(!execution.connectors.may_have_local_processes());
+        let exit: Value = serde_json::from_str(
+            &execution
+                .execute("exit-inspection", "worktree_exit", json!({"keep":false}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exit["kept"], true);
+        assert!(root.exists());
+        assert_eq!(execution.workspace_root(), main);
+        assert_eq!(
+            execution
+                .store
+                .conversation(execution.request.session_id)
+                .unwrap()
+                .unwrap()
+                .workspace,
+            main
+        );
+    })
+    .await;
+}
+
 fn git(root: &Path, args: &[&str]) {
     let result = Command::new("/usr/bin/git")
         .arg("-C")

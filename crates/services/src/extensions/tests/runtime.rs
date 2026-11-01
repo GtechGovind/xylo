@@ -864,3 +864,61 @@ async fn hook_output_larger_than_a_pipe_buffer_does_not_deadlock_its_input() {
         );
     }
 }
+
+#[tokio::test]
+async fn portable_hook_guarded_exit_two_preserves_environment_input_and_deny_shape() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir_all(source.join("hooks")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let command = "cat > received.json; printf '%s' \"$FIXTURE_VALUE\" > environment.txt; exit 2";
+    std::fs::write(
+        source.join("hooks/hooks.json"),
+        json!({"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":command}]}]}})
+            .to_string(),
+    )
+    .unwrap();
+    let service = ExtensionService::new(directory.path().join("profile/extensions"));
+    let package = service.install_local(&source).unwrap();
+    service.set_enabled(&package.id, true).unwrap();
+    service
+        .component_setup(
+            &package.id,
+            "hooks",
+            ComponentSetup {
+                workspace: workspace.clone(),
+                enabled_events: vec!["PreToolUse".into()],
+                environment: std::collections::BTreeMap::from([(
+                    "FIXTURE_VALUE".into(),
+                    "configured-value".into(),
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let store = crate::Store::open(directory.path().join("profile/store.db")).unwrap();
+    let output = service
+        .run_hooks(
+            "PreToolUse",
+            json!({"tool_name":"Read","marker":"private input"}),
+            &workspace,
+            store,
+            crate::CredentialVault::for_tests(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        output[0]["results"][0]["output"]["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(output[0]["results"][0]["output"]["exit_code"], 2);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("environment.txt")).unwrap(),
+        "configured-value"
+    );
+    let input: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(workspace.join("received.json")).unwrap()).unwrap();
+    assert_eq!(input["marker"], "private input");
+}

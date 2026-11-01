@@ -164,7 +164,7 @@ pub struct InspectionInUse;
 impl std::fmt::Display for InspectionInUse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "This checkout is retained after a local MCP inspection; stop its processes before removing it with Git.",
+            "This checkout is retained because process cleanup is unconfirmed (local MCP inspection or an interrupted command); stop its processes before removing it with Git.",
         )
     }
 }
@@ -210,6 +210,50 @@ fn inspection_lock(tree: &Worktree) -> Result<std::fs::File> {
 /// Retains a managed checkout, including when inspection starts in a subfolder
 /// or through an alias. The caller must keep the returned file for host lifetime.
 pub fn retain_inspection_workspace(workspace: &Path) -> Result<Option<(PathBuf, std::fs::File)>> {
+    Ok(retain_process_workspace(workspace)?.map(|lease| (lease.tree.path, lease.file)))
+}
+
+/// A durable pre-dispatch ownership token. Dropping it, including on worker
+/// death or aborted futures, never certifies cleanup. Only positive cleanup or
+/// trusted launch failure permits `release`; other owners' tokens stay intact.
+pub struct ProcessWorkspaceLease {
+    tree: Worktree,
+    file: std::fs::File,
+    token: String,
+}
+impl ProcessWorkspaceLease {
+    /// Errors describing command failure/cancellation are not cleanup failure.
+    /// Only the shared runner's typed uncertainty prevents releasing this token.
+    pub fn release_after<T>(self, result: &Result<T>) -> Result<()> {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<xylo_services::sandbox::CleanupUnknown>())
+        {
+            return Ok(());
+        }
+        self.release()
+    }
+
+    fn release(mut self) -> Result<()> {
+        use std::io::{Read, Seek, Write};
+        let _operation = lock(&self.tree.repository)?;
+        self.file.rewind()?;
+        let mut contents = String::new();
+        self.file.read_to_string(&mut contents)?;
+        let remaining = contents.replace(&self.token, "");
+        // Rewrite before truncation: failure remains conservative. A process
+        // crash during this operation cannot erase another owner's token.
+        self.file.rewind()?;
+        self.file.write_all(remaining.as_bytes())?;
+        self.file.set_len(remaining.len() as u64)?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+}
+
+/// Retain before dispatch, including through aliases and nested working dirs.
+/// A regular (unmanaged) checkout needs no native worktree deletion fence.
+pub fn retain_process_workspace(workspace: &Path) -> Result<Option<ProcessWorkspaceLease>> {
     let workspace = workspace.canonicalize()?;
     for root in workspace.ancestors() {
         if root.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("worktrees"))
@@ -230,13 +274,15 @@ pub fn retain_inspection_workspace(workspace: &Path) -> Result<Option<(PathBuf, 
             // No disconnect or host restart proves the local process tree has
             // exited. Persist before launch; only future positive exit proof
             // can justify automatically clearing this marker.
-            use std::io::Write;
-            file.write_all(b"1")?;
+            use std::io::{Seek, Write};
+            let token = format!("{}\n", uuid::Uuid::new_v4());
+            file.seek(std::io::SeekFrom::End(0))?;
+            file.write_all(token.as_bytes())?;
             file.sync_all()?;
             #[cfg(unix)]
             std::fs::File::open(tree.repository.join(".git/xylo-worktree-inspections"))?
                 .sync_all()?;
-            return Ok(Some((tree.path, file)));
+            return Ok(Some(ProcessWorkspaceLease { tree, file, token }));
         }
     }
     Ok(None)

@@ -16,6 +16,7 @@ use tokio::{
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
+pub use xylo_services::sandbox::CleanupUnknown;
 use xylo_services::sandbox::wait_for_guard_cleanup;
 
 const OUTPUT_LIMIT: usize = 512 * 1024;
@@ -252,8 +253,14 @@ pub async fn run_prepared_observed(
         pid: if guard_parent { None } else { child.id() },
     };
     let parent_guard = child.stdin.take();
-    let stdout = child.stdout.take().context("Missing stdout pipe")?;
-    let stderr = child.stderr.take().context("Missing stderr pipe")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CleanupUnknown("missing stdout pipe after spawn".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CleanupUnknown("missing stderr pipe after spawn".into()))?;
     let output = tokio::spawn(drain(stdout, false, observer.clone()));
     let errors = tokio::spawn(drain(stderr, true, observer));
     let _output_guard = AbortDrain(output.abort_handle());
@@ -270,6 +277,9 @@ pub async fn run_prepared_observed(
     let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     let cleanup = match &cleanup_status {
         Some(path) => wait_for_guard_cleanup(path).await,
+        None if guard_parent => {
+            Err(CleanupUnknown("guarded command has no acknowledgment path".into()).into())
+        }
         None => Ok(()),
     };
     if guard_parent && cleanup.is_ok() {
@@ -307,3 +317,6 @@ pub fn require_success(result: ProcessResult) -> Result<ProcessResult> {
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod cleanup_tests;
