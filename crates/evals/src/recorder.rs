@@ -104,7 +104,7 @@ impl ReplyBuilder {
             }
             StreamEvent::Usage(usage) => self.usage = serde_json::to_value(usage).ok(),
             StreamEvent::Finished(finish) => self.finish = Some(*finish),
-            StreamEvent::Native(_) => {}
+            StreamEvent::Native(_) | StreamEvent::Metadata { .. } => {}
         }
     }
 

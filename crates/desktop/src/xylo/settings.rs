@@ -670,6 +670,7 @@ impl Xylo {
                 None,
                 settings_ui::rows([self.response_timeout_row(cx)]),
             ))
+            .child(self.status_command_settings(cx))
             .child(self.about_section(cx))
             .into_any_element()
     }

@@ -301,7 +301,34 @@ impl Xylo {
             .child(divider())
             .child(subtitle(compaction))
             .child(subtitle(updated))
+            .child(self.quota_rows())
+            .child(self.usage_totals())
             .into_any_element()
+    }
+    pub(super) fn quota_rows(&self) -> AnyElement {
+        let mut rows = div().flex().flex_col().gap_1();
+        if let Some((model, limits)) = self
+            .turns
+            .get(&self.session)
+            .and_then(|turn| turn.rate_limits.as_ref())
+        {
+            rows = rows.child(subtitle(format!("Remaining quota · {model}")));
+            for (label, value) in [
+                ("Requests", limits.requests),
+                ("Tokens", limits.tokens),
+                ("Input tokens", limits.input_tokens),
+                ("Output tokens", limits.output_tokens),
+            ] {
+                if let Some(value) = value {
+                    rows = rows.child(context_row(None, label, value.to_string()));
+                }
+            }
+            rows = rows.child(subtitle(format!(
+                "Reported {}",
+                updated_label(limits.observed_at_ms, now_ms())
+            )));
+        }
+        rows.into_any_element()
     }
 }
 

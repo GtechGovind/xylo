@@ -379,6 +379,7 @@ impl Xylo {
             }
         }
         if completed {
+            self.invalidate_usage();
             if session != self.session
                 && let Some(history) = self.histories.get_mut(&session)
             {
@@ -840,6 +841,7 @@ impl Xylo {
                     }),
                 show_time,
             ))
+            .children(self.answer_usage(answer, index))
             .into_any_element()
     }
     /// Records the decision immediately so the card responds before the worker
@@ -1420,6 +1422,7 @@ impl Xylo {
                             ),
                     ),
             )
+            .child(self.composer_status(cx))
             .when_some(self.composer_hint(), |surface, hint| {
                 surface.child(
                     div()

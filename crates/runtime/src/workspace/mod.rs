@@ -3,6 +3,7 @@
 pub mod git;
 mod index;
 mod monitor;
+pub mod output_styles;
 mod paths;
 mod reader;
 mod rules;

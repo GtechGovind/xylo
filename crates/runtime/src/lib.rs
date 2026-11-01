@@ -8,6 +8,7 @@ pub mod host;
 pub mod learning;
 pub mod lsp;
 pub mod process;
+pub mod status_line;
 pub mod steering;
 pub mod terminal;
 pub mod turn_queue;
@@ -22,7 +23,7 @@ pub use xylo_services::{
     ExportSelection, FactCursor, FactDeleteKind, FactDeletePreview, FactDeleteRequest,
     FactDeletion, FactPage, FactVersion, MAX_DOCUMENT_DRAFT_BYTES, MemoryCursor, MemoryExport,
     MemoryFormSave, MemoryFormSnapshot, MemoryFormState, MemoryFormWrite, MemoryMutation,
-    MemoryPage, SteeringOutcome, verify_document_relink_source,
+    MemoryPage, SteeringOutcome, UsageReport, UsageTotals, verify_document_relink_source,
 };
 
 use anyhow::{Context, Result};

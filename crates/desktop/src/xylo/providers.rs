@@ -661,7 +661,7 @@ impl Xylo {
                 .collect();
             page = page.child(settings_ui::list_container(rows));
         }
-        page.into_any_element()
+        page.child(self.pricing_settings(cx)).into_any_element()
     }
 }
 #[derive(Default)]

@@ -183,6 +183,7 @@ pub struct Checkpoint {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletedTurn {
+    pub reply_id: Uuid,
     pub text: String,
     pub usage: Usage,
 }
@@ -313,6 +314,23 @@ impl Store {
         })
     }
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
+        ensure!(
+            settings.pricing_overrides.len() <= 512
+                && settings
+                    .pricing_overrides
+                    .iter()
+                    .all(|(model, price)| !model.trim().is_empty()
+                        && model.len() <= 200
+                        && price.valid()),
+            "Enter valid model prices"
+        );
+        ensure!(
+            settings
+                .status_line_command
+                .as_ref()
+                .is_none_or(|command| command.len() <= 8192),
+            "Status command exceeds 8 KiB"
+        );
         // Settings are plain JSON on disk: refuse secrets in custom headers.
         for provider in std::iter::once(&settings.provider).chain(&settings.providers) {
             crate::providers::validate_custom_headers(&provider.headers)?;
@@ -653,6 +671,7 @@ impl Store {
     ) -> Result<()> {
         let messages = crate::checkpoint::message_rows(messages)?;
         let receipt = CompletedTurn {
+            reply_id: assistant_reply_id(turn_id),
             text: text.into(),
             usage: usage.clone(),
         };

@@ -503,7 +503,20 @@ impl AgentEngine {
         }
         let mode = self.session.permissions().get();
         let (prompting, prompted) = (broker.clone(), request.clone());
-        let system = blocking(move || Ok(Self::system_prompt(&prompted, &prompting, mode))).await?;
+        let settings_store = self.store.clone();
+        let (system, prices) = blocking(move || {
+            let settings = settings_store.settings()?;
+            let style = xylo_runtime::workspace::output_styles::current(
+                &prompted.workspace,
+                &settings.output_style,
+            )?;
+            let system = crate::prompts::output_styles::apply(
+                Self::system_prompt(&prompted, &prompting, mode),
+                &style,
+            );
+            Ok((system, settings.pricing_overrides))
+        })
+        .await?;
         // Model calls admit their own memory when the model runs locally;
         // a child holds no lease of its own while it waits on tools.
         let resources = xylo_resources::ResourceManager::new();
@@ -550,8 +563,13 @@ impl AgentEngine {
         let outcome = agent.run(messages).await;
         let shutdown = broker.shutdown().await;
         match outcome {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
                 shutdown?;
+                let mut estimate = xylo_core::pricing::estimate(&outcome.usage.calls, &prices);
+                if outcome.usage.calls.is_empty() {
+                    estimate.unpriced_calls = 1;
+                }
+                outcome.usage.estimated_cost = Some(estimate);
                 if outcome.stopped_early {
                     tracing::warn!(session_id=%request.session_id, "Turn reached its step limit");
                 }

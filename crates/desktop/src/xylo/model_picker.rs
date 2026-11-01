@@ -328,6 +328,7 @@ impl Xylo {
         }
         self.model_picker.open = open;
         if open {
+            self.request_output_styles(cx);
             self.model_picker.last_query.clear();
             self.model_picker
                 .query
@@ -553,6 +554,7 @@ impl Xylo {
             )
             .child(div().relative().child(list).children(pinned))
             .child(self.reasoning_effort_control(cx))
+            .child(self.output_style_control(cx))
             .child(divider())
             .child(
                 picker_row("composer-manage-models", false)

@@ -214,6 +214,7 @@ async fn lost_completed_event_replays_receipt_without_model_or_duplicate_history
         context_tokens: 5,
         cache_read_tokens: Some(3),
         cache_write_tokens: None,
+        ..Usage::default()
     };
     engine
         .store

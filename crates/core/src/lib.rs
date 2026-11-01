@@ -1,5 +1,6 @@
 //! Application-owned contracts. Community engine types must not cross this boundary.
 mod branding;
+pub mod pricing;
 pub use branding::{APPLICATION_ID, APPLICATION_NAME, CREDENTIAL_SERVICE};
 mod documents;
 pub use documents::*;
@@ -327,6 +328,12 @@ pub struct AppSettings {
     pub ui: UiPreferences,
     #[serde(default)]
     pub secret_storage: SecretStorage,
+    #[serde(default)]
+    pub pricing_overrides: std::collections::BTreeMap<String, pricing::ModelPrice>,
+    #[serde(default = "default_output_style")]
+    pub output_style: String,
+    #[serde(default)]
+    pub status_line_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -427,8 +434,15 @@ impl Default for AppSettings {
             telemetry_export: false,
             ui: UiPreferences::default(),
             secret_storage: SecretStorage::default(),
+            pricing_overrides: Default::default(),
+            output_style: default_output_style(),
+            status_line_command: None,
         }
     }
+}
+
+fn default_output_style() -> String {
+    "default".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -551,6 +565,12 @@ pub struct Usage {
     /// `cache_read_tokens`. Part of `input_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
+    /// Successful request counts retain model identity and per-request context tiers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<pricing::UsageCall>,
+    /// Token-only estimate captured using the rates selected for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<pricing::CostEstimate>,
 }
 
 /// What a running turn is doing right now, for the activity line.
@@ -747,6 +767,20 @@ pub enum EngineEvent {
         #[serde(default)]
         kind: ErrorKind,
     },
+    ModelMetadata {
+        model: String,
+        rate_limits: Option<RateLimits>,
+    },
+}
+
+/// Numeric remaining quota reported by a provider, never inferred from usage.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimits {
+    pub requests: Option<u64>,
+    pub tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub observed_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -139,12 +139,38 @@ pub async fn run_prepared_sandboxed(
     timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<SandboxedResult> {
+    run_sandboxed_stdin(prepared, cwd, timeout, cancel, Stdio::null()).await
+}
+
+/// Supplies bounded JSON or text through an inherited private stdin file.
+pub async fn run_prepared_sandboxed_input(
+    prepared: xylo_services::sandbox::PreparedSandbox,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: CancellationToken,
+    input: &[u8],
+) -> Result<SandboxedResult> {
+    use std::io::{Seek, Write};
+    anyhow::ensure!(input.len() <= 32 * 1024, "Process input exceeds 32 KiB");
+    let mut file = tempfile::tempfile()?;
+    file.write_all(input)?;
+    file.rewind()?;
+    run_sandboxed_stdin(prepared, cwd, timeout, cancel, Stdio::from(file)).await
+}
+
+async fn run_sandboxed_stdin(
+    prepared: xylo_services::sandbox::PreparedSandbox,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: CancellationToken,
+    stdin: Stdio,
+) -> Result<SandboxedResult> {
     let xylo_services::sandbox::PreparedSandbox {
         command,
         temporary,
         status_file,
     } = prepared;
-    let result = run_prepared(command, cwd, timeout, cancel).await;
+    let result = run_prepared_io(command, cwd, timeout, cancel, stdin).await;
     if let Some(failure) = xylo_services::sandbox::read_start_status(&status_file) {
         return Err(NotStarted(failure.to_string()).into());
     }
@@ -159,10 +185,20 @@ pub async fn run_prepared_sandboxed(
 /// Runs a prepared command without a sandbox, draining output and owning its
 /// process group until it ends.
 pub async fn run_prepared(
+    command: Command,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<ProcessResult> {
+    run_prepared_io(command, cwd, timeout, cancel, Stdio::null()).await
+}
+
+async fn run_prepared_io(
     mut command: Command,
     cwd: &Path,
     timeout: Duration,
     cancel: CancellationToken,
+    stdin: Stdio,
 ) -> Result<ProcessResult> {
     if cancel.is_cancelled() {
         return Err(NotStarted("Cancelled before process start".into()).into());
@@ -172,7 +208,7 @@ pub async fn run_prepared(
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
