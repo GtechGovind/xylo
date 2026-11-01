@@ -22,6 +22,46 @@ fn usage_labels_distinguish_free_estimates_unknown_and_partial_prices() {
 }
 
 #[gpui_kit::test]
+fn confirmed_price_changes_refresh_usage_after_optimistic_edits(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (window, view) = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.event(xylo_runtime::host::HostEvent::Settings(view.settings.clone()), window, cx);
+            let cache_key = (view.session, vec![], 0, None);
+            let old_request = uuid::Uuid::new_v4();
+            view.usage_ui.key = Some(cache_key.clone());
+            view.usage_ui.pending = Some((old_request, None));
+            view.usage_ui.model.update(cx, |field, cx| field.set_value("custom-model", window, cx));
+            for (field, price) in view.usage_ui.rates.iter().zip(["1", "2", "0.1", "1.25"]) {
+                field.update(cx, |field, cx| field.set_value(price, window, cx));
+            }
+            view.save_price_override(cx);
+            assert_eq!(view.usage_ui.key.as_ref(), Some(&cache_key), "An optimistic edit is not a saved pricing change");
+            let saved = view.settings.clone();
+            view.event(xylo_runtime::host::HostEvent::Settings(saved), window, cx);
+            assert!(view.usage_ui.key.is_none(), "Saving a new price must refresh same-chat totals even though the local settings already contain that price");
+            assert_eq!(view.usage_ui.pending, Some((old_request, None)), "The bounded in-flight request may finish before the refresh");
+            view.usage_received(old_request, view.session, Ok((xylo_runtime::UsageReport::default(), None)), cx);
+            assert!(view.usage_ui.pending.is_none());
+            assert!(view.usage_ui.key.is_none(), "An older report must not suppress the next render's pricing refresh");
+
+            view.usage_ui.key = Some(cache_key.clone());
+            // Restore published price also removes the local override before
+            // its save acknowledgement reaches this event boundary.
+            view.settings.pricing_overrides.remove("custom-model");
+            view.event(xylo_runtime::host::HostEvent::Settings(view.settings.clone()), window, cx);
+            assert!(view.usage_ui.key.is_none(), "Restoring published prices must refresh same-chat totals");
+        });
+    }).unwrap();
+}
+
+#[gpui_kit::test]
 fn receipt_and_unsuccessful_turn_events_refresh_persisted_usage(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (window, view) = cx.update(|cx| {

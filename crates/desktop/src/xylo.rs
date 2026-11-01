@@ -1081,6 +1081,8 @@ impl Xylo {
                     self.provider_form(&settings.provider, window, cx);
                 }
                 self.settings = settings;
+                // Confirmed pricing updates can revalue pending receipts.
+                self.invalidate_usage();
                 self.sync_usage_forms(window, cx);
                 if let Some(mut ui) = local_ui {
                     for root in &self.settings.ui.open_projects {
