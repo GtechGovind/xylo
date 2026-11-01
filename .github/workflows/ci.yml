@@ -41,6 +41,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake pkg-config clang libclang-dev libasound2-dev libudev-dev libgtk-3-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxrandr-dev libxi-dev libxtst-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev libssl-dev libsecret-1-dev libpipewire-0.3-dev libgbm-dev libfontconfig1-dev libfreetype6-dev bubblewrap socat ripgrep
+      - name: Enable sandbox namespaces on the disposable Linux runner
+        if: runner.os == 'Linux'
+        shell: bash
+        # Ubuntu's host policy blocks bwrap's isolated loopback setup. This
+        # affects only this ephemeral CI VM, never an installed Xylo system.
+        run: |
+          if sysctl -n kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --unshare-user --unshare-net -- /bin/true
       - name: Pinned Rust toolchain
         run: rustup show active-toolchain
       - name: Rust build cache
@@ -51,7 +64,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: ci-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.github/workflows/ci.yml') }}
           restore-keys: ci-${{ runner.os }}-${{ runner.arch }}-
       - name: Sandboxed command dependencies
         run: npm ci --prefix crates/services/sandbox-helper --ignore-scripts --no-audit --no-fund
@@ -74,7 +87,7 @@ jobs:
         env:
           XYLO_EVAL_SCRIPT: .github/fixtures/cli-list-files.json
         run: |
-          cargo run --locked -p xylo-cli -- -p "list files" --output-format json --data-dir "$RUNNER_TEMP/xylo-cli-acceptance" > "$RUNNER_TEMP/cli-result.json"
+          "$CARGO_TARGET_DIR/debug/xylo-cli" -p "list files" --output-format json --data-dir "$RUNNER_TEMP/xylo-cli-acceptance" > "$RUNNER_TEMP/cli-result.json"
           python3 -c 'import json, os; result=json.load(open(os.environ["RUNNER_TEMP"]+"/cli-result.json")); assert result["exit_code"] == 0 and result["text"] == "Listed the workspace."'
       - name: Install RustSec audit
         run: cargo install cargo-audit --locked --version 0.22.2

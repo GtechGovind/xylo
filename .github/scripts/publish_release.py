@@ -95,7 +95,7 @@ Every download has a SHA-256 checksum and a project-key signature (`.sig`). The 
 
 {platform_status}
 
-The macOS `.app.tar.gz` preserves the app bundle's executable permissions. The `.dmg`, Windows installer, and Linux `.deb`/`.AppImage` are native packages. Executable tools require Node.js 22.12 or later. Linux also requires `bubblewrap`, `socat`, and `ripgrep`; the `.deb` declares these dependencies, while AppImage users install them separately.
+The macOS `.app.tar.gz` preserves the app bundle's executable permissions. The `.dmg`, Windows installer, and Linux `.deb`/`.AppImage` are native packages. Executable tools require Node.js 22.12 or later. Linux also requires `bubblewrap`, `socat`, and `ripgrep`; the `.deb` declares these dependencies, while AppImage users install them separately. Linux host policy must allow Bubblewrap to create user and network namespaces; some Ubuntu installations require AppArmor configuration.
 
 Artifact signatures use cargo-packager's Base64 encoding of Minisign signatures. Verification instructions and the public key are in the repository's distribution documentation.
 """
