@@ -46,6 +46,10 @@ pub(crate) trait ToolExecutor: Send + Sync {
     /// Updates utility requests to the provider that completed this model call.
     fn active_provider(&self, _provider: Arc<dyn crate::model::ModelProvider>) {}
 
+    /// A refreshed project prompt after an approved checkout change.
+    fn refreshed_system_prompt(&self) -> Option<String> {
+        None
+    }
     /// Tools offered directly to the model right now. Re-read before every
     /// model call, because the permission mode can change mid-task.
     fn schemas(&self) -> Vec<ToolSchema>;
@@ -77,11 +81,13 @@ pub(crate) trait ToolExecutor: Send + Sync {
 }
 
 /// Exact names other agents use for Xylo's tools.
-const ALIASES: [(&str, &str); 18] = [
+const ALIASES: [(&str, &str); 20] = [
     ("WebFetch", "web_fetch"),
     ("WebSearch", "web_search"),
     ("webfetch", "web_fetch"),
     ("websearch", "web_search"),
+    ("enterworktree", "worktree_enter"),
+    ("exitworktree", "worktree_exit"),
     ("read", "file_read"),
     ("write", "file_write"),
     ("edit", "file_edit"),

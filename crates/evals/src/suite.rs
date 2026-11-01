@@ -29,6 +29,7 @@ pub fn builtin() -> Vec<Task> {
         code_tool_safety(),
         shell_working_directory(),
         web_fetch(),
+        worktree_approval(),
         length_continuation(),
         truncated_call(),
         empty_answer(),
@@ -119,6 +120,40 @@ fn tool_loop() -> Task {
         ModelReply::text("Fixed: `add` in src/lib.rs now returns a + b."),
     ]);
     task.live = true;
+    task
+}
+
+fn worktree_approval() -> Task {
+    let mut task = task(
+        "worktree-approval",
+        "Denied checkout changes leave the chat root untouched",
+        "Create an isolated worktree, but respect a denied approval.",
+        |trial| {
+            vec![
+                completed(trial),
+                Check::expect(
+                    "checkout_approval",
+                    trial
+                        .approvals
+                        .iter()
+                        .any(|approval| approval.tool == "worktree_enter" && !approval.allowed),
+                    "Worktree creation requires user approval",
+                ),
+                Check::expect(
+                    "no_checkout_created",
+                    !trial.workspace.join(".xylo/worktrees/denied").exists(),
+                    "Denied worktree creation leaves no checkout",
+                ),
+            ]
+        },
+    );
+    task.approvals = ApprovalPolicy::DenyAll;
+    task.script = Script::replies([
+        ModelReply::calls(1, [("worktree_enter", json!({"name":"denied"}))]),
+        ModelReply::text(
+            "Worktree creation was denied. The chat remains in its original checkout.",
+        ),
+    ]);
     task
 }
 

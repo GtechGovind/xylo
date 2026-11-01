@@ -49,6 +49,7 @@ mod turn_queue_control;
 mod update_control;
 mod web_search_control;
 mod worker_control;
+mod worktree_control;
 use worker_control::{SessionSequences, WorkerHandle, effective_mode, retire_idle_workers};
 
 #[derive(Clone)]
@@ -301,6 +302,12 @@ pub enum HostEvent {
     },
     /// A conversation's title changed (user rename or generated title).
     ConversationRenamed(Conversation),
+    Worktrees(Vec<crate::workspace::worktree::Worktree>),
+    ChatWorktree {
+        session: Uuid,
+        workspace: PathBuf,
+        branch: Option<String>,
+    },
     Stopped,
 }
 
@@ -375,6 +382,9 @@ enum HostCommand {
     SetConversationArchived(Uuid, bool),
     RemoveProvider(ProviderConfig),
     ExportConversation(Uuid, PathBuf),
+    CreateChatWorktree(Uuid, PathBuf),
+    ListWorktrees(Option<PathBuf>),
+    RemoveWorktree(PathBuf, bool),
     Shutdown,
 }
 
@@ -385,6 +395,18 @@ pub struct HostClient {
 }
 
 impl HostClient {
+    /// Creates an isolated checkout for a new chat after an explicit UI action.
+    pub fn create_chat_worktree(&self, session: Uuid, repo: PathBuf) -> Result<()> {
+        self.enqueue(HostCommand::CreateChatWorktree(session, repo))
+    }
+    /// Lists retained worktrees for Settings.
+    pub fn list_worktrees(&self, repo: Option<PathBuf>) -> Result<()> {
+        self.enqueue(HostCommand::ListWorktrees(repo))
+    }
+    /// Removes a managed checkout; force requires a separate user confirmation.
+    pub fn remove_worktree(&self, path: PathBuf, force: bool) -> Result<()> {
+        self.enqueue(HostCommand::RemoveWorktree(path, force))
+    }
     pub fn spawn() -> Result<(Self, Receiver<HostEvent>)> {
         Self::spawn_at(AppPaths::discover()?)
     }
@@ -523,6 +545,7 @@ impl HostClient {
                     }
                     if memory_setup_needed {state.events.send(HostEvent::Status("Semantic search needs setup in Downloads. Your saved memories remain searchable.".into())).await?;}
                     if recovered > 0 {state.events.send(HostEvent::Status(format!("Recovered {recovered} interrupted actions; uncertain writes require review"))).await?;}
+                    if let Err(error) = state.cleanup_archived_worktrees().await { tracing::warn!(%error, "Retained worktree cleanup needs review"); }
                     state.send_conversations().await?;
                     let scheduling_state=state.clone();
                     let scheduling=tokio::spawn(async move{scheduling_state.schedule_loop().await;});
@@ -1640,6 +1663,11 @@ impl HostState {
                         .await??;
                 self.events.send(HostEvent::HistoryPage(page)).await?;
             }
+            HostCommand::CreateChatWorktree(session, repo) => {
+                self.create_chat_worktree(session, repo).await?
+            }
+            HostCommand::ListWorktrees(repo) => self.list_worktrees(repo).await?,
+            HostCommand::RemoveWorktree(path, force) => self.remove_worktree(path, force).await?,
             HostCommand::Conversations => self.send_conversations().await?,
             HostCommand::ApprovalRules(workspace) => {
                 let result = self.approval_rules(&workspace).await;
@@ -2753,7 +2781,7 @@ impl HostState {
         // during SQLite commit; a following Stop ends that exact run.
         *worker.run_request.lock() = Some(request_id);
         *worker.run_turn.lock() = Some(turn.turn_id);
-        *worker.workspace.lock() = Some(workspace);
+        worker.record_workspace(workspace);
         *worker.last_used.lock() = std::time::Instant::now();
         worker.queue_epoch.fetch_add(1, Ordering::AcqRel);
         worker.active.store(true, Ordering::Release);
@@ -2901,6 +2929,13 @@ impl HostState {
         loop {
             let dead = {
                 let workers = self.workers.lock().await;
+                if let Some(worker) = workers.get(&session) {
+                    ensure!(
+                        !worker.worktree_retiring.load(Ordering::Acquire)
+                            || *worker.exited.borrow(),
+                        "The worktree's background jobs are still stopping"
+                    );
+                }
                 match workers.get(&session) {
                     Some(worker) if worker.dead() => Some(worker.clone()),
                     Some(_) => return Ok(()),

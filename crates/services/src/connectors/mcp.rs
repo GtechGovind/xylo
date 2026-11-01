@@ -280,6 +280,17 @@ pub struct ConnectorBroker {
     local_scope: Option<ConnectorLaunchScope>,
 }
 impl ConnectorBroker {
+    /// A busy pool may still hold a local process and must retain its checkout.
+    pub fn may_have_local_processes(&self) -> bool {
+        let Ok(sessions) = self.pool.sessions.try_lock() else {
+            return true;
+        };
+        sessions.values().any(|slot| match slot.try_lock() {
+            Ok(session) => session.process.is_some(),
+            Err(_) => true,
+        })
+    }
+
     /// Creates an empty pool with the default [`MCP_IDLE_TIMEOUT`].
     pub fn new(store: Store, vault: CredentialVault) -> Self {
         Self {

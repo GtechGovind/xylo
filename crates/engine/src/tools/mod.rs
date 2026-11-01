@@ -30,6 +30,7 @@ mod read_state;
 mod risk;
 pub mod shell_jobs;
 pub(crate) mod web;
+mod worktree;
 use crate::{prompts, provider_guard::EffectiveWindow};
 use anyhow::{Context, Result, bail, ensure};
 pub(crate) use code::shell_name;
@@ -44,6 +45,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+pub use worktree::WorkspaceLease;
 use xylo_capabilities::{CapabilityConfig, CapabilityService};
 use xylo_core::{
     ConnectorConfig, EngineEvent, MemoryOrigin, PermissionMode, ToolDefinition, TurnPhase,
@@ -197,17 +199,33 @@ pub struct ToolBroker {
     /// Compiled schemas, the connector snapshot and the search index.
     lookup: lookup::Lookup,
     web: Arc<web::WebSession>,
-    web_provider: Mutex<Option<Arc<dyn crate::model::ModelProvider>>>,
+    web_provider: Arc<Mutex<Option<Arc<dyn crate::model::ModelProvider>>>>,
+    system_addendum: String,
+    workspace: Arc<worktree::LiveWorkspace>,
+    root_revision: u64,
+    root_brokers: Mutex<std::collections::HashMap<PathBuf, Arc<ToolBroker>>>,
 }
 impl ToolBroker {
     pub fn new(
-        request: TurnRequest,
+        mut request: TurnRequest,
         store: Store,
-        config: CapabilityConfig,
+        mut config: CapabilityConfig,
         session: ToolSession,
         events: tokio::sync::mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
     ) -> Result<Self> {
+        let workspace = session
+            .workspaces
+            .lock()
+            .entry(request.session_id)
+            .or_insert_with(|| Arc::new(worktree::LiveWorkspace::new(request.workspace.clone())))
+            .clone();
+        let selected = workspace.root.lock().clone();
+        if request.workspace != selected {
+            request.approved_rules.clear();
+        }
+        request.workspace = selected;
+        config.workspace = request.workspace.clone();
         let artifacts = config.artifacts.clone();
         if let Some(data) = artifacts.parent() {
             session.shell_jobs.configure(request.session_id, data);
@@ -261,6 +279,11 @@ impl ToolBroker {
             image_generation,
             served_context: Default::default(),
             lookup: lookup::Lookup::default(),
+            root_revision: workspace
+                .revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            workspace,
+            root_brokers: Mutex::default(),
             store,
             capabilities,
             capability_config: config,
@@ -272,7 +295,8 @@ impl ToolBroker {
             on_refusal: None,
             policy_excluded: Default::default(),
             web: session.web.clone(),
-            web_provider: Mutex::new(None),
+            web_provider: Arc::new(Mutex::new(None)),
+            system_addendum: String::new(),
             session,
             parent_id: None,
             events,
@@ -309,6 +333,7 @@ impl ToolBroker {
         child.custom_handler = self.custom_handler.clone();
         child.on_refusal = self.on_refusal.clone();
         child.policy_excluded = self.policy_excluded.clone();
+        child.system_addendum = self.system_addendum.clone();
         child.web = self.web.clone();
         *child.web_provider.lock() = self.web_provider.lock().clone();
         Ok(child)
@@ -363,6 +388,31 @@ impl ToolBroker {
     /// Shares the authorized turn provider with web utility requests.
     pub(crate) fn set_web_provider(&self, provider: Arc<dyn crate::model::ModelProvider>) {
         web::set_provider(self, provider);
+    }
+
+    /// The selected checkout for this conversation. An executing action holds a
+    /// root lease, so approval, path resolution and execution share this root.
+    pub fn workspace_root(&self) -> PathBuf {
+        self.workspace.root.lock().clone()
+    }
+
+    pub(crate) fn refreshed_system_prompt(&self) -> Option<String> {
+        if self.root_revision
+            == self
+                .workspace
+                .revision
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            None
+        } else {
+            self.workspace.prompt.lock().clone().map(|mut prompt| {
+                if !self.system_addendum.is_empty() {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&self.system_addendum);
+                }
+                prompt
+            })
+        }
     }
 
     pub fn definitions(&self) -> &[ToolDefinition] {
@@ -580,6 +630,93 @@ impl ToolBroker {
         self.execute_scoped(Some(namespace), call_id, name, arguments, Origin::Model)
     }
     fn execute_scoped(
+        &self,
+        namespace: Option<&str>,
+        call_id: &str,
+        name: &str,
+        arguments: Value,
+        origin: Origin,
+    ) -> Result<String> {
+        if origin == Origin::Hook {
+            // Hooks inherit the surrounding action's root lease and immutable
+            // component snapshot, including during a checkout transition.
+            ensure!(
+                name == "extension_component",
+                "Unsupported nested hook action"
+            );
+            return self.execute_at_root(namespace, call_id, name, arguments, origin);
+        }
+        if name == "call_tool" {
+            let target = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .context("Missing tool name")?;
+            ensure!(
+                target != "call_tool",
+                "Recursive tool dispatch is not allowed"
+            );
+            return self.execute_scoped(
+                namespace,
+                call_id,
+                target,
+                arguments
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+                origin,
+            );
+        }
+        let switch = matches!(name, "worktree_enter" | "worktree_exit");
+        ensure!(
+            !switch || (namespace.is_none() && self.parent_id.is_none()),
+            "Child agents cannot change the parent chat's checkout"
+        );
+        let _write = switch.then(|| self.workspace.gate.write());
+        let _read = (!switch).then(|| self.workspace.gate.read_recursive());
+        let root = self.workspace_root();
+        if self.request.workspace == root {
+            return self.execute_at_root(namespace, call_id, name, arguments, origin);
+        }
+        let cached = self.root_brokers.lock().get(&root).cloned();
+        let broker = if let Some(cached) = cached {
+            cached
+        } else {
+            let mut request = self.request.clone();
+            request.workspace = root.clone();
+            request.approved_rules = self
+                .store
+                .approval_rules(&root)?
+                .into_iter()
+                .map(|rule| rule.key)
+                .collect();
+            let mut broker = Self::new(
+                request,
+                self.store.clone(),
+                self.capability_config.clone(),
+                self.session.clone(),
+                self.events.clone(),
+                self.cancel.clone(),
+            )?;
+            broker.parent_id = self.parent_id;
+            broker.allowed_tools = self.allowed_tools.clone();
+            broker.definitions = self.definitions.clone();
+            broker.custom_tools = self.custom_tools.clone();
+            broker.custom_handler = self.custom_handler.clone();
+            broker.on_refusal = self.on_refusal.clone();
+            broker.policy_excluded = self.policy_excluded.clone();
+            broker.system_addendum = self.system_addendum.clone();
+            broker.web_provider = self.web_provider.clone();
+            broker.advertised = self.advertised.clone();
+            broker.served_context = self.served_context.clone();
+            broker.resources = self.resources.clone();
+            *broker.delegate.lock() = self.delegate.lock().clone();
+            let broker = Arc::new(broker);
+            self.root_brokers.lock().insert(root, broker.clone());
+            broker
+        };
+        broker.execute_at_root(namespace, call_id, name, arguments, origin)
+    }
+    fn execute_at_root(
         &self,
         namespace: Option<&str>,
         call_id: &str,
@@ -900,6 +1037,8 @@ impl ToolBroker {
                 )?
             } else if let Some(memory_origin) = memory_origin {
                 builtin::remember(self, &arguments, memory_origin)?
+            } else if matches!(name, "worktree_enter" | "worktree_exit") {
+                worktree::execute(self, name, &arguments)?
             } else if builtin::handles(name) {
                 match name {
                     "shell_command" | "run_command" | "shell_output" | "shell_kill"
@@ -1890,6 +2029,15 @@ impl ToolBroker {
     /// Stops what this broker started. A helper agent's broker closes only
     /// its own sessions; models and environments belong to the parent turn.
     pub async fn shutdown(&self) -> Result<()> {
+        let scoped = self
+            .root_brokers
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for broker in scoped {
+            broker.capabilities.shutdown().await?;
+        }
         if self.parent_id.is_some() {
             self.capabilities.shutdown_helper_sessions().await
         } else {

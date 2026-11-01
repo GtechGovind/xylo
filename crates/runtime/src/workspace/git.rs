@@ -81,7 +81,7 @@ fn parse_status(raw: &str) -> Result<Vec<GitChange>> {
     }
     Ok(changes)
 }
-fn trusted_git(root: &Path) -> Result<PathBuf> {
+pub(super) fn trusted_git(root: &Path) -> Result<PathBuf> {
     let root = root.canonicalize()?;
     #[cfg(unix)]
     let candidates = [
@@ -106,7 +106,7 @@ fn trusted_git(root: &Path) -> Result<PathBuf> {
         "Install a trusted system Git outside the selected project to enable native inspection"
     )
 }
-fn bounded_text(path: &Path, limit: usize) -> Result<String> {
+pub(super) fn bounded_text(path: &Path, limit: usize) -> Result<String> {
     use std::io::Read;
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
@@ -135,7 +135,7 @@ fn resolve_git_directory(root: &Path) -> Result<(PathBuf, PathBuf)> {
     }
     anyhow::bail!("Selected project is not a Git worktree")
 }
-fn metadata_link(source: &Path, target: &Path) -> Result<()> {
+pub(super) fn metadata_link(source: &Path, target: &Path) -> Result<()> {
     if !source.exists() {
         return Ok(());
     }

@@ -7,6 +7,7 @@ mod paths;
 mod reader;
 mod rules;
 mod search;
+pub mod worktree;
 pub use index::{FileCursor, FileEntry, FileOptions, FilePage};
 pub use search::{SearchCursor, SearchHit, SearchOptions, SearchPage};
 

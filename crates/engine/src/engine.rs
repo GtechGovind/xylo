@@ -277,9 +277,10 @@ impl AgentEngine {
     /// conversation (until the day, branch, mode, instructions or installed
     /// skills change) and the provider's cached prefix survives each new
     /// message. What is retrieved for the prompt goes in [`Self::recalled_context`].
-    fn system_prompt(request: &TurnRequest, broker: &ToolBroker, mode: PermissionMode) -> String {
+    fn system_prompt(_request: &TurnRequest, broker: &ToolBroker, mode: PermissionMode) -> String {
+        let workspace = broker.workspace_root();
         let mut context = crate::prompts::PromptContext::detect(
-            &request.workspace,
+            &workspace,
             mode,
             xylo_core::now_ms(),
             broker.window().prompt_budget(),
@@ -558,7 +559,6 @@ impl AgentEngine {
             cancel: cancel.clone(),
             timeout: CHILD_TIMEOUT,
             runtime: tokio::runtime::Handle::current(),
-            workspace: request.workspace.clone(),
             permissions: self.session.permissions().clone(),
         });
         broker.set_delegate(delegation.handler());

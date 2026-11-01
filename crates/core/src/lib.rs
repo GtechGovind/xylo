@@ -811,6 +811,11 @@ pub enum EngineEvent {
     ShellJobUpdated {
         job: ShellJob,
     },
+    /// The conversation selected a different managed checkout.
+    WorkspaceChanged {
+        workspace: PathBuf,
+        branch: Option<String>,
+    },
 }
 
 /// Live state of a conversation-owned shell job. The output is a bounded tail;

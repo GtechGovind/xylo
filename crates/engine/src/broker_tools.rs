@@ -36,7 +36,8 @@ impl BrokerTools {
 
     /// Children cannot delegate further.
     fn offered(&self, name: &str) -> bool {
-        self.namespace.is_none() || name != "agent_delegate"
+        self.namespace.is_none()
+            || !matches!(name, "agent_delegate" | "worktree_enter" | "worktree_exit")
     }
 }
 
@@ -52,6 +53,12 @@ impl ToolExecutor for BrokerTools {
         self.broker.set_web_provider(provider);
     }
 
+    fn refreshed_system_prompt(&self) -> Option<String> {
+        self.namespace
+            .is_none()
+            .then(|| self.broker.refreshed_system_prompt())
+            .flatten()
+    }
     fn schemas(&self) -> Vec<ToolSchema> {
         self.broker
             .initial_definitions()

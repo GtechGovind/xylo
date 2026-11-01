@@ -172,3 +172,10 @@ async fn web_fetch_task_reads_a_real_offline_page_with_private_approval() {
     let (_, result) = graded(&task).await;
     assert!(result.passed, "{}", explain(&result));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worktree_approval_task_passes_offline() {
+    let task = find("worktree-approval").unwrap();
+    let (_, result) = graded(&task).await;
+    assert!(result.passed, "{}", explain(&result));
+}

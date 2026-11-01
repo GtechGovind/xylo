@@ -53,6 +53,7 @@ pub(super) fn group_summary<'a>(tools: impl IntoIterator<Item = &'a ToolCard>) -
 fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
     match name {
         "lsp" => ("Inspected", "code location", "code locations"),
+        "worktree_enter" | "worktree_exit" => ("Changed", "worktree", "worktrees"),
         "file_read" | "read_file" => ("Read", "file", "files"),
         "extension_resource" => ("Read", "skill file", "skill files"),
         "search_project" | "find_files" | "grep" | "glob" | "find" => {
