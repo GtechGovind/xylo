@@ -18,6 +18,14 @@ fn validate(settings: &WebSearchSettings) -> Result<()> {
     Ok(())
 }
 
+/// Only this module can construct authority to replace vault-owned settings.
+pub(super) struct AuthorizedSearchSettings(WebSearchSettings);
+impl AuthorizedSearchSettings {
+    pub(super) fn configuration(&self) -> &WebSearchSettings {
+        &self.0
+    }
+}
+
 impl HostState {
     pub(super) async fn save_web_search(
         &self,
@@ -64,8 +72,13 @@ impl HostState {
             );
         }
         settings.web_search = config.clone();
+        let authority = AuthorizedSearchSettings(config.clone());
         let saved = self
-            .commit_settings(settings, settings_control::ProjectFields::Current)
+            .commit_settings_authorized(
+                settings,
+                settings_control::ProjectFields::Current,
+                Some(&authority),
+            )
             .await;
         match saved {
             Ok(saved) => {

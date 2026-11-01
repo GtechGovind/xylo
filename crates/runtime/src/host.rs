@@ -2942,14 +2942,29 @@ impl HostState {
         settings: AppSettings,
         fields: settings_control::ProjectFields,
     ) -> Result<AppSettings> {
+        self.commit_settings_authorized(settings, fields, None)
+            .await
+    }
+
+    /// A dedicated credential save can replace only its validated vault fields.
+    async fn commit_settings_authorized(
+        &self,
+        settings: AppSettings,
+        fields: settings_control::ProjectFields,
+        search: Option<&web_search_control::AuthorizedSearchSettings>,
+    ) -> Result<AppSettings> {
         let previous = self.settings.lock().await.clone();
         let requested = settings.secret_storage;
-        let mut applied = self.save_settings_snapshot(&settings, fields).await?;
+        let mut applied = self
+            .save_settings_snapshot(&settings, fields, search)
+            .await?;
         match self.apply_secret_storage(requested).await {
             Ok(actual) if actual == requested => {}
             Ok(actual) => {
                 applied.secret_storage = actual;
-                applied = self.save_settings_snapshot(&applied, fields).await?;
+                applied = self
+                    .save_settings_snapshot(&applied, fields, search)
+                    .await?;
                 self.events
                     .send(HostEvent::Settings(applied.clone()))
                     .await?;
@@ -2963,7 +2978,9 @@ impl HostState {
             Err(error) => {
                 // Never leave the saved choice and the live vault disagreeing.
                 applied.secret_storage = previous.secret_storage;
-                applied = self.save_settings_snapshot(&applied, fields).await?;
+                applied = self
+                    .save_settings_snapshot(&applied, fields, search)
+                    .await?;
                 if applied.permissions != previous.permissions {
                     self.forward_permissions(applied.permissions).await;
                 }
@@ -2984,9 +3001,16 @@ impl HostState {
         &self,
         settings: &AppSettings,
         fields: settings_control::ProjectFields,
+        search: Option<&web_search_control::AuthorizedSearchSettings>,
     ) -> Result<AppSettings> {
         let mut current = self.settings.lock().await;
         let mut value = settings.clone();
+        // Every generic snapshot preserves current credential ownership,
+        // independently of which project fields the caller may change.
+        value.web_search = search
+            .map(|authority| authority.configuration())
+            .unwrap_or(&current.web_search)
+            .clone();
         settings_control::merge_project_fields(
             &mut value,
             &current,

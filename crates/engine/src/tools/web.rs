@@ -309,43 +309,81 @@ fn fetch(broker: &ToolBroker, id: Uuid, arguments: &Value) -> Result<Value> {
     )
 }
 
+/// One checked response; its body has not been consumed.
+struct NetworkReply {
+    response: reqwest::Response,
+    private_addresses: Option<Vec<SocketAddr>>,
+}
+
+/// Pages and publisher resolution share this checked GET boundary.
+/// Approvals remain outside asynchronous futures.
+fn guarded_get(
+    broker: &ToolBroker,
+    id: Uuid,
+    url: &Url,
+    deadline: &mut tokio::time::Instant,
+    domain_preapproved: bool,
+) -> Result<NetworkReply> {
+    let host = url
+        .host_str()
+        .context("Missing web host")?
+        .trim_matches(['[', ']'])
+        .to_owned();
+    let wait = Instant::now();
+    if !domain_preapproved {
+        authorize_domain(broker, id, &host)?;
+    }
+    *deadline += wait.elapsed();
+    let addresses: Vec<SocketAddr>=broker.runtime.block_on(async {tokio::select! {biased;
+        _=broker.cancel.cancelled()=>bail!("Web request cancelled"),
+        result=tokio::time::timeout_at(*deadline,tokio::net::lookup_host((host.as_str(),url.port_or_known_default().context("Missing web port")?)))=>Ok(result.context("Web request timed out")?.context("Web DNS lookup failed")?.collect())
+    }})?;
+    ensure!(!addresses.is_empty(), "Web host has no addresses");
+    let private_addresses = if addresses
+        .iter()
+        .any(|address| !public_address(address.ip()))
+    {
+        let wait = Instant::now();
+        authorize_private(broker, id, url, &addresses)?;
+        *deadline += wait.elapsed();
+        Some(addresses.clone())
+    } else {
+        None
+    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .resolve_to_addrs(&host, &addresses)
+        .timeout(TIMEOUT)
+        .build()
+        .context("Create web client")?;
+    let response=broker.runtime.block_on(async {tokio::select! {biased;
+        _=broker.cancel.cancelled()=>bail!("Web request cancelled"),
+        result=tokio::time::timeout_at(*deadline,client.get(url.clone()).header("accept","text/html, text/plain, text/markdown, application/json").send())=>Ok(result.context("Web request timed out")?.map_err(|_|anyhow::anyhow!("Web connection failed"))?)
+    }})?;
+    Ok(NetworkReply {
+        response,
+        private_addresses,
+    })
+}
+
 fn fetch_page(broker: &ToolBroker, id: Uuid, mut url: Url, max: usize) -> Result<Page> {
     let mut deadline = tokio::time::Instant::now() + TIMEOUT;
     let mut domains = Vec::new();
     let mut private_targets = Vec::new();
     for hop in 0..=10 {
-        let host = url
-            .host_str()
-            .context("Missing web host")?
-            .trim_matches(['[', ']'])
-            .to_owned();
-        // Approval is blocking; keep it off the runtime executor and exclude user wait from transport timeout.
-        let wait = Instant::now();
-        if hop > 0 {
-            authorize_domain(broker, id, &host)?;
+        let reply = guarded_get(broker, id, &url, &mut deadline, hop == 0)?;
+        domains.push(
+            url.host_str()
+                .context("Missing web host")?
+                .trim_matches(['[', ']'])
+                .to_owned(),
+        );
+        if let Some(addresses) = reply.private_addresses {
+            private_targets.push((url.clone(), addresses));
         }
-        deadline += wait.elapsed();
-        domains.push(host.clone());
-        let addresses: Vec<_> = broker.runtime.block_on(async {tokio::select! { biased; _ = broker.cancel.cancelled() => bail!("Web request cancelled"), result = tokio::time::timeout_at(deadline,tokio::net::lookup_host((host.as_str(),url.port_or_known_default().context("Missing web port")?))) => Ok(result.context("Web request timed out")?.context("Web DNS lookup failed")?.collect()) }})?;
-        ensure!(!addresses.is_empty(), "Web host has no addresses");
-        if addresses
-            .iter()
-            .any(|address| !public_address(address.ip()))
-        {
-            let wait = Instant::now();
-            authorize_private(broker, id, &url, &addresses)?;
-            deadline += wait.elapsed();
-            private_targets.push((url.clone(), addresses.clone()));
-        }
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .resolve_to_addrs(&host, &addresses)
-            .timeout(TIMEOUT)
-            .build()
-            .context("Create web client")?;
-        let response = broker.runtime.block_on(async {tokio::select! { biased; _ = broker.cancel.cancelled() => bail!("Web request cancelled"), result = tokio::time::timeout_at(deadline,client.get(url.clone()).header("accept","text/html, text/plain, text/markdown, application/json").send()) => Ok(result.context("Web request timed out")?.map_err(|_| anyhow::anyhow!("Web connection failed"))?) }})?;
+        let response = reply.response;
         if response.status().is_redirection() {
             ensure!(hop < 10, "Web request exceeded 10 redirects");
             let location = response
@@ -540,6 +578,18 @@ fn search(broker: &ToolBroker, id: Uuid, arguments: &Value) -> Result<Value> {
     } else {
         fallback_search(broker, id, &args, &broker.store.settings()?.web_search)?
     };
+    if result["source_resolution"] == "gemini_grounding" {
+        let mut deadline = tokio::time::Instant::now() + TIMEOUT;
+        filter_grounding_sources(&mut result, &args, |source| {
+            resolve_grounding_publisher(
+                broker,
+                id,
+                request_url(broker, source)?,
+                &args,
+                &mut deadline,
+            )
+        })?;
+    }
     if let Some(results) = result.get_mut("results").and_then(Value::as_array_mut) {
         results.retain(|item| item["url"].as_str().is_some_and(|url| args.permits(url)));
     }
@@ -631,6 +681,112 @@ fn fallback_search(
         let results: Vec<_> = items.and_then(Value::as_array).into_iter().flatten().take(50).map(|item|json!({"title":item["title"],"url":item["url"],"snippet":item.get("description").or_else(||item.get("content")).unwrap_or(&Value::Null)})).collect();
         Ok(json!({"results":results,"citations":[],"backend":settings.backend}))
     })
+}
+
+/// Google grounding links are control URLs, never publisher-domain evidence.
+fn grounding_redirect(url: &Url) -> bool {
+    url.host_str() == Some("vertexaisearch.cloud.google.com")
+}
+
+/// Resolves only headers, with a common deadline and at most ten redirects.
+/// A disallowed publisher is discarded before a connection to that host.
+fn resolve_grounding_publisher(
+    broker: &ToolBroker,
+    id: Uuid,
+    mut url: Url,
+    args: &SearchArguments,
+    deadline: &mut tokio::time::Instant,
+) -> Result<Option<Url>> {
+    for hop in 0..=10 {
+        // The caller has identified the first URL as a Google control URL.
+        let control = hop == 0 || grounding_redirect(&url);
+        if !control && !args.permits(url.as_str()) {
+            return Ok(None);
+        }
+        let response = guarded_get(broker, id, &url, deadline, false)?.response;
+        if response.status().is_redirection() {
+            ensure!(hop < 10, "Grounding source exceeded 10 redirects");
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .context("Grounding redirect has no location")?
+                .to_str()
+                .context("Invalid grounding redirect location")?;
+            url = request_url(
+                broker,
+                url.join(location)
+                    .context("Invalid grounding redirect URL")?
+                    .as_str(),
+            )?;
+            continue;
+        }
+        // Status does not establish publisher identity. The checked connection
+        // and final URL do; publishers can deny automated access with HTTP 403.
+        return Ok((!control).then_some(url));
+    }
+    bail!("Grounding source exceeded 10 redirects")
+}
+
+/// Filters result and citation pairs by URL authority, never by display titles.
+fn filter_grounding_sources(
+    result: &mut Value,
+    args: &SearchArguments,
+    mut resolve: impl FnMut(&str) -> Result<Option<Url>>,
+) -> Result<()> {
+    result
+        .as_object_mut()
+        .context("Invalid grounding search result")?
+        .remove("source_resolution");
+    if args.allowed_domains.is_empty() && args.blocked_domains.is_empty() {
+        return Ok(());
+    }
+    let sources = result
+        .get_mut("results")
+        .and_then(Value::as_array_mut)
+        .context("Grounding response has no source list")?;
+    ensure!(sources.len() <= 50, "Grounding response exceeds 50 sources");
+    let mut publishers = HashMap::new();
+    let mut retained = Vec::new();
+    for mut source in std::mem::take(sources) {
+        let Some(original) = source["url"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(uri) = normalize_url(&original) else {
+            continue;
+        };
+        let publisher = if grounding_redirect(&uri) {
+            resolve(&original)?
+        } else {
+            Some(uri)
+        };
+        let Some(publisher) =
+            publisher.filter(|url| !grounding_redirect(url) && args.permits(url.as_str()))
+        else {
+            continue;
+        };
+        source["url"] = json!(publisher.as_str());
+        if publisher.as_str() != original {
+            source["grounding_url"] = json!(original);
+        }
+        publishers.insert(original, publisher.to_string());
+        retained.push(source);
+    }
+    *sources = retained;
+    if let Some(citations) = result.get_mut("citations").and_then(Value::as_array_mut) {
+        citations.retain_mut(|citation| {
+            let Some(original) = citation.pointer("/web/uri").and_then(Value::as_str) else {
+                return false;
+            };
+            let Some(publisher) = publishers.get(original) else {
+                return false;
+            };
+            citation["publisher_url"] = json!(publisher);
+            true
+        });
+    }
+    result["answer"] = json!("");
+    result["grounding_metadata"] = Value::Null;
+    Ok(())
 }
 
 #[cfg(test)]

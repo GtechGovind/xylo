@@ -39,6 +39,23 @@ pub(super) fn search_request(
         4096,
         Reasoning::Lowest,
     )?;
+    if provider.endpoint.protocol == ProviderProtocol::Responses
+        && body.pointer("/reasoning/effort").and_then(Value::as_str) == Some("minimal")
+    {
+        // Hosted search rejects GPT-5's ordinary minimum. Select only an
+        // advertised alternative; extraction still uses the ordinary builder.
+        const ORDER: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
+        let efforts = provider.config.supported_reasoning_efforts();
+        let effort = ORDER
+            .into_iter()
+            .find(|effort| efforts.contains(effort))
+            .ok_or_else(|| {
+                request::invalid(
+                    "Web search requires a supported reasoning effort other than minimal",
+                )
+            })?;
+        body["reasoning"]["effort"] = json!(effort);
+    }
     body["stream"] = json!(false);
     match provider.endpoint.protocol {
         ProviderProtocol::Responses => {
@@ -120,7 +137,15 @@ pub(super) async fn execute(
             .unwrap_or_else(|| "request_failed".into());
         return Err(provider.http_error(status, &code, None, None, &body));
     }
-    parse(provider.endpoint.protocol, &payload, &args)
+    let mut result = parse(provider.endpoint.protocol, &payload, &args)?;
+    result["model"] = json!(
+        payload
+            .get("model")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("modelVersion").and_then(Value::as_str))
+    );
+    result["requested_model"] = json!(provider.config.model);
+    Ok(result)
 }
 
 fn parse(
@@ -132,7 +157,7 @@ fn parse(
     let mut citations = Vec::new();
     let mut answer = String::new();
     let mut add = |item: &Value, url: &str, title: &str, snippet: &str| {
-        if args.permits(url) {
+        if protocol == ProviderProtocol::GeminiGenerateContent || args.permits(url) {
             results.push(json!({"title":title,"url":url,"snippet":snippet}));
             citations.push(item.clone());
         }
@@ -154,13 +179,19 @@ fn parse(
                     if let Some(text) = content["text"].as_str() {
                         answer.push_str(text);
                     }
+                    let text = content["text"].as_str().unwrap_or("");
+                    let boundaries: Vec<usize> = text
+                        .char_indices()
+                        .map(|(index, _)| index)
+                        .chain(std::iter::once(text.len()))
+                        .collect();
                     for citation in content["annotations"].as_array().into_iter().flatten() {
                         if let Some(url) = citation["url"].as_str() {
                             add(
                                 citation,
                                 url,
                                 citation["title"].as_str().unwrap_or(url),
-                                content["text"].as_str().unwrap_or(""),
+                                cited_range(text, &boundaries, citation),
                             );
                         }
                     }
@@ -245,9 +276,26 @@ fn parse(
     if !args.allowed_domains.is_empty() || !args.blocked_domains.is_empty() {
         answer.clear();
     }
-    Ok(
-        json!({"results":results,"citations":citations,"answer":answer,"backend":"provider","usage":payload.get("usage").or_else(||payload.get("usageMetadata")),"grounding_metadata":if protocol == ProviderProtocol::GeminiGenerateContent && args.allowed_domains.is_empty() && args.blocked_domains.is_empty() {payload.pointer("/candidates/0/groundingMetadata").cloned()}else{None}}),
-    )
+    let mut result = json!({"results":results,"citations":citations,"answer":answer,"backend":"provider","usage":payload.get("usage").or_else(||payload.get("usageMetadata")),"grounding_metadata":if protocol == ProviderProtocol::GeminiGenerateContent && args.allowed_domains.is_empty() && args.blocked_domains.is_empty() {payload.pointer("/candidates/0/groundingMetadata").cloned()}else{None}});
+    if protocol == ProviderProtocol::GeminiGenerateContent {
+        // Grounding URIs can be Google redirects. The broker owns the network
+        // authority needed to identify publishers before applying domain rules.
+        result["source_resolution"] = json!("gemini_grounding");
+    }
+    Ok(result)
+}
+
+/// Returns only the annotation's character range, never the surrounding answer.
+fn cited_range<'a>(text: &'a str, boundaries: &[usize], citation: &Value) -> &'a str {
+    let range = || {
+        let start = usize::try_from(citation["start_index"].as_u64()?).ok()?;
+        let end = usize::try_from(citation["end_index"].as_u64()?).ok()?;
+        if start >= end {
+            return None;
+        }
+        text.get(*boundaries.get(start)?..*boundaries.get(end)?)
+    };
+    range().unwrap_or("")
 }
 
 #[cfg(test)]
