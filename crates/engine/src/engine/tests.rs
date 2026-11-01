@@ -1377,3 +1377,147 @@ async fn engines_sharing_a_served_context_cache_keep_the_window_of_earlier_turns
         Some(8192)
     );
 }
+
+/// A local server that reports serving 4,096 tokens: the turn runs on the
+/// tiny-window profile, sends a tool call and then the answer, and every
+/// request carries the compact prompt, the five compact resident tools and a
+/// quarter of the window as its output limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_completes_with_a_tool_call_on_a_4k_served_window() {
+    let (directory, engine, mut request) = fixture();
+    std::fs::write(directory.path().join("sample.txt"), "tiny window contents").unwrap();
+    // Instructions too large for the tiny prompt are left out whole.
+    std::fs::write(
+        directory.path().join("AGENTS.md"),
+        "Prefer small, focused changes.\n".repeat(60),
+    )
+    .unwrap();
+    let (endpoint, server) = sequential_chat_serving(
+        Some(json!({"default_generation_settings":{"n_ctx":4096}})),
+        vec![
+            json!({"tool_calls":[{"index":0,"id":"tiny-call-1","type":"function","function":{"name":"file_read","arguments":json!({"path":"sample.txt"}).to_string()}}]}),
+            json!({"content":"sample.txt says: tiny window contents."}),
+            json!({"content":"Read the sample"}),
+        ],
+    )
+    .await;
+    request.provider = ProviderConfig {
+        endpoint,
+        model: "fixture".into(),
+        context_tokens: 32_768,
+        output_tokens: 2048,
+        timeout_seconds: 10,
+        ..Default::default()
+    };
+    request.prompt = "Read sample.txt and tell me what it says.".into();
+    engine.store.register_user_turn(&request).unwrap();
+    let (events, mut receiver) = mpsc::channel(1024);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        engine.run(request.clone(), events, CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let events = drain(&mut receiver);
+    let position = |check: &dyn Fn(&EngineEvent) -> bool| events.iter().position(check);
+    let finished = position(&|e| {
+        matches!(e, EngineEvent::ToolFinished { name, success: true, .. } if name == "file_read")
+    })
+    .expect("the tool call ran");
+    let completed = position(&|e| {
+        matches!(e, EngineEvent::Completed { text, .. } if text.contains("tiny window contents"))
+    })
+    .expect("the turn completed with the answer");
+    assert!(finished < completed);
+    assert!(events.iter().all(
+        |event| !matches!(event, EngineEvent::ContextUsage { usage } if usage.capacity != 4096)
+    ));
+    let bodies = server.await.unwrap();
+    for body in &bodies[..2] {
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "file_read",
+                "file_edit",
+                "shell_command",
+                "search_tools",
+                "call_tool"
+            ]
+        );
+        assert_eq!(body["max_tokens"], 1024);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            system.contains("# Left out to fit the context window"),
+            "{system}"
+        );
+        assert!(!system.contains("Prefer small, focused changes."));
+        assert!(!system.contains("# Skills\n"));
+    }
+    // The tool result reached the model within the tiny result budget.
+    let result = bodies[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap()
+            .contains("tiny window contents")
+    );
+}
+
+/// At 4K the compact system prompt and tools are byte-identical across the
+/// turns of a session, so a local server's prompt cache keeps its prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_4k_window_sends_identical_prompt_and_tool_bytes_across_turns() {
+    let (_directory, engine, mut request) = fixture();
+    let engine = engine.with_served_contexts(Default::default());
+    let (endpoint, server) = sequential_chat_serving(
+        Some(json!({"default_generation_settings":{"n_ctx":4096}})),
+        vec![
+            json!({"content":"First answer."}),
+            json!({"content":"Short title"}),
+            json!({"content":"Second answer."}),
+        ],
+    )
+    .await;
+    request.provider = ProviderConfig {
+        endpoint,
+        model: "fixture".into(),
+        context_tokens: 32_768,
+        output_tokens: 2048,
+        timeout_seconds: 10,
+        ..Default::default()
+    };
+    for prompt in ["What is in this project?", "Thanks"] {
+        request.turn_id = Uuid::new_v4();
+        request.prompt = prompt.into();
+        engine.store.register_user_turn(&request).unwrap();
+        let (events, _receiver) = mpsc::channel(1024);
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            engine.run(request.clone(), events, CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    let bodies = server.await.unwrap();
+    let (first, second) = (&bodies[0], &bodies[2]);
+    assert_eq!(first["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(first["tools"].to_string(), second["tools"].to_string());
+    assert_eq!(
+        first["messages"][0].to_string(),
+        second["messages"][0].to_string()
+    );
+    assert_eq!(first["max_tokens"], second["max_tokens"]);
+}

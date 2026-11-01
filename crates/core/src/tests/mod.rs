@@ -45,3 +45,19 @@ mod permission;
 mod reasoning;
 
 mod native_workspace_preferences;
+
+#[test]
+fn a_fresh_profile_has_no_provider_and_follows_the_system_theme() {
+    let settings = AppSettings::default();
+    assert!(!settings.model_ready());
+    assert!(settings.provider.name.is_empty());
+    assert!(settings.provider.endpoint.is_empty());
+    assert!(settings.providers.is_empty());
+    assert_eq!(settings.theme, "system");
+    let mut configured = settings;
+    configured.provider = ProviderConfig {
+        model: "local-coder".into(),
+        ..ProviderConfig::default()
+    };
+    assert!(configured.model_ready());
+}

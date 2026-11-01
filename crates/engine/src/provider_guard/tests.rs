@@ -556,10 +556,14 @@ async fn summaries_carry_a_harness_record_that_survives_the_next_compaction() {
 
 #[test]
 fn an_overflow_summarises_to_a_lower_target() {
-    let budget = ContextBudget::new(&config(5));
+    // Only large windows lower the target; small ones rely on the raised
+    // calibration.
+    let mut large = config(5);
+    large.context_tokens = 32_768;
+    let budget = ContextBudget::new(&large);
     let system = vec![Message::system("Policy")];
     let mut history = vec![Message::user("Refactor the parser")];
-    for index in 0..60 {
+    for index in 0..240 {
         round(&mut history, index, 40);
     }
     let normal = budget
@@ -601,8 +605,9 @@ fn the_budget_fits_the_served_window() {
     let budget = ContextBudget::new(&served);
     let usage = budget.usage(&[Message::user("hi")], &[], 512);
     assert_eq!(usage.capacity, 8192);
-    // Small windows summarise at 70 % rather than 80 %.
-    assert_eq!(usage.autocompact_threshold, 8192 / 100 * 70);
+    // A small window summarises one summary's size below the hard limit.
+    let summary = (budget.window().tokens() / 8).min(2048);
+    assert_eq!(usage.autocompact_threshold, u64::from(8192 - summary));
 }
 
 #[test]
@@ -624,4 +629,311 @@ fn calibration_never_learns_to_undercount_and_ignores_reasoning() {
     let text_only = fresh.usage(&messages, &[], 0).used();
     fresh.observe(&with_reasoning, &[], text_only + 64);
     assert!(fresh.usage(&messages, &[], 0).used() >= text_only);
+}
+
+/// A local server serving 4K of a configured 32K window, with the default
+/// output limit: the tiny-window profile.
+fn tiny_config() -> ProviderConfig {
+    ProviderConfig {
+        model: "unrecognized-custom-model".into(),
+        context_tokens: 32_768,
+        served_context_tokens: Some(4096),
+        output_tokens: 2048,
+        timeout_seconds: 5,
+        ..Default::default()
+    }
+}
+
+/// Five schemas about the size of the tiny window's compact resident tools.
+fn tiny_tools() -> Vec<ToolSchema> {
+    ["file_read", "file_edit", "shell_command", "search_tools", "call_tool"]
+        .into_iter()
+        .map(|name| ToolSchema {
+            name: name.into(),
+            description: format!("{name}: {}", noise(14)),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"text":{"type":"string"}},"required":["path"],"additionalProperties":false}),
+        })
+        .collect()
+}
+
+/// A file_read round whose result is as large as a tiny window lets a
+/// result be.
+fn tiny_round(messages: &mut Vec<Message>, index: usize, budget: &ContextBudget) {
+    let id = format!("call-{index}");
+    messages.push(Message::assistant_with_tool_calls(
+        "",
+        vec![ToolCall::new(
+            &id,
+            "file_read",
+            format!(r#"{{"path":"src/file{index}.rs"}}"#),
+        )],
+    ));
+    let mut result = noise(400);
+    result.truncate(budget.window().tool_result_bytes() - 64);
+    messages.push(Message::tool_result(id, result));
+}
+
+/// Records the summary request it answers.
+struct Capture {
+    requests: Arc<parking_lot::Mutex<Vec<ModelRequest>>>,
+}
+
+impl ModelProvider for Capture {
+    fn stream(&self, request: ModelRequest, _: CancellationToken) -> EventStream {
+        self.requests.lock().push(request);
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamEvent::Text("Requirements: fix the parser. Work done: read src/file0.rs [call-0]. Next: run the tests.".into()));
+            yield Ok(StreamEvent::Finished(FinishReason::Stop));
+        })
+    }
+}
+
+/// In a 4K window with the compact prompt and tools, masking frees older
+/// results, a summary is planned below its threshold, its request fits the
+/// window with the tiny summary prompt and output limit, and the condensed
+/// history leaves room for the next steps.
+#[tokio::test]
+async fn a_tiny_window_masks_and_summarises_within_the_window() {
+    let budget = ContextBudget::new(&tiny_config());
+    let window = budget.window();
+    assert!(window.tiny());
+    let tools = tiny_tools();
+    let max_tokens = 2048;
+    // About the estimated size of the compact system prompt (500 tokens).
+    let system = vec![Message::system(noise(190))];
+    let mut history = vec![Message::user("Fix the parser in src/")];
+    for index in 0..3 {
+        tiny_round(&mut history, index, &budget);
+    }
+    // Masking: the older reads go, the newest round stays.
+    let plan = budget
+        .mask_plan(&system, &history, &tools, max_tokens, Pressure::Normal)
+        .expect("masking frees older results");
+    let newest = history.len() - 1;
+    assert!(!plan.stubs.is_empty());
+    assert!(plan.stubs.iter().all(|(index, _)| *index != newest));
+    let before = budget.costs(&history).iter().sum::<usize>();
+    plan.apply(&mut history);
+    assert!(budget.costs(&history).iter().sum::<usize>() < before);
+    // Summary: once the threshold passes, a plan exists under both pressures.
+    let mut index = 3;
+    loop {
+        let mut view = system.clone();
+        view.extend_from_slice(&history);
+        if budget.over_threshold(&view, &tools, max_tokens) {
+            break;
+        }
+        tiny_round(&mut history, index, &budget);
+        index += 1;
+    }
+    for _ in 0..2 {
+        tiny_round(&mut history, index, &budget);
+        index += 1;
+    }
+    assert!(
+        budget
+            .summary_plan(&system, &history, &tools, max_tokens, Pressure::Overflow)
+            .is_some()
+    );
+    let plan = budget
+        .summary_plan(&system, &history, &tools, max_tokens, Pressure::Normal)
+        .expect("a tiny window can summarise");
+    let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let capture = Capture {
+        requests: requests.clone(),
+    };
+    let condensed = budget
+        .summarize(
+            &capture,
+            &history,
+            &plan,
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let request = requests.lock().pop().unwrap();
+    assert_eq!(request.max_tokens, window.tokens() / 8);
+    assert!(request.messages[0].content.contains("Stay under"));
+    let sent = budget.usage(&request.messages, &[], request.max_tokens);
+    assert!(
+        sent.used() + u64::from(request.max_tokens) <= u64::from(window.context()),
+        "{sent:?}"
+    );
+    // The summary keeps the record and the newest round, and the condensed
+    // request fits the hard limit with room to spare.
+    assert!(Record::parse(&condensed[0].content).is_some());
+    assert_eq!(condensed.last(), history.last());
+    let mut view = system.clone();
+    view.extend_from_slice(&condensed);
+    let (_, costs) = budget.fit(view.clone(), &tools, max_tokens).unwrap();
+    let used = costs.iter().sum::<usize>();
+    let hard = budget.allowance(&tools, max_tokens, window.context());
+    assert!(used < hard, "{used} of {hard}");
+}
+
+/// `count` tool schemas whose description has `words` words.
+fn schemas(count: usize, words: usize) -> Vec<ToolSchema> {
+    (0..count)
+        .map(|index| ToolSchema {
+            name: format!("tool_{index}"),
+            description: noise(words),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative or absolute path"},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}),
+        })
+        .collect()
+}
+
+/// A tool round whose result is `bytes` long.
+fn sized_round(messages: &mut Vec<Message>, index: usize, bytes: usize) {
+    let id = format!("call-{index}");
+    messages.push(Message::assistant_with_tool_calls(
+        "",
+        vec![ToolCall::new(
+            &id,
+            "file_read",
+            format!(r#"{{"path":"src/file{index}.rs"}}"#),
+        )],
+    ));
+    let mut result = noise(bytes / 3);
+    result.truncate(bytes);
+    messages.push(Message::tool_result(id, result));
+}
+
+/// Across windows from 4K to 128K, with each profile's preamble at its
+/// measured size (tiny: about 500 tokens of system prompt and 760 of tools;
+/// small: 1,350 and 1,790; large: 1,350 and about 4,240), the summary is an
+/// eighth of `W_eff` (at most 2,048 tokens), at least 15 % of `W_eff` of
+/// history fits before the threshold, a summary plan exists under both
+/// pressures, and the summary request fits the window.
+#[tokio::test]
+async fn every_window_from_4k_to_128k_can_summarise() {
+    for (context, output) in [
+        (4096, 1024),
+        (4096, 2048),
+        (4096, 4096),
+        (6144, 1024),
+        (6144, 2048),
+        (6144, 4096),
+        (8192, 1024),
+        (8192, 2048),
+        (8192, 4096),
+        (16_384, 2048),
+        (32_768, 4096),
+        (131_072, 8192),
+    ] {
+        let budget = ContextBudget::new(&ProviderConfig {
+            model: "unrecognized-custom-model".into(),
+            context_tokens: context,
+            output_tokens: output,
+            timeout_seconds: 5,
+            ..Default::default()
+        });
+        let window = budget.window();
+        let label = format!("{context}/{output}");
+        let (system, tools) = if window.tiny() {
+            (noise(190), schemas(5, 9))
+        } else if window.small() {
+            (noise(412), schemas(8, 31))
+        } else {
+            (noise(412), schemas(19, 31))
+        };
+        let system = vec![Message::system(system)];
+        let summary = budget.summary_tokens();
+        assert_eq!(summary, (window.tokens() / 8).clamp(192, 2048), "{label}");
+        let room = budget
+            .allowance(&tools, output, budget.proactive_context())
+            .saturating_sub(budget.costs(&system)[0]);
+        assert!(
+            room * 100 >= window.tokens() as usize * 15,
+            "{label}: {room} tokens of history before the threshold, W_eff {}",
+            window.tokens()
+        );
+        let mut history = vec![Message::user("Fix the parser in src/")];
+        let mut index = 0;
+        loop {
+            let mut view = system.clone();
+            view.extend_from_slice(&history);
+            if budget.over_threshold(&view, &tools, output) {
+                break;
+            }
+            sized_round(&mut history, index, window.tool_result_bytes() / 2);
+            index += 1;
+        }
+        for pressure in [Pressure::Overflow, Pressure::Normal] {
+            assert!(
+                budget
+                    .summary_plan(&system, &history, &tools, output, pressure)
+                    .is_some(),
+                "{label}: no {pressure:?} summary plan; system {}, tools {}, summary {summary}, record {}, allowance {}, history {:?}",
+                budget.costs(&system)[0],
+                budget.tool_tokens(&tools),
+                budget.record_tokens(),
+                budget.allowance(&tools, output, budget.target_context(pressure)),
+                budget.costs(&history)
+            );
+        }
+        let plan = budget
+            .summary_plan(&system, &history, &tools, output, Pressure::Normal)
+            .unwrap();
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let capture = Capture {
+            requests: requests.clone(),
+        };
+        let condensed = budget
+            .summarize(
+                &capture,
+                &history,
+                &plan,
+                Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let request = requests.lock().pop().unwrap();
+        assert_eq!(request.max_tokens, summary.min(window.output()), "{label}");
+        let sent = budget.usage(&request.messages, &[], request.max_tokens);
+        assert!(
+            sent.used() + u64::from(request.max_tokens) <= u64::from(window.context()),
+            "{label}: summary request {sent:?}"
+        );
+        let mut view = system.clone();
+        view.extend_from_slice(&condensed);
+        assert!(budget.fit(view, &tools, output).is_ok(), "{label}");
+    }
+}
+
+/// Windows of 32K and more summarise exactly as before the summary size
+/// scaled with the window: 2,048-token summaries, the 900-word prompt, 80 %
+/// and 60 % thresholds and the same record budget.
+#[test]
+fn large_windows_keep_their_summary_sizes() {
+    for (context, output) in [(32_768, 4096), (131_072, 8192), (131_072, 32_768)] {
+        let budget = ContextBudget::new(&ProviderConfig {
+            model: "unrecognized-custom-model".into(),
+            context_tokens: context,
+            output_tokens: output,
+            ..Default::default()
+        });
+        let margin = (context / 32).clamp(128, 4096);
+        assert_eq!(budget.window().tokens(), context - output - margin);
+        assert_eq!(budget.summary_tokens(), 2048);
+        assert_eq!(budget.proactive_context(), context / 100 * 80);
+        assert_eq!(budget.target_context(Pressure::Normal), context / 100 * 80);
+        assert_eq!(
+            budget.target_context(Pressure::Overflow),
+            context / 100 * 60
+        );
+        assert_eq!(
+            budget.record_tokens(),
+            (context - output - margin) as usize / 8
+        );
+        assert_eq!(budget.min_condensed_tokens(), 4096);
+        let prompt = budget.compaction_prompt();
+        assert_eq!(
+            prompt,
+            include_str!("../../prompts/compaction.md")
+                .trim_end()
+                .replace("{{words}}", "900")
+        );
+    }
 }

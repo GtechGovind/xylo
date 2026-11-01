@@ -24,6 +24,7 @@ zip={version="6",default-features=false,features=["deflate"]}
 rfd="0.17"
 shell-words="1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+libc = "0.2"
 sha2="0.11"
 hex="0.4"
 image={version="=0.25.10",default-features=false,features=["png"]}
@@ -34,6 +35,10 @@ image={version="=0.25.10",default-features=false,features=["png"]}
 # Match the desktop application's development debug information setting.
 [profile.dev]
 debug = 1
+
+# Same as the main workspace: dependencies lightly optimized in development.
+[profile.dev.package."*"]
+opt-level = 1
 
 [profile.release]
 lto = "thin"
@@ -164,3 +169,7 @@ harness=false
 name="paste-rendering"
 path="paste_rendering.rs"
 harness=false
+
+# Same patch as the main workspace; see third_party/block/XYLO_PATCH.md.
+[patch.crates-io]
+block = { path = "../../../third_party/block" }

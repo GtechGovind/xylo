@@ -7,6 +7,10 @@ on:
     paths:
       - "crates/capabilities/src/environments/capture_fs_windows.rs"
       - "crates/capabilities/src/plugins/windows_read*.rs"
+      - "crates/capabilities/src/plugins/windows_read/**"
+      - "crates/capabilities/src/windows_nt.rs"
+      - "crates/capabilities/src/input.rs"
+      - "crates/capabilities/src/input/**"
       - "crates/capabilities/validation/windows-read/**"
       - "crates/runtime/src/workspace/reader*.rs"
       - "crates/runtime/src/workspace/paths.rs"
@@ -19,6 +23,10 @@ on:
     paths:
       - "crates/capabilities/src/environments/capture_fs_windows.rs"
       - "crates/capabilities/src/plugins/windows_read*.rs"
+      - "crates/capabilities/src/plugins/windows_read/**"
+      - "crates/capabilities/src/windows_nt.rs"
+      - "crates/capabilities/src/input.rs"
+      - "crates/capabilities/src/input/**"
       - "crates/capabilities/validation/windows-read/**"
       - "crates/runtime/src/workspace/reader*.rs"
       - "crates/runtime/src/workspace/paths.rs"

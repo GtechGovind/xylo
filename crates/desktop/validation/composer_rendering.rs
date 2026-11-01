@@ -255,7 +255,7 @@ fn render() {
         ..Default::default()
     };
     // This is a persisted display configuration, not an available/live model.
-    settings.provider.model = "fixture-local-coder-model".into();
+    settings.provider = xylo_core::ProviderConfig { model: "fixture-local-coder-model".into(), ..Default::default() };
     settings.provider.reasoning_options = Some(vec![
         "low".into(),
         "medium".into(),

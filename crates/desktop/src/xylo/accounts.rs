@@ -148,12 +148,7 @@ impl Xylo {
                         "Signed out.".into()
                     },
                 );
-                self.settings
-                    .providers
-                    .retain(|provider| provider.credential_ref.as_deref() != Some(CHATGPT_REF));
-                if self.settings.provider.credential_ref.as_deref() == Some(CHATGPT_REF) {
-                    self.settings.provider = ProviderConfig::default();
-                }
+                forget_chatgpt(&mut self.settings);
                 let settings = self.settings.clone();
                 self.host_call(cx, |host| host.save_settings(settings));
                 self.reset_provider_discovery(cx);
@@ -206,15 +201,7 @@ impl Xylo {
         if !self.account.signed_out {
             return false;
         }
-        let before = settings.providers.len();
-        settings
-            .providers
-            .retain(|provider| provider.credential_ref.as_deref() != Some(CHATGPT_REF));
-        let active = settings.provider.credential_ref.as_deref() == Some(CHATGPT_REF);
-        if active {
-            settings.provider = ProviderConfig::default();
-        }
-        active || before != settings.providers.len()
+        forget_chatgpt(settings)
     }
     pub(super) fn account_model_selected(&mut self) {
         self.account.signed_out = false;
@@ -340,3 +327,26 @@ impl AccountUi {
         self.pending = Some((id, name.into()));
     }
 }
+
+/// Removes the ChatGPT account's models after sign-out. When ChatGPT was the
+/// active provider, chats switch to another saved model, or to no provider at
+/// all; nothing is invented in its place. Returns whether anything changed.
+fn forget_chatgpt(settings: &mut AppSettings) -> bool {
+    let before = settings.providers.len();
+    settings
+        .providers
+        .retain(|provider| provider.credential_ref.as_deref() != Some(CHATGPT_REF));
+    let active = settings.provider.credential_ref.as_deref() == Some(CHATGPT_REF);
+    if active {
+        settings.provider = settings
+            .providers
+            .first()
+            .cloned()
+            .unwrap_or_else(ProviderConfig::unset);
+    }
+    active || before != settings.providers.len()
+}
+
+#[cfg(test)]
+#[path = "accounts/tests.rs"]
+mod tests;

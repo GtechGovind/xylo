@@ -133,6 +133,28 @@ mod xylo {
                 assert!(Instant::now() < deadline, "Host fixture did not shut down");
                 std::thread::sleep(Duration::from_millis(10));
             }
+            assert_no_ssh_masters(&fixture.base);
+        }
+        /// Every SSH master the fixture client started (it logs its PID and
+        /// control socket path) must end with the host and helper, not
+        /// outlive them as an orphan.
+        fn assert_no_ssh_masters(base: &Path) {
+            let Ok(masters) = std::fs::read_to_string(base.join("ssh-masters")) else {
+                return;
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for line in masters.lines() {
+                let (pid, socket) = line.split_once(' ').unwrap();
+                let pid: libc::pid_t = pid.parse().unwrap();
+                // SAFETY: signal 0 only checks that the process exists.
+                while unsafe { libc::kill(pid, 0) } == 0 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "SSH master {pid} for {socket} outlived the host"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
         }
         #[cfg(unix)]
         #[gpui_kit::test]
@@ -876,6 +898,7 @@ for arg in "$@"; do
  previous=$arg
 done
 if [ "$master" = yes ]; then
+ printf '%s %s\n' "$$" "$socket" >> "$root/ssh-masters"
  printf '%s' "$$" > "$socket"
  trap 'rm -f "$socket"; exit 0' TERM INT EXIT
  while :; do sleep 1; done

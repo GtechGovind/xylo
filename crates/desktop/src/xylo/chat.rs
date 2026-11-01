@@ -975,7 +975,7 @@ impl Xylo {
     }
 
     fn chat_home(&self, cx: &mut Context<Self>) -> AnyElement {
-        let configured = self.settings.provider.validate().is_ok();
+        let configured = self.settings.model_ready();
         let project_name = self.workspace.as_ref().map(|path| {
             path.file_name()
                 .unwrap_or(path.as_os_str())
@@ -1288,7 +1288,7 @@ impl Xylo {
 
     fn prompt_box(&self, cx: &mut Context<Self>) -> AnyElement {
         let paste = cx.entity().downgrade();
-        let model = if self.settings.provider.model.is_empty() {
+        let model = if !self.settings.model_ready() {
             "Select model".to_string()
         } else {
             self.settings.provider.model.clone()

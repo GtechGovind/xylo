@@ -1,0 +1,1 @@
+- Project instructions: read AGENTS.md or CLAUDE.md in the workspace and its parent directories with file_read before changing code.

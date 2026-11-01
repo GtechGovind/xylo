@@ -15,6 +15,8 @@ pub mod models;
 pub mod plugins;
 pub mod process;
 mod speech;
+#[cfg(windows)]
+mod windows_nt;
 
 use anyhow::{Result, ensure};
 pub(crate) use input::{InputRoot, open_input};

@@ -19,6 +19,7 @@ tracing-subscriber.workspace = true
 rfd = "0.17"
 shell-words = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+libc = "0.2"
 
 lsp-types = { version = "0.97", features = ["proposed"] }
 

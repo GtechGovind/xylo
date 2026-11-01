@@ -233,6 +233,27 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
     tools
 }
 
+/// The description a tiny window's resident set offers for `name`: one line
+/// with what a model needs to call the tool right, without examples.
+pub(super) fn compact_description(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "file_read" => {
+            "Read a text file as numbered lines; when truncated, continue from next_offset"
+        }
+        "file_edit" => {
+            "Replace text in a file: old_string must match exactly once, without line-number prefixes; replace_all changes every match"
+        }
+        "shell_command" => {
+            "Run a bash command line in the workspace sandbox; no internet unless network is true with a justification"
+        }
+        "search_tools" => {
+            "Find tools not listed here (create files, search code, git, memory, skills, browser, connectors) with their arguments"
+        }
+        "call_tool" => "Run a tool found by search_tools with its arguments",
+        _ => return None,
+    })
+}
+
 fn def(
     name: &str,
     description: &str,

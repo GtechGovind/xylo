@@ -2,6 +2,8 @@
 resolver = "2"
 members = ["crates/core", "crates/runtime", "crates/resources", "crates/worker", "crates/desktop", "crates/services", "crates/capabilities", "crates/engine", "crates/scheduler", "crates/helper-client", "crates/helper", "crates/distribution", "crates/notifications", "crates/evals"]
 default-members = ["crates/desktop"]
+# Patched third-party crates are path dependencies, not workspace members.
+exclude = ["third_party"]
 
 [workspace.package]
 version = "0.1.0"
@@ -38,3 +40,15 @@ codegen-units = 16
 [profile.dev]
 debug = 1
 
+# Dependencies build lightly optimized in development. Unoptimized dependency
+# code made the desktop binary's unwind table exceed the 16 MB the macOS
+# linker can encode compactly (an `ld` warning on every build), and it is
+# slow to run. Xylo's own crates stay unoptimized for debugging.
+[profile.dev.package."*"]
+opt-level = 1
+
+
+# block 0.1.6 (via metal) declares a static of an uninhabited type, a future
+# incompatibility; see third_party/block/XYLO_PATCH.md.
+[patch.crates-io]
+block = { path = "third_party/block" }

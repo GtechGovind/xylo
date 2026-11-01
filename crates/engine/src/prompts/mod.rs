@@ -32,8 +32,14 @@ pub use instructions::project_instructions;
 pub use skills::{BundledSkill, bundled_skill, bundled_skills, skills_index};
 
 const SYSTEM: &str = include_str!("../../prompts/system.md");
+const SYSTEM_TINY: &str = include_str!("../../prompts/system-tiny.md");
+const SYSTEM_OMITTED: &str = include_str!("../../prompts/system-omitted.md");
+const SYSTEM_OMITTED_INSTRUCTIONS: &str =
+    include_str!("../../prompts/system-omitted-instructions.md");
+const SYSTEM_OMITTED_SKILLS: &str = include_str!("../../prompts/system-omitted-skills.md");
 const ENVIRONMENT: &str = include_str!("../../prompts/environment.md");
 const PERMISSIONS: &str = include_str!("../../prompts/permissions.md");
+const PERMISSIONS_TINY: &str = include_str!("../../prompts/permissions-tiny.md");
 const PERMISSION_CHANGE: &str = include_str!("../../prompts/permission-change.md");
 const SYSTEM_PROJECT_INSTRUCTIONS: &str =
     include_str!("../../prompts/system-project-instructions.md");
@@ -44,6 +50,7 @@ const PERMISSION_APPROVE_FOR_ME: &str = include_str!("../../prompts/permissions/
 const PERMISSION_FULL_ACCESS: &str = include_str!("../../prompts/permissions/full-access.md");
 const PERMISSION_READ_ONLY: &str = include_str!("../../prompts/permissions/read-only.md");
 const COMPACTION: &str = include_str!("../../prompts/compaction.md");
+const COMPACTION_TINY: &str = include_str!("../../prompts/compaction-tiny.md");
 const COMPACTION_REQUEST: &str = include_str!("../../prompts/compaction-request.md");
 const COMPACTION_UPDATE: &str = include_str!("../../prompts/compaction-update.md");
 const COMPACTION_SUMMARY: &str = include_str!("../../prompts/compaction-summary.md");
@@ -66,6 +73,7 @@ const RECALLED_CONTEXT: &str = include_str!("../../prompts/recalled-context.md")
 const RECALLED_FACTS: &str = include_str!("../../prompts/recalled-facts.md");
 const RECALLED_PROCEDURES: &str = include_str!("../../prompts/recalled-procedures.md");
 const RECALLED_SKILLS: &str = include_str!("../../prompts/recalled-skills.md");
+const RECALLED_OMITTED: &str = include_str!("../../prompts/recalled-omitted.md");
 const CONTINUE_ANSWER: &str = include_str!("../../prompts/continue-answer.md");
 const EMPTY_ANSWER: &str = include_str!("../../prompts/empty-answer.md");
 const OUTPUT_LIMIT_WITHOUT_ANSWER: &str =
@@ -88,6 +96,10 @@ pub struct PromptBudget {
     pub instruction_bytes: usize,
     /// Bytes of the skills index.
     pub skills_index_bytes: usize,
+    /// The tiny-window profile: the compact prompt, where a variable section
+    /// that does not fit its budget whole is left out, and the prompt names
+    /// what was left out, instead of being truncated.
+    pub compact: bool,
 }
 
 impl PromptBudget {
@@ -95,6 +107,7 @@ impl PromptBudget {
     pub const LARGEST: Self = Self {
         instruction_bytes: instructions::INSTRUCTION_BYTES,
         skills_index_bytes: skills::SKILLS_INDEX_BYTES,
+        compact: false,
     };
 }
 
@@ -118,21 +131,54 @@ pub struct PromptContext<'a> {
     pub permission_mode: PermissionMode,
     /// Output of [`project_instructions`]; empty when there are none.
     pub project_instructions: String,
-    /// Output of [`skills_index`]; empty when no skills are available.
+    /// Output of [`skills_index`]; empty when no skills are available. Set
+    /// it with [`PromptContext::set_skills_index`].
     pub skills_index: String,
+    /// Render the compact (tiny-window) prompt.
+    pub compact: bool,
+    /// The skills index budget this context was detected with.
+    pub skills_index_bytes: usize,
+    /// Sections the compact prompt left out because they did not fit whole.
+    pub omitted: Vec<Omitted>,
+}
+
+/// A variable system-prompt section the compact prompt left out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Omitted {
+    /// The project instruction files.
+    ProjectInstructions,
+    /// The skills index.
+    SkillsIndex,
 }
 
 impl<'a> PromptContext<'a> {
     /// A context for `workspace` with the host environment, repository state,
     /// today's date and the project instruction files (within `budget`)
-    /// filled in. The skills index starts empty; set it before calling
-    /// [`system`].
+    /// filled in. The skills index starts empty; set it with
+    /// [`PromptContext::set_skills_index`] before calling [`system`].
+    ///
+    /// Under a compact budget the instruction files are included only when
+    /// all of them fit whole; otherwise they are left out and recorded in
+    /// [`PromptContext::omitted`]. The decision depends only on the files
+    /// and the budget, so it is the same for every turn of a session.
     pub fn detect(
         workspace: &'a Path,
         permission_mode: PermissionMode,
         now_ms: i64,
         budget: PromptBudget,
     ) -> Self {
+        let mut omitted = Vec::new();
+        let project_instructions = if budget.compact {
+            let whole = project_instructions(workspace, instructions::INSTRUCTION_BYTES);
+            if whole.len() <= budget.instruction_bytes {
+                whole
+            } else {
+                omitted.push(Omitted::ProjectInstructions);
+                String::new()
+            }
+        } else {
+            project_instructions(workspace, budget.instruction_bytes)
+        };
         PromptContext {
             workspace,
             os: std::env::consts::OS,
@@ -141,19 +187,37 @@ impl<'a> PromptContext<'a> {
             git: GitInfo::detect(workspace),
             date: utc_date(now_ms),
             permission_mode,
-            project_instructions: project_instructions(workspace, budget.instruction_bytes),
+            project_instructions,
             skills_index: String::new(),
+            compact: budget.compact,
+            skills_index_bytes: budget.skills_index_bytes,
+            omitted,
+        }
+    }
+
+    /// Sets the skills index. A compact context renders the whole index
+    /// (see [`skills_index`]) and leaves it out, recording that, when it is
+    /// larger than the budget the context was detected with.
+    pub fn set_skills_index(&mut self, index: String) {
+        if self.compact && index.len() > self.skills_index_bytes {
+            self.omitted.push(Omitted::SkillsIndex);
+            self.skills_index = String::new();
+        } else {
+            self.skills_index = index;
         }
     }
 }
 
-/// The main agent's system prompt.
+/// The main agent's system prompt: the full prompt, or for a compact
+/// context the tiny-window prompt followed by a list of the sections it left
+/// out.
 pub fn system(ctx: &PromptContext) -> String {
+    let template = if ctx.compact { SYSTEM_TINY } else { SYSTEM };
     let mut sections = vec![fill(
-        SYSTEM,
+        template,
         &[
             ("environment", &environment_section(ctx)),
-            ("permissions", &permissions_section(ctx.permission_mode)),
+            ("permissions", &permissions_section(ctx)),
         ],
     )];
     sections.extend(project_instructions_section(ctx));
@@ -161,6 +225,7 @@ pub fn system(ctx: &PromptContext) -> String {
     if !skills.is_empty() {
         sections.push(fill(SYSTEM_SKILLS, &[("index", skills)]));
     }
+    sections.extend(omitted_section(&ctx.omitted));
     sections.join("\n\n")
 }
 
@@ -173,10 +238,11 @@ pub fn subagent(ctx: &PromptContext, task: &str) -> String {
         SUBAGENT,
         &[
             ("environment", &environment_section(ctx)),
-            ("permissions", &permissions_section(ctx.permission_mode)),
+            ("permissions", &permissions_section(ctx)),
         ],
     )];
     sections.extend(project_instructions_section(ctx));
+    sections.extend(omitted_section(&ctx.omitted));
     sections.push(fill(SUBAGENT_TASK, &[("task", task.trim())]));
     sections.join("\n\n")
 }
@@ -218,14 +284,35 @@ fn environment_section(ctx: &PromptContext) -> String {
     )
 }
 
-fn permissions_section(mode: PermissionMode) -> String {
+fn permissions_section(ctx: &PromptContext) -> String {
+    let mode = ctx.permission_mode;
     fill(
-        PERMISSIONS,
+        if ctx.compact {
+            PERMISSIONS_TINY
+        } else {
+            PERMISSIONS
+        },
         &[
             ("permission_mode", mode.label()),
             ("permission_policy", permission_policy(mode)),
         ],
     )
+}
+
+/// The list of sections a compact prompt left out, with how to reach each;
+/// `None` when nothing was left out.
+fn omitted_section(omitted: &[Omitted]) -> Option<String> {
+    let items: Vec<&str> = omitted
+        .iter()
+        .map(|section| {
+            match section {
+                Omitted::ProjectInstructions => SYSTEM_OMITTED_INSTRUCTIONS,
+                Omitted::SkillsIndex => SYSTEM_OMITTED_SKILLS,
+            }
+            .trim_end()
+        })
+        .collect();
+    (!items.is_empty()).then(|| fill(SYSTEM_OMITTED, &[("items", &items.join("\n"))]))
 }
 
 fn project_instructions_section(ctx: &PromptContext) -> Option<String> {
@@ -249,9 +336,16 @@ fn permission_policy(mode: PermissionMode) -> &'static str {
     text.trim_end()
 }
 
-/// System prompt for the context summarizer.
-pub fn compaction() -> &'static str {
-    COMPACTION.trim_end()
+/// System prompt for the context summarizer, whose summary must stay under
+/// `words` words.
+pub fn compaction(words: usize) -> String {
+    fill(COMPACTION, &[("words", &words.to_string())])
+}
+
+/// System prompt for the summarizer of a tiny window, whose summary must
+/// stay under `words` words.
+pub fn compaction_tiny(words: usize) -> String {
+    fill(COMPACTION_TINY, &[("words", &words.to_string())])
 }
 
 /// The summarizer's user message: the transcript to condense, and the
@@ -557,6 +651,12 @@ pub fn recalled_context(
         ));
     }
     (!sections.is_empty()).then(|| fill(RECALLED_CONTEXT, &[("sections", &sections.join("\n\n"))]))
+}
+
+/// The note that stands in a tiny window for a recalled context too large to
+/// fit; it points the model at `memory_search`.
+pub fn recalled_omitted() -> &'static str {
+    RECALLED_OMITTED.trim_end()
 }
 
 /// The first line of `text`, bounded and quoted as a JSON string with `<`

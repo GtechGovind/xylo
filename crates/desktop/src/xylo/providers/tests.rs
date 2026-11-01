@@ -187,3 +187,9 @@ fn a_chatgpt_connection_with_models_is_connected_before_its_account_status_is_re
         Status::Error
     );
 }
+
+#[test]
+fn a_fresh_profile_lists_no_provider() {
+    // The page shows its empty state, not a phantom "Local model" row.
+    assert!(saved_connections(&AppSettings::default()).is_empty());
+}

@@ -41,3 +41,8 @@ crates/services/sandbox-helper/package-lock.json. Distributed helper resources
 include each dependency's original license and notice files.
 Native asset distributors must also include the notices for every supplied
 browser, inference binary, document library, speech engine and model weight.
+
+This product includes a patched copy of the `block` crate 0.1.6
+(https://github.com/SSheldon/rust-block), Copyright (c) Steven Sheldon,
+licensed under the MIT License, in third_party/block. See
+third_party/block/XYLO_PATCH.md for the change.

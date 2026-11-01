@@ -389,6 +389,54 @@ fn describe_type(property: &Value) -> String {
     }
 }
 
+/// `schema` without what a tiny window cannot afford to send: property
+/// descriptions, examples, defaults and numeric or length bounds. Types,
+/// properties, required names, enums, items and `additionalProperties` stay,
+/// so a call that matches the full schema still matches this one.
+pub(crate) fn compact_parameters(schema: &Value) -> Value {
+    const DROPPED: [&str; 8] = [
+        "description",
+        "examples",
+        "default",
+        "minimum",
+        "maximum",
+        "minLength",
+        "maxLength",
+        "title",
+    ];
+    match schema {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| !DROPPED.contains(&key.as_str()))
+                .map(|(key, value)| {
+                    let value = match key.as_str() {
+                        // Property names are data, never keywords to drop.
+                        "properties" => match value {
+                            Value::Object(properties) => Value::Object(
+                                properties
+                                    .iter()
+                                    .map(|(name, property)| {
+                                        (name.clone(), compact_parameters(property))
+                                    })
+                                    .collect(),
+                            ),
+                            other => other.clone(),
+                        },
+                        "items" | "additionalProperties" | "anyOf" | "oneOf" | "allOf" => {
+                            compact_parameters(value)
+                        }
+                        _ => value.clone(),
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(compact_parameters).collect()),
+        other => other.clone(),
+    }
+}
+
 /// The first sentence of `description`, at most [`SHORT_DESCRIPTION_CHARS`].
 pub(crate) fn short_description(description: &str) -> String {
     let sentence = description

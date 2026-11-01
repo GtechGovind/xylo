@@ -526,7 +526,16 @@ async fn foreground_ssh_master_survives_connect_and_is_shared_but_only_owner_shu
     fs::write(manager.root.join("profiles.json"), "broken").unwrap();
     shutdown(&fixture.config).await.unwrap();
     assert_eq!(active_sessions(&fixture.config), 0);
-    assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+    // The client runs under the tether shell, so once the group is killed it is
+    // reaped by init rather than by this process: allow for that brief zombie.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shutdown left the master running"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let _ = fs::remove_file(socket);
 }
 #[cfg(unix)]
@@ -1156,6 +1165,52 @@ async fn dropped_caller_cancels_local_client_and_retains_output_until_explicit_r
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn checking_a_cancelled_command_reports_its_settled_outcome_not_running() {
+    let fixture = fixture(false);
+    let record = connected_existing(&fixture).await;
+    let id = Uuid::new_v4();
+    let args = json!({"environment_id":record.profile.id,"operation_id":id,"expected_revision":record.revision,"command":["__hang__"]});
+    let config = fixture.config.clone();
+    let call = tokio::spawn(async move {
+        execute_tool(
+            &config,
+            "environment_execute",
+            &args,
+            CancellationToken::new(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !fixture.root.path().join("dispatched").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("Fixture must reach native dispatch");
+    // The caller gives up and checks at once, while the cancelled run is still
+    // stopping the client and recording its receipt.
+    call.abort();
+    let started = std::time::Instant::now();
+    let receipt: EnvironmentReceipt = serde_json::from_value(
+        management(
+            &fixture.config,
+            "helper_environment_operation",
+            json!({"operation_id":id}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(
+        receipt.state,
+        EnvironmentOperationState::OutcomeUnknown,
+        "{}",
+        receipt.message
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
 #[tokio::test]
 async fn an_unreadable_profile_database_starts_fresh() {
     let directory = tempfile::tempdir().unwrap();
@@ -1184,4 +1239,129 @@ async fn an_unreadable_profile_database_starts_fresh() {
             .unwrap()
             .is_empty()
     );
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn ssh_master_ends_when_its_owner_ends_without_stopping_it() {
+    let fixture = fixture(true);
+    let base = fixture.root.path().canonicalize().unwrap();
+    let socket = base.join("s-tether");
+    let spec = crate::process::ProcessSpec {
+        executable: fixture.client.clone(),
+        args: [
+            "-S",
+            socket.to_str().unwrap(),
+            "-M",
+            "-N",
+            "--",
+            "example.invalid",
+        ]
+        .map(String::from)
+        .to_vec(),
+        cwd: base.clone(),
+        env: Default::default(),
+        timeout: Duration::from_secs(15),
+        output_limit: 8192,
+    };
+    let mut master =
+        crate::process::ManagedProcess::spawn_tethered(&native::tethered(spec)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Some(pid) = fs::read_to_string(&socket)
+            .ok()
+            .and_then(|pid| pid.parse::<i32>().ok())
+        {
+            break pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "master never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "an owned master stays up");
+    assert!(master.is_running().unwrap());
+    // The owner dies (crash, SIGKILL, process::exit): the kernel closes its
+    // file descriptors but no destructor stops the master.
+    master.sever_tether();
+    std::mem::forget(master);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the master outlived its owner"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // SIGTERM, not SIGKILL: the master removed its own control socket.
+    assert!(!socket.exists());
+}
+/// Live (non-zombie) processes in one process group, by PID.
+#[cfg(unix)]
+fn live_group_members(group: u32) -> Vec<u32> {
+    let listing = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,pgid=,stat="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (pid, pgid, stat) = (fields.next()?, fields.next()?, fields.next()?);
+            (pgid.parse::<u32>().ok()? == group && !stat.starts_with('Z'))
+                .then(|| pid.parse().ok())?
+        })
+        .collect()
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn a_master_that_exits_by_itself_leaves_no_watcher_to_signal_a_reused_pid() {
+    let fixture = fixture(true);
+    let base = fixture.root.path().canonicalize().unwrap();
+    // A client that starts and then exits on its own, as a master does when
+    // its connection drops.
+    let client = base.join("short-ssh");
+    executable(
+        &client,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\nsleep 0.2\n",
+    );
+    let marker = base.join("short-ssh.pid");
+    let spec = crate::process::ProcessSpec {
+        executable: client,
+        args: vec![marker.to_string_lossy().into_owned()],
+        cwd: base.clone(),
+        env: Default::default(),
+        timeout: Duration::from_secs(15),
+        output_limit: 8192,
+    };
+    let mut wrapper =
+        crate::process::ManagedProcess::spawn_tethered(&native::tethered(spec)).unwrap();
+    let group = wrapper.pid().unwrap();
+    // Observe only; `is_running` would kill the whole group and hide a watcher.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !marker.exists() || !live_group_members(group).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "processes left in the master's group: {:?}",
+            live_group_members(group)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The owner ends later: with no watcher left, nothing is signalled.
+    wrapper.sever_tether();
+    assert!(!wrapper.is_running().unwrap());
+}
+#[cfg(unix)]
+#[test]
+fn only_a_control_socket_nothing_listens_on_is_removed() {
+    let root = tempfile::tempdir().unwrap();
+    let stale = root.path().join("stale");
+    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    let live = root.path().join("live");
+    let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+    let file = root.path().join("file");
+    fs::write(&file, "123").unwrap();
+    for path in [&stale, &live, &file] {
+        native::remove_stale_socket(path);
+    }
+    assert!(!stale.exists());
+    assert!(live.exists() && file.exists());
 }

@@ -14,8 +14,9 @@
 //! 2. Once history passes [`masking::MASK_SHARE_PERCENT`] of the window, old
 //!    tool results are masked in batches (see [`masking`]); the stubs are
 //!    durable, like a summary.
-//! 3. When history passes the summary threshold (80 % of the window, 70 % for
-//!    small windows), older history is replaced by a model-written summary
+//! 3. When history passes the summary threshold (80 % of the window; for
+//!    small windows one summary's size, an eighth of `W_eff`, below the
+//!    hard limit), older history is replaced by a model-written summary
 //!    plus a harness record of pinned user messages and an artifact ledger
 //!    (see [`record`]). Both become part of the durable checkpoint, so later
 //!    steps and later turns reuse them instead of re-summarising.
@@ -24,7 +25,8 @@
 //!
 //! When the provider still rejects a request as too long, the caller retries
 //! once under [`Pressure::Overflow`]: estimates are raised, every eligible
-//! result is masked and the summary targets 60 % of the window.
+//! result is masked and the summary targets 60 % of the window (a small
+//! window keeps its usual target; only the raised estimates shrink it).
 mod masking;
 mod record;
 mod window;
@@ -55,19 +57,25 @@ use xylo_resources::{ResourceManager, TaskDemand};
 /// safety margin; observed Claude, Gemini and Llama-family code/prose ratios
 /// stay below it. Exact counts are used where the model's encoding is known.
 const FOREIGN_TOKEN_SCALE: f64 = 1.3;
-/// Output limit of a summary request.
+/// Largest output limit of a summary request (see
+/// [`ContextBudget::summary_tokens`]).
 const SUMMARY_TOKENS: u32 = 2048;
+/// Smallest output limit of a summary request.
+const SUMMARY_FLOOR: u32 = 192;
+/// Word limit the summarizer prompt states for a [`SUMMARY_TOKENS`] summary;
+/// smaller summaries get proportionally fewer words.
+const SUMMARY_WORDS: u32 = 900;
 /// The summarizer's own deadline never exceeds this.
 const SUMMARY_DEADLINE: Duration = Duration::from_secs(90);
 /// Request framing not attributable to any message.
 const FRAMING_TOKENS: usize = 256;
 /// Per-tool framing on top of its schema.
 const TOOL_FRAMING_TOKENS: usize = 64;
-/// Summary threshold as a share of the window; small windows summarise
-/// earlier so a long reasoning turn still has room.
+/// Summary threshold of a large window as a share of the window. Small
+/// windows derive theirs from the summary size instead
+/// ([`ContextBudget::proactive_context`]).
 const SUMMARY_SHARE_PERCENT: u32 = 80;
-const SMALL_SUMMARY_SHARE_PERCENT: u32 = 70;
-/// Target share of the window after an overflow forced compaction.
+/// Target share of a large window after an overflow forced compaction.
 const OVERFLOW_SHARE_PERCENT: u32 = 60;
 /// Calibration never scales estimates beyond these bounds. The floor is
 /// close to 1 because an underestimate risks an overflow, while an
@@ -447,21 +455,65 @@ impl ContextBudget {
         (context_tokens as usize).saturating_sub(fixed)
     }
 
-    /// The summary threshold.
+    /// The summary threshold. A large window summarises at 80 % of the
+    /// window. A small one (tiny included) summarises one summary's size
+    /// ([`Self::summary_tokens`]) below the hard limit: its fixed preamble
+    /// and output reserve take so much of the window that a share of it
+    /// could leave the summary and its record no room. With the summary and
+    /// the record an eighth of `W_eff` each, a plan fits whenever the
+    /// preamble (system prompt, tools and framing) stays below five eighths
+    /// of `W_eff`.
     fn proactive_context(&self) -> u32 {
-        let share = if self.window.small() {
-            SMALL_SUMMARY_SHARE_PERCENT
+        if self.window.small() {
+            self.context_tokens - self.summary_tokens()
         } else {
-            SUMMARY_SHARE_PERCENT
-        };
-        self.context_tokens / 100 * share
+            self.context_tokens / 100 * SUMMARY_SHARE_PERCENT
+        }
     }
 
-    /// The share of the window a summary aims below.
+    /// The share of the window a summary aims below. A small window keeps
+    /// its usual target under an overflow: the raised calibration
+    /// ([`ContextBudget::penalize_overflow`]) is what shrinks the retry,
+    /// since a lower target would leave the summary and its record no room.
     fn target_context(&self, pressure: Pressure) -> u32 {
         match pressure {
-            Pressure::Normal => self.proactive_context(),
-            Pressure::Overflow => self.context_tokens / 100 * OVERFLOW_SHARE_PERCENT,
+            Pressure::Overflow if !self.window.small() => {
+                self.context_tokens / 100 * OVERFLOW_SHARE_PERCENT
+            }
+            _ => self.proactive_context(),
+        }
+    }
+
+    /// Output limit of a summary request: an eighth of `W_eff` (the room the
+    /// record gets too), between [`SUMMARY_FLOOR`] and [`SUMMARY_TOKENS`].
+    /// Every window with `W_eff` of 16K or more gets the full 2,048.
+    fn summary_tokens(&self) -> u32 {
+        (self.window.tokens() / 8).clamp(SUMMARY_FLOOR, SUMMARY_TOKENS)
+    }
+
+    /// Least history worth a summary call: twice the summary in a large
+    /// window. A small window summarises only one summary's size below its
+    /// hard limit, so history past that is condensed once it outweighs the
+    /// summary itself; the record adds little, since the user messages it
+    /// copies come out of the condensed history.
+    fn min_condensed_tokens(&self) -> usize {
+        let summary = self.summary_tokens() as usize;
+        if self.window.small() {
+            summary
+        } else {
+            2 * summary
+        }
+    }
+
+    /// The summarizer's system prompt with a word limit that fits
+    /// [`Self::summary_tokens`]: the full prompt, or a tiny window's brief
+    /// one.
+    fn compaction_prompt(&self) -> String {
+        let tokens = self.summary_tokens();
+        if self.window.tiny() {
+            crate::prompts::compaction_tiny(tokens as usize * 3 / 5)
+        } else {
+            crate::prompts::compaction((tokens * SUMMARY_WORDS / SUMMARY_TOKENS) as usize)
         }
     }
 
@@ -544,9 +596,9 @@ impl ContextBudget {
     ) -> Option<SummaryPlan> {
         let allowance = self.allowance(tools, max_tokens, self.target_context(pressure));
         let costs = self.costs(history);
-        let fixed = self.costs(system).iter().sum::<usize>()
-            + SUMMARY_TOKENS as usize
-            + self.record_tokens();
+        let summary_tokens = self.summary_tokens() as usize;
+        let fixed =
+            self.costs(system).iter().sum::<usize>() + summary_tokens + self.record_tokens();
         if allowance <= fixed {
             return None;
         }
@@ -573,7 +625,7 @@ impl ContextBudget {
             }
         }
         let cut = cut.filter(|cut| {
-            costs[floor..*cut].iter().sum::<usize>() >= 2 * SUMMARY_TOKENS as usize
+            costs[floor..*cut].iter().sum::<usize>() >= self.min_condensed_tokens()
         })?;
         Some(SummaryPlan {
             cut,
@@ -603,7 +655,22 @@ impl ContextBudget {
         let mut record = previous.and_then(Record::parse).unwrap_or_default();
         let previous = previous.map(Record::strip);
         // The summarizer's own request must fit comfortably in the context.
-        let budget = (self.context_tokens as usize * 3 / 5).saturating_sub(SUMMARY_TOKENS as usize);
+        // A small window has no room for "comfortably": its transcript gets
+        // what the window holds after the summary's output, the prompt, the
+        // framing and the safety margin.
+        let summary_tokens = self.summary_tokens().min(self.output_tokens);
+        let system = self.compaction_prompt();
+        let budget = if self.window.small() {
+            let margin = self.context_tokens - self.window.output() - self.window.tokens();
+            (self.context_tokens as usize)
+                .saturating_sub(margin as usize)
+                .saturating_sub(summary_tokens as usize)
+                .saturating_sub(FRAMING_TOKENS)
+                .saturating_sub(self.tokens(&system))
+                .saturating_sub(self.tokens(&crate::prompts::compaction_request(previous, "")))
+        } else {
+            (self.context_tokens as usize * 3 / 5).saturating_sub(SUMMARY_TOKENS as usize)
+        };
         let covered = &history[plan.floor..plan.cut];
         let mut transcript = String::new();
         for each in [4000, 2000, 1000, 500, 250, 120] {
@@ -617,11 +684,11 @@ impl ContextBudget {
         }
         let request = ModelRequest {
             messages: vec![
-                Message::system(crate::prompts::compaction()),
+                Message::system(system),
                 Message::user(crate::prompts::compaction_request(previous, &transcript)),
             ],
             tools: Vec::new(),
-            max_tokens: SUMMARY_TOKENS.min(self.output_tokens),
+            max_tokens: summary_tokens,
             reasoning: crate::model::Reasoning::Configured,
         };
         let reply = tokio::time::timeout(

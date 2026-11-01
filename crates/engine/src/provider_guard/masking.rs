@@ -41,6 +41,14 @@ pub(crate) const MASK_SHARE_PERCENT: u32 = 55;
 pub(crate) const BATCH_SHARE_PERCENT: usize = 20;
 /// Results smaller than this are cheaper to keep than to replace.
 const MIN_MASK_BYTES: usize = 1024;
+/// A tiny window ([`super::EffectiveWindow::tiny`]) masks from a share of
+/// `W_eff` rather than of the window, smaller results, smaller batches and
+/// after at most [`TINY_RETENTION`] rounds: it holds only a few tool rounds,
+/// so the usual retention would never let masking free anything.
+const TINY_MASK_SHARE_PERCENT: u32 = 60;
+const TINY_MIN_MASK_BYTES: usize = 384;
+const TINY_BATCH_SHARE_PERCENT: usize = 10;
+const TINY_RETENTION: usize = 2;
 
 /// Tool rounds a result stays in context after the round that produced it.
 fn retention(tool: &str) -> usize {
@@ -98,7 +106,20 @@ impl ContextBudget {
     ) -> Option<MaskPlan> {
         let used =
             self.costs(system).iter().sum::<usize>() + self.costs(history).iter().sum::<usize>();
-        let mask_context = self.window.context() / 100 * MASK_SHARE_PERCENT;
+        let tiny = self.window.tiny();
+        let (mask_context, min_bytes, batch_share) = if tiny {
+            (
+                self.window.input_share(TINY_MASK_SHARE_PERCENT),
+                TINY_MIN_MASK_BYTES,
+                TINY_BATCH_SHARE_PERCENT,
+            )
+        } else {
+            (
+                self.window.context() / 100 * MASK_SHARE_PERCENT,
+                MIN_MASK_BYTES,
+                BATCH_SHARE_PERCENT,
+            )
+        };
         if pressure == Pressure::Normal && used <= self.allowance(tools, max_tokens, mask_context) {
             return None;
         }
@@ -113,7 +134,7 @@ impl ContextBudget {
         let mut saved = 0usize;
         for (index, message) in history.iter().enumerate() {
             if message.role != Role::Tool
-                || message.content.len() < MIN_MASK_BYTES
+                || message.content.len() < min_bytes
                 || prompts::is_masked_observation(&message.content)
             {
                 continue;
@@ -129,6 +150,7 @@ impl ContextBudget {
                 continue;
             }
             let keep = match pressure {
+                Pressure::Normal if tiny => retention(call.name).min(TINY_RETENTION),
                 Pressure::Normal => retention(call.name),
                 Pressure::Overflow => 1,
             };
@@ -151,7 +173,7 @@ impl ContextBudget {
             return None;
         }
         let allowance = self.allowance(tools, max_tokens, self.window.context());
-        if pressure == Pressure::Normal && saved * 100 < allowance * BATCH_SHARE_PERCENT {
+        if pressure == Pressure::Normal && saved * 100 < allowance * batch_share {
             return None;
         }
         Some(MaskPlan { stubs })

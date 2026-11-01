@@ -165,7 +165,11 @@ fn retry_runs_the_failed_turn_again_under_its_own_id(cx: &mut TestAppContext) {
         let (probe, worker) = std::sync::mpsc::sync_channel(4);
         view.validation_worker_commands = Some(probe);
         view.workspace = Some(std::path::PathBuf::from("/fixture"));
-        view.settings.provider.model = "fixture-model".into();
+        // A fresh profile has no provider; give the retry a working one.
+        view.settings.provider = xylo_core::ProviderConfig {
+            model: "fixture-model".into(),
+            ..Default::default()
+        };
         assert!(view.settings.provider.validate().is_ok());
         let session = view.session;
         let failed = xylo_core::TurnRequest {
