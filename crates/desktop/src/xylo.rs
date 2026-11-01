@@ -262,6 +262,9 @@ pub struct Xylo {
     memory_content: Entity<TextareaState>,
     memories: Vec<MemoryRecord>,
     facts: memory::MemoryUi,
+    web_search_backend: Option<xylo_core::WebSearchBackend>,
+    web_search_endpoint: Entity<InputState>,
+    web_search_secret: Entity<InputState>,
     connector_name: Entity<InputState>,
     connector_endpoint: Entity<InputState>,
     connector_command: Entity<InputState>,
@@ -539,6 +542,13 @@ impl Xylo {
             memory_content,
             memories: vec![],
             facts: memory::MemoryUi::default(),
+            web_search_backend: None,
+            web_search_endpoint: input("https://search.example", window, cx),
+            web_search_secret: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("API key (leave blank to keep saved key)")
+                    .masked(true)
+            }),
             connector_name: input("Connector name", window, cx),
             connector_endpoint: input("https://…/mcp", window, cx),
             connector_command: input("Executable path", window, cx),

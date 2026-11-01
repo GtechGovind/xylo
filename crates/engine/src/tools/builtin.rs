@@ -230,6 +230,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
     if cfg!(windows) {
         tools.retain(|tool| !matches!(tool.name.as_str(), "run_command" | "shell_command"));
     }
+    tools.extend(super::web::definitions());
     tools
 }
 

@@ -342,6 +342,9 @@ pub struct AppSettings {
     /// Default alternative model ID, used on the active authorized connection.
     #[serde(default)]
     pub fallback_model: Option<String>,
+    /// Optional search service for connections without native search.
+    #[serde(default)]
+    pub web_search: WebSearchSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -443,8 +446,29 @@ impl Default for AppSettings {
             ui: UiPreferences::default(),
             secret_storage: SecretStorage::default(),
             fallback_model: None,
+            web_search: WebSearchSettings::default(),
         }
     }
+}
+
+/// Saved web search configuration contains references, never credential values.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WebSearchSettings {
+    pub backend: WebSearchBackend,
+    pub endpoint: String,
+    pub credential_ref: Option<String>,
+}
+
+/// The fallback search service explicitly chosen by the user.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchBackend {
+    #[default]
+    Disabled,
+    Brave,
+    Tavily,
+    Searxng,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

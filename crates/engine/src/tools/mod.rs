@@ -23,6 +23,7 @@ pub(crate) mod lookup;
 mod permissions;
 mod portable;
 mod risk;
+pub(crate) mod web;
 use crate::{prompts, provider_guard::EffectiveWindow};
 use anyhow::{Context, Result, bail, ensure};
 pub(crate) use code::shell_name;
@@ -184,6 +185,8 @@ pub struct ToolBroker {
     served_context: Arc<std::sync::OnceLock<u32>>,
     /// Compiled schemas, the connector snapshot and the search index.
     lookup: lookup::Lookup,
+    web: Arc<web::WebSession>,
+    web_provider: Mutex<Option<Arc<dyn crate::model::ModelProvider>>>,
 }
 impl ToolBroker {
     pub fn new(
@@ -249,6 +252,8 @@ impl ToolBroker {
             definitions,
             advertised,
             allowed_tools: None,
+            web: session.web.clone(),
+            web_provider: Mutex::new(None),
             session,
             parent_id: None,
             events,
@@ -279,6 +284,8 @@ impl ToolBroker {
         child.parent_id = Some(parent_action_id);
         child.served_context = self.served_context.clone();
         child.lookup = self.lookup.child();
+        child.web = self.web.clone();
+        *child.web_provider.lock() = self.web_provider.lock().clone();
         Ok(child)
     }
     pub(crate) fn restrict_tools(&mut self, requested: &[String]) -> Result<()> {
@@ -313,6 +320,11 @@ impl ToolBroker {
     }
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    /// Shares the authorized turn provider with web utility requests.
+    pub(crate) fn set_web_provider(&self, provider: Arc<dyn crate::model::ModelProvider>) {
+        web::set_provider(self, provider);
     }
 
     pub fn definitions(&self) -> &[ToolDefinition] {
@@ -788,6 +800,8 @@ impl ToolBroker {
                 })?
             } else if name.starts_with("connector_") {
                 self.execute_connector(name, &arguments)?
+            } else if matches!(name, "web_fetch" | "web_search") {
+                web::execute(self, id, name, &arguments)?
             } else if name == "image_generate" {
                 image_generation::execute(self, id, &arguments)?
             } else if matches!(
@@ -1016,7 +1030,7 @@ impl ToolBroker {
     ) -> Result<MemoryOrigin> {
         let name = action.name.as_str();
         let arguments = action.arguments.as_ref().unwrap_or(&Value::Null);
-        if name.starts_with("browser_") {
+        if matches!(name, "web_fetch" | "web_search") || name.starts_with("browser_") {
             return Ok(MemoryOrigin::WebContent);
         }
         Ok(match name {

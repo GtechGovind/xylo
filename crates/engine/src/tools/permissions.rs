@@ -99,6 +99,7 @@ pub struct ToolSession {
     approvals: ApprovalGate,
     permissions: PermissionCell,
     vault: CredentialVault,
+    pub(super) web: Arc<super::web::WebSession>,
     connectors: Arc<OnceLock<ConnectorBroker>>,
 }
 
@@ -110,6 +111,7 @@ impl ToolSession {
             approvals: ApprovalGate::default(),
             permissions,
             vault,
+            web: Arc::default(),
             connectors: Arc::default(),
         }
     }
@@ -251,6 +253,10 @@ pub(crate) enum Verdict {
 
 /// Decides whether a call runs, asks or is refused under `mode`.
 pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
+    if matches!(call.name, "web_fetch" | "web_search") {
+        // The web module checks domain and private-network authority per hop.
+        return Verdict::Allow;
+    }
     if call.origin == Origin::Hook {
         return Verdict::Allow;
     }

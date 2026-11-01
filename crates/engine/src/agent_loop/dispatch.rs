@@ -39,6 +39,9 @@ pub(crate) enum Access {
 /// The tools a loop may call. Execution is blocking and exactly-once per
 /// call id: the implementation journals every dispatch.
 pub(crate) trait ToolExecutor: Send + Sync {
+    /// Updates utility requests to the provider that completed this model call.
+    fn active_provider(&self, _provider: Arc<dyn crate::model::ModelProvider>) {}
+
     /// Tools offered directly to the model right now. Re-read before every
     /// model call, because the permission mode can change mid-task.
     fn schemas(&self) -> Vec<ToolSchema>;
@@ -70,7 +73,11 @@ pub(crate) trait ToolExecutor: Send + Sync {
 }
 
 /// Exact names other agents use for Xylo's tools.
-const ALIASES: [(&str, &str); 9] = [
+const ALIASES: [(&str, &str); 13] = [
+    ("WebFetch", "web_fetch"),
+    ("WebSearch", "web_search"),
+    ("webfetch", "web_fetch"),
+    ("websearch", "web_search"),
     ("read", "file_read"),
     ("write", "file_write"),
     ("edit", "file_edit"),

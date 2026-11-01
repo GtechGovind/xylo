@@ -46,6 +46,7 @@ mod settings_control;
 mod steering_control;
 mod turn_queue_control;
 mod update_control;
+mod web_search_control;
 mod worker_control;
 use worker_control::{SessionSequences, WorkerHandle, effective_mode, retire_idle_workers};
 
@@ -335,6 +336,7 @@ enum HostCommand {
     Conversations,
     ConversationPage(Option<ConversationCursor>, usize),
     SaveSettings(AppSettings),
+    SaveWebSearch(xylo_core::WebSearchSettings, Option<String>),
     Models(u64, ProviderConfig),
     SaveProvider(u64, Box<AppSettings>, ProviderConfig, Option<String>),
     Workspace(PathBuf),
@@ -532,7 +534,7 @@ impl HostClient {
                         let receipt = received;
                         if matches!(command,HostCommand::Shutdown) {maintenance_stop.cancel();state.shutdown().await;scheduling.abort();editor_forwarder.abort();project_forwarder.abort();let _=learning_task.await;for task in notification_tasks {let _=task.await;}state.events.send(HostEvent::Stopped).await?;break;}
                         // Reserve at receipt, before any task can race to acquire admission.
-                        let settings_commit = matches!(&command, HostCommand::SaveSettings(_) | HostCommand::SaveProvider(..) | HostCommand::RemoveProvider(_)).then(|| settings_commits.reserve());
+                        let settings_commit = matches!(&command, HostCommand::SaveSettings(_) | HostCommand::SaveWebSearch(..) | HostCommand::SaveProvider(..) | HostCommand::RemoveProvider(_)).then(|| settings_commits.reserve());
                         // Preserve document ordering independently of concurrent
                         // host work. The language-server actor owns synchronization.
                         if state.installing.load(Ordering::Acquire) && matches!(&command,HostCommand::Workspace(_)|HostCommand::Lsp(_)) {
@@ -756,6 +758,15 @@ impl HostClient {
     pub fn save_settings(&self, settings: AppSettings) -> Result<()> {
         self.enqueue(HostCommand::SaveSettings(settings))
     }
+    /// Saves a search backend, keeping API key material in the credential vault.
+    pub fn save_web_search(
+        &self,
+        settings: xylo_core::WebSearchSettings,
+        secret: Option<String>,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::SaveWebSearch(settings, secret))
+    }
+
     /// Persist credentials before settings and discovery, within one host operation.
     pub fn save_provider(&self, settings: AppSettings, secret: Option<String>) -> Result<()> {
         let provider = settings.provider.clone();
@@ -1663,6 +1674,9 @@ impl HostState {
                     tokio::task::spawn_blocking(move || store.conversations_page(before, limit))
                         .await??;
                 self.events.send(HostEvent::ConversationPage(page)).await?;
+            }
+            HostCommand::SaveWebSearch(settings, secret) => {
+                self.save_web_search(settings, secret).await?
             }
             HostCommand::SaveSettings(settings) => {
                 let committed = self

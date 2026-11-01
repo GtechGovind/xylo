@@ -29,6 +29,7 @@ use std::path::{Component, Path, PathBuf};
 pub(crate) fn assess(name: &str, arguments: &Value, workspace: &Path) -> Option<String> {
     let text = |key: &str| arguments.get(key).and_then(Value::as_str);
     match name {
+        "web_fetch" | "web_search" => None,
         "file_write" | "file_edit" => {
             let path = resolve(workspace, text("path")?);
             if !inside(workspace, &path) {

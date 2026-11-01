@@ -41,6 +41,10 @@ impl BrokerTools {
 }
 
 impl ToolExecutor for BrokerTools {
+    fn active_provider(&self, provider: Arc<dyn crate::model::ModelProvider>) {
+        self.broker.set_web_provider(provider);
+    }
+
     fn schemas(&self) -> Vec<ToolSchema> {
         self.broker
             .initial_definitions()

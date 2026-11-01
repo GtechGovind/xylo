@@ -651,6 +651,11 @@ impl AgentLoop {
                                 usage.input_tokens,
                             );
                         }
+                        self.tools.active_provider(
+                            run.fallback
+                                .clone()
+                                .unwrap_or_else(|| self.provider.clone()),
+                        );
                         return Ok(response);
                     }
                     Err(StreamFailure::Fatal(error)) => return Err(error),

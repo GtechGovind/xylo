@@ -486,6 +486,24 @@ pub trait ModelProvider: Send + Sync {
     /// [`ModelError::Interrupted`] promptly.
     fn stream(&self, request: ModelRequest, cancel: CancellationToken) -> EventStream;
 
+    /// Whether this connection has a native web-search request adapter.
+    fn supports_search(&self) -> bool {
+        false
+    }
+
+    /// Runs a separate small native search request without conversation tools.
+    /// `addresses` are the broker-approved, pinned addresses for this endpoint.
+    async fn search(
+        &self,
+        _arguments: Value,
+        _addresses: Vec<std::net::SocketAddr>,
+        _cancel: CancellationToken,
+    ) -> Result<Value, ModelError> {
+        Err(ModelError::InvalidRequest(
+            "This provider has no native search".into(),
+        ))
+    }
+
     /// The configured alternative on the same authorized connection.
     fn fallback(&self) -> Option<(String, Arc<dyn ModelProvider>)> {
         None

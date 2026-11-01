@@ -44,6 +44,8 @@ pub struct Task {
     /// exercise scripted provider faults (truncation, overflow, empty
     /// replies) are offline only.
     pub live: bool,
+    /// Optional loopback page served only by the offline evaluation harness.
+    pub web_fixture: Option<&'static str>,
     /// Grades a finished trial; harness invariants are checked separately.
     pub grade: fn(&Trial) -> Vec<Check>,
 }
