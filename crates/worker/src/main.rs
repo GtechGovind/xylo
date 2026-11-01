@@ -396,22 +396,21 @@ async fn main() -> Result<()> {
                 }
             }
             WorkerCommand::Answer { action_id, answer } => {
-                if let Some(tools) = session.as_ref()
-                    && let Err(error) = tools.answer(action_id, answer)
-                {
-                    send(
-                        &output,
-                        &sequence,
-                        request_id,
-                        session_id,
-                        EngineEvent::Error {
-                            message: format!("Answer could not be applied: {error:#}"),
-                            retryable: false,
-                            kind: ErrorKind::Internal,
-                        },
-                    )
-                    .await?;
-                }
+                let result = session
+                    .as_ref()
+                    .context("This task is no longer running")
+                    .and_then(|tools| tools.answer(action_id, answer));
+                let event = match result {
+                    Ok(()) => EngineEvent::Status {
+                        text: "Answer accepted".into(),
+                    },
+                    Err(error) => EngineEvent::Error {
+                        message: format!("Answer could not be applied: {error:#}"),
+                        retryable: false,
+                        kind: ErrorKind::Internal,
+                    },
+                };
+                send(&output, &sequence, request_id, session_id, event).await?;
             }
             WorkerCommand::KillJob { job_id } => {
                 let stopped = session_id

@@ -197,3 +197,113 @@ async fn interaction_host_stop_cancels_only_the_reserved_wakeup() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn interaction_host_plan_answer_obeys_captured_and_current_authority() {
+    use xylo_core::InteractionAnswer;
+    let (root, host, _events) = state();
+    let session = Uuid::new_v4();
+    host.settings.lock().await.permissions = PermissionMode::AskForApproval;
+    host.start_loop(session, root.path().to_owned(), "/loop check".into())
+        .await
+        .unwrap();
+    let task = due_wakeup(&host).await;
+    host.scheduled.lock().await.insert(session, task.id);
+    let (mut incoming, _exit) = draft::mock_worker(&host, session, 4).await;
+    for (current, expected) in [
+        (PermissionMode::FullAccess, PermissionMode::AskForApproval),
+        (PermissionMode::ReadOnly, PermissionMode::ReadOnly),
+    ] {
+        host.settings.lock().await.permissions = current;
+        host.control_worker(
+            Some(session),
+            WorkerCommand::Answer {
+                action_id: Uuid::new_v4(),
+                answer: InteractionAnswer::ApprovePlan {
+                    mode: PermissionMode::FullAccess,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let command = incoming.recv().await.unwrap();
+        assert!(
+            matches!(command.payload, WorkerCommand::Answer {answer: InteractionAnswer::ApprovePlan {mode}, ..} if mode == expected),
+            "{command:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn interaction_host_delivery_failure_is_correlated() {
+    let (_root, host, events) = state();
+    let session = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    host.control_worker(
+        Some(session),
+        WorkerCommand::Answer {
+            action_id: id,
+            answer: xylo_core::InteractionAnswer::Reject,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(events.recv().await.unwrap(), HostEvent::InteractionReply { session:s, action_id, result:Err(_) } if s == session && action_id == id)
+    );
+}
+
+#[tokio::test]
+async fn interaction_plan_answer_and_permission_updates_share_admission_order() {
+    let (root, host, _events) = state();
+    let session = Uuid::new_v4();
+    host.settings.lock().await.permissions = PermissionMode::AskForApproval;
+    host.start_loop(session, root.path().to_owned(), "/loop check".into())
+        .await
+        .unwrap();
+    let task = due_wakeup(&host).await;
+    host.scheduled.lock().await.insert(session, task.id);
+    let (mut incoming, _exit) = draft::mock_worker(&host, session, 4).await;
+    let worker = host.workers.lock().await[&session].clone();
+    let guard = worker.permission_order.lock().await;
+    let mut answer = Box::pin(host.control_worker(
+        Some(session),
+        WorkerCommand::Answer {
+            action_id: Uuid::new_v4(),
+            answer: xylo_core::InteractionAnswer::ApprovePlan {
+                mode: PermissionMode::FullAccess,
+            },
+        },
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut answer)
+            .await
+            .is_err()
+    );
+    assert!(incoming.try_recv().is_err());
+    host.settings.lock().await.permissions = PermissionMode::ReadOnly;
+    let mut update = Box::pin(host.forward_permissions(PermissionMode::ReadOnly));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut update)
+            .await
+            .is_err()
+    );
+    drop(guard);
+    let (answered, ()) = tokio::join!(answer, update);
+    answered.unwrap();
+    assert!(matches!(
+        incoming.recv().await.unwrap().payload,
+        WorkerCommand::Answer {
+            answer: xylo_core::InteractionAnswer::ApprovePlan {
+                mode: PermissionMode::ReadOnly
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        incoming.recv().await.unwrap().payload,
+        WorkerCommand::SetPermissions {
+            mode: PermissionMode::ReadOnly
+        }
+    ));
+}

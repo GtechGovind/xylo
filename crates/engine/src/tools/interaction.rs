@@ -44,6 +44,7 @@ impl InteractionGate {
     }
 }
 fn validate_answer(request: &Request, answer: &InteractionAnswer) -> Result<()> {
+    answer.validate_text().map_err(anyhow::Error::msg)?;
     match (request, answer) {
         (_, InteractionAnswer::Reject) => Ok(()),
         (Request::Plan, InteractionAnswer::ApprovePlan { mode }) => {

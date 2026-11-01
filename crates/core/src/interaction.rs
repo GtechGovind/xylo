@@ -38,3 +38,24 @@ pub enum InteractionAnswer {
     KeepPlanning { feedback: String },
     Reject,
 }
+
+impl InteractionAnswer {
+    /// UTF-8 byte bounds shared by native clients and the authoritative gate.
+    pub fn validate_text(&self) -> Result<(), &'static str> {
+        match self {
+            Self::KeepPlanning { feedback }
+                if feedback.trim().is_empty() || feedback.len() > 8192 =>
+            {
+                Err("Feedback must contain 1..8192 bytes")
+            }
+            Self::Questions { answers }
+                if answers
+                    .iter()
+                    .any(|a| a.other.as_ref().is_some_and(|s| s.len() > 8192)) =>
+            {
+                Err("Other answers must be at most 8192 bytes")
+            }
+            _ => Ok(()),
+        }
+    }
+}

@@ -10,15 +10,17 @@ impl Xylo {
         answer: InteractionAnswer,
         cx: &mut Context<Self>,
     ) {
-        if let Some(card) = self
+        if let Err(error) = answer.validate_text() {
+            self.error = Some(error.into());
+            cx.notify();
+            return;
+        }
+        if !self
             .turns
-            .get_mut(&self.session)
-            .and_then(|turn| turn.tools.iter_mut().find(|card| card.id == id))
+            .get(&self.session)
+            .is_some_and(|turn| turn.tools.iter().any(|card| card.id == id && card.approval))
         {
-            if !card.approval {
-                return;
-            }
-            card.approval = false;
+            return;
         }
         self.engine_command(
             WorkerCommand::Answer {
@@ -103,7 +105,9 @@ impl Xylo {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let text = this.composer.read(cx).value().trim().to_owned();
-                        if text.is_empty() {
+                        if text.is_empty() || text.len() > 8192 {
+                            this.error = Some("Other answers must contain 1..8192 bytes".into());
+                            cx.notify();
                             return;
                         }
                         if let Some(answer) = this
@@ -124,7 +128,12 @@ impl Xylo {
             card = card.child(section);
         }
         let answers = tool.question_answers.clone();
-        let ready = !answers.is_empty()
+        let ready = (InteractionAnswer::Questions {
+            answers: answers.clone(),
+        })
+        .validate_text()
+        .is_ok()
+            && !answers.is_empty()
             && answers.iter().all(|answer| {
                 !answer.selected.is_empty()
                     || answer

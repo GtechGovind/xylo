@@ -2,6 +2,29 @@
 use super::*;
 
 impl HostState {
+    pub(super) async fn cap_plan_answer(
+        &self,
+        session: Uuid,
+        mut answer: xylo_core::InteractionAnswer,
+    ) -> Result<xylo_core::InteractionAnswer> {
+        if let xylo_core::InteractionAnswer::ApprovePlan { mode } = &mut answer {
+            if self.scheduled.lock().await.contains_key(&session) {
+                let current = self.settings.lock().await.permissions;
+                *mode = self
+                    .wakeup_permission(
+                        session,
+                        crate::scheduler::wakeup_mode(*mode, effective_mode(current, true)),
+                    )
+                    .await?;
+            }
+            ensure!(
+                *mode != PermissionMode::Plan,
+                "This task must remain in Plan mode. Keep planning or reject the plan."
+            );
+        }
+        Ok(answer)
+    }
+
     pub(super) async fn wakeup_permission(
         &self,
         session: Uuid,

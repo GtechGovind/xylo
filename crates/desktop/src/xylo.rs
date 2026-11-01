@@ -793,6 +793,43 @@ impl Xylo {
             self.note_context_usage(envelope);
         }
         match event {
+            HostEvent::PlanModes {
+                session,
+                action_id,
+                modes,
+                scheduled,
+            } => {
+                if let Some(card) = self
+                    .turns
+                    .get_mut(&session)
+                    .and_then(|turn| turn.tools.iter_mut().find(|card| card.id == action_id))
+                {
+                    card.input["allowed_modes"] = serde_json::json!(modes);
+                    card.input["scheduled"] = serde_json::json!(scheduled);
+                }
+                self.invalidate_live_history();
+                self.sync_history_list(cx);
+            }
+            HostEvent::InteractionReply {
+                session,
+                action_id,
+                result,
+            } => {
+                if let Some(card) = self
+                    .turns
+                    .get_mut(&session)
+                    .and_then(|turn| turn.tools.iter_mut().find(|card| card.id == action_id))
+                    && result.is_ok()
+                {
+                    card.approval = false;
+                }
+                // Rejected replies leave the draft and pending controls untouched.
+                if let Err(error) = result {
+                    self.error = Some(error);
+                }
+                self.invalidate_live_history();
+                self.sync_history_list(cx);
+            }
             HostEvent::ActionReviews { request_id, result } => {
                 self.action_reviews_received(request_id, result, cx)
             }

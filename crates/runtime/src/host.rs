@@ -58,6 +58,17 @@ pub struct ConnectorMutationReceipt {
 
 #[derive(Clone)]
 pub enum HostEvent {
+    InteractionReply {
+        session: Uuid,
+        action_id: Uuid,
+        result: std::result::Result<(), String>,
+    },
+    PlanModes {
+        session: Uuid,
+        action_id: Uuid,
+        modes: Vec<PermissionMode>,
+        scheduled: bool,
+    },
     ActionReviews {
         request_id: Uuid,
         result: std::result::Result<crate::ActionReviewPage, String>,
@@ -2459,6 +2470,32 @@ impl HostState {
                 .decide(session, &worker, action_id, allow, remember)
                 .await;
         }
+        if let WorkerCommand::Answer { action_id, answer } = command {
+            let result = async {
+                let worker = worker.context("This task is no longer running")?;
+                // Keep the cap and reply ordered with concurrent settings propagation.
+                let _permission_order = worker.permission_order.lock().await;
+                let answer = self.cap_plan_answer(session, answer).await?;
+                worker
+                    .send_control(
+                        session,
+                        Uuid::new_v4(),
+                        WorkerCommand::Answer { action_id, answer },
+                    )
+                    .await
+            }
+            .await;
+            if let Err(error) = result {
+                self.events
+                    .send(HostEvent::InteractionReply {
+                        session,
+                        action_id,
+                        result: Err(error.to_string()),
+                    })
+                    .await?;
+            }
+            return Ok(());
+        }
         let worker = worker.context("This task is no longer running")?;
         worker.send_control(session, Uuid::new_v4(), command).await
     }
@@ -2747,7 +2784,7 @@ impl HostState {
                 effective_mode(self.settings.lock().await.permissions, scheduled),
             )
             .await?;
-        *worker.mode.lock() = turn.permissions;
+        worker.record_mode(turn.permissions);
         if automatic {
             ensure!(
                 !worker.queue_stopped.load(Ordering::Acquire),
