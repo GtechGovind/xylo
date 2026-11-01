@@ -4,9 +4,13 @@ use super::*;
 #[tokio::test]
 async fn completed_hook_closes_inherited_pipes_and_fences_descendants() {
     let root = tempfile::tempdir().unwrap();
-    let child = root.path().join("child.pid");
+    // Linux sandbox PIDs are namespace-local, so checking $! with host ps
+    // can inspect an unrelated host process. Identify this exact executable.
+    let child = root.path().canonicalize().unwrap().join("hook-sleeper");
+    std::fs::copy("/bin/sleep", &child).unwrap();
+    let child_name = child.to_str().unwrap();
     let hook = CommandHook {
-        command: "sleep 300 & printf '%s' \"$!\" > child.pid; printf '{}'".into(),
+        command: format!("{} 300 & printf '{{}}'", shell_words::quote(child_name)),
         timeout: std::time::Duration::from_secs(3),
     };
     let result = run(
@@ -18,15 +22,17 @@ async fn completed_hook_closes_inherited_pipes_and_fences_descendants() {
     )
     .await;
     assert_eq!(result.unwrap(), serde_json::json!({}));
-    let pid = std::fs::read_to_string(&child).unwrap();
     let output = std::process::Command::new("/bin/ps")
-        .args(["-p", pid.trim(), "-o", "stat="])
+        .args(["-axww", "-o", "stat=,args="])
         .output()
         .unwrap();
-    let state = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    let processes = String::from_utf8_lossy(&output.stdout);
     assert!(
-        state.trim().is_empty() || state.trim().starts_with('Z'),
-        "hook returned with a live descendant: {state}"
+        !processes
+            .lines()
+            .any(|line| line.contains(child_name) && !line.trim_start().starts_with('Z')),
+        "hook returned with its descendant executable still running"
     );
 }
 

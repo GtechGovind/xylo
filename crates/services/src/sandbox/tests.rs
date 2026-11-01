@@ -131,6 +131,7 @@ struct Finished {
     output: std::process::Output,
     start: Option<StartFailure>,
     denials: Vec<String>,
+    status_bytes: Option<Vec<u8>>,
 }
 
 async fn sandbox_output(mut prepared: PreparedSandbox) -> Finished {
@@ -149,6 +150,7 @@ async fn sandbox_output(mut prepared: PreparedSandbox) -> Finished {
         output,
         start: read_start_status(&prepared.status_file),
         denials: read_network_denials(&prepared.status_file),
+        status_bytes: std::fs::read(&prepared.status_file).ok(),
     }
 }
 
@@ -198,7 +200,9 @@ async fn unspawnable_program_is_recorded_and_tool_statuses_pass_through() {
 async fn a_program_cannot_forge_a_start_failure() {
     let dir = tempfile::tempdir().unwrap();
     // The status file sits beside the child's TMPDIR, so the program can
-    // find it; the sandbox must still refuse to read or write it.
+    // find it; the sandbox must still hide the host file and prevent changes.
+    // Linux may expose a writable private tmpfs at this path, whose contents
+    // never reach the host. Test host authority rather than shadow-file I/O.
     let forged = r#"printf ran > ran.txt
 record='{"kind":"spawn_failed","reason":"forged"}'
 echo 'XYLO_SANDBOX_SPAWN_FAILED: forged' >&2
@@ -215,12 +219,19 @@ exit 127"#;
         &[],
     )
     .unwrap();
+    let secret = uuid::Uuid::new_v4().to_string();
+    let private_record = format!("{{\"kind\":\"private_fixture\",\"secret\":\"{secret}\"}}\n");
+    std::fs::write(&prepared.status_file, &private_record).unwrap();
     let finished = sandbox_output(prepared).await;
     let stdout = String::from_utf8_lossy(&finished.output.stdout);
     assert!(dir.path().join("ran.txt").exists(), "The program ran");
     assert!(
-        !stdout.contains("wrote-status") && !stdout.contains("read-status"),
-        "{stdout}"
+        !stdout.contains(&secret),
+        "The sandbox exposed private host status: {stdout}"
+    );
+    assert_eq!(
+        finished.status_bytes.as_deref(),
+        Some(private_record.as_bytes())
     );
     assert_eq!(finished.output.status.code(), Some(127));
     assert_eq!(
