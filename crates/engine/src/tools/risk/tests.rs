@@ -114,7 +114,7 @@ fn argv_commands_and_files_are_assessed() {
     ));
     assert!(flagged(
         "file_edit",
-        json!({"path":".env","old_string":"a","new_string":"b"})
+        json!({"path":".env","edits":[{"old_string":"a","new_string":"b"}]})
     ));
     assert!(!flagged(
         "file_write",

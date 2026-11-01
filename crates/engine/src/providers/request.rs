@@ -209,7 +209,11 @@ fn chat_body(
     max_tokens: u32,
 ) -> Result<Value, ModelError> {
     let mut output = Vec::new();
+    let mut pending_images = Vec::new();
     for message in messages {
+        if message.role != Role::Tool && !pending_images.is_empty() {
+            output.push(json!({"role":"user","content":std::mem::take(&mut pending_images)}));
+        }
         let role = match message.role {
             Role::System => "system",
             Role::User => "user",
@@ -244,6 +248,18 @@ fn chat_body(
             item["reasoning_content"] = json!(reasoning);
         }
         output.push(item);
+        if message.role == Role::Tool && !message.images.is_empty() {
+            let mut parts = vec![
+                json!({"type":"text","text":format!("Images from tool result {}", message.tool_call_id.as_deref().unwrap_or(""))}),
+            ];
+            for image in &message.images {
+                parts.push(json!({"type":"image_url","image_url":{"url":data_url(image)?}}));
+            }
+            pending_images.extend(parts);
+        }
+    }
+    if !pending_images.is_empty() {
+        output.push(json!({"role":"user","content":pending_images}));
     }
     let mut body = json!({"model":model,"messages":output,"stream":true,"stream_options":{"include_usage":true}});
     if !tools.is_empty() {
@@ -276,7 +292,18 @@ fn responses_body(
     for message in messages {
         match message.role {
             Role::System => instructions.push(message.content.clone()),
-            Role::Tool => input.push(json!({"type":"function_call_output","call_id":message.tool_call_id,"output":message.content})),
+            Role::Tool => {
+                let output = if message.images.is_empty() {
+                    json!(message.content)
+                } else {
+                    let mut parts = vec![json!({"type":"input_text","text":message.content})];
+                    for image in &message.images {
+                        parts.push(json!({"type":"input_image","image_url":data_url(image)?}));
+                    }
+                    Value::Array(parts)
+                };
+                input.push(json!({"type":"function_call_output","call_id":message.tool_call_id,"output":output}));
+            }
             Role::User => {
                 let mut content = vec![json!({"type":"input_text","text":message.content})];
                 for image in &message.images {
@@ -350,7 +377,14 @@ fn anthropic_body(
                 system.push(json!({"type":"text","text":message.content}));
                 continue;
             }
-            Role::Tool => content.push(json!({"type":"tool_result","tool_use_id":message.tool_call_id,"content":message.content})),
+            Role::Tool => {
+                let mut result = vec![json!({"type":"text","text":message.content})];
+                for image in &message.images {
+                    check_image(image)?;
+                    result.push(json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.data}}));
+                }
+                content.push(json!({"type":"tool_result","tool_use_id":message.tool_call_id,"content":result}));
+            }
             Role::User => {
                 content.push(json!({"type":"text","text":message.content}));
                 for image in &message.images {
@@ -464,6 +498,12 @@ fn gemini_body(
                     json!({"result":result})
                 };
                 parts.push(json!({"functionResponse":{"id":id,"name":name,"response":response}}));
+                for image in &message.images {
+                    check_image(image)?;
+                    parts.push(
+                        json!({"inlineData":{"mimeType":image.media_type,"data":image.data}}),
+                    );
+                }
             }
             Role::User => {
                 parts.push(json!({"text":message.content}));

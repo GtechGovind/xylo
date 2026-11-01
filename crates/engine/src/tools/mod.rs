@@ -18,11 +18,15 @@
 mod builtin;
 pub(crate) mod catalog;
 mod code;
+mod file_read;
 mod headless;
 mod image_generation;
 pub(crate) mod lookup;
+mod lsp;
+mod notebook;
 mod permissions;
 mod portable;
+mod read_state;
 mod risk;
 use crate::{prompts, provider_guard::EffectiveWindow};
 use anyhow::{Context, Result, bail, ensure};
@@ -149,6 +153,7 @@ const PROJECT_LOCAL_TOOLS: &[&str] = &[
     "search_tools",
     "agent_delegate",
     "connector_list",
+    "notebook_edit",
 ];
 
 /// Largest approval or start presentation; long arguments are excerpted so an
@@ -698,9 +703,15 @@ impl ToolBroker {
         };
         // Held from preview to write: a concurrent edit of the same file waits
         // and then plans against the content this one leaves behind.
-        let _edit_lock = if matches!(name, "file_write" | "file_edit") {
+        let _edit_lock = if matches!(name, "file_write" | "file_edit" | "notebook_edit") {
             let target = builtin::write_target(self, builtin::text(&arguments, "path")?, access)?;
             Some(builtin::EditLock::acquire(&target, &self.cancel)?)
+        } else {
+            None
+        };
+        let write_revision = if matches!(name, "file_write" | "file_edit" | "notebook_edit") {
+            let path = builtin::write_target(self, builtin::text(&arguments, "path")?, access)?;
+            Some(read_state::WriteRevision::capture(&path)?)
         } else {
             None
         };
@@ -815,6 +826,9 @@ impl ToolBroker {
                             "Pre-tool hook prevented this operation: {error:#}"
                         ))
                     })?;
+            }
+            if let Some(revision) = &write_revision {
+                revision.check()?;
             }
             let result = if self.custom_tools.iter().any(|tool| tool.name == name) {
                 headless::execute(self, id, name, &arguments)?
@@ -1035,6 +1049,7 @@ impl ToolBroker {
             session,
             &[
                 "file_read",
+                "lsp",
                 "files_list",
                 "find_files",
                 "search_project",
@@ -1044,7 +1059,7 @@ impl ToolBroker {
                 "extension_resource",
                 "skill_read",
             ],
-            &["memory_search"],
+            &["memory_search", "file_edit", "file_write"],
         )?;
         actions
             .iter()
@@ -1064,6 +1079,20 @@ impl ToolBroker {
             return Ok(MemoryOrigin::WebContent);
         }
         Ok(match name {
+            // Server responses can include dependency documentation and other
+            // outside text regardless of the requested document's location.
+            "lsp" => MemoryOrigin::ToolOutput,
+            "file_edit" | "file_write"
+                if action.result.as_ref().is_some_and(|result| {
+                    result
+                        .pointer("/summary/lsp_observation")
+                        .or_else(|| result.get("lsp_observation"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                }) =>
+            {
+                MemoryOrigin::ToolOutput
+            }
             "run_command" | "shell_command"
                 if arguments.get("network").and_then(Value::as_bool) == Some(true) =>
             {
@@ -1137,8 +1166,10 @@ impl ToolBroker {
     /// then reports the real error, and still refuses to leave the project.
     fn reach(&self, name: &str, arguments: &Value) -> Reach {
         let (requested, writing) = match name {
-            "file_read" => (arguments.get("path").and_then(Value::as_str), false),
-            "file_write" | "file_edit" => (arguments.get("path").and_then(Value::as_str), true),
+            "file_read" | "lsp" => (arguments.get("path").and_then(Value::as_str), false),
+            "file_write" | "file_edit" | "notebook_edit" => {
+                (arguments.get("path").and_then(Value::as_str), true)
+            }
             "files_list" | "find_files" | "search_project" => (
                 Some(arguments.get("path").and_then(Value::as_str).unwrap_or(".")),
                 false,
@@ -1176,7 +1207,7 @@ impl ToolBroker {
             },
             // Show the actual change, and reject an inapplicable edit before
             // any intent or approval exists.
-            "file_write" | "file_edit" => {
+            "file_write" | "file_edit" | "notebook_edit" => {
                 return builtin::change_preview(self, name, arguments, access);
             }
             // Installed plugins show their reviewed grants and budgets.
@@ -1757,6 +1788,10 @@ impl ToolBroker {
     /// field and point at the saved complete result, which file_read can page
     /// through.
     pub(crate) fn model_result(&self, id: Uuid, result: Value) -> Value {
+        let images = result
+            .get("images")
+            .or_else(|| result.pointer("/summary/images"))
+            .cloned();
         let model_bytes = self.window().tool_result_bytes();
         let Ok(encoded) = serde_json::to_vec(&result) else {
             return self.bound_result(id, result);
@@ -1801,6 +1836,9 @@ impl ToolBroker {
                     );
                 }
             }
+        }
+        if let Some(images) = images {
+            shortened["images"] = images;
         }
         shortened
     }

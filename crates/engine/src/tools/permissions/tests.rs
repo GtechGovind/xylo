@@ -96,7 +96,7 @@ fn verdict(
 #[test]
 fn presets_follow_the_codex_table() {
     use PermissionMode::*;
-    let edit = json!({"path":"src/lib.rs","old_string":"a","new_string":"b"});
+    let edit = json!({"path":"src/lib.rs","edits":[{"old_string":"a","new_string":"b"}]});
     let outside = Reach::Outside(PathBuf::from("/etc/hosts"));
     let cases = [
         (
@@ -438,7 +438,8 @@ fn ask_for_approval_asks_before_editing_files_that_run_code() {
         ".env",
     ] {
         for name in ["file_write", "file_edit"] {
-            let arguments = json!({"path":path,"content":"x","old_string":"a","new_string":"b"});
+            let arguments =
+                json!({"path":path,"content":"x","edits":[{"old_string":"a","new_string":"b"}]});
             assert!(
                 matches!(
                     project_verdict(AskForApproval, name, arguments, true),
@@ -611,4 +612,47 @@ fn memory_writes_after_untrusted_input_are_reviewed_without_standing_rules() {
     assert!(matches!(decide(ReadOnly, &call(true)), Verdict::Refuse(_)));
     assert!(approval_rule_for(&call(false)).is_some());
     assert_eq!(approval_rule_for(&call(true)), None);
+}
+
+#[test]
+fn review_h1_native_lsp_has_separate_execution_and_network_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let args = json!({"path":"a.py","operation":"hover"});
+    let call = Call {
+        name: "lsp",
+        arguments: &args,
+        writes: false,
+        origin: Origin::Model,
+        reach: &Reach::Project,
+        workspace: dir.path(),
+        network: None,
+        untrusted_input: false,
+    };
+    assert!(matches!(
+        decide(PermissionMode::ReadOnly, &call),
+        Verdict::Refuse(_)
+    ));
+    for mode in [PermissionMode::AskForApproval, PermissionMode::ApproveForMe] {
+        assert_eq!(decide(mode, &call), Verdict::Ask(NATIVE_LSP_REASON.into()));
+    }
+    let native = approval_rule_for(&call).unwrap().0;
+    assert!(native.starts_with("native-lsp:"));
+    assert_ne!(
+        native,
+        approval_rule("file_read", &args, &Reach::Project, dir.path())
+            .map(|rule| rule.0)
+            .unwrap_or_default()
+    );
+    let outside_reach = Reach::Outside(outside.path().join("a.py"));
+    let native_outside = approval_rule("lsp", &args, &outside_reach, dir.path())
+        .unwrap()
+        .0;
+    assert_ne!(native, native_outside);
+    assert_ne!(
+        native_outside,
+        approval_rule("file_read", &args, &outside_reach, dir.path())
+            .unwrap()
+            .0
+    );
 }

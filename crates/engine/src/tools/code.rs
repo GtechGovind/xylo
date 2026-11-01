@@ -192,54 +192,66 @@ pub(crate) struct EditPlan {
 /// Exact-string replacement against the file's current content. Every rejection
 /// happens before a write, so it is reported as definitive.
 pub(crate) fn plan_edit(path: &Path, shown: &str, args: &Value) -> Result<EditPlan> {
-    let old = text(args, "old_string")?;
-    let new = text(args, "new_string")?;
-    let all = args
-        .get("replace_all")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if old.is_empty() {
+    let edits = args
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| unapplied("edits must be a non-empty array"))?;
+    if edits.is_empty() || edits.len() > 1000 {
         return Err(unapplied(
-            "old_string is empty; use file_write to create or replace a whole file",
+            "edits must contain between 1 and 1000 replacements",
         ));
     }
-    if old == new {
-        return Err(unapplied("old_string and new_string are identical"));
-    }
     let original = read_text(path, shown)?;
-    // Models usually send LF. In a CRLF file, match LF text against CRLF and
-    // write every new line break as CRLF, even when old_string is one line.
-    let crlf = original.contains("\r\n");
-    let old = if crlf && !original.contains(old) && old.contains('\n') && !old.contains("\r\n") {
-        old.replace('\n', "\r\n")
-    } else {
-        old.to_owned()
-    };
-    let new = if crlf {
-        new.replace("\r\n", "\n").replace('\n', "\r\n")
-    } else {
-        new.to_owned()
-    };
-    let count = original.matches(old.as_str()).count();
-    if count == 0 {
-        return Err(unapplied(format!(
-            "old_string was not found in {shown}. Read the file again and copy the exact text, including indentation, without line-number prefixes"
-        )));
+    let mut updated = original.clone();
+    let mut replacements = 0;
+    for edit in edits {
+        let old = text(edit, "old_string")?;
+        let new = text(edit, "new_string")?;
+        let all = edit
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if old.is_empty() || old == new {
+            return Err(unapplied(
+                "old_string must be non-empty and differ from new_string",
+            ));
+        }
+        let crlf = updated.contains("\r\n");
+        let old = if crlf && !updated.contains(old) && old.contains('\n') && !old.contains("\r\n") {
+            old.replace('\n', "\r\n")
+        } else {
+            old.to_owned()
+        };
+        let new = if crlf {
+            new.replace("\r\n", "\n").replace('\n', "\r\n")
+        } else {
+            new.to_owned()
+        };
+        let count = updated.matches(old.as_str()).count();
+        if count == 0 {
+            return Err(unapplied(format!(
+                "old_string was not found in {shown}. Read the file again and copy the exact text without line-number prefixes"
+            )));
+        }
+        if count > 1 && !all {
+            return Err(unapplied(format!(
+                "old_string matches {count} places in {shown}. Include more surrounding lines or set replace_all to true"
+            )));
+        }
+        replacements += if all { count } else { 1 };
+        updated = if all {
+            updated.replace(&old, &new)
+        } else {
+            updated.replacen(&old, &new, 1)
+        };
+        if updated.len() > EDIT_FILE_BYTES as usize {
+            return Err(unapplied("Edited file exceeds 8 MiB"));
+        }
     }
-    if count > 1 && !all {
-        return Err(unapplied(format!(
-            "old_string matches {count} places in {shown}. Include more surrounding lines to make it unique, or set replace_all to true"
-        )));
-    }
-    let updated = if all {
-        original.replace(&old, &new)
-    } else {
-        original.replacen(&old, &new, 1)
-    };
     Ok(EditPlan {
         original,
         updated,
-        replacements: if all { count } else { 1 },
+        replacements,
     })
 }
 
@@ -358,50 +370,31 @@ fn relative(base: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-struct Collect<'a> {
-    shown: &'a str,
-    output: &'a mut String,
-    matches: &'a mut usize,
-    limit: usize,
+struct Collect {
+    rows: Vec<(bool, Option<u64>, Vec<u8>)>,
+    matches: usize,
+    stop_after: usize,
     files_only: bool,
-    matched_file: bool,
+    store_rows: bool,
 }
-impl Collect<'_> {
-    fn line(&mut self, separator: char, number: Option<u64>, bytes: &[u8]) {
-        let decoded = String::from_utf8_lossy(bytes);
-        let mut decoded = decoded.trim_end_matches(['\n', '\r']).to_owned();
-        if decoded.chars().count() > SEARCH_LINE_CHARS {
-            decoded = decoded.chars().take(SEARCH_LINE_CHARS).collect::<String>() + "…";
-        }
-        let number = number.map_or_else(String::new, |n| n.to_string());
-        self.output.push_str(&format!(
-            "{}{separator}{number}{separator}{decoded}\n",
-            self.shown
-        ));
-    }
-}
-impl Sink for Collect<'_> {
+impl Sink for Collect {
     type Error = std::io::Error;
     fn matched(&mut self, _: &Searcher, found: &SinkMatch<'_>) -> Result<bool, Self::Error> {
-        self.matched_file = true;
-        if self.files_only {
-            return Ok(false);
+        self.matches += 1;
+        if self.store_rows {
+            self.rows
+                .push((true, found.line_number(), found.bytes().to_vec()));
         }
-        *self.matches += 1;
-        self.line(':', found.line_number(), found.bytes());
-        Ok(*self.matches < self.limit)
+        Ok(!self.files_only && self.matches < self.stop_after)
     }
     fn context(&mut self, _: &Searcher, context: &SinkContext<'_>) -> Result<bool, Self::Error> {
-        self.line('-', context.line_number(), context.bytes());
-        Ok(true)
-    }
-    fn context_break(&mut self, _: &Searcher) -> Result<bool, Self::Error> {
-        self.output.push_str("--\n");
+        self.rows
+            .push((false, context.line_number(), context.bytes().to_vec()));
         Ok(true)
     }
 }
 
-/// In-process ripgrep-engine search that respects ignore files.
+/// In-process ripgrep search with deterministic paging and independent context.
 pub(crate) fn search(
     root: &Path,
     base: &Path,
@@ -411,34 +404,65 @@ pub(crate) fn search(
     let query = text(args, "query")?;
     ensure!(!query.is_empty(), "query is empty");
     let flag = |key| args.get(key).and_then(Value::as_bool).unwrap_or(false);
-    let files_only = flag("files_only");
-    let context = args
-        .get("context")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(10) as usize;
+    let mode = args
+        .get("output_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("content");
+    ensure!(
+        matches!(mode, "content" | "files" | "count"),
+        "Unknown output_mode"
+    );
     let limit = args
         .get("max_results")
         .and_then(Value::as_u64)
         .unwrap_or(200)
         .clamp(1, 2000) as usize;
+    let offset = args
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(200_000) as usize;
+    let context = |key| args.get(key).and_then(Value::as_u64).unwrap_or(0).min(10) as usize;
+    let multiline = flag("multiline");
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(flag("case_insensitive"))
         .fixed_strings(flag("literal"))
+        .multi_line(multiline)
         .build(query)
         .context("Invalid regular expression; set literal to true to search exact text")?;
     let mut searcher = SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(0))
         .line_number(true)
-        .before_context(if files_only { 0 } else { context })
-        .after_context(if files_only { 0 } else { context })
+        .multi_line(multiline)
+        .before_context(if mode == "content" {
+            context("before")
+        } else {
+            0
+        })
+        .after_context(if mode == "content" {
+            context("after")
+        } else {
+            0
+        })
         .build();
     let filter = glob_filter(args.get("glob").and_then(Value::as_str))?;
+    let mut types = ignore::types::TypesBuilder::new();
+    types.add_defaults();
+    if let Some(kind) = args.get("type").and_then(Value::as_str) {
+        types.select(kind);
+    }
+    let types = types.build().context("Unknown ripgrep file type")?;
+    let mut walk = ignore::WalkBuilder::new(base);
+    walk.hidden(false)
+        .require_git(false)
+        .types(types)
+        .sort_by_file_path(|a, b| a.cmp(b))
+        .filter_entry(|entry| entry.file_name() != ".git");
     let shown_root = Shown::new(root);
     let mut output = String::new();
-    let (mut matches, mut files, mut visited) = (0_usize, 0_usize, 0_usize);
+    let (mut matches, mut files, mut visited, mut rows_seen, mut returned) = (0, 0, 0, 0, 0);
     let mut truncated = false;
-    for entry in walker(base) {
+    for entry in walk.build() {
         ensure!(!cancel.is_cancelled(), "Search cancelled");
         let Ok(entry) = entry else { continue };
         visited += 1;
@@ -457,13 +481,20 @@ pub(crate) fn search(
             continue;
         }
         let shown = shown_root.show(entry.path());
+        let remaining = offset
+            .saturating_add(limit)
+            .saturating_add(1)
+            .saturating_sub(rows_seen);
         let mut sink = Collect {
-            shown: &shown,
-            output: &mut output,
-            matches: &mut matches,
-            limit,
-            files_only,
-            matched_file: false,
+            rows: Vec::new(),
+            matches: 0,
+            stop_after: if mode == "content" {
+                remaining.max(1)
+            } else {
+                usize::MAX
+            },
+            files_only: mode == "files",
+            store_rows: mode == "content",
         };
         if searcher
             .search_path(&matcher, entry.path(), &mut sink)
@@ -471,24 +502,61 @@ pub(crate) fn search(
         {
             continue;
         }
-        if sink.matched_file {
-            files += 1;
-            if files_only {
-                output.push_str(&shown);
-                output.push('\n');
-            }
+        if sink.matches == 0 {
+            continue;
         }
-        if (files_only && files >= limit) || (!files_only && matches >= limit) {
+        files += 1;
+        matches += sink.matches;
+        if mode == "content" {
+            let mut included = false;
+            for (matched, number, bytes) in sink.rows {
+                if matched {
+                    included = rows_seen >= offset && returned < limit;
+                    rows_seen += 1;
+                    if included {
+                        returned += 1;
+                    }
+                }
+                if !included && matched {
+                    continue;
+                }
+                // Leading context belongs to the first visible match, unless paging skips it.
+                if !matched && !included && rows_seen < offset {
+                    continue;
+                }
+                if !matched && returned >= limit && rows_seen > offset + limit {
+                    continue;
+                }
+                let decoded = String::from_utf8_lossy(&bytes);
+                let decoded = decoded.trim_end_matches(['\n', '\r']);
+                let decoded: String = decoded.chars().take(SEARCH_LINE_CHARS).collect();
+                let sep = if matched { ':' } else { '-' };
+                output.push_str(&format!(
+                    "{shown}{sep}{}{sep}{decoded}\n",
+                    number.unwrap_or(0)
+                ));
+            }
+        } else {
+            if rows_seen >= offset && returned < limit {
+                if mode == "files" {
+                    output.push_str(&format!("{shown}\n"));
+                } else {
+                    output.push_str(&format!("{shown}:{}\n", sink.matches));
+                }
+                returned += 1;
+            }
+            rows_seen += 1;
+        }
+        if rows_seen > offset + limit {
             truncated = true;
             break;
         }
     }
-    Ok(json!({
-        "matches": if files_only { files } else { matches },
-        "files": files,
-        "truncated": truncated,
-        "results": if output.is_empty() { "No matches".to_owned() } else { output },
-    }))
+    Ok(
+        json!({"matches":matches,"files":files,"output_mode":mode,"offset":offset,"returned":returned,
+        "truncated":truncated,"next_offset":if truncated {Some(offset+returned)} else {None},
+        "results":if output.is_empty(){"No matches".to_owned()}else{output}}),
+    )
 }
 
 /// Glob discovery (newest first) that respects ignore files.
@@ -639,3 +707,6 @@ pub(crate) fn shell_name() -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod parity_tests;

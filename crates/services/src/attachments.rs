@@ -64,7 +64,8 @@ impl AttachmentStore {
         Ok(Self { root })
     }
 
-    /// The host invokes this only for a native picker, drop or pasted-file action.
+    /// Imports a native picker, drop, paste, or broker-authorized file read.
+    /// Callers authorize the source path before invoking this method.
     pub fn import_file(
         &self,
         session_id: Uuid,

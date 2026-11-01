@@ -467,11 +467,19 @@ async fn failing_commands_are_definitive_observations_with_their_output() {
 async fn accepted_edits_apply_without_prompts_and_inapplicable_edits_leave_no_intent() {
     let (directory, broker, mut events) = fixture(PermissionMode::AskForApproval);
     std::fs::write(directory.path().join("lib.rs"), "fn a() {}\n").unwrap();
+    run(
+        &broker,
+        "read-before-edit",
+        "file_read",
+        json!({"path":"lib.rs"}),
+    )
+    .await
+    .unwrap();
     let output = run(
         &broker,
         "edit",
         "file_edit",
-        json!({"path":"lib.rs","old_string":"fn a()","new_string":"fn b()"}),
+        json!({"path":"lib.rs","edits":[{"old_string":"fn a()","new_string":"fn b()"}]}),
     )
     .await
     .unwrap();
@@ -488,7 +496,7 @@ async fn accepted_edits_apply_without_prompts_and_inapplicable_edits_leave_no_in
             &broker,
             "edit-missing",
             "file_edit",
-            json!({"path":"lib.rs","old_string":"absent","new_string":"x"}),
+            json!({"path":"lib.rs","edits":[{"old_string":"absent","new_string":"x"}]}),
         )
         .await
         .is_err()
@@ -536,13 +544,21 @@ async fn always_allow_covers_matching_actions_for_the_turn() {
         }
     }
     first.await.unwrap().unwrap();
+    broker.session.permissions().set(PermissionMode::FullAccess);
+    run(&broker, "read-notes", "file_read", json!({"path":notes}))
+        .await
+        .unwrap();
+    broker
+        .session
+        .permissions()
+        .set(PermissionMode::AskForApproval);
     let task = broker.clone();
     let target = notes.clone();
     tokio::task::spawn_blocking(move || {
         task.execute(
             "edit",
             "file_edit",
-            json!({"path":target,"old_string":"one","new_string":"two"}),
+            json!({"path":target,"edits":[{"old_string":"one","new_string":"two"}]}),
         )
     })
     .await
@@ -1675,6 +1691,14 @@ async fn concurrent_edits_to_one_file_both_land() {
     let (directory, broker, _events) = fixture(PermissionMode::AskForApproval);
     let lines: String = (0..64).map(|index| format!("line {index}\n")).collect();
     std::fs::write(directory.path().join("shared.txt"), &lines).unwrap();
+    run(
+        &broker,
+        "read-shared",
+        "file_read",
+        json!({"path":"shared.txt"}),
+    )
+    .await
+    .unwrap();
     let mut edits = Vec::new();
     for index in 0..64 {
         let task = broker.clone();
@@ -1682,7 +1706,7 @@ async fn concurrent_edits_to_one_file_both_land() {
             task.execute(
                 &format!("edit-{index}"),
                 "file_edit",
-                json!({"path":"shared.txt","old_string":format!("line {index}\n"),"new_string":format!("edited {index}\n")}),
+                json!({"path":"shared.txt","edits":[{"old_string":format!("line {index}\n"),"new_string":format!("edited {index}\n")}]}),
             )
         }));
     }
@@ -2008,4 +2032,5 @@ async fn tool_results_are_shortened_to_the_window_budget() {
     assert_eq!(large.model_result(Uuid::new_v4(), result.clone()), result);
 }
 
+mod code_parity;
 mod headless;
