@@ -22,6 +22,40 @@ fn usage_labels_distinguish_free_estimates_unknown_and_partial_prices() {
 }
 
 #[gpui_kit::test]
+fn receipt_and_unsuccessful_turn_events_refresh_persisted_usage(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (window, view) = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            for event in [
+                xylo_core::EngineEvent::Error {
+                    message: "Rejected request".into(),
+                    retryable: false,
+                    kind: xylo_core::ErrorKind::Provider,
+                },
+                xylo_core::EngineEvent::Cancelled,
+                xylo_core::EngineEvent::ContextUsage {
+                    usage: Default::default(),
+                },
+            ] {
+                view.usage_ui.key = Some((view.session, vec![], 0, None));
+                view.engine_event(view.session, event, window, cx);
+                assert!(
+                    view.usage_ui.key.is_none(),
+                    "Unsuccessful turns must reload their recorded request receipts"
+                );
+            }
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn styles_and_price_forms_change_only_their_selected_settings(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (window, view) = cx.update(|cx| {

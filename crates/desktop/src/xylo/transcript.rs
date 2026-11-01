@@ -182,7 +182,7 @@ pub(super) fn failure_title(failure: &TurnFailure) -> &'static str {
         ErrorKind::EmptyResponse => "The model returned no usable reply",
         ErrorKind::Authentication => "The provider did not accept the saved credentials",
         ErrorKind::RateLimited => "The provider is limiting requests right now",
-        ErrorKind::Provider => "The model provider could not be reached",
+        ErrorKind::Provider => "The model request failed",
         ErrorKind::ContextOverflow => "This task no longer fits the model's context window",
         ErrorKind::Internal => "The task stopped with an error",
     }

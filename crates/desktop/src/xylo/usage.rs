@@ -264,7 +264,7 @@ impl Xylo {
                 self.usage_ui
                     .report_error
                     .clone()
-                    .unwrap_or_else(|| "Usage appears after the first completed answer.".into()),
+                    .unwrap_or_else(|| "Usage appears when a model request reports tokens.".into()),
             )
             .into_any_element();
         };

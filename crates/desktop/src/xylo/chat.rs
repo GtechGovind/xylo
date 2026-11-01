@@ -379,6 +379,13 @@ impl Xylo {
             _ => None,
         };
         let completed = matches!(event, EngineEvent::Completed { .. });
+        let usage_changed = matches!(
+            event,
+            EngineEvent::Completed { .. }
+                | EngineEvent::Cancelled
+                | EngineEvent::Error { .. }
+                | EngineEvent::ContextUsage { .. }
+        );
         let review_changed = matches!(
             &event,
             EngineEvent::Started
@@ -406,8 +413,10 @@ impl Xylo {
                 self.record_artifact(path);
             }
         }
-        if completed {
+        if usage_changed {
             self.invalidate_usage();
+        }
+        if completed {
             if session != self.session
                 && let Some(history) = self.histories.get_mut(&session)
             {
