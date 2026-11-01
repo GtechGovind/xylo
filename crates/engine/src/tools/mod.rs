@@ -693,7 +693,8 @@ impl ToolBroker {
             .map(|entry| self.project_approved(entry).map(|approved| !approved))
             .transpose()?
             .unwrap_or(false);
-        let mut definition = self.effective_definition(name, &arguments)?;
+        let (mut definition, catalog_authority) =
+            self.effective_definition_reviewed(name, &arguments)?;
         if let Some(skill) = &skill_snapshot {
             definition.writes = !skill.dynamic_commands.is_empty();
         }
@@ -933,7 +934,7 @@ impl ToolBroker {
                     name,
                     &arguments,
                     project_connector.as_ref(),
-                    catalog_revision,
+                    catalog_authority.as_ref(),
                 )?
             } else if name == "image_generate" {
                 image_generation::execute(self, id, &arguments)?
@@ -1694,7 +1695,19 @@ impl ToolBroker {
             .find(|c| c.id == id)
             .context("Connector is not configured")
     }
+    #[cfg(test)]
     fn effective_definition(&self, name: &str, args: &Value) -> Result<ToolDefinition> {
+        Ok(self.effective_definition_reviewed(name, args)?.0)
+    }
+    fn effective_definition_reviewed(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Result<(
+        ToolDefinition,
+        Option<xylo_services::ConnectorCatalogAuthority>,
+    )> {
+        let mut authority = None;
         let mut definition = self
             .definitions
             .iter()
@@ -1708,7 +1721,9 @@ impl ToolBroker {
                 .and_then(Value::as_str)
                 .context("Connector tool name is required")?;
             let tools = if is_mcp(&config) {
-                self.cached_connector_tools(&config)?
+                let snapshot = self.cached_connector_catalog(&config)?;
+                authority = Some(snapshot.authority);
+                snapshot.tools
             } else {
                 NativeConnectors::tools(&config.transport)?
             };
@@ -1738,14 +1753,14 @@ impl ToolBroker {
         } else if name == "extension_component" {
             definition.writes = args.get("operation").and_then(Value::as_str) != Some("status");
         }
-        Ok(definition)
+        Ok((definition, authority))
     }
     fn execute_connector(
         &self,
         name: &str,
         args: &Value,
         project: Option<&xylo_services::ProjectConnector>,
-        catalog_revision: u64,
+        catalog_authority: Option<&xylo_services::ConnectorCatalogAuthority>,
     ) -> Result<Value> {
         if name == "connector_list" {
             return Ok(json!({"status":"success","summary":self.all_connectors()?,"artifacts":[]}));
@@ -1804,7 +1819,7 @@ impl ToolBroker {
                 tool,
                 arguments,
                 &self.cancel,
-                catalog_revision,
+                catalog_authority.context("MCP catalog was not reviewed")?,
             ))?
         } else {
             self.runtime

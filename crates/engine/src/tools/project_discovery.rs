@@ -73,6 +73,12 @@ impl ToolBroker {
         &self,
         config: &ConnectorConfig,
     ) -> Result<Vec<ToolDefinition>> {
+        Ok(self.cached_connector_catalog(config)?.tools)
+    }
+    pub(super) fn cached_connector_catalog(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<xylo_services::ConnectorCatalogSnapshot> {
         let project = xylo_services::project_connectors(self.discovery_root())?
             .into_iter()
             .find(|entry| entry.config.id == config.id);
@@ -90,7 +96,7 @@ impl ToolBroker {
             ),
             None => self.connectors.clone(),
         };
-        broker.cached_tools(config)
+        broker.catalog_snapshot(config)
     }
     pub(super) fn project_broker(
         &self,

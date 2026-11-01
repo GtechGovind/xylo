@@ -52,7 +52,7 @@ pub(super) fn save_catalog_generation(
         let current = tx.query_row("SELECT generation FROM connector_catalog_state WHERE id=?1",[id.to_string()],|row|row.get::<_, i64>(0)).optional()?.unwrap_or(0);
         ensure!(current == generation, "MCP tools changed during discovery; retry discovery");
         tx.execute("INSERT INTO connector_tools(id,fingerprint,json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,json=excluded.json,updated_at=excluded.updated_at",params![id.to_string(),fingerprint,json,xylo_core::now_ms()])?;
-        tx.execute("INSERT INTO connector_catalog_state(id,generation,available) VALUES(?1,?2,1) ON CONFLICT(id) DO UPDATE SET available=1",params![id.to_string(),generation])?;
+        tx.execute("INSERT INTO connector_catalog_state(id,generation,available) VALUES(?1,?2,1) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation,available=1",params![id.to_string(),generation.checked_add(1).context("MCP catalog generation exhausted")?])?;
         tx.commit()?;
         Ok(())
     })

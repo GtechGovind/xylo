@@ -181,6 +181,22 @@ impl StderrState {
     }
 }
 
+/// Opaque authority of one atomic catalog read. It binds reviewed definitions
+/// to the durable generation, connector configuration, local scope, and trust.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorCatalogAuthority {
+    id: Uuid,
+    generation: i64,
+    fingerprint: String,
+    trusted: bool,
+}
+/// Definitions and their authority must stay together through classification,
+/// approval, and queued dispatch, even when another process refreshes the catalog.
+pub struct ConnectorCatalogSnapshot {
+    pub tools: Vec<ToolDefinition>,
+    pub authority: ConnectorCatalogAuthority,
+}
+
 type Client = RunningService<RoleClient, handler::Handler>;
 struct Session {
     client: Option<Client>,
@@ -683,25 +699,36 @@ impl ConnectorBroker {
         config: &ConnectorConfig,
         scope: Option<&ConnectorLaunchScope>,
     ) -> Result<Vec<ToolDefinition>> {
-        use rusqlite::OptionalExtension;
+        Ok(self.catalog_snapshot_with_scope(config, scope)?.tools)
+    }
+    /// Atomically reads persisted definitions and the authority used to review them.
+    pub fn catalog_snapshot(&self, config: &ConnectorConfig) -> Result<ConnectorCatalogSnapshot> {
+        self.catalog_snapshot_with_scope(config, self.local_scope.as_ref())
+    }
+    fn catalog_snapshot_with_scope(
+        &self,
+        config: &ConnectorConfig,
+        scope: Option<&ConnectorLaunchScope>,
+    ) -> Result<ConnectorCatalogSnapshot> {
         ensure!(
             !self.pool.catalog_failure.load(Ordering::Acquire),
             "MCP catalog persistence failed; restart after repairing storage"
         );
-        ensure_catalog_available(&self.pool.store, config.id)?;
         let id = config.id;
+        let trusted = config.trusted;
         let fingerprint = Self::fingerprint(config, scope)?;
         self.pool.store.call(move |conn| {
-            let json: Option<String> = conn
-                .query_row(
-                    "SELECT json FROM connector_tools WHERE id=?1 AND fingerprint=?2 AND NOT EXISTS(SELECT 1 FROM connector_catalog_state WHERE id=?1 AND available=0)",
-                    rusqlite::params![id.to_string(), fingerprint],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            Ok(match json {
-                Some(json) => serde_json::from_str(&json)?,
-                None => Vec::new(),
+            // One statement means the schema and generation share one SQLite
+            // snapshot; never pair a newer generation with an older definition.
+            let (generation, unavailable, json): (i64, bool, Option<String>) = conn.query_row(
+                "SELECT COALESCE((SELECT generation FROM connector_catalog_state WHERE id=?1),0), EXISTS(SELECT 1 FROM connector_catalog_state WHERE id=?1 AND available=0), (SELECT json FROM connector_tools WHERE id=?1 AND fingerprint=?2)",
+                rusqlite::params![id.to_string(), fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            ensure!(!unavailable, "MCP tool catalog is unavailable after a change; rediscover tools before calling");
+            Ok(ConnectorCatalogSnapshot {
+                tools: json.map(|json| serde_json::from_str(&json)).transpose()?.unwrap_or_default(),
+                authority: ConnectorCatalogAuthority { id, generation, fingerprint, trusted },
             })
         })
     }
@@ -716,19 +743,27 @@ impl ConnectorBroker {
         arguments: Value,
         cancel: &CancellationToken,
     ) -> Result<Value> {
-        self.call_reviewed(config, name, arguments, cancel, self.catalog_revision())
+        let snapshot = self.catalog_snapshot(config)?;
+        self.call_reviewed(config, name, arguments, cancel, &snapshot.authority)
             .await
     }
-    /// The revision captured before classifying and approving this call. Recheck
-    /// after connection admission so a queued call cannot use revoked authority.
+    /// Uses the authority captured with the definitions used for classification.
+    /// Recheck after connection admission so replacement by any pool/process
+    /// requires new classification and approval before this call can dispatch.
     pub async fn call_reviewed(
         &self,
         config: &ConnectorConfig,
         name: &str,
         arguments: Value,
         cancel: &CancellationToken,
-        revision: u64,
+        authority: &ConnectorCatalogAuthority,
     ) -> Result<Value> {
+        ensure!(
+            authority.id == config.id
+                && authority.trusted == config.trusted
+                && authority.fingerprint == Self::fingerprint(config, self.local_scope.as_ref())?,
+            "MCP configuration or scope changed after review; review the call again"
+        );
         let args = arguments
             .as_object()
             .context("Tool arguments must be a JSON object")?
@@ -748,8 +783,8 @@ impl ConnectorBroker {
         );
         ensure_catalog_available(&self.pool.store, config.id)?;
         ensure!(
-            revision == self.catalog_revision(),
-            "MCP tools changed before dispatch; discover and retry the call"
+            self.catalog_snapshot(config)?.authority == *authority,
+            "MCP catalog changed after review; discover and review the call again"
         );
         let result = Self::call_tool(&session, name, args, cancel).await;
         let result = match result {
@@ -1274,3 +1309,6 @@ mod catalog;
 use catalog::{
     catalog_generation, ensure_catalog_available, invalidate_catalog, save_catalog_generation,
 };
+
+#[cfg(test)]
+mod shared_authority_tests;
