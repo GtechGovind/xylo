@@ -106,7 +106,6 @@ esac
             provider: ProviderConfig::default(),
             attachments: Vec::new(),
             permissions: PermissionMode::AskForApproval,
-            approved_rules: Vec::new(),
         };
         let (sender, events) = tokio::sync::mpsc::channel(64);
         let broker = Arc::new(

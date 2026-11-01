@@ -1296,3 +1296,5 @@ async fn incremental_checkpoints_store_exactly_the_latest_messages() {
 }
 
 mod provider_fallback;
+
+mod hooks;

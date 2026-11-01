@@ -30,7 +30,7 @@ function childEnvironment() {
   delete process.env.XYLO_SANDBOX_CHILD_ENV;
   if (!environment || Array.isArray(environment) || typeof environment !== 'object') throw new Error('Invalid child environment');
   for (const [name, value] of Object.entries(environment)) {
-    if (!/^[A-Za-z0-9_]{1,128}$/.test(name) || typeof value !== 'string' || name === 'XYLO_SANDBOX_CHILD_ENV') throw new Error('Invalid child environment');
+    if (!/^[A-Za-z0-9_]{1,128}$/.test(name) || typeof value !== 'string' || name.startsWith('XYLO_SANDBOX_')) throw new Error('Invalid child environment');
   }
   return environment;
 }

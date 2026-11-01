@@ -44,6 +44,20 @@ pub(crate) trait ToolExecutor: Send + Sync {
         Vec::new()
     }
 
+    /// A post-tool hook may stop the next model step without discarding a completed tool result.
+    fn pending_stop(&self) -> Option<String> {
+        None
+    }
+
+    /// Delivers a lifecycle event outside provider streaming and tool batches.
+    fn lifecycle(
+        &self,
+        _event: &str,
+        _input: Value,
+    ) -> anyhow::Result<xylo_services::hooks::HookOutput> {
+        Ok(Default::default())
+    }
+
     /// Tools offered directly to the model right now. Re-read before every
     /// model call, because the permission mode can change mid-task.
     fn schemas(&self) -> Vec<ToolSchema>;
@@ -337,3 +351,17 @@ async fn joined(handle: JoinHandle<String>) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// Hook edits must satisfy the same schema as model-authored tool input.
+pub(crate) fn validate_hook_input(
+    name: &str,
+    input: &Value,
+    schema: &CompiledSchema,
+) -> anyhow::Result<()> {
+    arguments::validate(input, schema).map_err(|problems| {
+        anyhow::anyhow!(
+            "Hook updatedInput for {name} is invalid: {}",
+            problems.join("; ")
+        )
+    })
+}

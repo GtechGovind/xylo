@@ -173,7 +173,6 @@ async fn managed_tool_images_rehydrate_and_stream_for_every_api_family() {
             provider: provider_config,
             permissions: PermissionMode::ReadOnly,
             attachments: vec![attachment.clone()],
-            approved_rules: Vec::new(),
         };
         let message = Message::tool_result(
             "tool-image",

@@ -38,7 +38,6 @@ impl Fixture {
             provider: ProviderConfig::default(),
             permissions: PermissionMode::AskForApproval,
             attachments: vec![],
-            approved_rules: Vec::new(),
         };
         let id = Uuid::new_v4();
         let guard = if qualified {

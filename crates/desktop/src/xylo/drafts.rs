@@ -298,7 +298,6 @@ impl Xylo {
                     provider: self.settings.turn_provider(),
                     permissions: self.settings.permissions,
                     attachments: vec![],
-                    approved_rules: Vec::new(),
                 },
             });
         }
@@ -830,7 +829,6 @@ impl Xylo {
                 permissions: self.settings.permissions,
                 attachments: entry.attachments.clone(),
                 // The host fills the project's standing approvals at admission.
-                approved_rules: Vec::new(),
             },
             dispatched: false,
         });

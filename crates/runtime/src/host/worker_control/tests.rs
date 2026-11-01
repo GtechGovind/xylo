@@ -128,13 +128,8 @@ async fn admission_uses_current_mode_and_the_projects_standing_approvals() {
     turn.permissions = PermissionMode::ReadOnly;
     let session = turn.session_id;
     let workspace = std::fs::canonicalize(&turn.workspace).unwrap();
-    host.store
-        .save_approval_rule(&ApprovalRule {
-            key: "run:cargo test".into(),
-            label: "`cargo test` commands".into(),
-            workspace,
-            created_at: now_ms(),
-        })
+    SettingsFiles::for_workspace(&workspace)
+        .save_rule("Bash(cargo test:*)", PermissionDecision::Allow, false)
         .unwrap();
     host.settings.lock().await.permissions = PermissionMode::ApproveForMe;
     let (mut incoming, _exit) = crate::host::tests::draft::mock_worker(&host, session, 4).await;
@@ -150,7 +145,14 @@ async fn admission_uses_current_mode_and_the_projects_standing_approvals() {
         panic!("the run was not dispatched")
     };
     assert_eq!(turn.permissions, PermissionMode::ApproveForMe);
-    assert_eq!(turn.approved_rules, vec!["run:cargo test".to_owned()]);
+    assert_eq!(
+        SettingsFiles::for_workspace(&workspace)
+            .load()
+            .unwrap()
+            .rules[0]
+            .pattern,
+        "Bash(cargo test:*)"
+    );
 }
 
 #[test]
@@ -305,8 +307,7 @@ async fn always_allow_saves_the_rule_for_the_chats_project_once() {
             action_id,
             PendingApproval {
                 name: "run_command".into(),
-                rule_key: Some("run:cargo test".into()),
-                rule: Some("`cargo test` commands".into()),
+                rule_key: Some("Bash(cargo test:*)".into()),
                 parent_id: None,
                 decision: None,
             },
@@ -324,18 +325,16 @@ async fn always_allow_saves_the_rule_for_the_chats_project_once() {
         incoming.recv().await.unwrap().payload,
         WorkerCommand::Approve { remember: true, .. }
     ));
-    let rules = host.store.approval_rules(&workspace).unwrap();
+    let files = SettingsFiles::for_workspace(&workspace);
+    let rules = files.load().unwrap().rules;
     assert_eq!(rules.len(), 1);
-    assert_eq!(rules[0].key, "run:cargo test");
-    assert_eq!(rules[0].label, "`cargo test` commands");
-    host.store
-        .remove_approval_rule(&workspace, "run:cargo test")
-        .unwrap();
+    assert_eq!(rules[0].pattern, "Bash(cargo test:*)");
+    files.remove_rule(&rules[0]).unwrap();
     host.handle(HostCommand::Worker(Some(session), approve))
         .await
         .unwrap();
     assert!(
-        host.store.approval_rules(&workspace).unwrap().is_empty(),
+        files.load().unwrap().rules.is_empty(),
         "a duplicate decision does not save again"
     );
 }

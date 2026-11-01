@@ -397,3 +397,37 @@ async fn the_search_index_is_reused_until_what_it_covers_changes() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_updates_validate_the_target_connector_schema_before_dispatch() {
+    let (_directory, broker, _events) = fixture(PermissionMode::FullAccess);
+    let server = connector("Hook target", "stdio");
+    broker.store.save_connector(&server).unwrap();
+    let (broker, _events) = reopened(&broker);
+    tokio::task::spawn_blocking(move || {
+        broker
+            .connectors
+            .cache_tools_for_tests(&server, &[mcp_tool("create_issue", "Create issue", true)])
+            .unwrap();
+        let input =
+            json!({"connector_id":server.id,"tool":"create_issue","arguments":{"title":42}});
+        let error = broker
+            .validate_updated_input("connector_call", &input)
+            .unwrap_err();
+        assert!(error.to_string().contains("title"), "{error}");
+        let valid =
+            json!({"connector_id":server.id,"tool":"create_issue","arguments":{"title":"Checked"}});
+        broker
+            .validate_updated_input("connector_call", &valid)
+            .unwrap();
+        assert!(
+            broker
+                .store
+                .unresolved_actions(broker.request.session_id)
+                .unwrap()
+                .is_empty()
+        );
+    })
+    .await
+    .unwrap();
+}

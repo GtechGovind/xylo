@@ -236,7 +236,6 @@ async fn wrong_project_turn_admission_preserves_history_checkpoint_and_original_
                     },
                     permissions: PermissionMode::ReadOnly,
                     attachments: vec![],
-                    approved_rules: Vec::new(),
                 },
             },
         )

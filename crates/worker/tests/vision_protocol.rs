@@ -187,7 +187,6 @@ async fn actual_worker_sends_managed_image_and_rehydrates_it_after_process_resta
         },
         permissions: PermissionMode::ReadOnly,
         attachments: vec![image.clone()],
-        approved_rules: Vec::new(),
     };
     let mut worker = Worker::start(&paths).await;
     worker

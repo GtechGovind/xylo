@@ -20,6 +20,7 @@ pub(crate) mod catalog;
 mod code;
 mod file_read;
 mod headless;
+mod hooks;
 mod image_generation;
 pub(crate) mod lookup;
 mod lsp;
@@ -177,8 +178,10 @@ pub struct ToolBroker {
     on_refusal: Option<crate::RefusalObserver>,
     policy_excluded: std::collections::HashSet<String>,
     session: ToolSession,
-    /// "Always allow" rule keys in force for this turn, shared with children.
+    /// Explicit native grants approved in this turn, shared with children.
     rules: RuleSet,
+    hook_notes: Mutex<Vec<(xylo_core::NoteKind, String)>>,
+    pub(crate) hook_stop: Mutex<Option<String>>,
     /// The `agent_delegate` action this child broker works for.
     parent_id: Option<Uuid>,
     events: tokio::sync::mpsc::Sender<EngineEvent>,
@@ -251,7 +254,9 @@ impl ToolBroker {
                 );
                 SqliteMemory::new(store.clone())
             }),
-            rules: Arc::new(Mutex::new(request.approved_rules.iter().cloned().collect())),
+            rules: Arc::default(),
+            hook_notes: Mutex::default(),
+            hook_stop: Mutex::default(),
             request,
             connectors: session.connectors(&store).with_local_scope(connector_scope),
             native: NativeConnectors::new(vault)?,
@@ -350,11 +355,16 @@ impl ToolBroker {
     }
 
     pub(crate) fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
-        self.session.shell_jobs.take_notes(self.request.session_id)
+        let mut notes = self.session.shell_jobs.take_notes(self.request.session_id);
+        notes.extend(self.take_hook_notes());
+        notes
     }
 
     pub fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
+    }
+    pub(crate) fn take_hook_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
+        std::mem::take(&mut *self.hook_notes.lock())
     }
     /// The permission mode in force right now.
     pub fn mode(&self) -> PermissionMode {
@@ -575,6 +585,24 @@ impl ToolBroker {
         arguments: Value,
         origin: Origin,
     ) -> Result<String> {
+        self.execute_prepared(
+            namespace,
+            call_id,
+            name,
+            arguments,
+            origin,
+            hooks::HookState::default(),
+        )
+    }
+    fn execute_prepared(
+        &self,
+        namespace: Option<&str>,
+        call_id: &str,
+        name: &str,
+        arguments: Value,
+        origin: Origin,
+        mut hook_state: hooks::HookState,
+    ) -> Result<String> {
         ensure!(
             namespace.is_none() || name != "agent_delegate",
             "Child agents cannot delegate further"
@@ -617,6 +645,57 @@ impl ToolBroker {
             self.store
                 .action_for_key(self.request.session_id, self.request.turn_id, &key)?
         {
+            if action.intent.arguments == arguments {
+                return self.replay(action, name, &arguments);
+            }
+            let binding = self.store.extension_action_binding(action.intent.id)?;
+            if binding.as_ref().and_then(|v| v.get("requested_input")) == Some(&arguments) {
+                let executed = action.intent.arguments.clone();
+                return self.replay(action, name, &executed);
+            }
+            return self.replay(action, name, &arguments);
+        }
+        let frozen_shell = matches!(name, "shell_command" | "run_command")
+            .then(|| shell_jobs::prepare(self, &arguments))
+            .transpose()?;
+        let original_arguments = hook_state
+            .requested
+            .take()
+            .unwrap_or_else(|| arguments.clone());
+        let prepared_arguments = arguments.clone();
+        let hooked = origin == Origin::Model;
+        let mut arguments = arguments;
+        let hook_control = if let Some(previous) = hook_state.pre.take() {
+            previous
+        } else if hooked {
+            use xylo_services::settings_files::{PermissionDecision, SettingsFiles};
+            if SettingsFiles::for_workspace(&self.request.workspace)
+                .load()?
+                .evaluate(name, &arguments)
+                == Some(PermissionDecision::Deny)
+            {
+                let reason = "Denied by settings permission rules";
+                if let Some(refused) = &self.on_refusal {
+                    refused(reason);
+                }
+                bail!(reason);
+            }
+            let control =
+                self.run_event_hooks(namespace, call_id, "PreToolUse", name, &arguments, None)?;
+            Self::enforce_hook(&control).context("Pre-tool hook prevented this operation")?;
+            if let Some(updated) = &control.updated_input {
+                arguments = updated.clone();
+                self.validate_updated_input(name, &arguments)?;
+            }
+            control
+        } else {
+            xylo_services::hooks::HookOutput::default()
+        };
+        let key = Self::journal_key(namespace, call_id);
+        if let Some(action) =
+            self.store
+                .action_for_key(self.request.session_id, self.request.turn_id, &key)?
+        {
             return self.replay(action, name, &arguments);
         }
         ensure!(
@@ -641,9 +720,13 @@ impl ToolBroker {
             !(name.starts_with("plugin_") && arguments.get("capabilities").is_some()),
             "Plugins run only with the grants reviewed in Settings; remove `capabilities`"
         );
-        let shell_context = matches!(name, "shell_command" | "run_command")
-            .then(|| shell_jobs::prepare(self, &arguments))
-            .transpose()?;
+        let shell_context = if arguments == prepared_arguments {
+            frozen_shell
+        } else {
+            matches!(name, "shell_command" | "run_command")
+                .then(|| shell_jobs::prepare(self, &arguments))
+                .transpose()?
+        };
         let reach = if self.custom_tools.iter().any(|tool| tool.name == name) {
             Reach::Outside(std::path::PathBuf::from("SDK client"))
         } else if let Some(path) = shell_context
@@ -676,8 +759,83 @@ impl ToolBroker {
             network,
             untrusted_input: exposure.is_some_and(MemoryOrigin::untrusted),
         };
-        let verdict = permissions::decide(mode, &call);
-        let rule = permissions::approval_rule_for(&call);
+        let permission_alias = if name == "connector_call" {
+            self.connector(&arguments).ok().map(|config| {
+                format!(
+                    "mcp__{}__{}",
+                    connector_slug(&config.name),
+                    arguments["tool"].as_str().unwrap_or_default()
+                )
+            })
+        } else {
+            None
+        };
+        let (mut verdict, mut explicit_rule) =
+            permissions::configured_named(mode, &call, permission_alias.as_deref())?;
+        if hook_control.decision == Some(xylo_services::settings_files::PermissionDecision::Ask)
+            && !matches!(verdict, Verdict::Refuse(_))
+        {
+            verdict = Verdict::Ask("A configured hook requires approval".into());
+            explicit_rule = true;
+        }
+        if hook_control.decision == Some(xylo_services::settings_files::PermissionDecision::Allow)
+            && !explicit_rule
+            && call.network.is_none()
+            && name != "lsp"
+            && !matches!(reach, Reach::Outside(_))
+            && !call.untrusted_input
+            && !matches!(verdict, Verdict::Refuse(_))
+        {
+            verdict = Verdict::Allow;
+        }
+
+        if origin == Origin::Model && matches!(verdict, Verdict::Ask(_)) && !hook_state.permission {
+            let control = self.run_event_hooks(
+                namespace,
+                call_id,
+                "PermissionRequest",
+                name,
+                &arguments,
+                None,
+            )?;
+            Self::enforce_hook(&control)?;
+            if let Some(updated) = &control.updated_input {
+                self.validate_updated_input(name, updated)?;
+                let updated = updated.clone();
+                let mut previous = hook_control;
+                previous.merge(control);
+                previous.updated_input = None;
+                return self.execute_prepared(
+                    namespace,
+                    call_id,
+                    name,
+                    updated,
+                    origin,
+                    hooks::HookState {
+                        pre: Some(previous),
+                        permission: true,
+                        requested: Some(original_arguments),
+                    },
+                );
+            }
+            if control.decision == Some(xylo_services::settings_files::PermissionDecision::Ask) {
+                explicit_rule = true;
+            }
+            if control.decision == Some(xylo_services::settings_files::PermissionDecision::Allow)
+                && !explicit_rule
+                && call.network.is_none()
+                && name != "lsp"
+                && !matches!(reach, Reach::Outside(_))
+                && !call.untrusted_input
+            {
+                verdict = Verdict::Allow;
+            }
+        }
+        let rule = if explicit_rule {
+            None
+        } else {
+            permissions::approval_rule_for(&call)
+        };
         let ask = match verdict {
             Verdict::Refuse(message) => {
                 if let Some(refused) = &self.on_refusal {
@@ -687,9 +845,15 @@ impl ToolBroker {
             }
             Verdict::Allow => None,
             Verdict::Ask(reason) => {
-                let remembered = rule
-                    .as_ref()
-                    .is_some_and(|(key, _)| self.rules.lock().contains(key));
+                let remembered = !explicit_rule
+                    && name == "lsp"
+                    && rule.as_ref().is_some_and(|(key, _)| {
+                        self.rules.lock().contains(key)
+                            || self
+                                .store
+                                .native_execution_granted(&self.request.workspace, key)
+                                .unwrap_or(false)
+                    });
                 (!remembered).then_some(reason)
             }
         };
@@ -784,13 +948,22 @@ impl ToolBroker {
         if let Some(snapshot) = &skill_snapshot {
             self.store.record_extension_action_binding(
                 id,
-                &json!({"kind":"skill","snapshot":snapshot}),
+                &json!({"kind":"skill","snapshot":snapshot,"requested_input":original_arguments}),
             )?;
         }
         if let Some(snapshot) = &component_snapshot {
             self.store.record_extension_action_binding(
                 id,
-                &json!({"kind":"component","snapshot":snapshot}),
+                &json!({"kind":"component","snapshot":snapshot,"requested_input":original_arguments}),
+            )?;
+        }
+        if original_arguments != arguments
+            && skill_snapshot.is_none()
+            && component_snapshot.is_none()
+        {
+            self.store.record_extension_action_binding(
+                id,
+                &json!({"kind":"hook_input","requested_input":original_arguments}),
             )?;
         }
         if let Err(error) = self.emit(EngineEvent::ToolStarted {
@@ -815,8 +988,11 @@ impl ToolBroker {
                 // The mode may have changed while the user decided; an
                 // approval never outranks a mode that now refuses the action.
                 let current = self.mode();
-                matches!(permissions::decide(current, &call), Verdict::Refuse(_))
-                    .then(|| format!("Permission mode changed to {}; not run", current.label()))
+                matches!(
+                    permissions::configured_named(current, &call, permission_alias.as_deref())?.0,
+                    Verdict::Refuse(_)
+                )
+                .then(|| format!("Permission mode changed to {}; not run", current.label()))
             } else {
                 Some("Action denied or task cancelled".to_owned())
             };
@@ -836,20 +1012,17 @@ impl ToolBroker {
             self.store.deny_action(id)?;
             bail!("Task cancelled before execution")
         }
+        if let Verdict::Refuse(reason) =
+            permissions::configured_named(self.mode(), &call, permission_alias.as_deref())?.0
+        {
+            self.store.deny_action(id)?;
+            bail!(reason);
+        }
         self.store.mark_action_running(id)?;
         // Hooks wrap the model's calls, never their own executions.
-        let hooked = origin == Origin::Model && name != "extension_component";
         // All fallible execution branches stay inside this closure, so no `?`
         // can strand a running action without recording failure/uncertainty.
         let execution = (|| -> Result<Value> {
-            if hooked {
-                self.run_event_hooks(namespace, call_id, "PreToolUse", name, &arguments, None)
-                    .map_err(|error| {
-                        code::unapplied(format!(
-                            "Pre-tool hook prevented this operation: {error:#}"
-                        ))
-                    })?;
-            }
             if let Some(revision) = &write_revision {
                 revision.check()?;
             }
@@ -1514,93 +1687,6 @@ impl ToolBroker {
                     && !effective_writes(&connector.config, &candidate.definition)
             })
         })
-    }
-    fn run_event_hooks(
-        &self,
-        namespace: Option<&str>,
-        call_id: &str,
-        event: &str,
-        tool_name: &str,
-        arguments: &Value,
-        result: Option<&Value>,
-    ) -> Result<()> {
-        let service = portable::service(self);
-        let input = json!({"event":event,"hook_event_name":event,"tool_name":tool_name,"tool_input":arguments,"tool_response":result,"session_id":self.request.session_id,"cwd":self.request.workspace});
-        let hooks = service.matching_hooks(event, &input, &self.request.workspace)?;
-        if hooks.is_empty() {
-            return Ok(());
-        }
-        ensure!(
-            !self
-                .store
-                .unresolved_actions(self.request.session_id)?
-                .iter()
-                .any(|action| action.state == "outcome_unknown"
-                    && action.intent.name == "extension_component"
-                    && action
-                        .intent
-                        .arguments
-                        .get("operation")
-                        .and_then(Value::as_str)
-                        == Some("event")),
-            "A previous hook outcome is unknown; reconcile its action before further hook execution"
-        );
-        for (index, hook) in hooks.into_iter().enumerate() {
-            let hook_id = format!("{call_id}:hook:{event}:{index}");
-            let args = json!({"id":hook.package,"component":hook.component,"operation":"event","input":input});
-            self.execute_scoped(
-                namespace,
-                &hook_id,
-                "extension_component",
-                args,
-                Origin::Hook,
-            )?;
-            let actual = self
-                .store
-                .action_for_key(
-                    self.request.session_id,
-                    self.request.turn_id,
-                    &Self::journal_key(namespace, &hook_id),
-                )?
-                .and_then(|action| action.result)
-                .context("Hook outcome was not recorded")?;
-            for entry in actual
-                .get("results")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                ensure!(
-                    entry
-                        .pointer("/hook_control/blocked")
-                        .and_then(Value::as_bool)
-                        != Some(true),
-                    "Configured hook blocked this operation or requested separate approval"
-                );
-                let output = &entry["output"];
-                ensure!(
-                    output.pointer("/hookSpecificOutput/updatedInput").is_none()
-                        && output.get("updatedInput").is_none()
-                        && output
-                            .pointer("/hookSpecificOutput/updatedToolInput")
-                            .is_none()
-                        && output
-                            .pointer("/hookSpecificOutput/updatedMCPToolOutput")
-                            .is_none(),
-                    "Unsupported hook execution-changing directive; updatedInput/output replacement requires host validation and renewed approval"
-                );
-                let decision = output
-                    .pointer("/hookSpecificOutput/permissionDecision")
-                    .or_else(|| output.get("decision"))
-                    .and_then(Value::as_str);
-                ensure!(
-                    output.get("continue").and_then(Value::as_bool) != Some(false)
-                        && decision.is_none_or(|decision| matches!(decision, "allow" | "approve")),
-                    "Configured hook blocked this operation or requested separate approval"
-                );
-            }
-        }
-        Ok(())
     }
     fn connector(&self, args: &Value) -> Result<ConnectorConfig> {
         let id = Uuid::parse_str(

@@ -307,7 +307,11 @@ fn prepare_internal(
         Network::None => "none",
         Network::Unrestricted => "unrestricted",
     };
-    let spec = json!({"program":program,"args":args,"workspace":workspace,"read_roots":read_roots,"protected_paths":protected_paths,"trusted_paths":trusted_paths_with_node(&node)?,"toolchain_read_roots":toolchain_read_roots,"coding_environment":coding_environment,"temporary":child_temporary,"status_file":status_file,"allowed_domains":allowed_domains,"network":network});
+    let settings_paths = crate::settings_files::SettingsFiles::for_workspace(&workspace)
+        .sources()
+        .map(Path::to_owned)
+        .collect::<Vec<_>>();
+    let spec = json!({"settings_paths":settings_paths,"program":program,"args":args,"workspace":workspace,"read_roots":read_roots,"protected_paths":protected_paths,"trusted_paths":trusted_paths_with_node(&node)?,"toolchain_read_roots":toolchain_read_roots,"coding_environment":coding_environment,"temporary":child_temporary,"status_file":status_file,"allowed_domains":allowed_domains,"network":network});
     let mut command = tokio::process::Command::new(&node);
     command
         .arg(helper)
@@ -860,6 +864,33 @@ pub fn ensure_writable_target(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Provides bounded JSON input while stdin remains a private parent-lifetime pipe.
+/// The trusted launcher opens the file before the sandbox; the child receives only its descriptor.
+pub fn set_child_input(prepared: &mut PreparedSandbox, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    ensure!(bytes.len() <= 1024 * 1024, "Sandbox input exceeds 1 MiB");
+    let path = prepared
+        .status_file
+        .parent()
+        .context("Sandbox control directory missing")?
+        .join("stdin");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    prepared
+        .command
+        .env("XYLO_SANDBOX_CHILD_STDIN", path)
+        .env("XYLO_SANDBOX_PARENT_GUARD", "1");
+    Ok(())
+}
+
 /// Plugin-controlled environment reaches only the sandboxed child. It must never
 /// influence the trusted Node launcher, runtime import, or policy initialization.
 pub fn set_child_environment(
@@ -880,7 +911,7 @@ pub fn set_child_environment(
             "Invalid child environment variable"
         );
         ensure!(
-            name != "XYLO_SANDBOX_CHILD_ENV",
+            !name.starts_with("XYLO_SANDBOX_"),
             "Reserved child environment variable"
         );
     }

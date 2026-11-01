@@ -41,11 +41,23 @@ impl BrokerTools {
 }
 
 impl ToolExecutor for BrokerTools {
+    fn pending_stop(&self) -> Option<String> {
+        self.broker.hook_stop.lock().take()
+    }
+    fn lifecycle(
+        &self,
+        event: &str,
+        input: Value,
+    ) -> anyhow::Result<xylo_services::hooks::HookOutput> {
+        self.broker
+            .lifecycle(self.namespace.as_deref(), event, input)
+    }
+
     fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
         if self.namespace.is_none() {
             self.broker.take_notes()
         } else {
-            Vec::new()
+            self.broker.take_hook_notes()
         }
     }
     fn schemas(&self) -> Vec<ToolSchema> {

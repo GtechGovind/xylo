@@ -295,7 +295,6 @@ pub(crate) async fn run_trial_with(
         },
         permissions: task.mode,
         attachments: Vec::new(),
-        approved_rules: Vec::new(),
     };
     store.register_user_turn(&request)?;
 

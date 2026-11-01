@@ -44,11 +44,12 @@
 //!   added.
 mod dispatch;
 mod fallback;
+mod hooks;
 mod recovery;
 mod retry;
 mod stall;
 
-pub(crate) use dispatch::{Access, ToolExecutor, error_result};
+pub(crate) use dispatch::{Access, ToolExecutor, error_result, validate_hook_input};
 
 use crate::{
     model::{
@@ -283,7 +284,19 @@ impl AgentLoop {
             cut_off: false,
         };
         let mut messages = messages;
-        match self.steps(&mut messages, &mut run).await {
+        let result = self.steps(&mut messages, &mut run).await;
+        let ending = self
+            .hook(
+                "SessionEnd",
+                serde_json::json!({"reason":if result.is_ok(){"completed"}else{"failed"}}),
+            )
+            .await;
+        let ending = match ending {
+            Ok(output) => self.hook_context(&mut messages, &output).await,
+            Err(error) => Err(error),
+        };
+        let result = result.and_then(|value| ending.map(|_| value));
+        match result {
             Ok((text, stopped_early)) => {
                 run.usage.elapsed_ms = run.started.elapsed().as_millis() as u64;
                 Ok(LoopOutcome {
@@ -310,6 +323,21 @@ impl AgentLoop {
         messages: &mut Vec<Message>,
         run: &mut Run,
     ) -> anyhow::Result<(String, bool)> {
+        let prompt = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        let start = self
+            .hook("SessionStart", serde_json::json!({"source":"startup"}))
+            .await?;
+        self.hook_context(messages, &start).await?;
+        let submitted = self
+            .hook("UserPromptSubmit", serde_json::json!({"prompt":prompt}))
+            .await?;
+        self.hook_context(messages, &submitted).await?;
+        let mut stop_continuations = 0;
         // A resumed turn may end with calls that never produced a result.
         if let Some(index) = messages.iter().rposition(|m| m.role == Role::Assistant)
             && unanswered(&messages[index..]).next().is_some()
@@ -323,6 +351,9 @@ impl AgentLoop {
         let mut answer = recovery::AnswerRecovery::default();
         let mut stall = stall::StallDetector::default();
         loop {
+            if let Some(reason) = self.tools.pending_stop() {
+                anyhow::bail!("{reason}");
+            }
             if self.cancel.is_cancelled() {
                 return Err(ModelError::Interrupted.into());
             }
@@ -377,6 +408,28 @@ impl AgentLoop {
                         // Guidance that arrived while the answer streamed
                         // continues the task instead of being left unread.
                         if !final_call && self.apply_guidance(messages).await? > 0 {
+                            continue;
+                        }
+                        let stopped=self.hook(if self.root(){"Stop"}else{"SubagentStop"},serde_json::json!({"response":text,"stop_hook_active":stop_continuations>0,"continuations":stop_continuations})).await?;
+                        if let Some(reason) = &stopped.stop_reason {
+                            anyhow::bail!("{reason}");
+                        }
+                        for context in &stopped.context {
+                            messages.push(application_note(context));
+                            self.show_note(NoteKind::Hook, context.clone()).await?;
+                        }
+                        let reason = stopped.block_reason.or_else(|| {
+                            (stopped.decision
+                                == Some(xylo_services::settings_files::PermissionDecision::Deny))
+                            .then(|| "The stop hook requested further work".into())
+                        });
+                        if let Some(reason) = reason
+                            && stop_continuations < 3
+                            && !final_call
+                        {
+                            stop_continuations += 1;
+                            messages.push(application_note(&reason));
+                            self.show_note(NoteKind::Hook, reason).await?;
                             continue;
                         }
                         run.cut_off = cut_off;
@@ -530,6 +583,22 @@ impl AgentLoop {
     /// itself travels in the conversation as an application note.
     async fn show_note(&self, kind: NoteKind, text: String) -> anyhow::Result<()> {
         if self.root() {
+            if kind != NoteKind::Hook {
+                let output = self
+                    .hook(
+                        "Notification",
+                        serde_json::json!({"message":text,"notification_type":kind}),
+                    )
+                    .await?;
+                if let Some(reason) = output.stop_reason {
+                    anyhow::bail!("{reason}");
+                }
+                anyhow::ensure!(
+                    output.decision
+                        != Some(xylo_services::settings_files::PermissionDecision::Deny),
+                    "Notification hook denied continuation"
+                );
+            }
             self.emit(EngineEvent::HarnessNote { kind, text }).await?;
         }
         Ok(())
@@ -738,6 +807,10 @@ impl AgentLoop {
                 self.budget
                     .summary_plan(&system, messages, tools, self.max_tokens, pressure)
         {
+            let compact = self
+                .hook("PreCompact", serde_json::json!({"trigger":"auto"}))
+                .await?;
+            self.hook_context(messages, &compact).await?;
             self.phase(TurnPhase::Compacting).await?;
             match self
                 .budget

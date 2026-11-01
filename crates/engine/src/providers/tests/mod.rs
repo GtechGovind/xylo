@@ -224,7 +224,6 @@ async fn managed_image_refs_rehydrate_into_actual_streamed_images_for_every_api_
             provider: provider_config,
             permissions: PermissionMode::ReadOnly,
             attachments: vec![attachment.clone()],
-            approved_rules: Vec::new(),
         };
         let message = user_message(&turn);
         let durable = serde_json::to_string(&message).unwrap();

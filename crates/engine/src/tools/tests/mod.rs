@@ -123,7 +123,6 @@ fn fixture_with(mode: PermissionMode, adjust: impl FnOnce(&mut TurnRequest)) -> 
         },
         attachments: Vec::new(),
         permissions: mode,
-        approved_rules: Vec::new(),
     };
     adjust(&mut request);
     let (events, receiver) = tokio::sync::mpsc::channel(256);
@@ -504,95 +503,86 @@ async fn accepted_edits_apply_without_prompts_and_inapplicable_edits_leave_no_in
     assert!(broker.journaled("edit-missing").unwrap().is_none());
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn always_allow_covers_matching_actions_for_the_turn() {
-    let (_directory, broker, mut events) = fixture(PermissionMode::AskForApproval);
+async fn always_allow_uses_the_saved_file_rule_and_revocation_is_immediate() {
+    let (directory, broker, mut events) = fixture(PermissionMode::AskForApproval);
     let outside = tempfile::tempdir().unwrap();
-    let folder = outside.path().canonicalize().unwrap();
-    let notes = folder.join("notes.txt");
+    let path = outside.path().join("notes.txt");
+    std::fs::write(&path, "notes").unwrap();
+    let args = json!({"path":path});
     let task = broker.clone();
-    let target = notes.clone();
-    let first = tokio::task::spawn_blocking(move || {
-        task.execute(
-            "write",
-            "file_write",
-            json!({"path":target,"content":"one\n"}),
-        )
-    });
-    while let Some(event) = events.recv().await {
+    let input = args.clone();
+    let first = tokio::task::spawn_blocking(move || task.execute("read", "file_read", input));
+    let pattern = loop {
         if let EngineEvent::ApprovalRequired {
             action_id,
-            arguments,
-            rule,
             rule_key,
-            reason,
-            parent_id,
             ..
-        } = event
+        } = events.recv().await.unwrap()
         {
-            assert_eq!(rule.unwrap(), format!("file edits in {}", folder.display()));
-            assert_eq!(rule_key.unwrap(), format!("edit:{}", folder.display()));
-            assert!(reason.unwrap().contains("outside the project"));
-            assert_eq!(parent_id, None);
-            assert!(arguments["diff"].as_str().unwrap().contains("+one"));
-            assert!(arguments["request"].get("content").is_none());
+            let pattern = rule_key.unwrap();
+            xylo_services::settings_files::SettingsFiles::for_workspace(directory.path())
+                .save_rule(
+                    &pattern,
+                    xylo_services::settings_files::PermissionDecision::Allow,
+                    false,
+                )
+                .unwrap();
             broker
                 .session
                 .approvals()
                 .decide_with(action_id, true, true)
                 .unwrap();
+            break pattern;
+        }
+    };
+    first.await.unwrap().unwrap();
+    run(&broker, "again", "file_read", args.clone())
+        .await
+        .unwrap();
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, EngineEvent::ApprovalRequired { .. }));
+    }
+    let files = xylo_services::settings_files::SettingsFiles::for_workspace(directory.path());
+    let rule = files
+        .load()
+        .unwrap()
+        .rules
+        .into_iter()
+        .find(|r| r.pattern == pattern)
+        .unwrap();
+    files.remove_rule(&rule).unwrap();
+    let task = broker.clone();
+    let third = tokio::task::spawn_blocking(move || task.execute("revoked", "file_read", args));
+    loop {
+        if let EngineEvent::ApprovalRequired { action_id, .. } = events.recv().await.unwrap() {
+            broker
+                .session
+                .approvals()
+                .decide_with(action_id, false, false)
+                .unwrap();
             break;
         }
     }
-    first.await.unwrap().unwrap();
-    broker.session.permissions().set(PermissionMode::FullAccess);
-    run(&broker, "read-notes", "file_read", json!({"path":notes}))
-        .await
-        .unwrap();
-    broker
-        .session
-        .permissions()
-        .set(PermissionMode::AskForApproval);
-    let task = broker.clone();
-    let target = notes.clone();
-    tokio::task::spawn_blocking(move || {
-        task.execute(
-            "edit",
-            "file_edit",
-            json!({"path":target,"edits":[{"old_string":"one","new_string":"two"}]}),
-        )
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    while let Ok(event) = events.try_recv() {
-        assert!(!matches!(event, EngineEvent::ApprovalRequired { .. }));
-    }
-    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "two\n");
+    assert!(third.await.unwrap().is_err());
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn approved_rules_from_the_turn_request_skip_the_prompt() {
+async fn file_rules_allow_exact_outside_reads() {
     let outside = tempfile::tempdir().unwrap();
-    let folder = outside.path().canonicalize().unwrap();
-    let (_directory, broker, mut events) =
-        fixture_with(PermissionMode::AskForApproval, |request| {
-            request.approved_rules = vec![format!("edit:{}", folder.display())];
-        });
-    run(
-        &broker,
-        "seeded",
-        "file_write",
-        json!({"path":folder.join("seeded.txt"),"content":"seeded"}),
-    )
-    .await
-    .unwrap();
+    let path = outside.path().join("notes.txt");
+    std::fs::write(&path, "readable").unwrap();
+    let (directory, broker, mut events) = fixture(PermissionMode::AskForApproval);
+    let args = json!({"path":path});
+    xylo_services::settings_files::SettingsFiles::for_workspace(directory.path())
+        .save_rule(
+            &format!("file_read(json:{args})"),
+            xylo_services::settings_files::PermissionDecision::Allow,
+            false,
+        )
+        .unwrap();
+    run(&broker, "allowed", "file_read", args).await.unwrap();
     while let Ok(event) = events.try_recv() {
         assert!(!matches!(event, EngineEvent::ApprovalRequired { .. }));
     }
-    assert_eq!(
-        std::fs::read_to_string(folder.join("seeded.txt")).unwrap(),
-        "seeded"
-    );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_connector_write_classification_cannot_be_overridden_by_arguments() {
@@ -1371,10 +1361,7 @@ async fn hook_denial_blocks_original_mutation_and_read_only_tasks_still_run_hook
     .unwrap_err();
     assert!(error.to_string().contains("Pre-tool hook prevented"));
     assert!(!directory.path().join("should-not-exist.txt").exists());
-    assert_eq!(
-        broker.journaled("blocked-write").unwrap().unwrap().state,
-        "failed"
-    );
+    assert!(broker.journaled("blocked-write").unwrap().is_none());
     let (directory, broker, mut events) = fixture(PermissionMode::ReadOnly);
     std::fs::write(directory.path().join("sample.txt"), "readable").unwrap();
     installed_tool_hooks(&broker, "printf ran > hook-marker; printf '{}'", "");
@@ -1473,7 +1460,7 @@ async fn hook_updated_input_is_rejected_before_original_mutation() {
         )
     });
     let error = execute.await.unwrap().unwrap_err();
-    assert!(format!("{error:#}").contains("Unsupported hook execution-changing directive"));
+    assert!(format!("{error:#}").contains("Hook updatedInput"));
     assert!(!directory.path().join("original.txt").exists());
     assert!(!directory.path().join("changed.txt").exists());
 }
@@ -1957,10 +1944,13 @@ async fn network_requests_are_validated_approved_and_sandbox_denials_suggest_the
                 .approvals()
                 .decide_with(action_id, true, false)
                 .unwrap();
-            break (rule.unwrap(), reason.unwrap());
+            break (rule, reason.unwrap());
         }
     };
-    assert_eq!(rule, "network access for exactly `git --version`");
+    assert!(
+        rule.is_none(),
+        "Network capability approvals cannot be persisted as ordinary rules"
+    );
     assert!(reason.contains("Check the git version"), "{reason}");
     let output = tokio::time::timeout(Duration::from_secs(30), approved)
         .await
@@ -2034,3 +2024,5 @@ async fn tool_results_are_shortened_to_the_window_budget() {
 
 mod code_parity;
 mod headless;
+
+mod settings;

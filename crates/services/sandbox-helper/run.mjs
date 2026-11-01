@@ -23,7 +23,7 @@
 //
 // Never call process.exit(): setting process.exitCode lets output drain.
 import { spawn } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
+import { appendFileSync, realpathSync, openSync, closeSync, fstatSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -105,10 +105,12 @@ try {
   delete process.env.XYLO_SANDBOX_CHILD_ENV;
   if (!childEnvironment || Array.isArray(childEnvironment) || typeof childEnvironment !== 'object') throw new Error('Invalid child environment');
   for (const [name, value] of Object.entries(childEnvironment)) {
-    if (!/^[A-Za-z0-9_]{1,128}$/.test(name) || typeof value !== 'string' || name === 'XYLO_SANDBOX_CHILD_ENV') throw new Error('Reserved child environment variable');
+    if (!/^[A-Za-z0-9_]{1,128}$/.test(name) || typeof value !== 'string' || name.startsWith('XYLO_SANDBOX_')) throw new Error('Reserved child environment variable');
   }
   if (!statusFile) throw new Error('Missing status file');
   const control = dirname(statusFile);
+  const requestedInput = guardParent ? process.env.XYLO_SANDBOX_CHILD_STDIN : undefined;
+  delete process.env.XYLO_SANDBOX_CHILD_STDIN;
   const workspace = realpathSync(spec.workspace);
   // Only the trusted coding launcher may grant one explicitly reviewed root.
   // Canonical identity must still match when the helper starts after approval.
@@ -134,11 +136,21 @@ try {
       denyRead: [homedir(), control, ...(spec.protected_paths ?? [])],
       allowRead: [...writable, ...allowed, helperDirectory, process.execPath],
       allowWrite: [...writable, spec.temporary],
-      denyWrite: [...writable.flatMap(root => ['.git', '.agents', '.claude', '.codex'].map(name => join(root, name))), control, ...allowed, ...(spec.protected_paths ?? []), ...(spec.trusted_paths ?? [])],
+      denyWrite: [...writable.flatMap(root => ['.git', '.agents', '.claude', '.codex', '.xylo'].map(name => join(root, name))), control, ...allowed, ...(spec.settings_paths ?? []), ...(spec.protected_paths ?? []), ...(spec.trusted_paths ?? [])],
     },
   }, networkDecision(network === 'unrestricted'));
   const wrapped = await manager.wrapWithSandbox([process.execPath, childEntry, spec.program, ...spec.args].map(quote).join(' '));
-  child = spawn(wrapped, { shell: '/bin/sh', cwd, stdio: [guardParent ? 'ignore' : 'inherit', 'inherit', 'inherit', 'pipe'], env: { ...process.env, XYLO_SANDBOX_CHILD_ENV: JSON.stringify({ TMPDIR: spec.temporary, ...codingEnvironment, ...childEnvironment }), TMPDIR: spec.temporary } });
+  let inputFd;
+  try {
+    if (requestedInput) {
+      const canonical = realpathSync(requestedInput);
+      if (canonical !== requestedInput || dirname(canonical) !== realpathSync(control)) throw new Error('Invalid private child input path');
+      inputFd = openSync(canonical, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const info = fstatSync(inputFd);
+      if (!info.isFile() || info.size > 1024 * 1024) throw new Error('Invalid private child input file');
+    }
+    child = spawn(wrapped, { shell: '/bin/sh', cwd, stdio: [inputFd ?? (guardParent ? 'ignore' : 'inherit'), 'inherit', 'inherit', 'pipe'], env: { ...process.env, XYLO_SANDBOX_CHILD_ENV: JSON.stringify({ TMPDIR: spec.temporary, ...codingEnvironment, ...childEnvironment }), TMPDIR: spec.temporary } });
+  } finally { if (inputFd !== undefined) closeSync(inputFd); }
   let failed = false;
   let spawnFailed = false;
   readControl(child.stdio[3], reason => {

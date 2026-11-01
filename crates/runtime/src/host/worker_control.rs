@@ -50,7 +50,6 @@ pub(super) fn effective_mode(mode: PermissionMode, scheduled: bool) -> Permissio
 pub(super) struct PendingApproval {
     pub(super) name: String,
     pub(super) rule_key: Option<String>,
-    pub(super) rule: Option<String>,
     pub(super) parent_id: Option<Uuid>,
     /// Request id of the first decision sent; later ones are duplicates.
     pub(super) decision: Option<Uuid>,
@@ -544,7 +543,6 @@ impl HostState {
         let pending = pending.unwrap_or(PendingApproval {
             name: "approval".into(),
             rule_key: None,
-            rule: None,
             parent_id: None,
             decision: None,
         });
@@ -732,7 +730,7 @@ impl WorkerReader {
             EngineEvent::ApprovalRequired {
                 action_id,
                 name,
-                rule,
+                rule: _,
                 rule_key,
                 parent_id,
                 ..
@@ -742,7 +740,6 @@ impl WorkerReader {
                     PendingApproval {
                         name: name.clone(),
                         rule_key: rule_key.clone(),
-                        rule: rule.clone(),
                         parent_id: *parent_id,
                         decision: None,
                     },

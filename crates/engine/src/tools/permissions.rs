@@ -35,11 +35,8 @@
 //! the fact then keeps the untrusted origin the broker assigns it, which
 //! keeps it out of automatically recalled context.
 //!
-//! "Always allow" rules are owned by the host and persisted per project. A
-//! turn is seeded with them through `TurnRequest.approved_rules`; a rule the
-//! user remembers during the turn is added to that turn's set, and the host
-//! persists it for later turns. Nothing outlives the turn in the worker, so a
-//! revoked rule stops applying at the next turn.
+//! Settings files are authoritative and are reread before each call.
+//! Native execution grants remain separate from ordinary permission rules.
 use super::risk::{self, Fetch};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -327,6 +324,54 @@ pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
     }
 }
 
+/// File policy is authoritative even in Full Access and for hook/custom calls.
+pub(crate) fn configured(mode: PermissionMode, call: &Call) -> Result<(Verdict, bool)> {
+    configured_named(mode, call, None)
+}
+
+/// Resolves connector aliases without changing the call's effective safety classification.
+pub(crate) fn configured_named(
+    mode: PermissionMode,
+    call: &Call,
+    alias: Option<&str>,
+) -> Result<(Verdict, bool)> {
+    use xylo_services::settings_files::{PermissionDecision, SettingsFiles};
+    let settings = SettingsFiles::for_workspace(call.workspace).load()?;
+    let primary = settings.evaluate(call.name, call.arguments);
+    let secondary = alias.and_then(|name| settings.evaluate(name, call.arguments));
+    let decision = [
+        PermissionDecision::Deny,
+        PermissionDecision::Ask,
+        PermissionDecision::Allow,
+    ]
+    .into_iter()
+    .find(|decision| primary == Some(*decision) || secondary == Some(*decision));
+    let default = decide(mode, call);
+    let independent = call.name == "lsp"
+        || call.network.is_some()
+        || (SANDBOXED_COMMANDS.contains(&call.name) && matches!(call.reach, Reach::Outside(_)))
+        || (call.name == "memory_remember" && call.untrusted_input);
+    if matches!(default, Verdict::Refuse(_)) && decision != Some(PermissionDecision::Deny) {
+        return Ok((default, false));
+    }
+    Ok(match decision {
+        Some(PermissionDecision::Deny) => (
+            Verdict::Refuse("Denied by settings permission rules".into()),
+            true,
+        ),
+        Some(PermissionDecision::Ask) => (
+            Verdict::Ask("A settings permission rule requires approval".into()),
+            true,
+        ),
+        Some(PermissionDecision::Allow)
+            if !independent && !matches!(default, Verdict::Refuse(_)) =>
+        {
+            (Verdict::Allow, false)
+        }
+        _ => (default, false),
+    })
+}
+
 /// Why a memory write after untrusted input asks: the user must review a
 /// fact that content from outside the project may have shaped.
 pub(crate) const UNTRUSTED_MEMORY_WRITE: &str = "This conversation has read content from outside the project, which can carry injected instructions; review this fact before it is saved to project memory";
@@ -522,7 +567,48 @@ pub(crate) fn approval_rule_for(call: &Call) -> Option<(String, String)> {
     if call.name == "memory_remember" && call.untrusted_input {
         return None;
     }
-    approval_rule(call.name, call.arguments, call.reach, call.workspace)
+    if call.network.is_some() {
+        return None;
+    }
+    let (key, label) = approval_rule(call.name, call.arguments, call.reach, call.workspace)?;
+    if call.name == "lsp" {
+        return Some((key, label));
+    }
+    let fields: &[&str] = match call.name {
+        "file_read" | "file_write" | "file_edit" | "notebook_edit" => &["path"],
+        "shell_command" => &["command"],
+        "run_command" => &["program", "args"],
+        "connector_call" => &["connector_id", "tool"],
+        "plugin_run_installed" => &["id", "package_sha256"],
+        "extension_component" => &["id", "component", "operation"],
+        _ => &[],
+    };
+    let key = if fields.is_empty() {
+        call.name.to_owned()
+    } else {
+        let selected: serde_json::Map<String, Value> = fields
+            .iter()
+            .filter_map(|key| {
+                call.arguments
+                    .get(*key)
+                    .map(|value| ((*key).into(), value.clone()))
+            })
+            .collect();
+        format!("{}(fields:{})", call.name, Value::Object(selected))
+    };
+    if key.len() > 8192 {
+        return None;
+    }
+    let label = match call.name {
+        "file_read" | "file_write" | "file_edit" | "notebook_edit" => format!(
+            "{} for {}",
+            call.name,
+            call.arguments["path"].as_str().unwrap_or("this file")
+        ),
+        "run_command" => "this program with these exact arguments".into(),
+        _ => label,
+    };
+    Some((key, label))
 }
 
 /// The rule key and its label for "always allow in this project". Every

@@ -180,7 +180,6 @@ fn turn(session: Uuid, workspace: &std::path::Path, endpoint: String) -> TurnReq
         },
         permissions: PermissionMode::AskForApproval,
         attachments: Vec::new(),
-        approved_rules: Vec::new(),
     }
 }
 

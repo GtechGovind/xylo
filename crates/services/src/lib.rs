@@ -44,3 +44,7 @@ pub use turn_queue::*;
 
 #[cfg(test)]
 mod tests;
+
+pub mod settings_files;
+
+pub mod hooks;

@@ -63,3 +63,6 @@ impl AppPaths {
 
 #[cfg(test)]
 mod tests;
+
+/// File-backed permission settings shared with the desktop editor.
+pub use xylo_services::settings_files;

@@ -142,12 +142,6 @@ pub async fn serve(profile: &Profile, options: &Options, telemetry: &Observabili
             provider,
             permissions: mode,
             attachments: Vec::new(),
-            approved_rules: profile
-                .store
-                .approval_rules(&conversation.workspace)?
-                .into_iter()
-                .map(|rule| rule.key)
-                .collect(),
         };
         let turn_id = request.turn_id;
         profile.store.register_user_turn(&request)?;

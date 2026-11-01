@@ -22,7 +22,7 @@ pub(crate) const VERSION: i64 = 2;
 /// Every table, index and trigger of the application database.
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE approval_rules(workspace TEXT NOT NULL,key TEXT NOT NULL,label TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(workspace,key)) WITHOUT ROWID;
+CREATE TABLE native_execution_grants(workspace TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(workspace,key)) WITHOUT ROWID;
 
 CREATE TABLE conversations(id TEXT PRIMARY KEY,json TEXT NOT NULL,updated_at INTEGER NOT NULL);
 CREATE INDEX conversations_keyset ON conversations(updated_at DESC,id DESC);

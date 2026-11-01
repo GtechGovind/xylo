@@ -178,7 +178,6 @@ mod xylo {
             .into_iter()
             .map(|prompt| {
                 let turn = TurnRequest {
-                    approved_rules: Vec::new(),
                     session_id: self.session,
                     turn_id: Uuid::new_v4(),
                     workspace: self.workspace.clone().unwrap(),

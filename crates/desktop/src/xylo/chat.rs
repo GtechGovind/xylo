@@ -497,7 +497,6 @@ impl Xylo {
         // The same prompt and images, with the connection fixed since the failure.
         request.provider = self.settings.provider.clone();
         request.permissions = self.settings.permissions;
-        request.approved_rules = Vec::new();
         self.engine_command(WorkerCommand::Run { turn: request }, cx);
         self.invalidate_live_history();
         self.sync_history_list(cx);

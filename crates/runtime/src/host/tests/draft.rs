@@ -157,7 +157,6 @@ pub(in crate::host) fn input(host: &HostState) -> (TurnRequest, DraftSubmission)
         },
         permissions: PermissionMode::ReadOnly,
         attachments: Vec::new(),
-        approved_rules: Vec::new(),
     };
     let draft = DraftSubmission {
         key,

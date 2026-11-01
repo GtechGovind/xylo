@@ -12647,6 +12647,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "ort",
+ "regex",
  "reqwest 0.13.5",
  "rmcp",
  "rusqlite",

@@ -4,13 +4,14 @@
 use super::*;
 use crate::icons::AppIcon;
 use gpui_kit::TestSupportExt;
+use xylo_runtime::settings_files::{PermissionDecision, PermissionRule};
 
 /// Standing approvals of the open project, as shown on the Permissions page.
 #[derive(Default)]
 pub(super) struct PermissionsUi {
     /// The project whose rules are listed (or being loaded).
     workspace: Option<PathBuf>,
-    rules: Vec<ApprovalRule>,
+    rules: Vec<PermissionRule>,
     loading: bool,
     /// When the current load or revoke was sent, for the slow-wait caption.
     loading_since: Option<std::time::Instant>,
@@ -18,15 +19,6 @@ pub(super) struct PermissionsUi {
 }
 /// The tag next to a trusted connection's name in the Connections list.
 const TRUSTED_TAG: &str = "Trusted";
-fn allowed_since(created_at: i64) -> String {
-    let seconds = now_ms().saturating_sub(created_at).max(0) / 1000;
-    match seconds {
-        0..=59 => "Allowed just now".into(),
-        60..=3599 => format!("Allowed {} min ago", seconds / 60),
-        3600..=86399 => format!("Allowed {} h ago", seconds / 3600),
-        _ => format!("Allowed {} days ago", seconds / 86400),
-    }
-}
 fn secret_storage_label(storage: SecretStorage) -> &'static str {
     match storage {
         SecretStorage::LocalFile => "Local encrypted file",
@@ -216,7 +208,7 @@ impl Xylo {
         }
         cx.notify();
     }
-    fn revoke_approval_rule(&mut self, key: String, cx: &mut Context<Self>) {
+    fn revoke_approval_rule(&mut self, key: PermissionRule, cx: &mut Context<Self>) {
         let Some(workspace) = self.permissions.workspace.clone() else {
             return;
         };
@@ -236,7 +228,7 @@ impl Xylo {
     pub(super) fn approval_rules_received(
         &mut self,
         workspace: PathBuf,
-        result: Result<Vec<ApprovalRule>, String>,
+        result: Result<Vec<PermissionRule>, String>,
         cx: &mut Context<Self>,
     ) {
         if self.permissions.workspace.as_ref() != Some(&workspace) {
@@ -245,8 +237,7 @@ impl Xylo {
         self.permissions.loading = false;
         self.permissions.loading_since = None;
         match result {
-            Ok(mut rules) => {
-                rules.sort_by_key(|rule| std::cmp::Reverse(rule.created_at));
+            Ok(rules) => {
                 self.permissions.rules = rules;
                 self.permissions.error = None;
             }
@@ -765,8 +756,8 @@ impl Xylo {
             .description("How Xylo's actions are approved. Changes apply from the next action, including in running tasks.")
             .child(settings_ui::section("Approval mode", None, modes))
             .child(settings_ui::section(
-                "Always-allowed actions",
-                Some("Actions you chose “Always allow” for in this project.".into()),
+                "Permission rules",
+                Some("Deny takes priority over ask, then allow. Managed rules cannot be edited.".into()),
                 self.approval_rules_section(cx),
             ))
             .child(settings_ui::section(
@@ -783,6 +774,62 @@ impl Xylo {
     }
     fn approval_rules_section(&self, cx: &mut Context<Self>) -> Div {
         let mut section = div().w_full().flex().flex_col().gap(px(10.));
+        let mut destination = div().flex().gap_2();
+        for (project, label) in [(false, "Local settings"), (true, "Shared project settings")] {
+            destination = destination.child(
+                settings_ui::secondary_button(
+                    if project {
+                        "permission-destination-project"
+                    } else {
+                        "permission-destination-local"
+                    },
+                    label,
+                )
+                .disabled(self.settings.permission_rules_project == project)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.settings.permission_rules_project = project;
+                    let settings = view.settings.clone();
+                    view.host_call(cx, |host| host.save_settings(settings));
+                    cx.notify();
+                })),
+            );
+        }
+        section = section.child(destination).child(subtitle(
+            "New rules and Always allow use this destination. Local settings are git-ignored.",
+        ));
+        section = section.child(Input::new(&self.permission_pattern));
+        let mut actions = div().flex().gap_2();
+        for decision in [
+            PermissionDecision::Allow,
+            PermissionDecision::Ask,
+            PermissionDecision::Deny,
+        ] {
+            actions = actions.child(
+                settings_ui::secondary_button(
+                    SharedString::from(format!("permission-add-{}", decision.key())),
+                    format!("Add {} rule", decision.key()),
+                )
+                .disabled(self.workspace.is_none() || self.permissions.loading)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    let Some(workspace) = view.workspace.clone() else {
+                        return;
+                    };
+                    let pattern = view.permission_pattern.read(cx).value().trim().to_owned();
+                    let project = view.settings.permission_rules_project;
+                    view.host_call(cx, |host| {
+                        host.save_permission_rule(workspace, pattern, decision, project)
+                    });
+                    view.permissions.loading = true;
+                    cx.notify();
+                })),
+            );
+        }
+        section = section.child(actions).child(
+            settings_ui::secondary_button("refresh-permission-files", "Reload rules")
+                .disabled(self.permissions.loading)
+                .on_click(cx.listener(|view, _, _, cx| view.refresh_approval_rules(cx))),
+        );
+
         if let Some(error) = &self.permissions.error {
             section = section.child(settings_ui::inline_error(error));
         }
@@ -816,33 +863,36 @@ impl Xylo {
             }
             return section.child(settings_ui::empty_state(
                 AppIcon::Permissions,
-                "Nothing is always allowed",
-                "Choose “Always allow” on an approval to skip asking for that action in this project.",
+                "No permission rules",
+                "Add a rule above, edit a settings file, or choose Always allow on an approval.",
                 None,
             ));
         }
-        let rules = self
-            .permissions
-            .rules
-            .iter()
-            .enumerate()
-            .map(|(index, rule)| {
-                let key = rule.key.clone();
-                settings_ui::list_item(
-                    ("approval-rule", index),
-                    None,
-                    rule.label.clone(),
-                    Some(allowed_since(rule.created_at).into()),
-                )
-                .trailing(
-                    settings_ui::text_button(("revoke-approval-rule", index), "Revoke")
-                        .disabled(self.permissions.loading)
+        let rules =
+            self.permissions
+                .rules
+                .iter()
+                .enumerate()
+                .map(|(index, rule)| {
+                    let key = rule.clone();
+                    settings_ui::list_item(
+                        ("approval-rule", index),
+                        None,
+                        format!("{}: {}", rule.decision.key(), rule.pattern),
+                        Some(rule.source.display().to_string().into()),
+                    )
+                    .trailing(
+                        settings_ui::text_button(
+                            ("revoke-approval-rule", index),
+                            if rule.managed { "Managed" } else { "Remove" },
+                        )
+                        .disabled(self.permissions.loading || rule.managed)
                         .on_click(cx.listener(move |view, _, _, cx| {
                             view.revoke_approval_rule(key.clone(), cx)
                         })),
-                )
-                .into_any_element()
-            });
+                    )
+                    .into_any_element()
+                });
         section.child(settings_ui::list_container(rules))
     }
 
