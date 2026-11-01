@@ -523,13 +523,18 @@ mod xylo {
                     window.render_frame(cx);
                     let queue = window.find("composer-pending").bounds();
                     let composer = window.find("image-drop-target").bounds();
+                    let status = window.find("composer-status-line").bounds();
                     assert!(
                         queue.bottom() <= composer.top(),
                         "Pending messages belong above the composer"
                     );
                     assert!(
-                        composer.bottom() <= px(height) && composer.bottom() >= px(height - 35.),
-                        "Conversation composer stays bottom anchored"
+                        composer.bottom() <= status.top(),
+                        "The status row belongs below the composer"
+                    );
+                    assert!(
+                        status.bottom() <= px(height) && status.bottom() >= px(height - 35.),
+                        "Conversation composer and status stay bottom anchored"
                     );
                     assert!(window.find(("remove-queued", 0usize)).visible());
                     assert!(

@@ -264,9 +264,20 @@ fn sandbox_does_not_inherit_provider_environment() {
             "LC_ALL",
             "TMPDIR",
             "SYSTEMROOT",
+            "XYLO_SANDBOX_CLEANUP_STATUS",
         ]
         .contains(&k.as_str())
     }));
+    assert_eq!(
+        prepared
+            .command
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| { (key == "XYLO_SANDBOX_CLEANUP_STATUS").then_some(value) }),
+        Some(Some(
+            prepared.status_file.with_extension("cleanup").as_os_str()
+        ))
+    );
 }
 
 #[test]

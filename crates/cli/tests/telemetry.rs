@@ -18,6 +18,7 @@ fn opt_in_otlp_exports_spans_tokens_cost_and_tool_latency_without_content() {
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();

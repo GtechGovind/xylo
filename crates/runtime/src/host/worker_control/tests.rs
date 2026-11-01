@@ -1,6 +1,16 @@
 use super::*;
 use crate::host::tests::{next_event, state, stop};
 
+async fn mark_scheduled(host: &HostState, session: Uuid) {
+    let task = host
+        .default_scheduler()
+        .unwrap()
+        .create("fixture".into(), "0 * * * * * *".into())
+        .await
+        .unwrap();
+    host.scheduled.lock().await.insert(session, task.id);
+}
+
 #[tokio::test]
 async fn handshake_waits_for_the_reply_to_hello_and_skips_unsolicited_ready() {
     let hello = Uuid::new_v4();
@@ -181,7 +191,7 @@ async fn scheduled_admission_never_runs_with_full_access() {
         let (turn, draft) = crate::host::tests::draft::input(&host);
         let session = turn.session_id;
         if scheduled {
-            host.scheduled.lock().await.insert(session, Uuid::new_v4());
+            mark_scheduled(&host, session).await;
         }
         let (mut incoming, _exit) = crate::host::tests::draft::mock_worker(&host, session, 4).await;
         host.worker_command_with_draft_and_receipt(
@@ -210,10 +220,7 @@ async fn full_access_forwarded_to_a_scheduled_worker_becomes_approve_for_me() {
     let (_directory, host, _events) = state();
     let interactive = Uuid::new_v4();
     let scheduled = Uuid::new_v4();
-    host.scheduled
-        .lock()
-        .await
-        .insert(scheduled, Uuid::new_v4());
+    mark_scheduled(&host, scheduled).await;
     let (mut interactive_commands, _a) =
         crate::host::tests::draft::mock_worker(&host, interactive, 4).await;
     let (mut scheduled_commands, _b) =
@@ -658,7 +665,7 @@ done
         host.settings.lock().await.permissions = PermissionMode::FullAccess;
         let (turn, draft) = crate::host::tests::draft::input(&host);
         let session = turn.session_id;
-        host.scheduled.lock().await.insert(session, Uuid::new_v4());
+        mark_scheduled(&host, session).await;
         let worker = host.start_worker(session, fixture("ignore")).await.unwrap();
         host.workers.lock().await.insert(session, worker);
         host.worker_command_with_draft_and_receipt(
@@ -682,7 +689,7 @@ done
         let (_directory, host, events) = state();
         let (turn, draft) = crate::host::tests::draft::input(&host);
         let session = turn.session_id;
-        host.scheduled.lock().await.insert(session, Uuid::new_v4());
+        mark_scheduled(&host, session).await;
         let worker = host
             .start_worker(session, fixture("delayed"))
             .await

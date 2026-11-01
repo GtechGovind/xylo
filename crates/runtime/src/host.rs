@@ -2996,7 +2996,11 @@ impl HostState {
             credential,
         };
         permit.send(Envelope::new(request_id, Some(session), 0, command));
-        self.events.send(worker.permission_event(session)).await?;
+        // Admission and dispatch already succeeded. A lost UI subscriber
+        // cannot turn this into a failed admission and invite a duplicate run.
+        if let Err(error) = self.events.send(worker.permission_event(session)).await {
+            tracing::debug!(%error, "Publish admitted permission mode");
+        }
         let cancelled = {
             let mut starting = self.queued.lock();
             starting.remove(&session);
