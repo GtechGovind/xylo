@@ -210,19 +210,10 @@ pub fn configured_alias(
     ensure!(hooks.len() <= 128, "Too many hooks for one event");
     Ok(hooks)
 }
-struct OwnedProcess {
-    child: tokio::process::Child,
-    pid: Option<u32>,
-}
-impl Drop for OwnedProcess {
+struct OutputTask(tokio::task::AbortHandle);
+impl Drop for OutputTask {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.pid {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-        }
-        let _ = self.child.start_kill();
+        self.0.abort();
     }
 }
 /// Runs offline inside the project sandbox with bounded JSON input and output.
@@ -251,45 +242,53 @@ pub async fn run(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .kill_on_drop(false);
     #[cfg(unix)]
     prepared.command.process_group(0);
-    let child = prepared.command.spawn().context("Start sandboxed hook")?;
-    let mut process = OwnedProcess {
-        pid: child.id(),
-        child,
-    };
-    let _owner = process
-        .child
-        .stdin
-        .take()
-        .context("Hook owner pipe missing")?;
-    let stdout = process.child.stdout.take().context("Hook stdout missing")?;
-    let work = async {
+    let mut child = prepared.command.spawn().context("Start sandboxed hook")?;
+    let owner = child.stdin.take().context("Hook owner pipe missing")?;
+    let stdout = child.stdout.take().context("Hook stdout missing")?;
+    let output = tokio::spawn(async move {
         let mut output = Vec::new();
         stdout
             .take(1024 * 1024 + 1)
             .read_to_end(&mut output)
             .await?;
         ensure!(output.len() <= 1024 * 1024, "Hook output exceeds 1 MiB");
-        let status = process.child.wait().await?;
-        if let Some(failure) = crate::sandbox::read_start_status(&prepared.status_file) {
-            bail!("{failure}");
-        }
-        if status.code() == Some(2) {
-            return Ok(json!({"decision":"deny"}));
-        }
-        ensure!(
-            status.success(),
-            "Hook command failed (exit {:?})",
-            status.code()
-        );
-        if output.is_empty() {
-            return Ok(json!({}));
-        }
-        let value: Value = serde_json::from_slice(&output).context("Hook output must be JSON")?;
-        HookOutput::parse(&value)?;
-        Ok(value)
+        Ok::<_, anyhow::Error>(output)
+    });
+    let _output_guard = OutputTask(output.abort_handle());
+    // Only the anchored watchdog may signal this group. Helper stdin remains
+    // the owner pipe; the command receives its JSON through a separate file.
+    let status = tokio::select! {
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("Hook execution cancelled; effects may be incomplete")),
+        result = tokio::time::timeout(command.timeout, child.wait()) =>
+            result.context("Hook execution timed out; effects may be incomplete")
+                .and_then(|result| result.context("Wait for sandboxed hook")),
     };
-    tokio::select! {_=cancel.cancelled()=>bail!("Hook execution cancelled; effects may be incomplete"),result=tokio::time::timeout(command.timeout,work)=>result.context("Hook execution timed out; effects may be incomplete")?}
+    drop(owner);
+    let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    let cleanup_path = prepared.status_file.with_extension("cleanup");
+    crate::sandbox::wait_for_guard_cleanup(&cleanup_path).await?;
+    reaped.context("Sandboxed hook did not retire")??;
+    let captured = tokio::time::timeout(Duration::from_secs(2), output).await;
+    let status = status?;
+    let output = captured.context("Hook output pipes did not close")???;
+    if let Some(failure) = crate::sandbox::read_start_status(&prepared.status_file) {
+        bail!("{failure}");
+    }
+    let code = crate::sandbox::read_guard_exit_code(&cleanup_path).or_else(|| status.code());
+    if code == Some(2) {
+        return Ok(json!({"decision":"deny"}));
+    }
+    ensure!(code == Some(0), "Hook command failed (exit {code:?})");
+    if output.is_empty() {
+        return Ok(json!({}));
+    }
+    let value: Value = serde_json::from_slice(&output).context("Hook output must be JSON")?;
+    HookOutput::parse(&value)?;
+    Ok(value)
 }
+
+#[cfg(all(test, unix))]
+mod tests;

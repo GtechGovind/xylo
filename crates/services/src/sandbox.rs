@@ -948,3 +948,29 @@ pub fn read_guard_exit_code(path: &std::path::Path) -> Option<i32> {
         })
         .flatten()
 }
+
+/// Waits for the trusted watchdog's fork fence, not merely the helper's exit.
+pub async fn wait_for_guard_cleanup(path: &Path) -> Result<()> {
+    // No handshake means the helper never gained authority to dispatch.
+    if !path.exists() {
+        return Ok(());
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let state = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            match state.as_ref().and_then(|value| value["state"].as_str()) {
+                Some("done") => return Ok(()),
+                Some("failed") => {
+                    anyhow::bail!(
+                        "Owned process group cleanup failed; side effects may have occurred"
+                    )
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .context("Owned process group cleanup did not finish")?
+}

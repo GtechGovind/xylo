@@ -16,6 +16,7 @@ use tokio::{
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
+use xylo_services::sandbox::wait_for_guard_cleanup;
 
 const OUTPUT_LIMIT: usize = 512 * 1024;
 
@@ -156,38 +157,15 @@ pub async fn run_prepared_sandboxed(
     timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<SandboxedResult> {
-    run_sandboxed_stdin(prepared, cwd, timeout, cancel, Stdio::null()).await
-}
-
-/// Supplies bounded JSON or text through an inherited private stdin file.
-pub async fn run_prepared_sandboxed_input(
-    prepared: xylo_services::sandbox::PreparedSandbox,
-    cwd: &Path,
-    timeout: Duration,
-    cancel: CancellationToken,
-    input: &[u8],
-) -> Result<SandboxedResult> {
-    use std::io::{Seek, Write};
-    anyhow::ensure!(input.len() <= 32 * 1024, "Process input exceeds 32 KiB");
-    let mut file = tempfile::tempfile()?;
-    file.write_all(input)?;
-    file.rewind()?;
-    run_sandboxed_stdin(prepared, cwd, timeout, cancel, Stdio::from(file)).await
-}
-
-async fn run_sandboxed_stdin(
-    prepared: xylo_services::sandbox::PreparedSandbox,
-    cwd: &Path,
-    timeout: Duration,
-    cancel: CancellationToken,
-    stdin: Stdio,
-) -> Result<SandboxedResult> {
     let xylo_services::sandbox::PreparedSandbox {
         command,
         temporary,
         status_file,
     } = prepared;
-    let result = run_prepared_io(command, cwd, Some(timeout), cancel, None, false, stdin).await;
+    let guarded = command.as_std().get_envs().any(|(name, value)| {
+        name == "XYLO_SANDBOX_PARENT_GUARD" && value.is_some_and(|value| value == "1")
+    });
+    let result = run_prepared_observed(command, cwd, Some(timeout), cancel, None, guarded).await;
     if let Some(failure) = xylo_services::sandbox::read_start_status(&status_file) {
         return Err(NotStarted(failure.to_string()).into());
     }
@@ -197,6 +175,19 @@ async fn run_sandboxed_stdin(
         result: result?,
         network_denials,
     })
+}
+
+/// Supplies bounded input to the child while retaining the helper's owner pipe.
+pub async fn run_prepared_sandboxed_input(
+    mut prepared: xylo_services::sandbox::PreparedSandbox,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: CancellationToken,
+    input: &[u8],
+) -> Result<SandboxedResult> {
+    anyhow::ensure!(input.len() <= 32 * 1024, "Process input exceeds 32 KiB");
+    xylo_services::sandbox::set_child_input(&mut prepared, input)?;
+    run_prepared_sandboxed(prepared, cwd, timeout, cancel).await
 }
 
 /// Runs a prepared command without a sandbox, draining output and owning its
@@ -214,29 +205,12 @@ pub async fn run_prepared(
 /// keeps a private stdin pipe open; its detached watchdog fences and kills
 /// the process group if the owner exits, including abrupt worker termination.
 pub async fn run_prepared_observed(
-    command: Command,
-    cwd: &Path,
-    timeout: Option<Duration>,
-    cancel: CancellationToken,
-    observer: Option<OutputObserver>,
-    guard_parent: bool,
-) -> Result<ProcessResult> {
-    let stdin = if guard_parent {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    };
-    run_prepared_io(command, cwd, timeout, cancel, observer, guard_parent, stdin).await
-}
-
-async fn run_prepared_io(
     mut command: Command,
     cwd: &Path,
     timeout: Option<Duration>,
     cancel: CancellationToken,
     observer: Option<OutputObserver>,
     guard_parent: bool,
-    stdin: Stdio,
 ) -> Result<ProcessResult> {
     if guard_parent {
         command.env("XYLO_SANDBOX_PARENT_GUARD", "1");
@@ -249,7 +223,11 @@ async fn run_prepared_io(
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
         .current_dir(cwd)
-        .stdin(stdin)
+        .stdin(if guard_parent {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(!guard_parent);
@@ -317,30 +295,6 @@ async fn run_prepared_io(
         stderr: String::from_utf8_lossy(&err).into_owned(),
         truncated: out_truncated || err_truncated,
     })
-}
-
-/// Waits for the trusted watchdog's fork fence, not merely the helper's exit.
-async fn wait_for_guard_cleanup(path: &Path) -> Result<()> {
-    // No handshake means the helper never gained authority to dispatch.
-    if !path.exists() {
-        return Ok(());
-    }
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let state = std::fs::read(path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-            match state.as_ref().and_then(|value| value["state"].as_str()) {
-                Some("done") => return Ok(()),
-                Some("failed") => {
-                    bail!("Owned process group cleanup failed; side effects may have occurred")
-                }
-                _ => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
-        }
-    })
-    .await
-    .context("Owned process group cleanup did not finish")?
 }
 
 /// Require a successful exit while retaining the actual native error message.
