@@ -314,6 +314,9 @@ impl Xylo {
     ) {
         self.log(match &event {
             EngineEvent::Delta { .. } | EngineEvent::ThinkingDelta { .. } => String::new(),
+            EngineEvent::CustomToolRequested {
+                name, action_id, ..
+            } => format!("Custom tool requested: {name} ({action_id})"),
             EngineEvent::ToolStarted { name, .. } => format!("Tool started: {name}"),
             EngineEvent::ToolFinished { name, success, .. } => {
                 format!("Tool finished: {name}, success={success}")

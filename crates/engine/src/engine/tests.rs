@@ -1527,4 +1527,5 @@ async fn a_4k_window_sends_identical_prompt_and_tool_bytes_across_turns() {
     assert_eq!(first["max_tokens"], second["max_tokens"]);
 }
 
+mod headless;
 mod provider_fallback;

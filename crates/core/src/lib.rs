@@ -769,6 +769,12 @@ pub enum EngineEvent {
     ThinkingDelta {
         text: String,
     },
+    /// A registered SDK tool is authorized and ready for client execution.
+    CustomToolRequested {
+        action_id: Uuid,
+        name: String,
+        arguments: Value,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -995,3 +1001,6 @@ pub struct TeamTask {
 
 #[cfg(test)]
 mod tests;
+
+/// Public headless CLI and SDK protocol.
+pub mod stdio;

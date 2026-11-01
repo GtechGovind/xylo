@@ -18,6 +18,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 futures-util = "0.3"
 directories = "6"

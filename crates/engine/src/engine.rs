@@ -68,6 +68,7 @@ pub type ProviderLayer =
 
 /// Xylo's native agent engine.
 pub struct AgentEngine {
+    options: crate::RunOptions,
     store: Store,
     paths: AppPaths,
     session: ToolSession,
@@ -87,6 +88,7 @@ impl AgentEngine {
     /// permission mode and the unlocked secret vault.
     pub fn new(store: Store, paths: AppPaths, session: ToolSession) -> Self {
         Self {
+            options: Default::default(),
             steering: SteeringControl::new(store.clone()),
             provider_credential: None,
             credential_resolver: None,
@@ -96,6 +98,12 @@ impl AgentEngine {
             paths,
             session,
         }
+    }
+
+    /// Applies headless constraints to every root and delegated broker.
+    pub fn with_run_options(mut self, options: crate::RunOptions) -> Self {
+        self.options = options;
+        self
     }
 
     /// Wakes the running turn to apply newly queued guidance at its next
@@ -195,14 +203,16 @@ impl AgentEngine {
         events: mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
     ) -> Result<ToolBroker> {
-        ToolBroker::new(
+        let mut broker = ToolBroker::new(
             request.clone(),
             self.store.clone(),
             self.capability_config(request)?,
             self.session.clone(),
             events,
             cancel,
-        )
+        )?;
+        broker.configure_run(&self.options)?;
+        Ok(broker)
     }
 
     /// The conversation to continue: the checkpoint with every pending tool
@@ -522,7 +532,12 @@ impl AgentEngine {
         }
         let mode = self.session.permissions().get();
         let (prompting, prompted) = (broker.clone(), request.clone());
-        let system = blocking(move || Ok(Self::system_prompt(&prompted, &prompting, mode))).await?;
+        let mut system =
+            blocking(move || Ok(Self::system_prompt(&prompted, &prompting, mode))).await?;
+        if !self.options.append_system_prompt.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&self.options.append_system_prompt);
+        }
         // Model calls admit their own memory when the model runs locally;
         // a child holds no lease of its own while it waits on tools.
         let resources = xylo_resources::ResourceManager::new();
@@ -555,7 +570,11 @@ impl AgentEngine {
             tools: Arc::new(BrokerTools::root(broker.clone())),
             system,
             max_tokens: request.provider.output_tokens,
-            max_model_calls: MAX_MODEL_CALLS,
+            max_model_calls: self
+                .options
+                .max_turns
+                .unwrap_or(MAX_MODEL_CALLS)
+                .min(MAX_MODEL_CALLS),
             events: events.clone(),
             permissions: Some((self.session.permissions().clone(), mode)),
             journal: Some(Journal::new(

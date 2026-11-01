@@ -1,0 +1,66 @@
+name: Release packages
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            formats: app,dmg
+          - os: ubuntu-24.04
+            formats: deb,appimage
+          - os: windows-2022
+            formats: nsis
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config clang libclang-dev libasound2-dev libudev-dev libgtk-3-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxrandr-dev libxi-dev libxtst-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev libssl-dev libsecret-1-dev libpipewire-0.3-dev libgbm-dev libfontconfig1-dev libfreetype6-dev libfuse2 file patchelf desktop-file-utils
+      - name: Pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Build application binaries
+        run: cargo build --release --workspace --bins --locked
+      - name: Install pinned packager
+        run: cargo install cargo-packager --version 0.11.8 --locked
+      - name: Package, sign and notarize when configured
+        shell: bash
+        env:
+          PACKAGE_FORMATS: ${{ matrix.formats }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: python3 .github/scripts/package_release.py
+      - name: Upload reviewable release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Xylo-${{ runner.os }}-${{ runner.arch }}
+          path: dist/**
+          if-no-files-found: error
+          retention-days: 14

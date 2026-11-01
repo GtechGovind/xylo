@@ -349,6 +349,7 @@ impl TurnState {
             self.flush_text();
         }
         match event {
+            EngineEvent::CustomToolRequested { .. } => return,
             EngineEvent::Ready { .. }
             | EngineEvent::TitleUpdated { .. }
             | EngineEvent::Steering { .. }

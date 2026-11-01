@@ -18,6 +18,7 @@
 mod builtin;
 pub(crate) mod catalog;
 mod code;
+mod headless;
 mod image_generation;
 pub(crate) mod lookup;
 mod permissions;
@@ -165,6 +166,10 @@ pub struct ToolBroker {
     /// connectors); the live mode filters them again at every read.
     advertised: Vec<ToolDefinition>,
     allowed_tools: Option<std::collections::HashSet<String>>,
+    custom_tools: Vec<ToolDefinition>,
+    custom_handler: Option<crate::CustomToolHandler>,
+    on_refusal: Option<crate::RefusalObserver>,
+    policy_excluded: std::collections::HashSet<String>,
     session: ToolSession,
     /// "Always allow" rule keys in force for this turn, shared with children.
     rules: RuleSet,
@@ -249,6 +254,10 @@ impl ToolBroker {
             definitions,
             advertised,
             allowed_tools: None,
+            custom_tools: Vec::new(),
+            custom_handler: None,
+            on_refusal: None,
+            policy_excluded: Default::default(),
             session,
             parent_id: None,
             events,
@@ -279,6 +288,12 @@ impl ToolBroker {
         child.parent_id = Some(parent_action_id);
         child.served_context = self.served_context.clone();
         child.lookup = self.lookup.child();
+        child.allowed_tools = self.allowed_tools.clone();
+        child.definitions = self.definitions.clone();
+        child.custom_tools = self.custom_tools.clone();
+        child.custom_handler = self.custom_handler.clone();
+        child.on_refusal = self.on_refusal.clone();
+        child.policy_excluded = self.policy_excluded.clone();
         Ok(child)
     }
     pub(crate) fn restrict_tools(&mut self, requested: &[String]) -> Result<()> {
@@ -304,10 +319,19 @@ impl ToolBroker {
             };
             allowed.extend(names.iter().map(|name| name.to_string()));
         }
+        self.policy_excluded.extend(
+            self.definitions
+                .iter()
+                .filter(|definition| !allowed.contains(&definition.name))
+                .map(|definition| definition.name.clone()),
+        );
         self.definitions
             .retain(|definition| allowed.contains(&definition.name));
         self.advertised
             .retain(|definition| allowed.contains(&definition.name));
+        if let Some(previous) = &self.allowed_tools {
+            allowed.retain(|name| previous.contains(name));
+        }
         self.allowed_tools = Some(allowed);
         Ok(())
     }
@@ -447,7 +471,9 @@ impl ToolBroker {
                 if small {
                     SMALL_WINDOW_CORE_TOOLS.contains(&name)
                 } else {
-                    CORE_TOOLS.contains(&name) || configured(name)
+                    CORE_TOOLS.contains(&name)
+                        || configured(name)
+                        || self.custom_tools.iter().any(|tool| tool.name == name)
                 }
             })
             .cloned()
@@ -559,12 +585,19 @@ impl ToolBroker {
                 origin,
             );
         }
-        ensure!(
-            self.allowed_tools
-                .as_ref()
-                .is_none_or(|allowed| allowed.contains(name)),
-            "This child is not authorized to call tool '{name}'"
-        );
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(name))
+        {
+            let reason = format!(
+                "Tool '{name}' is not authorized: excluded by the allowed/disallowed tool policy"
+            );
+            if let Some(refused) = &self.on_refusal {
+                refused(&reason);
+            }
+            bail!(reason);
+        }
         let key = Self::journal_key(namespace, call_id);
         if let Some(action) =
             self.store
@@ -594,7 +627,11 @@ impl ToolBroker {
             !(name.starts_with("plugin_") && arguments.get("capabilities").is_some()),
             "Plugins run only with the grants reviewed in Settings; remove `capabilities`"
         );
-        let reach = self.reach(name, &arguments);
+        let reach = if self.custom_tools.iter().any(|tool| tool.name == name) {
+            Reach::Outside(std::path::PathBuf::from("SDK client"))
+        } else {
+            self.reach(name, &arguments)
+        };
         let network = if matches!(name, "run_command" | "shell_command") {
             builtin::network_request(&arguments)?
         } else {
@@ -619,7 +656,12 @@ impl ToolBroker {
         let verdict = permissions::decide(mode, &call);
         let rule = permissions::approval_rule_for(&call);
         let ask = match verdict {
-            Verdict::Refuse(message) => bail!(message),
+            Verdict::Refuse(message) => {
+                if let Some(refused) = &self.on_refusal {
+                    refused(&message);
+                }
+                bail!(message)
+            }
             Verdict::Allow => None,
             Verdict::Ask(reason) => {
                 let remembered = rule
@@ -774,7 +816,9 @@ impl ToolBroker {
                         ))
                     })?;
             }
-            let result = if name == "search_tools" {
+            let result = if self.custom_tools.iter().any(|tool| tool.name == name) {
+                headless::execute(self, id, name, &arguments)?
+            } else if name == "search_tools" {
                 self.search_tools(namespace, &arguments)
             } else if name == "agent_delegate" {
                 // End the registration guard before the blocking callback;

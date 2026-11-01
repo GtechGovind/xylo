@@ -12361,6 +12361,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "xylo-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "xylo-core",
+ "xylo-engine",
+ "xylo-evals",
+ "xylo-runtime",
+ "xylo-sdk",
+ "xylo-services",
+]
+
+[[package]]
 name = "xylo-core"
 version = "0.1.0"
 dependencies = [
@@ -12555,6 +12575,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "portable-pty",
+ "reqwest 0.13.5",
  "rusqlite",
  "serde",
  "serde_json",
@@ -12563,6 +12584,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "windows-sys 0.61.2",
@@ -12583,6 +12605,19 @@ dependencies = [
  "chrono",
  "cron",
  "fs2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "xylo-core",
+]
+
+[[package]]
+name = "xylo-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "serde",
  "serde_json",
  "tempfile",

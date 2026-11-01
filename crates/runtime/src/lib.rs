@@ -3,10 +3,13 @@
 pub mod drafts;
 pub mod extensions;
 pub use xylo_services::action_review::*;
+pub mod conversation_export;
+pub mod headless;
 pub mod history;
 pub mod host;
 pub mod learning;
 pub mod lsp;
+pub mod observability;
 pub mod process;
 pub mod steering;
 pub mod terminal;

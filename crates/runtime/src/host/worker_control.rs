@@ -370,6 +370,17 @@ impl HostState {
             tokio::task::spawn_blocking(move || vault.export_key()).await??
         };
         let mut child = command
+            .env(
+                "RUST_LOG",
+                std::env::var("RUST_LOG").unwrap_or_else(|_| {
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        "debug"
+                    } else {
+                        "info"
+                    }
+                    .into()
+                }),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -779,6 +790,9 @@ impl WorkerReader {
             {
                 tracing::warn!(%error, "Settle ended task guidance");
             }
+        }
+        if let Some(turn) = current_turn {
+            crate::observability::observe(self.session, turn, &envelope.payload);
         }
         let successful = matches!(envelope.payload, EngineEvent::Completed { .. });
         envelope.sequence = self.sequences.next(self.session);

@@ -2007,3 +2007,5 @@ async fn tool_results_are_shortened_to_the_window_budget() {
     assert!(shortened["full_result"].is_string());
     assert_eq!(large.model_result(Uuid::new_v4(), result.clone()), result);
 }
+
+mod headless;
