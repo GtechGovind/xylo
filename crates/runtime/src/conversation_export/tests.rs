@@ -24,6 +24,7 @@ fn exports_all_pages_in_order_to_adjacent_files() {
                 content: format!("message {index}\nwith newline"),
                 created_at: index,
                 attachments: Vec::new(),
+                reasoning: None,
                 status: Default::default(),
             })
             .unwrap();
