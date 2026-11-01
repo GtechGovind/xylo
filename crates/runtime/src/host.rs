@@ -504,6 +504,7 @@ impl HostClient {
                     search_requests: Mutex::new(HashMap::new()),
                     image_import_gate: Mutex::new(()),
                     secrets: parking_lot::RwLock::new(secrets),
+                    inspection_worktrees: parking_lot::Mutex::new(HashMap::new()),
                     store,
                     settings: Mutex::new(settings.clone()),
                     latest_project_open: AtomicU64::new(0),
@@ -1149,6 +1150,9 @@ struct HostState {
     accounts: xylo_services::providers::ChatGptSignInService,
     /// The vault and connector broker, or why the vault could not be opened.
     secrets: parking_lot::RwLock<std::result::Result<Secrets, String>>,
+    /// Keep ownership even after disconnect, pool shutdown, or vault replacement:
+    /// those operations do not acknowledge local process-tree exit.
+    inspection_worktrees: parking_lot::Mutex<HashMap<PathBuf, std::fs::File>>,
     settings: Mutex<AppSettings>,
     /// Receipt number of the newest project open applied to `settings`; a
     /// settings snapshot received before it must not undo that open.
@@ -2054,6 +2058,14 @@ impl HostState {
                         let workspace = workspace
                             .clone()
                             .context("Choose a project before inspecting a local MCP connection")?;
+                        if let Some((root, lease)) =
+                            crate::workspace::worktree::retain_inspection_workspace(&workspace)?
+                        {
+                            self.inspection_worktrees
+                                .lock()
+                                .entry(root)
+                                .or_insert(lease);
+                        }
                         connectors.as_ref().clone().with_local_scope(
                             xylo_services::ConnectorLaunchScope {
                                 workspace,

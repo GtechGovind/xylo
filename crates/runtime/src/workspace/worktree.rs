@@ -155,6 +155,92 @@ fn lock(repo: &Path) -> Result<std::fs::File> {
     fs2::FileExt::try_lock_exclusive(&file).context("Another worktree operation is running")?;
     Ok(file)
 }
+
+/// Host inspection cannot yet prove that a local server's descendants exited.
+/// Its shared lease and durable marker are independent of the connector pool.
+/// The marker survives host exit because host death is not process-exit proof.
+#[derive(Debug)]
+pub struct InspectionInUse;
+impl std::fmt::Display for InspectionInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "This checkout is retained after a local MCP inspection; stop its processes before removing it with Git.",
+        )
+    }
+}
+impl std::error::Error for InspectionInUse {}
+
+fn inspection_lock(tree: &Worktree) -> Result<std::fs::File> {
+    let name = tree.path.file_name().context("Invalid worktree path")?;
+    let locks = tree.repository.join(".git/xylo-worktree-inspections");
+    directory(&locks)?;
+    let path = locks.join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(&path)?;
+    ensure!(
+        file.metadata()?.is_file() && !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+        "Invalid worktree inspection lock"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.nlink() == 1
+                && metadata.mode() & 0o077 == 0
+                // SAFETY: geteuid only reads the calling process's identity.
+                && metadata.uid() == unsafe { libc::geteuid() },
+            "Worktree inspection lock must be private and owned by the current user"
+        );
+    }
+    Ok(file)
+}
+
+/// Retains a managed checkout, including when inspection starts in a subfolder
+/// or through an alias. The caller must keep the returned file for host lifetime.
+pub fn retain_inspection_workspace(workspace: &Path) -> Result<Option<(PathBuf, std::fs::File)>> {
+    let workspace = workspace.canonicalize()?;
+    for root in workspace.ancestors() {
+        if root.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("worktrees"))
+            && root
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                == Some(std::ffi::OsStr::new(".xylo"))
+        {
+            // A managed-looking path that is disappearing or malformed must
+            // fail closed, never silently launch without ownership.
+            let tree = inspect(root)?;
+            let _operation = lock(&tree.repository)?;
+            // Removal may have completed between discovering the tree and locking.
+            let tree = inspect(root)?;
+            let mut file = inspection_lock(&tree)?;
+            fs2::FileExt::try_lock_shared(&file)?;
+            // No disconnect or host restart proves the local process tree has
+            // exited. Persist before launch; only future positive exit proof
+            // can justify automatically clearing this marker.
+            use std::io::Write;
+            file.write_all(b"1")?;
+            file.sync_all()?;
+            #[cfg(unix)]
+            std::fs::File::open(tree.repository.join(".git/xylo-worktree-inspections"))?
+                .sync_all()?;
+            return Ok(Some((tree.path, file)));
+        }
+    }
+    Ok(None)
+}
 /// Every native operation uses only Git data through a neutral common directory.
 /// Repository/user config, hooks, attributes and credential helpers are never
 /// imported. Protocols and lazy fetching are disabled; no shell is involved.
@@ -468,6 +554,17 @@ async fn status_inner(tree: &Worktree) -> Result<WorktreeStatus> {
 pub async fn remove(path: &Path, force: bool) -> Result<()> {
     let tree = inspect(path)?;
     let _lock = lock(&tree.repository)?;
+    let _inspection = inspection_lock(&tree)?;
+    match fs2::FileExt::try_lock_exclusive(&_inspection) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(InspectionInUse.into());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if _inspection.metadata()?.len() != 0 {
+        return Err(InspectionInUse.into());
+    }
     // Even explicit force must not enter a nested repository natively.
     reject_submodules(&tree).await?;
     ensure!(

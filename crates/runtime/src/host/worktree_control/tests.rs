@@ -1,5 +1,71 @@
 //! Host lifecycle coverage for new chats and archived worktree cleanup.
 use super::*;
+
+#[tokio::test]
+async fn worktree_host_inspection_retains_ownership_after_disconnect_and_pool_shutdown() {
+    let (_profile, host, events) = super::super::tests::state();
+    let repo = repo();
+    let id = Uuid::new_v4();
+    host.create_chat_worktree(id, repo.path().into())
+        .await
+        .unwrap();
+    let path = host.store.conversation(id).unwrap().unwrap().workspace;
+    std::fs::create_dir(path.join("nested")).unwrap();
+    let config = ConnectorConfig {
+        id: Uuid::new_v4(),
+        name: "Inspection fixture".into(),
+        transport: "stdio".into(),
+        endpoint: String::new(),
+        command: Some(PathBuf::from("/usr/bin/true")),
+        args: vec![],
+        credential_ref: None,
+        trusted: false,
+    };
+    host.store.save_connector(&config).unwrap();
+    while events.try_recv().is_ok() {}
+    host.handle(HostCommand::ConnectorTools(
+        Uuid::new_v4(),
+        config.id,
+        Some(path.join("nested")),
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        HostEvent::ConnectorToolsFailed { .. }
+    ));
+    let connectors = host.connectors().unwrap();
+    let _ = connectors.disconnect(config.id).await;
+    connectors.shutdown().await;
+    assert!(
+        !connectors.may_have_local_processes(),
+        "An empty pool is not exit proof"
+    );
+    assert!(
+        host.workers.lock().await.is_empty(),
+        "Ownership belongs to the host"
+    );
+    for force in [false, true] {
+        let error = host.remove_worktree(path.clone(), force).await.unwrap_err();
+        assert!(error.is::<worktree::InspectionInUse>(), "{error:#}");
+        assert!(error.to_string().contains("stop its processes"));
+        assert!(path.exists());
+    }
+    host.store.set_conversation_archived(id, true).unwrap();
+    host.cleanup_archived_worktrees().await.unwrap();
+    assert!(path.exists());
+    drop(host);
+    let (_next_profile, next_host, _events) = super::super::tests::state();
+    let error = next_host
+        .remove_worktree(path.clone(), true)
+        .await
+        .unwrap_err();
+    assert!(error.is::<worktree::InspectionInUse>());
+    assert!(
+        path.exists(),
+        "A restarted host cannot assume the old processes exited"
+    );
+}
 fn repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     for args in [
