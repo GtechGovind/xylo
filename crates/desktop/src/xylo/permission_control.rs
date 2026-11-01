@@ -16,6 +16,7 @@ pub(super) fn permission_glyph(mode: PermissionMode) -> AppIcon {
         PermissionMode::ApproveForMe => AppIcon::PermissionAuto,
         PermissionMode::FullAccess => AppIcon::PermissionFull,
         PermissionMode::ReadOnly => AppIcon::PermissionReadOnly,
+        PermissionMode::Plan => AppIcon::Plan,
     }
 }
 

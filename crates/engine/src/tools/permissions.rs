@@ -75,6 +75,7 @@ impl PermissionCell {
             0 => PermissionMode::AskForApproval,
             1 => PermissionMode::ApproveForMe,
             2 => PermissionMode::FullAccess,
+            4 => PermissionMode::Plan,
             _ => PermissionMode::ReadOnly,
         }
     }
@@ -86,6 +87,7 @@ impl PermissionCell {
             PermissionMode::ApproveForMe => 1,
             PermissionMode::FullAccess => 2,
             PermissionMode::ReadOnly => 3,
+            PermissionMode::Plan => 4,
         };
         self.0.store(value, Ordering::Release);
     }
@@ -97,6 +99,7 @@ impl PermissionCell {
 #[derive(Clone)]
 pub struct ToolSession {
     approvals: ApprovalGate,
+    pub(crate) interactions: super::interaction::InteractionGate,
     permissions: PermissionCell,
     vault: CredentialVault,
     connectors: Arc<OnceLock<ConnectorBroker>>,
@@ -111,6 +114,7 @@ impl ToolSession {
     pub fn new(permissions: PermissionCell, vault: CredentialVault) -> Self {
         Self {
             approvals: ApprovalGate::default(),
+            interactions: Default::default(),
             permissions,
             vault,
             connectors: Arc::default(),
@@ -133,6 +137,11 @@ impl ToolSession {
     /// Where approval decisions are delivered.
     pub fn approvals(&self) -> &ApprovalGate {
         &self.approvals
+    }
+
+    /// Delivers a validated answer to the waiting tool.
+    pub fn answer(&self, id: Uuid, answer: xylo_core::InteractionAnswer) -> Result<()> {
+        self.interactions.answer(id, answer, &self.permissions)
     }
 
     /// The live permission mode.
@@ -277,11 +286,28 @@ pub(crate) const NATIVE_LSP_REASON: &str = "Runs a native language server outsid
 
 /// Decides whether a call runs, asks or is refused under `mode`.
 pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
+    // Interaction authority never grants file, network, or native execution.
+    if matches!(call.name, "ask_user" | "exit_plan_mode") {
+        return Verdict::Allow;
+    }
+    if mode == PermissionMode::Plan
+        && (call.writes || call.network.is_some() || call.origin == Origin::Hook)
+    {
+        return Verdict::Refuse(
+            "Plan mode permits only reading and questions; approve a plan before making changes"
+                .into(),
+        );
+    }
+    let mode = if mode == PermissionMode::Plan {
+        PermissionMode::ReadOnly
+    } else {
+        mode
+    };
     // Reading code and running an unrestricted native server are separate
     // authorities, including for hooks and already-running server sessions.
     if call.name == "lsp" {
         return match mode {
-            PermissionMode::ReadOnly => Verdict::Refuse("Native language-server execution requires write permission; this task is read-only".into()),
+            PermissionMode::ReadOnly | PermissionMode::Plan => Verdict::Refuse("Native language-server execution requires write permission; this task is read-only".into()),
             PermissionMode::FullAccess => Verdict::Allow,
             PermissionMode::AskForApproval | PermissionMode::ApproveForMe => Verdict::Ask(match call.reach {
                 Reach::Outside(path) => format!("{NATIVE_LSP_REASON}; reads files outside the project: {}",path.display()),
@@ -294,7 +320,7 @@ pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
         && let Reach::Outside(path) = call.reach
     {
         return match mode {
-            PermissionMode::ReadOnly => Verdict::Refuse(
+            PermissionMode::ReadOnly | PermissionMode::Plan => Verdict::Refuse(
                 "Outside shell commands require write permission; this task is read-only".into(),
             ),
             PermissionMode::FullAccess => Verdict::Allow,
@@ -319,11 +345,13 @@ pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
     match mode {
         PermissionMode::FullAccess => Verdict::Allow,
         PermissionMode::ApproveForMe => approve_for_me(call),
-        PermissionMode::ReadOnly if call.writes => Verdict::Refuse(format!(
+        PermissionMode::ReadOnly | PermissionMode::Plan if call.writes => Verdict::Refuse(format!(
             "{} requires write permission; this task is read-only",
             call.name
         )),
-        PermissionMode::ReadOnly | PermissionMode::AskForApproval => ask_for_approval(call),
+        PermissionMode::ReadOnly | PermissionMode::Plan | PermissionMode::AskForApproval => {
+            ask_for_approval(call)
+        }
     }
 }
 
@@ -385,7 +413,7 @@ fn outside_reason(call: &Call, path: &Path) -> String {
 fn network(mode: PermissionMode, call: &Call, justification: &str) -> Verdict {
     match mode {
         PermissionMode::FullAccess => Verdict::Allow,
-        PermissionMode::ReadOnly => Verdict::Refuse(format!(
+        PermissionMode::ReadOnly | PermissionMode::Plan => Verdict::Refuse(format!(
             "{} requires write permission; this task is read-only",
             call.name
         )),

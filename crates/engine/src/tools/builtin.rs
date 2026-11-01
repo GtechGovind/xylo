@@ -242,6 +242,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
             false,
         ),
     ];
+    tools.extend(super::interaction::definitions());
     // The OS sandbox is not qualified on Windows, so commands are not offered.
     tools.push(def("notebook_edit", "Edit a notebook cell after file_read. Insert after cell_id, or use an empty cell_id to insert first; replace clears old execution outputs; delete removes the cell", json!({"path":{"type":"string"},"cell_id":{"type":"string"},"new_source":{"type":"string"},"cell_type":{"type":"string","enum":["code","markdown","raw"]},"edit_mode":{"type":"string","enum":["replace","insert","delete"]}}), &["path","cell_id","new_source","edit_mode"], true));
     tools.push(def("lsp", "Query native language intelligence. Starts a native server with account file and network access; requires separate execution approval. Remember this native authority to allow automatic diagnostics after edits. Positions are zero-based UTF-16. Workspace symbols searches the identifier at that position", json!({"operation":{"type":"string","enum":["definition","references","hover","symbols","workspace_symbols","diagnostics"]},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}), &["operation","path"], true));

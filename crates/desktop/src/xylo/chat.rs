@@ -13,6 +13,10 @@ use crate::icons::{self, AppIcon};
 use gpui_kit::base::Disableable;
 use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+#[path = "chat/plan_card.rs"]
+mod plan_card;
+#[path = "chat/question_card.rs"]
+mod question_card;
 #[path = "chat/thinking.rs"]
 mod thinking;
 #[path = "tool_result_view.rs"]
@@ -323,6 +327,8 @@ impl Xylo {
             EngineEvent::ToolFinished { name, success, .. } => {
                 format!("Tool finished: {name}, success={success}")
             }
+            EngineEvent::QuestionRequired { .. } => "Questions need answers".into(),
+            EngineEvent::PlanRequired { .. } => "Plan needs a decision".into(),
             EngineEvent::ApprovalRequired { name, .. } => format!("Approval required: {name}"),
             other => format!("{other:?}"),
         });
@@ -876,6 +882,17 @@ impl Xylo {
         remember: bool,
         cx: &mut Context<Self>,
     ) {
+        let interaction = self
+            .turns
+            .get(&self.session)
+            .and_then(|turn| turn.tools.iter().find(|t| t.id == id))
+            .is_some_and(|card| matches!(card.name.as_str(), "ask_user" | "exit_plan_mode"));
+        if interaction {
+            if !allow {
+                self.answer_interaction(id, xylo_core::InteractionAnswer::Reject, cx);
+            }
+            return;
+        }
         if let Some(card) = self
             .turns
             .get_mut(&self.session)
@@ -1380,6 +1397,7 @@ impl Xylo {
                             .min_h(px(32.))
                             .child(self.composer_context_actions(cx))
                             .child(self.composer_permissions(cx))
+                            .when(self.schedules.iter().any(|task| task.enabled && task.wakeup.as_ref().is_some_and(|wakeup| wakeup.session_id == self.session)), |row| row.child(secondary("stop-conversation-wakeups", "Stop wakeups").on_click(cx.listener(|this, _, _, cx| { let session = this.session; this.host_call(cx, |host| host.stop_wakeups(session)); }))))
                             .child(div().flex_1().min_w_0())
                             .children(self.composer_context(cx))
                             .child(self.unified_model_control(model, cx))

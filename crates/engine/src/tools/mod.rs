@@ -21,6 +21,7 @@ mod code;
 mod file_read;
 mod headless;
 mod image_generation;
+mod interaction;
 pub(crate) mod lookup;
 mod lsp;
 mod notebook;
@@ -68,7 +69,9 @@ pub type Delegate = Arc<dyn Fn(&DelegateCall) -> Result<Value> + Send + Sync>;
 
 /// Tools offered to the model directly in every mode that allows them; the
 /// rest stay discoverable through `search_tools` and `call_tool`.
-const CORE_TOOLS: [&str; 19] = [
+const CORE_TOOLS: [&str; 21] = [
+    "ask_user",
+    "exit_plan_mode",
     "extension_skill",
     "extension_resource",
     "file_read",
@@ -174,6 +177,7 @@ pub struct ToolBroker {
     allowed_tools: Option<std::collections::HashSet<String>>,
     custom_tools: Vec<ToolDefinition>,
     custom_handler: Option<crate::CustomToolHandler>,
+    interactive: bool,
     on_refusal: Option<crate::RefusalObserver>,
     policy_excluded: std::collections::HashSet<String>,
     session: ToolSession,
@@ -266,6 +270,7 @@ impl ToolBroker {
             allowed_tools: None,
             custom_tools: Vec::new(),
             custom_handler: None,
+            interactive: true,
             on_refusal: None,
             policy_excluded: Default::default(),
             session,
@@ -302,6 +307,7 @@ impl ToolBroker {
         child.definitions = self.definitions.clone();
         child.custom_tools = self.custom_tools.clone();
         child.custom_handler = self.custom_handler.clone();
+        child.interactive = self.interactive;
         child.on_refusal = self.on_refusal.clone();
         child.policy_excluded = self.policy_excluded.clone();
         Ok(child)
@@ -365,7 +371,9 @@ impl ToolBroker {
     /// in every mode so the provider's cached prefix survives a mode change,
     /// and [`permissions::decide`] refuses what the mode does not allow.
     fn usable(&self, definition: &ToolDefinition) -> bool {
-        self.mode().allows_writes() || !definition.writes
+        matches!(definition.name.as_str(), "ask_user" | "exit_plan_mode")
+            || self.mode().allows_writes()
+            || !definition.writes
     }
     /// The project facts to recall for this turn's prompt, at most
     /// [`RECALLED_FACTS`]. Only facts the user stated or approved, or that
@@ -764,7 +772,8 @@ impl ToolBroker {
             turn_id: self.request.turn_id,
             name: name.into(),
             arguments: arguments.clone(),
-            writes: definition.writes,
+            // Interactions serialize with writes but have no external effect to reconcile after a crash.
+            writes: definition.writes && !matches!(name, "ask_user" | "exit_plan_mode"),
             idempotency_key: key.clone(),
         };
         match self.store.begin_action(&intent)? {
@@ -838,7 +847,9 @@ impl ToolBroker {
         }
         self.store.mark_action_running(id)?;
         // Hooks wrap the model's calls, never their own executions.
-        let hooked = origin == Origin::Model && name != "extension_component";
+        let hooked = origin == Origin::Model
+            && name != "extension_component"
+            && self.mode() != PermissionMode::Plan;
         // All fallible execution branches stay inside this closure, so no `?`
         // can strand a running action without recording failure/uncertainty.
         let execution = (|| -> Result<Value> {
@@ -891,6 +902,9 @@ impl ToolBroker {
                     "shell_command" | "run_command" | "shell_output" | "shell_kill"
                     | "shell_jobs" => {
                         shell_jobs::execute(self, name, &arguments, access, shell_context)?
+                    }
+                    "ask_user" | "exit_plan_mode" | "schedule_wakeup" => {
+                        interaction::execute(self, id, name, &arguments)?
                     }
                     _ => builtin::execute(self, name, &arguments, access)?,
                 }
@@ -994,7 +1008,8 @@ impl ToolBroker {
                     return Err(ObservedFailure(model).into());
                 }
                 let message = format!("{error:#}");
-                let definitive_rejection = error.downcast_ref::<code::Unapplied>().is_some()
+                let definitive_rejection = matches!(name, "ask_user" | "exit_plan_mode")
+                    || error.downcast_ref::<code::Unapplied>().is_some()
                     || error
                         .downcast_ref::<xylo_runtime::process::NotStarted>()
                         .is_some()

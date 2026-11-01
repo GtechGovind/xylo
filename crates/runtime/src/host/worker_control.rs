@@ -502,7 +502,16 @@ impl HostState {
             .map(|(session, worker)| (*session, worker.clone()))
             .collect();
         for (session, worker) in workers {
-            let mode = effective_mode(setting, scheduled.contains(&session));
+            let mode = match self
+                .wakeup_permission(
+                    session,
+                    effective_mode(setting, scheduled.contains(&session)),
+                )
+                .await
+            {
+                Ok(mode) => mode,
+                Err(_) => PermissionMode::ReadOnly,
+            };
             *worker.mode.lock() = mode;
             let delivered = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -757,8 +766,19 @@ impl WorkerReader {
                     }
                 }
             }
-            EngineEvent::ToolFinished { action_id, .. } => {
+            EngineEvent::ToolFinished {
+                action_id,
+                name,
+                success,
+                ..
+            } => {
                 self.worker.approvals.lock().remove(action_id);
+                if name == "schedule_wakeup"
+                    && *success
+                    && let Ok(tasks) = self.scheduler.list().await
+                {
+                    let _ = self.events.send(HostEvent::Schedules(tasks)).await;
+                }
             }
             _ => {}
         }
@@ -777,6 +797,15 @@ impl WorkerReader {
             EngineEvent::Completed { .. } | EngineEvent::Cancelled | EngineEvent::Error { .. }
         );
         let scheduled = terminal && self.is_scheduled().await;
+        if matches!(
+            envelope.payload,
+            EngineEvent::Error { .. } | EngineEvent::Cancelled
+        ) && let Err(error) =
+            interaction_control::pause_schedule(&self.scheduler, &self.scheduled, self.session)
+                .await
+        {
+            tracing::error!(%error, "Pause failed conversation wakeup");
+        }
         if matches!(envelope.payload, EngineEvent::Completed { .. })
             && let Err(error) =
                 acknowledge_schedule(&self.scheduler, &self.scheduled, self.session).await

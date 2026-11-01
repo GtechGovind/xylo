@@ -1264,6 +1264,28 @@ impl Xylo {
             self.show_composer_hint(reason, cx);
             return;
         }
+        let command = self.composer.read(cx).value().trim().to_owned();
+        if command == "/loop stop" {
+            let session = self.session;
+            self.host_call(cx, |host| host.stop_wakeups(session));
+            return;
+        }
+        if command.starts_with("/loop ") {
+            let Some(workspace) = self.workspace.clone() else {
+                return;
+            };
+            if let Err(error) = xylo_runtime::scheduler::parse_loop(&command) {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+            let session = self.session;
+            self.host_call(cx, |host| host.start_loop(session, workspace, command));
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.draft_changed(cx);
+            return;
+        }
         self.submit_persisted_draft(window, cx);
         self.refresh_composer_placeholder(cx);
     }
@@ -1874,6 +1896,25 @@ impl Render for Xylo {
             .on_action(
                 cx.listener(|view, _: &EscapePressed, window, cx| view.escape_pressed(window, cx)),
             )
+            .on_action(cx.listener(|view, _: &CyclePermissions, window, cx| {
+                if view
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+                {
+                    let index = PermissionMode::ALL
+                        .iter()
+                        .position(|mode| *mode == view.settings.permissions)
+                        .unwrap_or(0);
+                    view.set_permission_mode(
+                        PermissionMode::ALL[(index + 1) % PermissionMode::ALL.len()],
+                        cx,
+                    );
+                } else {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|view, _: &FocusComposer, window, cx| {
                 view.navigate(Page::Chat, cx);
                 view.composer

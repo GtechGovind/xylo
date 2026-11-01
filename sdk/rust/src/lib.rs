@@ -18,7 +18,10 @@ use tokio::{
 use uuid::Uuid;
 use xylo_core::stdio::{Command, Input};
 pub use xylo_core::stdio::{Event, VERSION as PROTOCOL_VERSION};
-pub use xylo_core::{EngineEvent, PermissionMode, ToolDefinition, Usage};
+pub use xylo_core::{
+    EngineEvent, InteractionAnswer, PermissionMode, QuestionAnswer, QuestionOption, ToolDefinition,
+    Usage, UserQuestion,
+};
 
 /// Explicit process and profile configuration. Environment is inherited.
 #[derive(Clone, Default)]
@@ -66,6 +69,10 @@ impl Control {
     /// Explicitly approves or denies a currently pending broker action.
     pub async fn approve(&self, action_id: Uuid, allow: bool) -> Result<()> {
         self.send(Command::Approve { action_id, allow }).await
+    }
+    /// Answers one pending question or plan without changing tool constraints.
+    pub async fn answer(&self, action_id: Uuid, answer: InteractionAnswer) -> Result<()> {
+        self.send(Command::Answer { action_id, answer }).await
     }
     /// Cancels the active turn while keeping its conversation available.
     pub async fn cancel(&self) -> Result<()> {
@@ -223,6 +230,13 @@ impl Session {
         while let Some(event) = stream.next().await? {
             if let EngineEvent::ApprovalRequired { action_id, .. } = &event.payload {
                 control.approve(*action_id, false).await?;
+            }
+            if let EngineEvent::QuestionRequired { action_id, .. }
+            | EngineEvent::PlanRequired { action_id, .. } = &event.payload
+            {
+                control
+                    .answer(*action_id, InteractionAnswer::Reject)
+                    .await?;
             }
             events.push(event);
         }

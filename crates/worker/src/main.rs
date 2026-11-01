@@ -222,7 +222,11 @@ async fn main() -> Result<()> {
                 // later changes arrive as SetPermissions.
                 permissions.set(turn.permissions);
                 let engine = AgentEngine::new(store.clone(), paths.clone(), tools)
-                    .with_served_contexts(served_contexts.clone());
+                    .with_served_contexts(served_contexts.clone())
+                    .with_run_options(xylo_engine::RunOptions {
+                        interactive: true,
+                        ..Default::default()
+                    });
                 let engine = Arc::new(match credential {
                     Some(credential) => engine
                         .with_provider_credential(credential)
@@ -384,6 +388,24 @@ async fn main() -> Result<()> {
                         session_id,
                         EngineEvent::Error {
                             message: format!("Approval for action {action_id} failed: {error:#}"),
+                            retryable: false,
+                            kind: ErrorKind::Internal,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            WorkerCommand::Answer { action_id, answer } => {
+                if let Some(tools) = session.as_ref()
+                    && let Err(error) = tools.answer(action_id, answer)
+                {
+                    send(
+                        &output,
+                        &sequence,
+                        request_id,
+                        session_id,
+                        EngineEvent::Error {
+                            message: format!("Answer could not be applied: {error:#}"),
                             retryable: false,
                             kind: ErrorKind::Internal,
                         },

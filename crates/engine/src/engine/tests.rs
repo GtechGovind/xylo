@@ -1528,4 +1528,5 @@ async fn a_4k_window_sends_identical_prompt_and_tool_bytes_across_turns() {
 }
 
 mod headless;
+mod interaction;
 mod provider_fallback;

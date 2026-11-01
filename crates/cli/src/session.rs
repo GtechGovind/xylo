@@ -47,6 +47,7 @@ pub async fn serve(profile: &Profile, options: &Options, telemetry: &Observabili
         None
     };
     let mut run_options = options.run.clone();
+    run_options.interactive = options.stream_input;
     let replies: Replies = Arc::default();
     run_options.custom_handler = Some(custom_handler(replies.clone()));
     let policy_refused = Arc::new(AtomicBool::new(false));
@@ -161,6 +162,7 @@ pub async fn serve(profile: &Profile, options: &Options, telemetry: &Observabili
         let mut refused = false;
         let mut shutting_down = false;
         let mut waiting_approvals = HashSet::new();
+        let mut waiting_interactions = HashSet::new();
         loop {
             tokio::select! {
                 event = incoming.recv() => {
@@ -175,6 +177,10 @@ pub async fn serve(profile: &Profile, options: &Options, telemetry: &Observabili
                             refused = true;
                             cancel.cancel();
                         }
+                    }
+                    if let EngineEvent::QuestionRequired { action_id, .. } | EngineEvent::PlanRequired { action_id, .. } = &event {
+                        if shutting_down { let _ = tools.answer(*action_id, xylo_core::InteractionAnswer::Reject); cancel.cancel(); }
+                        else if options.stream_input { waiting_interactions.insert(*action_id); }
                     }
                     if let EngineEvent::CustomToolRequested { action_id, name, .. } = &event
                         && run_options.custom_tools.iter().any(|tool| tool.name == *name) {
@@ -191,10 +197,12 @@ pub async fn serve(profile: &Profile, options: &Options, telemetry: &Observabili
                     match command.transpose()? {
                         Some(Command::Approve { action_id, allow }) => { tools.approvals().decide_with(action_id, allow, false)?; waiting_approvals.remove(&action_id); if !allow { refused = true; } }
                         Some(Command::ToolResult { action_id, result }) => { let mut replies = replies.lock().map_err(|_| anyhow::anyhow!("Custom tool replies poisoned"))?; let reply = replies.get_mut(&action_id).context("No custom tool result is pending for this action")?; ensure!(reply.is_none(), "Custom tool result already delivered"); *reply = Some(result); }
+                        Some(Command::Answer { action_id, answer }) => { refused |= matches!(answer, xylo_core::InteractionAnswer::Reject); tools.answer(action_id, answer)?; waiting_interactions.remove(&action_id); }
                         Some(Command::Cancel) => cancel.cancel(),
                         Some(Command::Shutdown) => { cancel.cancel(); shutting_down = true; }
                         None => {
                             shutting_down = true;
+                            for action_id in waiting_interactions.drain() { let _ = tools.answer(action_id, xylo_core::InteractionAnswer::Reject); refused = true; }
                             for action_id in waiting_approvals.drain() { let _ = tools.approvals().decide_with(action_id, false, false); refused = true; }
                             if refused { eprintln!("Refused pending approval: stream-json input closed before a decision"); cancel.cancel(); }
                             if !replies.lock().map_err(|_| anyhow::anyhow!("Custom tool replies poisoned"))?.is_empty() { eprintln!("Custom tool client disconnected before replying"); cancel.cancel(); }

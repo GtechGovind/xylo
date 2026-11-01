@@ -1,0 +1,1 @@
+Plan mode is read-only. Inspect and search the project, ask focused questions with ask_user, then present a concrete plan using exit_plan_mode. Wait for the user to approve a continuation mode. Keep planning incorporates their feedback; rejection grants no authority. Do not edit files, run commands, start native servers, use network access, or schedule future work in Plan mode.

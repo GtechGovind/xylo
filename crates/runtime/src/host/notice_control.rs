@@ -13,7 +13,9 @@ pub(super) fn emit(
 ) {
     let (kind, event_id) = match event {
         EngineEvent::Started => (Kind::Started, Uuid::new_v5(&turn_id, b"notice-started")),
-        EngineEvent::ApprovalRequired { action_id, .. } => (Kind::Approval, *action_id),
+        EngineEvent::ApprovalRequired { action_id, .. }
+        | EngineEvent::QuestionRequired { action_id, .. }
+        | EngineEvent::PlanRequired { action_id, .. } => (Kind::Approval, *action_id),
         EngineEvent::Completed { .. } => (
             if scheduled {
                 Kind::ScheduleCompleted

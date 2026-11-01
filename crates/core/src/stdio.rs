@@ -56,6 +56,10 @@ pub enum Command {
     },
     Cancel,
     Shutdown,
+    Answer {
+        action_id: Uuid,
+        answer: crate::InteractionAnswer,
+    },
 }
 
 /// One engine event, with durable conversation and turn identity.

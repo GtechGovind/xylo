@@ -242,3 +242,5 @@ async fn rejected_mutation_preserves_store_and_prompt_budget() {
             .is_err()
     );
 }
+
+mod wakeups;

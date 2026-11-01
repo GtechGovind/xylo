@@ -165,3 +165,9 @@ async fn parallel_children_are_classified_apart_from_the_parent() {
     assert_eq!(result.metrics.child_calls, 4);
     assert_eq!(trial.trace.child_conversations().len(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interaction_plan_declines_offline_without_granting_write_authority() {
+    let (_, result) = graded(&find("plan-interaction").unwrap()).await;
+    assert!(result.passed, "{}", explain(&result));
+}

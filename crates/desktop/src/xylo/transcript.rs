@@ -52,6 +52,9 @@ pub(super) fn group_summary<'a>(tools: impl IntoIterator<Item = &'a ToolCard>) -
 }
 fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
     match name {
+        "ask_user" => ("Asked", "question", "questions"),
+        "exit_plan_mode" => ("Reviewed", "plan", "plans"),
+        "schedule_wakeup" => ("Scheduled", "wakeup", "wakeups"),
         "lsp" => ("Inspected", "code location", "code locations"),
         "file_read" | "read_file" => ("Read", "file", "files"),
         "extension_resource" => ("Read", "skill file", "skill files"),
@@ -86,8 +89,13 @@ pub(super) fn duration_label(ms: i64) -> String {
 
 /// The live activity of a running turn, in plain words.
 pub(super) fn phase_label(turn: &TurnState) -> String {
-    if turn.pending_approvals().next().is_some() {
-        return "Waiting for your approval".into();
+    if let Some(tool) = turn.pending_approvals().next() {
+        return match tool.name.as_str() {
+            "ask_user" => "Waiting for your answers",
+            "exit_plan_mode" => "Waiting for your plan decision",
+            _ => "Waiting for your approval",
+        }
+        .into();
     }
     match turn.phase {
         Some(TurnPhase::Preparing) => "Preparing…".into(),

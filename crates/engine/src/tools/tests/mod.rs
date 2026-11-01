@@ -2034,3 +2034,5 @@ async fn tool_results_are_shortened_to_the_window_budget() {
 
 mod code_parity;
 mod headless;
+
+mod interaction;
