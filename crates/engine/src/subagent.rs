@@ -108,6 +108,7 @@ impl Delegation {
             xylo_core::now_ms(),
             window.prompt_budget(),
         );
+        child.record_instruction_sources(&context.instruction_sources)?;
         let child_loop = AgentLoop {
             provider: self.provider.clone(),
             budget: self.budget.clone(),

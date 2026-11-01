@@ -4,7 +4,7 @@ use crate::VaultKey;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
-fn broker(
+pub(super) fn broker(
     endpoint: String,
     transport: &str,
 ) -> (ConnectorBroker, ConnectorConfig, tempfile::TempDir) {
@@ -23,7 +23,7 @@ fn broker(
     };
     (ConnectorBroker::new(store, vault), config, temp)
 }
-fn result(request: &Value, changed: bool) -> Value {
+pub(super) fn result(request: &Value, changed: bool) -> Value {
     let value = match request["method"].as_str().unwrap_or_default() {
         "initialize" => {
             json!({"protocolVersion":request["params"]["protocolVersion"],"serverInfo":{"name":"fixture","version":"1"},"capabilities":{"tools":{"listChanged":true},"resources":{},"prompts":{}}})
@@ -139,7 +139,10 @@ async fn mcp_metadata_and_list_changed_use_real_protocol_messages() {
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while broker.catalog_revision() < 2 {
+        while !broker
+            .cached_tools(&config)
+            .is_ok_and(|tools| tools.first().is_some_and(|tool| tool.name == "latest"))
+        {
             tokio::task::yield_now().await;
         }
     })

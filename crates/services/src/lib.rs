@@ -44,3 +44,5 @@ pub use turn_queue::*;
 
 #[cfg(test)]
 mod tests;
+
+mod instruction_sources;

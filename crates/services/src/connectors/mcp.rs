@@ -218,6 +218,7 @@ struct Pool {
     reaper_started: AtomicBool,
     forms: Arc<handler::Forms>,
     revision: Arc<AtomicU64>,
+    catalog_failure: Arc<AtomicBool>,
 }
 impl Pool {
     fn idle_timeout(&self) -> Duration {
@@ -300,6 +301,7 @@ impl ConnectorBroker {
                 reaper_started: AtomicBool::new(false),
                 forms: Arc::default(),
                 revision: Arc::default(),
+                catalog_failure: Arc::default(),
             }),
             local_scope: None,
             route: None,
@@ -323,7 +325,7 @@ impl ConnectorBroker {
     ) -> Result<()> {
         self.pool.forms.answer(id, action, content)
     }
-    /// Advances when server notifications replace a persisted tool catalog.
+    /// Advances on invalidation and successful catalog replacement.
     pub fn catalog_revision(&self) -> u64 {
         self.pool.revision.load(Ordering::Acquire)
     }
@@ -441,6 +443,7 @@ impl ConnectorBroker {
             route: session.route.clone(),
             forms: self.pool.forms.clone(),
             revision: self.pool.revision.clone(),
+            catalog_failure: self.pool.catalog_failure.clone(),
             refreshing: Arc::default(),
             notifications: Arc::default(),
         };
@@ -588,6 +591,7 @@ impl ConnectorBroker {
         let mut session = tokio::select! {_ = cancel.cancelled()=>bail!("Connector discovery cancelled"),s=slot.lock()=>s};
         self.ensure_connected(&mut session, config, cancel, local_scope)
             .await?;
+        let generation = catalog_generation(&self.pool.store, config.id)?;
         let list = async {
             let client = session.client.as_ref().context("MCP client unavailable")?;
             let mut cursor = None;
@@ -639,7 +643,11 @@ impl ConnectorBroker {
         let id = config.id;
         let json = serde_json::to_string(&result)?;
         let fingerprint = Self::fingerprint(config, local_scope)?;
-        tokio::task::spawn_blocking(move || save_catalog(&store, id, fingerprint, json)).await??;
+        tokio::task::spawn_blocking(move || {
+            save_catalog_generation(&store, id, fingerprint, json, generation)
+        })
+        .await??;
+        self.pool.revision.fetch_add(1, Ordering::AcqRel);
         drop(_permit);
         if has_prompts {
             let mut broker = self.clone();
@@ -676,12 +684,17 @@ impl ConnectorBroker {
         scope: Option<&ConnectorLaunchScope>,
     ) -> Result<Vec<ToolDefinition>> {
         use rusqlite::OptionalExtension;
+        ensure!(
+            !self.pool.catalog_failure.load(Ordering::Acquire),
+            "MCP catalog persistence failed; restart after repairing storage"
+        );
+        ensure_catalog_available(&self.pool.store, config.id)?;
         let id = config.id;
         let fingerprint = Self::fingerprint(config, scope)?;
         self.pool.store.call(move |conn| {
             let json: Option<String> = conn
                 .query_row(
-                    "SELECT json FROM connector_tools WHERE id=?1 AND fingerprint=?2",
+                    "SELECT json FROM connector_tools WHERE id=?1 AND fingerprint=?2 AND NOT EXISTS(SELECT 1 FROM connector_catalog_state WHERE id=?1 AND available=0)",
                     rusqlite::params![id.to_string(), fingerprint],
                     |r| r.get(0),
                 )
@@ -703,6 +716,19 @@ impl ConnectorBroker {
         arguments: Value,
         cancel: &CancellationToken,
     ) -> Result<Value> {
+        self.call_reviewed(config, name, arguments, cancel, self.catalog_revision())
+            .await
+    }
+    /// The revision captured before classifying and approving this call. Recheck
+    /// after connection admission so a queued call cannot use revoked authority.
+    pub async fn call_reviewed(
+        &self,
+        config: &ConnectorConfig,
+        name: &str,
+        arguments: Value,
+        cancel: &CancellationToken,
+        revision: u64,
+    ) -> Result<Value> {
         let args = arguments
             .as_object()
             .context("Tool arguments must be a JSON object")?
@@ -716,6 +742,15 @@ impl ConnectorBroker {
         let mut session = tokio::select! {_ = cancel.cancelled()=>bail!("Connector call cancelled"),s=slot.lock()=>s};
         self.ensure_connected(&mut session, config, cancel, self.local_scope.as_ref())
             .await?;
+        ensure!(
+            !self.pool.catalog_failure.load(Ordering::Acquire),
+            "MCP catalog persistence failed; restart after repairing storage"
+        );
+        ensure_catalog_available(&self.pool.store, config.id)?;
+        ensure!(
+            revision == self.catalog_revision(),
+            "MCP tools changed before dispatch; discover and retry the call"
+        );
         let result = Self::call_tool(&session, name, args, cancel).await;
         let result = match result {
             Ok(result) => result,
@@ -818,14 +853,10 @@ impl ConnectorBroker {
 }
 
 /// Persists one connector's discovered catalog under its fingerprint.
+#[cfg(any(test, feature = "test-support"))]
 fn save_catalog(store: &Store, id: Uuid, fingerprint: String, json: String) -> Result<()> {
-    store.call(move |conn| {
-        conn.execute(
-            "INSERT INTO connector_tools(id,fingerprint,json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,json=excluded.json,updated_at=excluded.updated_at",
-            rusqlite::params![id.to_string(), fingerprint, json, xylo_core::now_ms()],
-        )?;
-        Ok(())
-    })
+    let generation = catalog_generation(store, id)?;
+    save_catalog_generation(store, id, fingerprint, json, generation)
 }
 
 /// MCP tool annotations are hints from the server. A tool counts as read-only
@@ -1235,3 +1266,11 @@ mod tests;
 
 #[cfg(test)]
 mod completeness_tests;
+
+#[cfg(test)]
+mod refresh_failure_tests;
+
+mod catalog;
+use catalog::{
+    catalog_generation, ensure_catalog_available, invalidate_catalog, save_catalog_generation,
+};

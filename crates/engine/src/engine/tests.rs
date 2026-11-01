@@ -6,7 +6,7 @@ use uuid::Uuid;
 use xylo_core::{ApiFamily, Conversation, PermissionMode, Usage, now_ms};
 use xylo_services::ActionIntent;
 
-fn fixture() -> (tempfile::TempDir, AgentEngine, TurnRequest) {
+pub(super) fn fixture() -> (tempfile::TempDir, AgentEngine, TurnRequest) {
     let directory = tempfile::tempdir().unwrap();
     let paths = AppPaths::at(directory.path().join("profile")).unwrap();
     let store = Store::open(&paths.database).unwrap();
@@ -1215,7 +1215,8 @@ async fn system_prompt_is_identical_across_turns_and_recall_follows_each_prompt(
         let broker = engine
             .broker(&request, events.clone(), CancellationToken::new())
             .unwrap();
-        let system = AgentEngine::system_prompt(&request, &broker, PermissionMode::ReadOnly);
+        let system =
+            AgentEngine::system_prompt(&request, &broker, PermissionMode::ReadOnly).unwrap();
         let recalled = AgentEngine::recalled_context(&broker);
         broker.shutdown().await.unwrap();
         prompts.push((system, recalled));
@@ -1529,3 +1530,6 @@ async fn a_4k_window_sends_identical_prompt_and_tool_bytes_across_turns() {
 
 mod headless;
 mod provider_fallback;
+
+#[path = "child_instruction_provenance_tests.rs"]
+mod child_instruction_provenance_tests;

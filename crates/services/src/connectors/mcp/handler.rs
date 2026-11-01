@@ -57,6 +57,7 @@ pub(super) struct Handler {
     pub route: Arc<std::sync::RwLock<Option<Route>>>,
     pub forms: Arc<Forms>,
     pub revision: Arc<AtomicU64>,
+    pub catalog_failure: Arc<AtomicBool>,
     pub refreshing: Arc<AtomicBool>,
     pub notifications: Arc<AtomicU64>,
 }
@@ -70,7 +71,17 @@ impl ClientHandler for Handler {
         info
     }
     async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) {
+        // Revoke authority before scheduling network work, even if the server's
+        // next tools/list errors or never replies. Persistence also fences restart.
+        let invalidated = invalidate_catalog(&self.store, self.config.id);
+        self.revision.fetch_add(1, Ordering::AcqRel);
         self.notifications.fetch_add(1, Ordering::AcqRel);
+        if invalidated.is_err() {
+            self.refresh_failed();
+            // No call may rely on a transition that could not be persisted.
+            self.catalog_failure.store(true, Ordering::Release);
+            return;
+        }
         if self.refreshing.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -79,6 +90,7 @@ impl ClientHandler for Handler {
             loop {
                 let observed = handler.notifications.load(Ordering::Acquire);
                 let list = async {
+                    let generation = catalog_generation(&handler.store, handler.config.id)?;
                     let mut cursor = None;
                     let mut seen = std::collections::HashSet::new();
                     let mut tools = Vec::new();
@@ -114,21 +126,28 @@ impl ClientHandler for Handler {
                             break;
                         }
                     }
-                    Ok::<_, anyhow::Error>(tools)
+                    Ok::<_, anyhow::Error>((tools, generation))
                 };
-                if let Ok(Ok(tools)) = tokio::time::timeout(DISCOVERY_TIMEOUT, list).await {
+                let mut saved_latest = false;
+                if let Ok(Ok((tools, generation))) =
+                    tokio::time::timeout(DISCOVERY_TIMEOUT, list).await
+                {
                     let store = handler.store.clone();
                     let id = handler.config.id;
                     let fingerprint = handler.fingerprint.clone();
                     if let Ok(json) = serde_json::to_string(&tools) {
                         let saved = tokio::task::spawn_blocking(move || {
-                            save_catalog(&store, id, fingerprint, json)
+                            save_catalog_generation(&store, id, fingerprint, json, generation)
                         })
                         .await;
                         if matches!(saved, Ok(Ok(()))) {
                             handler.revision.fetch_add(1, Ordering::AcqRel);
+                            saved_latest = true;
                         }
                     }
+                }
+                if !saved_latest && handler.notifications.load(Ordering::Acquire) == observed {
+                    handler.refresh_failed();
                 }
                 handler.refreshing.store(false, Ordering::Release);
                 if handler.notifications.load(Ordering::Acquire) == observed
@@ -220,5 +239,14 @@ impl ClientHandler for Handler {
             .send(EngineEvent::McpElicitationClosed { request_id: id })
             .await;
         Ok(response.unwrap_or_else(|| ElicitResult::new(ElicitationAction::Cancel)))
+    }
+}
+
+impl Handler {
+    /// At most one bounded, content-free notice per failed coalesced refresh.
+    fn refresh_failed(&self) {
+        if let Some(route) = self.route.read().ok().and_then(|route| route.clone()) {
+            let _ = route.events.try_send(EngineEvent::Status { text: "An MCP server changed its tools, but refresh failed. Its tools are unavailable; rediscover them in Connections or with connector_tools.".into() });
+        }
     }
 }

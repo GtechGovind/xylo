@@ -19,6 +19,7 @@ fn sample(workspace: &Path) -> PromptContext<'_> {
         date: "2026-10-31".to_owned(),
         permission_mode: PermissionMode::AskForApproval,
         project_instructions: String::new(),
+        instruction_sources: Vec::new(),
         skills_index: String::new(),
         compact: false,
         skills_index_bytes: SKILLS_INDEX_BYTES,

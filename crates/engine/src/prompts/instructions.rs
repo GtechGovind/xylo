@@ -35,14 +35,27 @@ const OMITTED: &str = "[Outer instruction files omitted: size limit reached]\n";
 /// `budget` bytes (never more than [`INSTRUCTION_BYTES`]). Empty when there
 /// are none.
 pub fn project_instructions(workspace: &Path, budget: usize) -> String {
-    project_instructions_with_home(
+    project_instruction_sources(workspace, budget).0
+}
+
+/// Expanded startup text and the canonical files that contributed to it. Keep
+/// these sources with the text: an import may leave the active project.
+pub fn project_instruction_sources(workspace: &Path, budget: usize) -> (String, Vec<PathBuf>) {
+    project_instruction_sources_with_home(
         workspace,
         std::env::var_os("HOME").map(PathBuf::from).as_deref(),
         budget,
     )
 }
-
+#[cfg(test)]
 fn project_instructions_with_home(workspace: &Path, home: Option<&Path>, budget: usize) -> String {
+    project_instruction_sources_with_home(workspace, home, budget).0
+}
+fn project_instruction_sources_with_home(
+    workspace: &Path,
+    home: Option<&Path>,
+    budget: usize,
+) -> (String, Vec<PathBuf>) {
     let budget = budget.min(INSTRUCTION_BYTES);
     let repository = repository_root(workspace);
     let base = repository.as_deref().unwrap_or(workspace);
@@ -59,12 +72,12 @@ fn project_instructions_with_home(workspace: &Path, home: Option<&Path>, budget:
         let mut group = Vec::new();
         for name in INSTRUCTION_FILES {
             let path = directory.join(name);
-            if let Some(text) = expand(&path, workspace, home, budget, 0, &mut Default::default())
+            if let Some((text, sources)) = expanded(&path, workspace, home, budget)
                 && !text.is_empty()
                 && !discovered.contains(&text)
             {
                 discovered.push(text.clone());
-                group.push((path, text));
+                group.push((path, text, sources));
             }
         }
         paths.extend(group.into_iter().rev());
@@ -72,15 +85,8 @@ fn project_instructions_with_home(workspace: &Path, home: Option<&Path>, budget:
     if let Some(home) = home {
         for name in [".claude/CLAUDE.md", ".xylo/AGENTS.md"] {
             let path = home.join(name);
-            if let Some(text) = expand(
-                &path,
-                workspace,
-                Some(home),
-                budget,
-                0,
-                &mut Default::default(),
-            ) {
-                paths.push((path, text));
+            if let Some((text, sources)) = expanded(&path, workspace, Some(home), budget) {
+                paths.push((path, text, sources));
             }
         }
     }
@@ -88,7 +94,8 @@ fn project_instructions_with_home(workspace: &Path, home: Option<&Path>, budget:
     let mut texts: Vec<String> = Vec::new();
     let mut used = 0;
     let mut omitted = false;
-    for (path, text) in paths {
+    let mut sources = Vec::new();
+    for (path, text, contributing) in paths {
         if text.is_empty() || texts.contains(&text) {
             continue;
         }
@@ -101,6 +108,7 @@ fn project_instructions_with_home(workspace: &Path, home: Option<&Path>, budget:
         used += section.len();
         texts.push(text);
         sections.push(section);
+        sources.extend(contributing);
     }
     sections.reverse();
     let mut output = String::new();
@@ -108,7 +116,7 @@ fn project_instructions_with_home(workspace: &Path, home: Option<&Path>, budget:
         output.push_str(OMITTED);
     }
     output.push_str(sections.join("\n").trim_end());
-    output
+    (output, sources)
 }
 
 /// Reads at most one budget's worth of a file, trimmed; `None` when absent
@@ -146,6 +154,26 @@ fn display_path(path: &Path, base: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Retains the canonical source set alongside the expanded text.
+fn expanded(
+    path: &Path,
+    workspace: &Path,
+    home: Option<&Path>,
+    budget: usize,
+) -> Option<(String, Vec<PathBuf>)> {
+    let mut sources = Vec::new();
+    let text = expand(
+        path,
+        workspace,
+        home,
+        budget,
+        0,
+        &mut Default::default(),
+        &mut sources,
+    )?;
+    Some((text, sources))
+}
+
 /// Expands whole-line imports, bounded before every read and canonicalized before access.
 fn expand(
     path: &Path,
@@ -154,6 +182,7 @@ fn expand(
     budget: usize,
     depth: usize,
     seen: &mut std::collections::HashSet<PathBuf>,
+    sources: &mut Vec<PathBuf>,
 ) -> Option<String> {
     let canonical = path.canonicalize().ok()?;
     if depth > 5 || !seen.insert(canonical.clone()) {
@@ -170,6 +199,7 @@ fn expand(
         return None;
     }
     let text = read_bounded(&canonical, budget)?;
+    sources.push(canonical.clone());
     let mut output = String::new();
     let mut fenced = false;
     for line in text.lines() {
@@ -203,6 +233,7 @@ fn expand(
                     budget.saturating_sub(output.len()),
                     depth + 1,
                     seen,
+                    sources,
                 )
             }) {
                 output.push_str(&target);
@@ -223,13 +254,23 @@ pub struct ScopedInstructions {
     root: PathBuf,
     seen: std::collections::HashSet<PathBuf>,
     used: usize,
-    rules: Option<std::collections::BTreeMap<PathBuf, String>>,
+    rules: Option<std::collections::BTreeMap<PathBuf, (String, Vec<PathBuf>)>>,
 }
 impl ScopedInstructions {
     /// Returns newly applicable project text, once per source and within the turn's budget.
+    #[cfg(test)]
     pub fn touch(&mut self, workspace: &Path, path: &Path, budget: usize) -> String {
+        self.touch_with_sources(workspace, path, budget).0
+    }
+    /// Sources are emitted only for matching instruction sections, including imports.
+    pub fn touch_with_sources(
+        &mut self,
+        workspace: &Path,
+        path: &Path,
+        budget: usize,
+    ) -> (String, Vec<PathBuf>) {
         let Ok(root) = workspace.canonicalize() else {
-            return String::new();
+            return Default::default();
         };
         if self.root != root {
             self.root = root.clone();
@@ -252,7 +293,7 @@ impl ScopedInstructions {
             })
             .ok();
         let Some(path) = path.filter(|path| path.starts_with(&root)) else {
-            return String::new();
+            return Default::default();
         };
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let budget = budget.min(INSTRUCTION_BYTES);
@@ -293,16 +334,11 @@ impl ScopedInstructions {
                         if !source.starts_with(&root) || remaining < MIN_FILE_BYTES {
                             continue;
                         }
-                        if let Some(text) = expand(
-                            &source,
-                            &root,
-                            home.as_deref(),
-                            budget.min(remaining),
-                            0,
-                            &mut Default::default(),
-                        ) {
+                        if let Some((text, sources)) =
+                            expanded(&source, &root, home.as_deref(), budget.min(remaining))
+                        {
                             remaining = remaining.saturating_sub(text.len());
-                            rules.insert(source, text);
+                            rules.insert(source, (text, sources));
                         }
                     }
                 }
@@ -311,6 +347,7 @@ impl ScopedInstructions {
         });
         candidates.extend(rules.keys().cloned().map(|path| (path, true)));
         let mut output = String::new();
+        let mut sources = Vec::new();
         for (source, rule) in candidates {
             let source = if rule {
                 source
@@ -327,22 +364,15 @@ impl ScopedInstructions {
             if remaining < MIN_FILE_BYTES {
                 break;
             }
-            let expanded;
-            let text = if rule {
+            let expansion;
+            let (text, contributing) = if rule {
                 let Some(text) = self.rules.as_ref().and_then(|rules| rules.get(&source)) else {
                     continue;
                 };
                 text
             } else {
-                expanded = expand(
-                    &source,
-                    &root,
-                    home.as_deref(),
-                    remaining,
-                    0,
-                    &mut Default::default(),
-                );
-                let Some(text) = expanded.as_ref() else {
+                expansion = expanded(&source, &root, home.as_deref(), remaining);
+                let Some(text) = expansion.as_ref() else {
                     continue;
                 };
                 text
@@ -359,8 +389,9 @@ impl ScopedInstructions {
             self.used += note.len();
             self.seen.insert(source);
             output.push_str(&note);
+            sources.extend(contributing.iter().cloned());
         }
-        output
+        (output, sources)
     }
 }
 
@@ -440,3 +471,6 @@ fn rule_patterns(value: &str) -> Vec<String> {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod provenance_tests;

@@ -277,13 +277,18 @@ impl AgentEngine {
     /// conversation (until the day, branch, mode, instructions or installed
     /// skills change) and the provider's cached prefix survives each new
     /// message. What is retrieved for the prompt goes in [`Self::recalled_context`].
-    fn system_prompt(request: &TurnRequest, broker: &ToolBroker, mode: PermissionMode) -> String {
+    fn system_prompt(
+        request: &TurnRequest,
+        broker: &ToolBroker,
+        mode: PermissionMode,
+    ) -> Result<String> {
         let mut context = crate::prompts::PromptContext::detect(
             &request.workspace,
             mode,
             xylo_core::now_ms(),
             broker.window().prompt_budget(),
         );
+        broker.record_instruction_sources(&context.instruction_sources)?;
         context.set_skills_index(broker.project_skill_context().unwrap_or_else(|error| {
             tracing::warn!(error=%error, "Skill index unavailable");
             String::new()
@@ -291,7 +296,7 @@ impl AgentEngine {
         if !context.omitted.is_empty() {
             tracing::debug!(omitted = ?context.omitted, "Compact system prompt left sections out");
         }
-        crate::prompts::system(&context)
+        Ok(crate::prompts::system(&context))
     }
 
     /// The application note that follows a new user message with the
@@ -539,8 +544,7 @@ impl AgentEngine {
         }
         let mode = self.session.permissions().get();
         let (prompting, prompted) = (broker.clone(), request.clone());
-        let mut system =
-            blocking(move || Ok(Self::system_prompt(&prompted, &prompting, mode))).await?;
+        let mut system = blocking(move || Self::system_prompt(&prompted, &prompting, mode)).await?;
         if !self.options.append_system_prompt.is_empty() {
             system.push_str("\n\n");
             system.push_str(&self.options.append_system_prompt);
@@ -910,3 +914,6 @@ fn refresh_operator_observations(messages: &mut [Message], broker: &ToolBroker) 
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod startup_instruction_provenance_tests;
