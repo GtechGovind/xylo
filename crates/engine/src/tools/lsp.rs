@@ -54,6 +54,7 @@ fn automatic_authorized(broker: &ToolBroker, path: &Path) -> bool {
         origin: Origin::Model,
         reach: &reach,
         workspace: &broker.request.workspace,
+        cwd: None,
         network: None,
         untrusted_input: false,
     };
