@@ -31,6 +31,7 @@ impl ToolBroker {
             self.definitions.push(definition.clone());
             self.advertised.push(definition.clone());
         }
+        self.system_addendum = options.append_system_prompt.clone();
         self.on_refusal = options.on_refusal.clone();
         self.custom_tools = options.custom_tools.clone();
         self.custom_handler = options.custom_handler.clone();

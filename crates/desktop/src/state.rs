@@ -354,6 +354,7 @@ impl TurnState {
         }
         match event {
             EngineEvent::CustomToolRequested { .. } => return,
+            EngineEvent::WorkspaceChanged { .. } => return,
             EngineEvent::Ready { .. }
             | EngineEvent::TitleUpdated { .. }
             | EngineEvent::Steering { .. }

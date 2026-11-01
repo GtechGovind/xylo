@@ -193,6 +193,12 @@ impl Xylo {
             .font_weight(FontWeight::MEDIUM)
             .text_color(rgb(text_secondary()))
             .child(title)
+            .when_some(
+                self.workspace
+                    .as_deref()
+                    .and_then(super::worktrees::branch_label),
+                |row, branch| row.child(format!("  ·  {branch}")),
+            )
             .into_any_element()
     }
     /// The open chat as plain text, oldest first, including the live turn.

@@ -349,6 +349,9 @@ pub struct AppSettings {
     /// Default alternative model ID, used on the active authorized connection.
     #[serde(default)]
     pub fallback_model: Option<String>,
+    /// Optional search service for connections without native search.
+    #[serde(default)]
+    pub web_search: WebSearchSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -453,12 +456,33 @@ impl Default for AppSettings {
             output_style: default_output_style(),
             status_line_command: None,
             fallback_model: None,
+            web_search: WebSearchSettings::default(),
         }
     }
 }
 
 fn default_output_style() -> String {
     "default".into()
+}
+
+/// Saved web search configuration contains references, never credential values.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WebSearchSettings {
+    pub backend: WebSearchBackend,
+    pub endpoint: String,
+    pub credential_ref: Option<String>,
+}
+
+/// The fallback search service explicitly chosen by the user.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchBackend {
+    #[default]
+    Disabled,
+    Brave,
+    Tavily,
+    Searxng,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -810,6 +834,11 @@ pub enum EngineEvent {
     /// An update from a shell job, including after the turn has ended.
     ShellJobUpdated {
         job: ShellJob,
+    },
+    /// The conversation selected a different managed checkout.
+    WorkspaceChanged {
+        workspace: PathBuf,
+        branch: Option<String>,
     },
 }
 

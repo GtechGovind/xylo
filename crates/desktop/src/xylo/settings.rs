@@ -771,6 +771,11 @@ impl Xylo {
                 self.approval_rules_section(cx),
             ))
             .child(settings_ui::section(
+                "Worktrees",
+                Some("Isolated checkouts retained by chats. Removal preserves Git branches.".into()),
+                self.worktree_settings(cx),
+            ))
+            .child(settings_ui::section(
                 "Security",
                 Some("Switching removes saved keys and tokens; you'll reconnect providers and connections afterwards.".into()),
                 settings_ui::rows([settings_ui::setting_row(
@@ -1070,7 +1075,8 @@ impl Xylo {
         if let Some(inspection) = self.connector_inspection_section(cx) {
             page = page.child(inspection);
         }
-        page.into_any_element()
+        page.child(self.web_search_settings_section(cx))
+            .into_any_element()
     }
     fn connection_form_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let editing = self.connector_editing.and_then(|id| {

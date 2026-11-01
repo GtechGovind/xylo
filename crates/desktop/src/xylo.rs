@@ -16,6 +16,8 @@ mod drafts;
 use drafts::{DraftFlushAction, DraftUi};
 #[path = "xylo/turn_queue.rs"]
 mod turn_queue;
+#[path = "xylo/worktrees.rs"]
+mod worktrees;
 use turn_queue::TurnQueueUi;
 #[path = "xylo/attachments.rs"]
 mod attachments;
@@ -265,6 +267,9 @@ pub struct Xylo {
     memory_content: Entity<TextareaState>,
     memories: Vec<MemoryRecord>,
     facts: memory::MemoryUi,
+    web_search_backend: Option<xylo_core::WebSearchBackend>,
+    web_search_endpoint: Entity<InputState>,
+    web_search_secret: Entity<InputState>,
     connector_name: Entity<InputState>,
     connector_endpoint: Entity<InputState>,
     connector_command: Entity<InputState>,
@@ -327,6 +332,8 @@ pub struct Xylo {
     /// while the composer or the transcript has focus.
     transcript_focus: FocusHandle,
     native: NativeUi,
+    worktrees: Vec<xylo_runtime::workspace::worktree::Worktree>,
+    worktree_pending: Option<Uuid>,
     documents: documents::DocumentUi,
     assets: AssetsUi,
     account: AccountUi,
@@ -543,6 +550,13 @@ impl Xylo {
             memory_content,
             memories: vec![],
             facts: memory::MemoryUi::default(),
+            web_search_backend: None,
+            web_search_endpoint: input("https://search.example", window, cx),
+            web_search_secret: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("API key (leave blank to keep saved key)")
+                    .masked(true)
+            }),
             connector_name: input("Connector name", window, cx),
             connector_endpoint: input("https://…/mcp", window, cx),
             connector_command: input("Executable path", window, cx),
@@ -605,6 +619,8 @@ impl Xylo {
             context_updated_at: BTreeMap::new(),
             transcript_focus: cx.focus_handle(),
             native: NativeUi::new(),
+            worktrees: Vec::new(),
+            worktree_pending: None,
             documents: documents::DocumentUi::new(window, cx),
             assets: AssetsUi::default(),
             account: AccountUi::default(),
@@ -1216,6 +1232,7 @@ impl Xylo {
                 }
             }
             HostEvent::Error(error) => {
+                self.worktree_pending = None;
                 self.quit_after_save = None;
                 self.error = Some(error.clone());
                 self.log(format!("ERROR {error}"));
@@ -1226,6 +1243,12 @@ impl Xylo {
             HostEvent::ApprovalRules { workspace, result } => {
                 self.approval_rules_received(workspace, result, cx)
             }
+            HostEvent::Worktrees(trees) => self.worktrees = trees,
+            HostEvent::ChatWorktree {
+                session,
+                workspace,
+                branch: _,
+            } => self.chat_worktree_changed(session, workspace, window, cx),
             HostEvent::ConversationRenamed(conversation) => self.conversation_renamed(conversation),
             HostEvent::Engine(envelope) => {
                 // Engine events always name their chat; one without a session

@@ -214,9 +214,14 @@ impl ToolPresentation {
         let empty = Value::Null;
         let output = summary.unwrap_or(&empty);
         let verb = match name {
+            "worktree_enter" => "Enter worktree",
+            "worktree_exit" => "Leave worktree",
             "files_list" => "List",
             "find_files" => "Find",
             "file_read" => "Read",
+            "web_fetch" => "Fetch page",
+            "web_search" => "Search web",
+            "web_access" => "Web access",
             "file_write" => "Write",
             "file_edit" | "notebook_edit" => "Edit",
             "lsp" => "Inspect code",
@@ -237,7 +242,7 @@ impl ToolPresentation {
             .unwrap_or_default()
             .into();
         let mut target = [
-            "query", "pattern", "path", "task", "command", "program", "name", "url",
+            "query", "domain", "pattern", "path", "task", "command", "program", "name", "url",
         ]
         .iter()
         .find_map(|key| input.get(*key).and_then(Value::as_str))
@@ -266,6 +271,8 @@ impl ToolPresentation {
             verb: verb.replace('_', " "),
             target: short(&one_line(&target), 160),
             question: match name {
+                "worktree_enter" | "worktree_exit" => "Change this chat’s checkout?",
+                "web_access" => "Allow this web connection?",
                 "file_write" | "file_edit" | "notebook_edit" => {
                     "Allow this change to your project?"
                 }
@@ -293,6 +300,15 @@ impl ToolPresentation {
             shown.error = Some(short(error.unwrap_or("The action could not finish."), 500));
         }
         shown.body = match name {
+            "worktree_enter" | "worktree_exit" => ToolBody::Message(format!(
+                "Checkout: {}{}",
+                text(output, "workspace"),
+                if output.get("kept").and_then(Value::as_bool) == Some(true) {
+                    " · previous worktree retained"
+                } else {
+                    ""
+                }
+            )),
             // A skill's instructions and resources are for the model; the row
             // names the skill and its description is the tooltip.
             "extension_skill" => {

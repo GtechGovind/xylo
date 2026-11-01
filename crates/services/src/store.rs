@@ -453,6 +453,15 @@ impl Store {
         })
     }
 
+    /// Updates the selected checkout after a conversation changes worktrees.
+    pub fn set_conversation_workspace(
+        &self,
+        id: Uuid,
+        workspace: std::path::PathBuf,
+    ) -> Result<Option<Conversation>> {
+        self.update_conversation(id, move |conversation| conversation.workspace = workspace)
+    }
+
     /// Applies `change` to one stored conversation inside a write transaction.
     fn update_conversation(
         &self,
@@ -539,6 +548,22 @@ impl Store {
             json.map(|json| Ok(serde_json::from_str(&json)?))
                 .transpose()
         })
+    }
+    /// Distinct chat roots, including archives, for retained checkout discovery.
+    pub fn conversation_workspaces(&self) -> Result<Vec<std::path::PathBuf>> {
+        self.call(move |conn| {
+            let mut statement = conn
+                .prepare("SELECT DISTINCT json_extract(json,'$.workspace') FROM conversations")?;
+            let rows = statement.query_map([], |row| {
+                row.get::<_, String>(0).map(std::path::PathBuf::from)
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+    /// Managed-worktree chats, including archives, for host lifecycle checks.
+    pub fn worktree_conversations(&self) -> Result<Vec<Conversation>> {
+        self.call(move |conn| json_rows(conn,
+            "SELECT json FROM conversations WHERE json_extract(json,'$.workspace') LIKE '%/.xylo/worktrees/%'", []))
     }
     pub fn conversations(&self, limit: usize) -> Result<Vec<Conversation>> {
         self.call(move |conn| {

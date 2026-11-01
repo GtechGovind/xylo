@@ -462,7 +462,6 @@ impl ShellJobs {
             self.note(job.session, NoteKind::ShellJob, note);
         }
         self.publish(job);
-        job.finished.store(true, Ordering::Release);
         job.changed.notify_waiters();
     }
 }
@@ -475,7 +474,7 @@ pub(super) struct ExecutionContext {
 }
 
 pub(super) fn prepare(broker: &ToolBroker, args: &Value) -> Result<ExecutionContext> {
-    let root = broker.request.workspace.canonicalize()?;
+    let root = broker.workspace_root().canonicalize()?;
     let jobs = &broker.session.shell_jobs;
     let session = broker.request.session_id;
     let current = jobs.cwd(
@@ -761,6 +760,7 @@ fn start(
     };
     let task_job = job.clone();
     let task_jobs = jobs.clone();
+    let workspace_lease = broker.session.retain_workspace(session, &root);
     let run = async move {
         let sandbox::PreparedSandbox {
             command,
@@ -790,6 +790,9 @@ fn start(
         }
         task_jobs.finish(&task_job, &result, &root, &data, outside.as_deref());
         drop(temporary);
+        drop(workspace_lease);
+        task_job.finished.store(true, Ordering::Release);
+        task_job.changed.notify_waiters();
         result
     };
     if background {

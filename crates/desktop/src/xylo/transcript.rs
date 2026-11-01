@@ -53,6 +53,7 @@ pub(super) fn group_summary<'a>(tools: impl IntoIterator<Item = &'a ToolCard>) -
 fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
     match name {
         "lsp" => ("Inspected", "code location", "code locations"),
+        "worktree_enter" | "worktree_exit" => ("Changed", "worktree", "worktrees"),
         "file_read" | "read_file" => ("Read", "file", "files"),
         "extension_resource" => ("Read", "skill file", "skill files"),
         "search_project" | "find_files" | "grep" | "glob" | "find" => {
@@ -66,7 +67,8 @@ fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
         "shell_output" => ("Read", "job output", "job outputs"),
         "shell_kill" => ("Stopped", "shell job", "shell jobs"),
         "shell_jobs" => ("Listed", "shell job", "shell jobs"),
-        "web_fetch" | "web_search" | "browser" => ("Fetched", "page", "pages"),
+        "web_fetch" | "browser" => ("Fetched", "page", "pages"),
+        "web_search" => ("Searched", "query", "queries"),
         "memory_search" | "memory_remember" => ("Used memory", "time", "times"),
         "extension_skill" => ("Used", "skill", "skills"),
         name if name.starts_with("git_") => ("Checked git", "time", "times"),

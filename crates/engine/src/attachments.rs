@@ -104,7 +104,20 @@ fn hydrate(
     Ok(())
 }
 
+#[async_trait::async_trait]
 impl ModelProvider for AttachmentProvider {
+    fn supports_search(&self) -> bool {
+        self.inner.supports_search()
+    }
+    async fn search(
+        &self,
+        arguments: serde_json::Value,
+        addresses: Vec<std::net::SocketAddr>,
+        cancel: CancellationToken,
+    ) -> Result<serde_json::Value, ModelError> {
+        self.inner.search(arguments, addresses, cancel).await
+    }
+
     fn fallback(&self) -> Option<(String, Arc<dyn ModelProvider>)> {
         let (name, inner) = self.inner.fallback()?;
         Some((

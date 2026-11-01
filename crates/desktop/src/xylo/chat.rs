@@ -312,6 +312,9 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let EngineEvent::WorkspaceChanged { workspace, .. } = &event {
+            self.chat_worktree_changed(session, workspace.clone(), window, cx);
+        }
         self.log(match &event {
             EngineEvent::Delta { .. }
             | EngineEvent::ThinkingDelta { .. }
@@ -1029,6 +1032,24 @@ impl Xylo {
                     .child(name.clone())
                     .when(!ready, |context| context.child("· loading project…"));
             }
+        }
+        if self.workspace.is_some()
+            && !self
+                .conversations
+                .iter()
+                .any(|chat| chat.id == self.session)
+        {
+            context = context.child(
+                secondary(
+                    "new-worktree-chat",
+                    if self.worktree_pending == Some(self.session) {
+                        "Creating worktree…"
+                    } else {
+                        "Work in a new worktree"
+                    },
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.start_worktree_chat(cx))),
+            );
         }
         if !configured {
             context = context.child("·").child("No model set up");

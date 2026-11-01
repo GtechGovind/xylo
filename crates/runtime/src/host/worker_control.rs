@@ -118,6 +118,7 @@ pub(super) struct WorkerHandle {
     pub(super) run_turn: Arc<parking_lot::Mutex<Option<Uuid>>>,
     /// Canonical project of the chat; standing approvals are saved here.
     pub(super) workspace: Arc<parking_lot::Mutex<Option<PathBuf>>>,
+    retained_workspaces: Arc<parking_lot::Mutex<std::collections::BTreeSet<PathBuf>>>,
     pub(super) model_activity: Arc<Mutex<Option<ModelActivityLease>>>,
     pub(super) approvals: Arc<parking_lot::Mutex<HashMap<Uuid, PendingApproval>>>,
     controls: Arc<parking_lot::Mutex<VecDeque<(Uuid, Control)>>>,
@@ -127,6 +128,9 @@ pub(super) struct WorkerHandle {
     pub(super) mode: Arc<parking_lot::Mutex<PermissionMode>>,
     /// Set when the host killed the process because it ignored Stop.
     pub(super) forced_stop: Arc<AtomicBool>,
+    /// Worktree removal requested graceful shutdown. Keep this process owned
+    /// and reject new turns until its exit is confirmed, including after errors.
+    pub(super) worktree_retiring: Arc<AtomicBool>,
     /// The run a Stop was already sent for; repeated Stops send nothing.
     stop_sent: Arc<parking_lot::Mutex<Option<Uuid>>>,
     /// Retire the process when its current turn ends (a standing approval of
@@ -151,6 +155,7 @@ impl WorkerHandle {
             run_request: Arc::default(),
             run_turn: Arc::default(),
             workspace: Arc::default(),
+            retained_workspaces: Arc::default(),
             model_activity: Arc::default(),
             approvals: Arc::default(),
             controls: Arc::default(),
@@ -158,14 +163,32 @@ impl WorkerHandle {
             running_jobs: Arc::default(),
             mode: Arc::default(),
             forced_stop: Arc::default(),
+            worktree_retiring: Arc::default(),
             stop_sent: Arc::default(),
             retire_after_run: Arc::default(),
         }
     }
 
+    /// Records a selected checkout for native cleanup coordination.
+    pub(super) fn record_workspace(&self, root: PathBuf) {
+        let previous = self.workspace.lock().replace(root.clone());
+        let mut retained = self.retained_workspaces.lock();
+        retained.insert(root);
+        retained.extend(previous);
+    }
+
+    /// Earlier checkouts remain owned until worker exit closes background tools.
+    pub(super) fn owns_workspace(&self, root: &std::path::Path) -> bool {
+        self.retained_workspaces.lock().contains(root)
+            || self.workspace.lock().as_deref() == Some(root)
+    }
+
     /// The process ended, is ending, or can no longer receive commands.
     pub(super) fn dead(&self) -> bool {
-        self.stop.is_cancelled() || *self.exited.borrow() || self.commands.is_closed()
+        self.worktree_retiring.load(Ordering::Acquire)
+            || self.stop.is_cancelled()
+            || *self.exited.borrow()
+            || self.commands.is_closed()
     }
 
     fn idle(&self) -> bool {
@@ -721,6 +744,9 @@ impl WorkerReader {
             return self.route_reply(envelope, active_request).await;
         }
         match &envelope.payload {
+            EngineEvent::WorkspaceChanged { workspace, .. } => {
+                self.worker.record_workspace(workspace.clone());
+            }
             EngineEvent::ProviderCredentialRequested {
                 request_id,
                 generation,

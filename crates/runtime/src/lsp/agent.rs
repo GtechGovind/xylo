@@ -25,6 +25,24 @@ pub struct AgentService {
     state: Mutex<State>,
 }
 impl AgentService {
+    /// Retains a checkout while a server or an in-flight operation may own it.
+    /// Merely constructing this lazy service does not start a process.
+    pub fn may_have_processes(&self, workspace: &Path) -> bool {
+        if self.manager.stopping.is_cancelled() || self.state.try_lock().is_err() {
+            return true;
+        }
+        let Ok(servers) = self.manager.servers.try_lock() else {
+            return true;
+        };
+        servers.iter().any(|(key, slot)| {
+            key.workspace == workspace
+                && match slot.try_lock() {
+                    Ok(session) => session.is_some(),
+                    Err(_) => true,
+                }
+        })
+    }
+
     /// Uses application-owned language-server configuration from `data`.
     pub fn new(data: PathBuf) -> Self {
         let (events, receiver) = async_channel::bounded(256);

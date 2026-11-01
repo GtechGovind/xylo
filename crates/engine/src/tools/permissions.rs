@@ -99,10 +99,13 @@ pub struct ToolSession {
     approvals: ApprovalGate,
     permissions: PermissionCell,
     vault: CredentialVault,
+    pub(super) web: Arc<super::web::WebSession>,
     connectors: Arc<OnceLock<ConnectorBroker>>,
     pub(crate) reads: Arc<super::read_state::ReadState>,
     pub(crate) lsp: Arc<OnceLock<xylo_runtime::lsp::AgentService>>,
     pub(super) shell_jobs: super::shell_jobs::ShellJobs,
+    pub(super) workspaces: Arc<Mutex<HashMap<Uuid, Arc<super::worktree::LiveWorkspace>>>>,
+    workspace_uses: super::worktree::WorkspaceUses,
 }
 
 impl ToolSession {
@@ -113,10 +116,13 @@ impl ToolSession {
             approvals: ApprovalGate::default(),
             permissions,
             vault,
+            web: Arc::default(),
             connectors: Arc::default(),
             reads: Arc::default(),
             lsp: Arc::default(),
             shell_jobs: super::shell_jobs::ShellJobs::default(),
+            workspaces: Arc::default(),
+            workspace_uses: Default::default(),
         }
     }
 
@@ -128,6 +134,17 @@ impl ToolSession {
     /// Stops a job only when it belongs to this conversation.
     pub fn kill_job(&self, session: Uuid, job: Uuid) -> Result<()> {
         self.shell_jobs.kill(session, job)
+    }
+
+    /// Keeps a checkout alive for a background job or delegated agent. Retain
+    /// this guard until the process and all its descendants have stopped.
+    pub fn retain_workspace(&self, session: Uuid, root: &Path) -> super::worktree::WorkspaceLease {
+        self.workspace_uses.retain(session, root)
+    }
+
+    /// Whether owned work still depends on this checkout.
+    pub fn workspace_in_use(&self, session: Uuid, root: &Path) -> bool {
+        self.workspace_uses.in_use(session, root)
     }
 
     /// Where approval decisions are delivered.
@@ -305,6 +322,18 @@ pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
                     .map(|why| format!("; network access: {why}"))
                     .unwrap_or_default()
             )),
+        };
+    }
+
+    if matches!(call.name, "web_fetch" | "web_search") {
+        // The web module checks domain and private-network authority per hop.
+        return Verdict::Allow;
+    }
+    if matches!(call.name, "worktree_enter" | "worktree_exit") {
+        return if mode == PermissionMode::ReadOnly {
+            Verdict::Refuse("Worktree changes require write permission".into())
+        } else {
+            Verdict::Ask("Changes this chat’s checkout using native Git outside the sandbox, with no network or repository executable configuration".into())
         };
     }
     if call.origin == Origin::Hook {
@@ -517,6 +546,9 @@ pub(crate) fn approval_rule_for(call: &Call) -> Option<(String, String)> {
         .and_then(Value::as_bool)
         == Some(true)
     {
+        return None;
+    }
+    if matches!(call.name, "worktree_enter" | "worktree_exit") {
         return None;
     }
     if call.name == "memory_remember" && call.untrusted_input {

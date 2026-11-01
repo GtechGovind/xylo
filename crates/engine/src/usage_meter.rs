@@ -1,4 +1,5 @@
 //! Turn-owned accounting shared by main, helper and utility model requests.
+mod search;
 use crate::model::{EventStream, ModelError, ModelProvider, ModelRequest, ModelUsage, StreamEvent};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -133,6 +134,7 @@ struct Metered {
     model: String,
     meter: Meter,
 }
+#[async_trait::async_trait]
 impl ModelProvider for Metered {
     fn stream(&self, request: ModelRequest, cancel: CancellationToken) -> EventStream {
         let mut stream = self.inner.stream(request, cancel);
@@ -156,6 +158,28 @@ impl ModelProvider for Metered {
                 yield event;
             }
         })
+    }
+
+    fn supports_search(&self) -> bool {
+        self.inner.supports_search()
+    }
+
+    async fn search(
+        &self,
+        arguments: serde_json::Value,
+        addresses: Vec<std::net::SocketAddr>,
+        cancel: CancellationToken,
+    ) -> Result<serde_json::Value, ModelError> {
+        let id = Uuid::new_v4();
+        self.meter.record(id, self.model.clone(), None).await?;
+        let result = self.inner.search(arguments, addresses, cancel).await?;
+        let model = result
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&self.model)
+            .to_owned();
+        self.meter.record(id, model, search::usage(&result)).await?;
+        Ok(result)
     }
 
     fn fallback(&self) -> Option<(String, Arc<dyn ModelProvider>)> {

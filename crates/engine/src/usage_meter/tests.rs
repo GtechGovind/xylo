@@ -167,3 +167,72 @@ async fn a_reopened_turn_meter_includes_prior_requests_and_new_fallback_requests
         vec!["primary", "alternative"]
     );
 }
+
+struct SearchFixture(serde_json::Value);
+#[async_trait::async_trait]
+impl ModelProvider for SearchFixture {
+    fn stream(&self, _: ModelRequest, _: CancellationToken) -> EventStream {
+        Box::pin(futures_util::stream::empty())
+    }
+    fn supports_search(&self) -> bool {
+        true
+    }
+    async fn search(
+        &self,
+        _: serde_json::Value,
+        _: Vec<std::net::SocketAddr>,
+        _: CancellationToken,
+    ) -> Result<serde_json::Value, ModelError> {
+        Ok(self.0.clone())
+    }
+}
+#[tokio::test]
+async fn native_search_survives_metering_and_records_actual_model_cache_and_reasoning() {
+    use serde_json::json;
+    for (raw, input, output, read, write) in [
+        (
+            json!({"input_tokens":12,"output_tokens":7,"input_tokens_details":{"cached_tokens":3}}),
+            12,
+            7,
+            3,
+            0,
+        ),
+        (
+            json!({"input_tokens":12,"output_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}),
+            17,
+            7,
+            3,
+            2,
+        ),
+        (
+            json!({"promptTokenCount":12,"candidatesTokenCount":7,"thoughtsTokenCount":2,"cachedContentTokenCount":3,"toolUsePromptTokenCount":1}),
+            13,
+            9,
+            3,
+            0,
+        ),
+    ] {
+        let meter = Meter::default();
+        let provider = meter.wrap(
+            Arc::new(SearchFixture(
+                json!({"usage":raw,"model":"actual-search-model","requested_model":"configured"}),
+            )),
+            "configured".into(),
+        );
+        assert!(provider.supports_search());
+        provider
+            .search(json!({"query":"fixture"}), vec![], CancellationToken::new())
+            .await
+            .unwrap();
+        let mut usage = Usage::default();
+        meter.apply(&mut usage);
+        assert_eq!((usage.input_tokens, usage.output_tokens), (input, output));
+        assert_eq!(usage.calls.len(), 1);
+        let call = &usage.calls[0];
+        assert_eq!(call.model, "actual-search-model");
+        assert_eq!(
+            (call.cache_read_tokens, call.cache_write_tokens),
+            (read, write)
+        );
+    }
+}

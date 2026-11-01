@@ -26,6 +26,7 @@ pub mod scripted;
 pub mod suite;
 pub mod task;
 pub mod trace;
+mod web_fixture;
 
 pub use metrics::{Report, TaskSummary, TrialMetrics};
 pub use runner::{ModelSource, Trial, TrialResult, run_trial};

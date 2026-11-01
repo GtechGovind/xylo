@@ -67,6 +67,20 @@ const WRITE_BYTES: usize = 2 * 1024 * 1024;
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     let mut tools = vec![
         def(
+            "worktree_enter",
+            "Create an isolated Git worktree and use it for this chat. Requires approval. Main checkout changes are left untouched",
+            json!({"name":{"type":"string"},"base":{"type":"string"}}),
+            &[],
+            true,
+        ),
+        def(
+            "worktree_exit",
+            "Return this chat to its main checkout. With keep false, remove the worktree only if clean and without unpushed work; otherwise keep it",
+            json!({"keep":{"type":"boolean"}}),
+            &["keep"],
+            true,
+        ),
+        def(
             "agent_delegate",
             "Delegate a bounded, self-contained subtask (for example a broad search or an independent investigation) to a supervised child agent with this task's provider and permissions. Give it full context; it returns its findings",
             json!({"task":{"type":"string"},"context":{"type":"string"}}),
@@ -253,6 +267,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
             )
         });
     }
+    tools.extend(super::web::definitions());
     tools
 }
 

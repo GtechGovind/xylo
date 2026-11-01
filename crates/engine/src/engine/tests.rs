@@ -887,7 +887,6 @@ async fn child_timeout_cancels_its_stalled_process_without_cancelling_the_parent
         cancel: parent_cancel.clone(),
         timeout: Duration::from_millis(1500),
         runtime: tokio::runtime::Handle::current(),
-        workspace: request.workspace.clone(),
         permissions: crate::tools::PermissionCell::new(PermissionMode::FullAccess),
     });
     let handler = delegation.handler();

@@ -9,6 +9,8 @@ async fn agent_requests_start_on_demand_and_report_current_diagnostics() {
     std::fs::write(dir.path().join("language-servers.json"),json!({"servers":[{"languages":["python"],"executable":"/usr/bin/python3","args":[concat!(env!("CARGO_MANIFEST_DIR"),"/src/lsp/agent/test_server.py")]}]}).to_string()).unwrap();
     let service = AgentService::new(dir.path().to_owned());
     assert!(service.manager.servers.lock().await.is_empty());
+    let root = dir.path().canonicalize().unwrap();
+    assert!(!service.may_have_processes(&root));
     let diagnostics = service
         .request(
             dir.path(),
@@ -24,6 +26,11 @@ async fn agent_requests_start_on_demand_and_report_current_diagnostics() {
         diagnostics["diagnostics"][0]["message"],
         "incompatible type"
     );
+    assert!(service.may_have_processes(&root));
+    assert!(!service.may_have_processes(&root.join("another-checkout")));
+    let busy = service.state.lock().await;
+    assert!(service.may_have_processes(&root));
+    drop(busy);
     for (operation, method) in [
         ("definition", "textDocument/definition"),
         ("references", "textDocument/references"),
