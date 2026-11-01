@@ -41,7 +41,8 @@ pub(crate) fn assess(name: &str, arguments: &Value, workspace: &Path) -> Option<
                 .map(|kind| format!("Changes {kind}"))
                 .or_else(|| auto_run_config(workspace, &path))
         }
-        "file_read" | "lsp" | "files_list" | "find_files" | "search_project" => {
+        "lsp" => Some(super::permissions::NATIVE_LSP_REASON.into()),
+        "file_read" | "files_list" | "find_files" | "search_project" => {
             let path = resolve(workspace, text("path").unwrap_or("."));
             secret_path(&path).map(|kind| format!("Reads {kind}"))
         }

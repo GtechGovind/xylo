@@ -153,7 +153,6 @@ const PROJECT_LOCAL_TOOLS: &[&str] = &[
     "agent_delegate",
     "connector_list",
     "notebook_edit",
-    "lsp",
 ];
 
 /// Largest approval or start presentation; long arguments are excerpted so an
@@ -1016,7 +1015,7 @@ impl ToolBroker {
                 "extension_resource",
                 "skill_read",
             ],
-            &["memory_search"],
+            &["memory_search", "file_edit", "file_write"],
         )?;
         actions
             .iter()
@@ -1036,6 +1035,20 @@ impl ToolBroker {
             return Ok(MemoryOrigin::WebContent);
         }
         Ok(match name {
+            // Server responses can include dependency documentation and other
+            // outside text regardless of the requested document's location.
+            "lsp" => MemoryOrigin::ToolOutput,
+            "file_edit" | "file_write"
+                if action.result.as_ref().is_some_and(|result| {
+                    result
+                        .pointer("/summary/lsp_observation")
+                        .or_else(|| result.get("lsp_observation"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                }) =>
+            {
+                MemoryOrigin::ToolOutput
+            }
             "run_command" | "shell_command"
                 if arguments.get("network").and_then(Value::as_bool) == Some(true) =>
             {
@@ -1048,7 +1061,7 @@ impl ToolBroker {
                     MemoryOrigin::ToolOutput
                 }
             }
-            "file_read" | "lsp" | "files_list" | "find_files" | "search_project"
+            "file_read" | "files_list" | "find_files" | "search_project"
                 if matches!(self.reach(name, arguments), Reach::Outside(_)) =>
             {
                 MemoryOrigin::ToolOutput

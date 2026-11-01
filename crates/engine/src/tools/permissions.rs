@@ -256,8 +256,24 @@ pub(crate) enum Verdict {
     Refuse(String),
 }
 
+/// Native language servers inherit account file and network access.
+pub(crate) const NATIVE_LSP_REASON: &str = "Runs a native language server outside the sandbox, with your account's file and network access";
+
 /// Decides whether a call runs, asks or is refused under `mode`.
 pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
+    // Reading code and running an unrestricted native server are separate
+    // authorities, including for hooks and already-running server sessions.
+    if call.name == "lsp" {
+        return match mode {
+            PermissionMode::ReadOnly => Verdict::Refuse("Native language-server execution requires write permission; this task is read-only".into()),
+            PermissionMode::FullAccess => Verdict::Allow,
+            PermissionMode::AskForApproval | PermissionMode::ApproveForMe => Verdict::Ask(match call.reach {
+                Reach::Outside(path) => format!("{NATIVE_LSP_REASON}; reads files outside the project: {}",path.display()),
+                Reach::Project => NATIVE_LSP_REASON.into(),
+            }),
+        };
+    }
+
     if call.origin == Origin::Hook {
         return Verdict::Allow;
     }
@@ -449,6 +465,20 @@ fn rule(
     workspace: &Path,
 ) -> Option<(String, String)> {
     let text = |key: &str| arguments.get(key).and_then(Value::as_str);
+    if name == "lsp" {
+        let scope = match reach {
+            Reach::Project => workspace,
+            Reach::Outside(path) => path.parent().unwrap_or(path),
+        };
+        let identity = serde_json::to_string(&(workspace, scope)).ok()?;
+        return Some((
+            format!("native-lsp:{identity}"),
+            format!(
+                "native language-server execution outside the sandbox with file and network access in {}",
+                scope.display()
+            ),
+        ));
+    }
     if let Reach::Outside(path) = reach {
         let folder = if path.is_dir() {
             path.as_path()

@@ -34,6 +34,7 @@ async fn edits_require_a_conversation_read_and_report_type_errors() {
         .await
         .unwrap();
     std::fs::write(dir.path().join("profile/language-servers.json"),json!({"servers":[{"languages":["python"],"executable":"/usr/bin/python3","args":[concat!(env!("CARGO_MANIFEST_DIR"),"/../runtime/src/lsp/agent/test_server.py")]}]}).to_string()).unwrap();
+    broker.session.permissions().set(PermissionMode::FullAccess);
     let result = run(&broker, "edit", "file_edit", edit).await.unwrap();
     let value: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(
@@ -74,7 +75,7 @@ async fn read_images_return_managed_tool_attachments() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an installed native clangd; run during native qualification"]
 async fn native_type_error_is_in_the_successful_edit_result() {
-    let (dir, broker, _events) = fixture(PermissionMode::ApproveForMe);
+    let (dir, broker, _events) = fixture(PermissionMode::FullAccess);
     let path = dir.path().join("a.cpp");
     std::fs::write(&path, "int main() { return 1; }\n").unwrap();
     run(&broker, "read", "file_read", json!({"path":"a.cpp"}))

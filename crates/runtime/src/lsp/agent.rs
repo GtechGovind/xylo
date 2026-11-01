@@ -17,6 +17,8 @@ struct State {
     next_version: i32,
 }
 /// Starts servers lazily and synchronizes disk content before every request.
+/// Callers must authorize native execution with inherited file and network access;
+/// this transport does not sandbox language servers or decide agent permissions.
 pub struct AgentService {
     manager: Manager,
     events: async_channel::Receiver<LspEvent>,
@@ -100,6 +102,7 @@ impl AgentService {
         state.next_version = version;
         state.versions.insert(path.clone(), version);
         if operation == "diagnostics" {
+            let mut versionless = false;
             let wait = async {
                 loop {
                     let event = tokio::select! {_ = cancel.cancelled()=>bail!("Code intelligence cancelled"), event=self.events.recv()=>event?};
@@ -109,17 +112,24 @@ impl AgentService {
                         diagnostics,
                     } = event
                         && reported == path
-                        && reported_version.is_none_or(|reported| reported >= version)
                     {
-                        return Ok::<_, anyhow::Error>(
-                            json!({"path":path,"diagnostics":diagnostics,"timed_out":false}),
-                        );
+                        match reported_version {
+                            Some(reported) if reported == version => {
+                                return Ok::<_, anyhow::Error>(
+                                    json!({"path":path,"diagnostics":diagnostics,"timed_out":false,"freshness":"versioned","version":version}),
+                                );
+                            }
+                            None => versionless = true,
+                            _ => {}
+                        }
                     }
                 }
             };
             return match tokio::time::timeout(Duration::from_millis(1500), wait).await {
                 Ok(value) => value,
-                Err(_) => Ok(json!({"path":path,"diagnostics":[],"timed_out":true})),
+                Err(_) => Ok(
+                    json!({"path":path,"diagnostics":null,"timed_out":true,"freshness":"unavailable","unavailable_reason":if versionless {"The language server did not correlate its diagnostics with the current document revision"}else{"No current-revision diagnostics were received within 1.5 seconds"}}),
+                ),
             };
         }
         let method = match operation {
