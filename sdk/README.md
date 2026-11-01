@@ -16,7 +16,7 @@ Configure a provider in the desktop first and close it before using the same pro
 
 ## Rust SDK
 
-The public `xylo-sdk` crate in `sdk/rust` is a process client. It does not embed the worker or expose private worker commands or credential material. The API consists of `Session::new`, `Session::run`, `Session::stream`, `Session::approve`, `Session::register_tool`, `Session::on_event`, and `Session::close`. A cloned `Control` can answer approvals or cancel while the session is borrowed by a stream. Consume each stream through its terminal event before starting another run; dropping the session kills its child. Environment and process configuration are explicit in `SessionOptions`. Supply `executable` when the CLI is not on PATH.
+The public `xylo-sdk` crate in `sdk/rust` is a process client. It does not embed the worker or expose private worker commands or credential material. The API consists of `Session::new`, `Session::run`, `Session::stream`, `Session::approve`, `Session::register_tool`, `Session::on_event`, and `Session::close`. A cloned `Control` can answer approvals or cancel while the session is borrowed by a stream. Consume each stream through its terminal event before starting another run. After abandoning a stream, `close` drains unread output without invoking hooks or tool callbacks, requests shutdown, and waits up to five seconds before a forced stop with a further five-second reap deadline. Dropping the session kills its child. Environment and process configuration are explicit in `SessionOptions`. Supply `executable` when the CLI is not on PATH.
 
 ```rust,no_run
 use xylo_sdk::{Session, SessionOptions};

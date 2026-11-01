@@ -5,6 +5,8 @@
 //! Custom tools execute in the SDK caller only after the CLI broker authorizes
 //! them. They must declare `writes=true` and use an `sdk_` name.
 
+mod shutdown;
+
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
@@ -243,11 +245,10 @@ impl Session {
             events,
         })
     }
-    /// Gracefully closes the input and waits for the CLI's exit status.
+    /// Drains unread events while requesting shutdown, without invoking callbacks.
+    /// After five seconds, stops the CLI and allows five more seconds to reap it.
     pub async fn close(mut self) -> Result<i32> {
-        self.control.send(Command::Shutdown).await?;
-        self.control.input.lock().await.take();
-        Ok(self.child.wait().await?.code().unwrap_or(1))
+        shutdown::close(&mut self.child, &mut self.output, &self.control).await
     }
 }
 
