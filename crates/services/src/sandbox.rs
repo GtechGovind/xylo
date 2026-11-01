@@ -366,14 +366,28 @@ pub fn helper_path() -> Result<PathBuf> {
         &std::env::current_exe()?,
         Path::new(env!("CARGO_MANIFEST_DIR")),
         cfg!(debug_assertions),
+        std::env::consts::OS,
     )
 }
 
-fn resolve_helper_path(executable: &Path, services: &Path, debug_build: bool) -> Result<PathBuf> {
+fn resolve_helper_path(
+    executable: &Path,
+    services: &Path,
+    debug_build: bool,
+    platform: &str,
+) -> Result<PathBuf> {
+    // cargo-packager uses an app resource directory on macOS, usr/lib/xylo
+    // beside usr/bin on Linux (also inside AppImage), and the install root on Windows.
+    let resource = match platform {
+        "macos" => "../Resources/sandbox-helper/run.mjs",
+        "linux" => "../lib/xylo/sandbox-helper/run.mjs",
+        "windows" => "sandbox-helper/run.mjs",
+        _ => anyhow::bail!("Unsupported application package platform"),
+    };
     let packaged = executable
         .parent()
         .context("Missing executable directory")?
-        .join("../Resources/sandbox-helper/run.mjs");
+        .join(resource);
     if packaged.is_file() {
         return Ok(packaged.canonicalize()?);
     }

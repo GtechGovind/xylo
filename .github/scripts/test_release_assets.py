@@ -2,8 +2,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from publish_release import validate_receipts
+from publish_release import validate_receipts, wait_for_ci
 from release_assets import platform_name, sha256
 
 
@@ -61,6 +62,19 @@ class ReleaseAssetsTests(unittest.TestCase):
         self.assertEqual(platform_name('Windows', 'AMD64'), ('windows', 'x64'))
         self.assertEqual(platform_name('Linux', 'x86_64'), ('linux', 'x64'))
         self.assertEqual(platform_name('Darwin', 'arm64'), ('macos', 'arm64'))
+
+    def test_failed_ci_blocks_full_publication(self):
+        with patch('publish_release.subprocess.check_output', return_value=json.dumps([
+            {'status': 'completed', 'conclusion': 'failure', 'url': 'https://example.invalid/ci'}
+        ])):
+            with self.assertRaisesRegex(ValueError, 'CI must pass'):
+                wait_for_ci('owner/repo', 'fixture')
+
+    def test_passing_ci_allows_full_publication(self):
+        with patch('publish_release.subprocess.check_output', return_value=json.dumps([
+            {'status': 'completed', 'conclusion': 'success', 'url': 'https://example.invalid/ci'}
+        ])):
+            wait_for_ci('owner/repo', 'fixture')
 
 
 if __name__ == '__main__':

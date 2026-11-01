@@ -68,7 +68,8 @@ fn noninteractive_approval_is_denied_with_a_clear_error() {
     assert_eq!(
         output.status.code(),
         Some(2),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!path.exists());

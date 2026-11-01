@@ -286,18 +286,17 @@ async fn component_environment_cannot_change_launcher_home_path_or_node_startup(
         ),
         (
             "DYLD_INSERT_LIBRARIES".into(),
-            workspace
-                .join("absent.dylib")
-                .to_string_lossy()
-                .into_owned(),
+            // This environment belongs to the final child. On runners without
+            // SIP, an absent dylib kills even /bin/echo after sandbox entry.
+            // Use a valid library; assert separately that it cannot reach the launcher.
+            "/usr/lib/libSystem.B.dylib".into(),
         ),
     ]);
     crate::sandbox::set_child_environment(&mut prepared, &environment).unwrap();
     let env = prepared.command.as_std().get_envs().collect::<Vec<_>>();
-    assert!(
-        !env.iter()
-            .any(|(name, _)| name.to_str() == Some("NODE_OPTIONS"))
-    );
+    for protected in ["NODE_OPTIONS", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"] {
+        assert!(!env.iter().any(|(name, _)| name.to_str() == Some(protected)));
+    }
     let output = prepared.command.output().await.unwrap();
     assert!(
         output.status.success(),

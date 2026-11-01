@@ -10,19 +10,37 @@ fn release_checkout_finds_helper_but_installed_app_requires_bundled_copy() {
     let release = root.join("checkout/target/release/xylo-worker");
     std::fs::create_dir_all(release.parent().unwrap()).unwrap();
     assert_eq!(
-        resolve_helper_path(&release, &services, false).unwrap(),
+        resolve_helper_path(&release, &services, false, "macos").unwrap(),
         helper
     );
-    let installed = root.join("Xylo.app/Contents/MacOS/xylo-worker");
-    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
-    assert!(resolve_helper_path(&installed, &services, false).is_err());
-    let bundled = root.join("Xylo.app/Contents/Resources/sandbox-helper/run.mjs");
-    std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
-    std::fs::write(&bundled, "bundled fixture").unwrap();
-    assert_eq!(
-        resolve_helper_path(&installed, &services, false).unwrap(),
-        bundled
-    );
+    for (platform, binary, resource) in [
+        (
+            "macos",
+            "Xylo.app/Contents/MacOS/xylo-worker",
+            "Xylo.app/Contents/Resources/sandbox-helper/run.mjs",
+        ),
+        (
+            "linux",
+            "usr/bin/xylo-worker",
+            "usr/lib/xylo/sandbox-helper/run.mjs",
+        ),
+        (
+            "windows",
+            "Xylo/xylo-worker.exe",
+            "Xylo/sandbox-helper/run.mjs",
+        ),
+    ] {
+        let installed = root.join(binary);
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        assert!(resolve_helper_path(&installed, &services, false, platform).is_err());
+        let bundled = root.join(resource);
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "bundled fixture").unwrap();
+        assert_eq!(
+            resolve_helper_path(&installed, &services, false, platform).unwrap(),
+            bundled
+        );
+    }
 }
 #[test]
 fn launcher_path_excludes_relative_project_and_package_directories() {

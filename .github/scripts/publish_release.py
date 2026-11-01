@@ -7,8 +7,27 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 
 from release_assets import sha256
+
+
+def wait_for_ci(repo, commit):
+    """Do not publish the complete RC until the matching main CI run passes."""
+    deadline = time.monotonic() + 3600
+    while time.monotonic() < deadline:
+        runs = json.loads(subprocess.check_output([
+            "gh", "run", "list", "--repo", repo, "--workflow", "ci.yml",
+            "--commit", commit, "--branch", "main", "--limit", "1",
+            "--json", "status,conclusion,url",
+        ], text=True))
+        if runs and runs[0]["status"] == "completed":
+            if runs[0]["conclusion"] != "success":
+                raise ValueError(f"CI must pass before publishing: {runs[0]['url']}")
+            return
+        print("Waiting for the matching main CI run to finish", flush=True)
+        time.sleep(30)
+    raise TimeoutError("CI has not completed; verified downloads remain in Actions artifacts")
 
 
 def validate_receipts(root, version, commit, required_platforms=None):
@@ -48,6 +67,9 @@ def run():
     if not tag.startswith("v") or "-rc." not in tag:
         raise SystemExit("This publisher is for release-candidate tags only")
     version = tag[1:]
+    repo = os.environ["GITHUB_REPOSITORY"]
+    if not args.allow_partial:
+        wait_for_ci(repo, os.environ["GITHUB_SHA"])
     root = Path("dist/downloads")
     receipts = validate_receipts(root, version, os.environ["GITHUB_SHA"], {'macos'} if args.allow_partial else None)
     destination = Path("dist/publish")
@@ -77,7 +99,6 @@ The macOS `.app.tar.gz` preserves the app bundle's executable permissions. The `
 
 Artifact signatures use cargo-packager's Base64 encoding of Minisign signatures. Verification instructions and the public key are in the repository's distribution documentation.
 """
-    repo = os.environ["GITHUB_REPOSITORY"]
     existing = subprocess.run(["gh", "release", "view", tag, "--repo", repo, "--json", "isDraft,isPrerelease,assets"], text=True, capture_output=True)
     existing_names = set()
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", encoding="utf-8") as handle:
