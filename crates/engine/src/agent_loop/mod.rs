@@ -205,6 +205,7 @@ struct Run {
     started: Instant,
     usage: Usage,
     streamed: String,
+    active_model: String,
     /// The final answer reached the output limit.
     cut_off: bool,
 }
@@ -280,6 +281,7 @@ impl AgentLoop {
             fallback,
             started: Instant::now(),
             usage: Usage::default(),
+            active_model: String::new(),
             streamed: String::new(),
             cut_off: false,
         };
@@ -712,6 +714,13 @@ impl AgentLoop {
                 let error = match self.stream_once(request.clone(), &mut shown, run).await {
                     Ok(response) => {
                         if let Some(usage) = response.usage {
+                            run.usage.calls.push(xylo_core::pricing::UsageCall {
+                                model: run.active_model.clone(),
+                                input_tokens: usage.input_tokens,
+                                output_tokens: usage.output_tokens,
+                                cache_read_tokens: usage.cache_read_tokens.unwrap_or_default(),
+                                cache_write_tokens: usage.cache_write_tokens.unwrap_or_default(),
+                            });
                             run.usage.input_tokens += usage.input_tokens;
                             run.usage.output_tokens += usage.output_tokens;
                             run.usage.context_tokens = usage.input_tokens;
@@ -879,6 +888,7 @@ impl AgentLoop {
             .unwrap_or(&self.provider)
             .stream(request, self.cancel.clone());
         let mut response = Assembler::default();
+        run.active_model.clear();
         let mut attempt_text = String::new();
         let mut matching = true;
         let mut pending = String::new();
@@ -900,6 +910,17 @@ impl AgentLoop {
                 Some(Err(error)) => break Err(error),
                 Some(Ok(event)) => event,
             };
+            if let StreamEvent::Metadata { model, rate_limits } = &event {
+                run.active_model.clone_from(model);
+                if self.root() {
+                    self.emit(EngineEvent::ModelMetadata {
+                        model: model.clone(),
+                        rate_limits: rate_limits.clone(),
+                    })
+                    .await
+                    .map_err(StreamFailure::Fatal)?;
+                }
+            }
             if let StreamEvent::Text(text) = &event
                 && self.root()
             {

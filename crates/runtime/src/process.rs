@@ -149,12 +149,38 @@ pub async fn run_prepared_sandboxed(
     timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<SandboxedResult> {
+    run_sandboxed_stdin(prepared, cwd, timeout, cancel, Stdio::null()).await
+}
+
+/// Supplies bounded JSON or text through an inherited private stdin file.
+pub async fn run_prepared_sandboxed_input(
+    prepared: xylo_services::sandbox::PreparedSandbox,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: CancellationToken,
+    input: &[u8],
+) -> Result<SandboxedResult> {
+    use std::io::{Seek, Write};
+    anyhow::ensure!(input.len() <= 32 * 1024, "Process input exceeds 32 KiB");
+    let mut file = tempfile::tempfile()?;
+    file.write_all(input)?;
+    file.rewind()?;
+    run_sandboxed_stdin(prepared, cwd, timeout, cancel, Stdio::from(file)).await
+}
+
+async fn run_sandboxed_stdin(
+    prepared: xylo_services::sandbox::PreparedSandbox,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: CancellationToken,
+    stdin: Stdio,
+) -> Result<SandboxedResult> {
     let xylo_services::sandbox::PreparedSandbox {
         command,
         temporary,
         status_file,
     } = prepared;
-    let result = run_prepared(command, cwd, timeout, cancel).await;
+    let result = run_prepared_io(command, cwd, Some(timeout), cancel, None, false, stdin).await;
     if let Some(failure) = xylo_services::sandbox::read_start_status(&status_file) {
         return Err(NotStarted(failure.to_string()).into());
     }
@@ -181,12 +207,29 @@ pub async fn run_prepared(
 /// keeps a private stdin pipe open; its launcher kills the process group if
 /// the owner exits, including an abrupt worker termination.
 pub async fn run_prepared_observed(
+    command: Command,
+    cwd: &Path,
+    timeout: Option<Duration>,
+    cancel: CancellationToken,
+    observer: Option<OutputObserver>,
+    guard_parent: bool,
+) -> Result<ProcessResult> {
+    let stdin = if guard_parent {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    run_prepared_io(command, cwd, timeout, cancel, observer, guard_parent, stdin).await
+}
+
+async fn run_prepared_io(
     mut command: Command,
     cwd: &Path,
     timeout: Option<Duration>,
     cancel: CancellationToken,
     observer: Option<OutputObserver>,
     guard_parent: bool,
+    stdin: Stdio,
 ) -> Result<ProcessResult> {
     if guard_parent {
         command.env("XYLO_SANDBOX_PARENT_GUARD", "1");
@@ -199,11 +242,7 @@ pub async fn run_prepared_observed(
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
         .current_dir(cwd)
-        .stdin(if guard_parent {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);

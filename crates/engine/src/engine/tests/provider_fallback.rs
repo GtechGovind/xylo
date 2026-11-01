@@ -26,6 +26,22 @@ async fn configured_fallback_survives_provider_guards_and_a_real_http_529() {
         .await
         .unwrap();
     let events = drain(&mut events);
+    let usage = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::Completed { usage, .. } => Some(usage),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        usage.calls.len(),
+        1,
+        "Failed overload responses have no usage receipt"
+    );
+    assert_eq!(usage.calls[0].model, "alternative-model");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (10, 5));
+    assert_eq!(usage.estimated_cost.unwrap().unpriced_calls, 1);
+    assert!(events.iter().any(|event| matches!(event, EngineEvent::ModelMetadata {model, ..} if model == "alternative-model")));
     assert!(events.iter().any(
         |event| matches!(event, EngineEvent::Completed { text, .. } if text == "Recovered answer")
     ));

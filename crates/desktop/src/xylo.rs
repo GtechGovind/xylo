@@ -88,6 +88,8 @@ mod settings;
 #[path = "xylo/settings_ui.rs"]
 mod settings_ui;
 mod shell_jobs;
+#[path = "xylo/usage.rs"]
+mod usage;
 #[path = "xylo/work_panel.rs"]
 mod work_panel;
 use native_tools::NativeUi;
@@ -330,6 +332,7 @@ pub struct Xylo {
     quit_tasks_confirmed: bool,
     /// Quitting waits for pending saves; the banner offers Quit anyway.
     quit_waiting_for_saves: bool,
+    usage_ui: usage::UsageUi,
     model_picker: model_picker::ModelPickerUi,
     /// When context accounting last arrived, per chat.
     context_updated_at: BTreeMap<Uuid, i64>,
@@ -623,6 +626,7 @@ impl Xylo {
             quit_after_save: None,
             quit_tasks_confirmed: false,
             quit_waiting_for_saves: false,
+            usage_ui: usage::UsageUi::new(window, cx),
             model_picker: model_picker::ModelPickerUi::new(window, cx),
             context_updated_at: BTreeMap::new(),
             transcript_focus: cx.focus_handle(),
@@ -1024,6 +1028,7 @@ impl Xylo {
                     self.provider_form(&settings.provider, window, cx);
                 }
                 self.settings = settings;
+                self.sync_usage_forms(window, cx);
                 if let Some(mut ui) = local_ui {
                     for root in &self.settings.ui.open_projects {
                         if !ui.open_projects.contains(root) {
@@ -1061,6 +1066,17 @@ impl Xylo {
                 }
             }
             HostEvent::ConversationPage(page) => self.conversation_page(page, cx),
+            HostEvent::Usage {
+                request_id,
+                session_id,
+                result,
+            } => self.usage_received(request_id, session_id, result, cx),
+            HostEvent::OutputStyles { request_id, result } => {
+                self.output_styles_received(request_id, result, cx)
+            }
+            HostEvent::StatusLine { request_id, result } => {
+                self.status_line_received(request_id, result, cx)
+            }
             HostEvent::HistoryPage(page) => self.history_page(page, cx),
             HostEvent::ModelsFailed {
                 generation,
@@ -1765,6 +1781,9 @@ impl Xylo {
 }
 impl Render for Xylo {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.page == Page::Chat && !self.settings_open && !self.updates.installing {
+            self.refresh_usage(cx);
+        }
         if self.updates.installing {
             return div()
                 .size_full()

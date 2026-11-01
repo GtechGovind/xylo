@@ -318,6 +318,11 @@ pub enum StreamEvent {
     Native(NativeContent),
     Usage(ModelUsage),
     Finished(FinishReason),
+    /// Application-owned request identity and bounded numeric response headers.
+    Metadata {
+        model: String,
+        rate_limits: Option<xylo_core::RateLimits>,
+    },
 }
 
 /// A complete model response.
@@ -574,6 +579,7 @@ impl Assembler {
             StreamEvent::Native(native) => self.native = Some(native),
             StreamEvent::Usage(usage) => self.usage = Some(usage),
             StreamEvent::Finished(reason) => self.finish = Some(reason),
+            StreamEvent::Metadata { .. } => {}
         }
     }
 

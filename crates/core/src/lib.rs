@@ -2,6 +2,7 @@
 mod review_prompts;
 pub use review_prompts::{ReviewKind, review_prompt};
 mod branding;
+pub mod pricing;
 pub use branding::{APPLICATION_ID, APPLICATION_NAME, CREDENTIAL_SERVICE};
 mod documents;
 pub use documents::*;
@@ -330,6 +331,12 @@ pub struct AppSettings {
     pub ui: UiPreferences,
     #[serde(default)]
     pub secret_storage: SecretStorage,
+    #[serde(default)]
+    pub pricing_overrides: std::collections::BTreeMap<String, pricing::ModelPrice>,
+    #[serde(default = "default_output_style")]
+    pub output_style: String,
+    #[serde(default)]
+    pub status_line_command: Option<String>,
     /// Default alternative model ID, used on the active authorized connection.
     #[serde(default)]
     pub fallback_model: Option<String>,
@@ -439,11 +446,18 @@ impl Default for AppSettings {
             telemetry_export: false,
             ui: UiPreferences::default(),
             secret_storage: SecretStorage::default(),
+            pricing_overrides: Default::default(),
+            output_style: default_output_style(),
+            status_line_command: None,
             fallback_model: None,
             web_search: WebSearchSettings::default(),
             permission_rules_project: false,
         }
     }
+}
+
+fn default_output_style() -> String {
+    "default".into()
 }
 
 /// Saved web search configuration contains references, never credential values.
@@ -592,6 +606,12 @@ pub struct Usage {
     /// `cache_read_tokens`. Part of `input_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
+    /// Successful request counts retain model identity and per-request context tiers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<pricing::UsageCall>,
+    /// Token-only estimate captured using the rates selected for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<pricing::CostEstimate>,
 }
 
 /// What a running turn is doing right now, for the activity line.
@@ -796,6 +816,10 @@ pub enum EngineEvent {
         #[serde(default)]
         kind: ErrorKind,
     },
+    ModelMetadata {
+        model: String,
+        rate_limits: Option<RateLimits>,
+    },
     /// Visible provider reasoning, separate from the answer.
     ThinkingDelta {
         text: String,
@@ -821,6 +845,16 @@ pub enum EngineEvent {
     McpElicitationClosed {
         request_id: Uuid,
     },
+}
+
+/// Numeric remaining quota reported by a provider, never inferred from usage.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimits {
+    pub requests: Option<u64>,
+    pub tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub observed_at_ms: i64,
 }
 
 /// Live state of a conversation-owned shell job. The output is a bounded tail;

@@ -86,6 +86,7 @@ pub(super) fn state() -> (tempfile::TempDir, Arc<HostState>, Receiver<HostEvent>
     let lsp = crate::lsp::Service::new(paths.data.clone(), editor_events);
     let (workspace_events, _) = async_channel::bounded(16);
     let host = Arc::new(HostState {
+        status_line: Default::default(),
         discovery: Arc::new(provider_control::DiscoveryControl::default()),
         provider_save_gate: Mutex::new(()),
         workspace: crate::workspace::WorkspaceService::new(workspace_events),

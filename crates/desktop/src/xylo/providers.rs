@@ -665,7 +665,7 @@ impl Xylo {
             page = page.child(settings_ui::list_container(rows));
         }
         page = page.child(self.fallback_model_settings(cx));
-        page.into_any_element()
+        page.child(self.pricing_settings(cx)).into_any_element()
     }
 }
 #[derive(Default)]

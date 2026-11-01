@@ -20,6 +20,7 @@
 
 mod environment;
 mod instructions;
+pub(crate) mod output_styles;
 mod render;
 mod skills;
 

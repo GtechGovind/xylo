@@ -11,6 +11,7 @@ mod request;
 mod search;
 mod stream;
 mod thinking;
+mod usage;
 
 pub(crate) use renewal::build_renewable;
 
@@ -329,6 +330,7 @@ impl ModelProvider for NativeProvider {
                 .get("x-request-id")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| diagnostics::identifier(value, &provider.error_redactions));
+            yield crate::model::StreamEvent::Metadata { model: provider.config.model.clone(), rate_limits: usage::remaining(response.headers()) };
             let mut bytes = response.bytes_stream();
             let mut framing = stream::SseDecoder::default();
             let mut state = stream::EventState::new(

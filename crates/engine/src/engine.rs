@@ -530,7 +530,11 @@ impl AgentEngine {
             managed_endpoint(&self.paths, &request.provider.endpoint)?,
         );
         let summary_deadline = guarded.timeout();
-        let provider: Arc<dyn ModelProvider> = Arc::new(guarded);
+        let usage_store = self.store.clone();
+        let usage_meter =
+            blocking(move || crate::usage_meter::Meter::for_turn(usage_store, session, turn))
+                .await?;
+        let provider = usage_meter.wrap(Arc::new(guarded), request.provider.model.clone());
         let budget = ContextBudget::new(&request.provider);
         let mut messages = self
             .restored_messages(&request, events.clone(), cancel.clone())
@@ -547,7 +551,20 @@ impl AgentEngine {
         }
         let mode = self.session.permissions().get();
         let (prompting, prompted) = (broker.clone(), request.clone());
-        let mut system = blocking(move || Self::system_prompt(&prompted, &prompting, mode)).await?;
+        let settings_store = self.store.clone();
+        let (mut system, prices) = blocking(move || {
+            let settings = settings_store.settings()?;
+            let style = xylo_runtime::workspace::output_styles::current(
+                &prompting.workspace_root(),
+                &settings.output_style,
+            )?;
+            let system = crate::prompts::output_styles::apply(
+                Self::system_prompt(&prompted, &prompting, mode)?,
+                &style,
+            );
+            Ok((system, settings.pricing_overrides))
+        })
+        .await?;
         if !self.options.append_system_prompt.is_empty() {
             system.push_str("\n\n");
             system.push_str(&self.options.append_system_prompt);
@@ -601,8 +618,14 @@ impl AgentEngine {
         let outcome = agent.run(messages).await;
         let shutdown = broker.shutdown().await;
         match outcome {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
                 shutdown?;
+                usage_meter.apply(&mut outcome.usage);
+                let mut estimate = xylo_core::pricing::estimate(&outcome.usage.calls, &prices);
+                if outcome.usage.calls.is_empty() {
+                    estimate.unpriced_calls = 1;
+                }
+                outcome.usage.estimated_cost = Some(estimate);
                 if outcome.stopped_early {
                     tracing::warn!(session_id=%request.session_id, "Turn reached its step limit");
                 }

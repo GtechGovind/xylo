@@ -187,6 +187,7 @@ pub struct Checkpoint {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletedTurn {
+    pub reply_id: Uuid,
     pub text: String,
     pub usage: Usage,
 }
@@ -317,6 +318,23 @@ impl Store {
         })
     }
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
+        ensure!(
+            settings.pricing_overrides.len() <= 512
+                && settings
+                    .pricing_overrides
+                    .iter()
+                    .all(|(model, price)| !model.trim().is_empty()
+                        && model.len() <= 200
+                        && price.valid()),
+            "Enter valid model prices"
+        );
+        ensure!(
+            settings
+                .status_line_command
+                .as_ref()
+                .is_none_or(|command| command.len() <= 8192),
+            "Status command exceeds 8 KiB"
+        );
         // Settings are plain JSON on disk: refuse secrets in custom headers.
         for provider in std::iter::once(&settings.provider).chain(&settings.providers) {
             crate::providers::validate_custom_headers(&provider.headers)?;
@@ -675,6 +693,7 @@ impl Store {
     ) -> Result<()> {
         let messages = crate::checkpoint::message_rows(messages)?;
         let receipt = CompletedTurn {
+            reply_id: assistant_reply_id(turn_id),
             text: text.into(),
             usage: usage.clone(),
         };
@@ -688,6 +707,7 @@ impl Store {
             tx.execute("INSERT INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4)",params![message.id.to_string(),session_id.to_string(),serde_json::to_string(&message)?,timestamp])?;
             tx.execute("DELETE FROM messages WHERE id=?1",[interrupted_reply_id(turn_id).to_string()])?;
             tx.execute("INSERT INTO completed_turns(session_id,turn_id,json,completed_at) VALUES(?1,?2,?3,?4)",params![session_id.to_string(),turn_id.to_string(),receipt_json,timestamp])?;
+            tx.execute("DELETE FROM turn_usage WHERE session_id=?1 AND turn_id=?2",params![session_id.to_string(),turn_id.to_string()])?;
             tx.execute("UPDATE conversations SET updated_at=?1,json=json_set(json,'$.updated_at',?1) WHERE id=?2",params![timestamp,session_id.to_string()])?;
             tx.execute("INSERT OR IGNORE INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) VALUES(?1,?2,'pending',?3,?3)",params![session_id.to_string(),turn_id.to_string(),timestamp])?;
             tx.commit()?;Ok(())})

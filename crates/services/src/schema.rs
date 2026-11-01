@@ -32,6 +32,9 @@ CREATE INDEX messages_session_append ON messages(session_id);
 CREATE TABLE checkpoints(session_id TEXT PRIMARY KEY REFERENCES conversations(id),turn_id TEXT NOT NULL,length INTEGER NOT NULL,revision INTEGER NOT NULL,updated_at INTEGER NOT NULL,fallback_model TEXT);
 CREATE TABLE checkpoint_messages(session_id TEXT NOT NULL REFERENCES checkpoints(session_id),position INTEGER NOT NULL,json TEXT NOT NULL,PRIMARY KEY(session_id,position)) WITHOUT ROWID;
 CREATE TABLE completed_turns(session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,json TEXT NOT NULL,completed_at INTEGER NOT NULL,PRIMARY KEY(session_id,turn_id));
+CREATE INDEX completed_turns_reply ON completed_turns(session_id,json_extract(json,'$.reply_id'));
+CREATE INDEX completed_turns_day ON completed_turns(completed_at);
+CREATE TABLE turn_usage(session_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,turn_id TEXT NOT NULL,call_id TEXT NOT NULL,json TEXT NOT NULL,PRIMARY KEY(session_id,turn_id,call_id));
 
 CREATE TABLE instruction_sources(session_id TEXT NOT NULL,workspace TEXT NOT NULL,path TEXT NOT NULL,outside INTEGER NOT NULL CHECK(outside IN(0,1)),PRIMARY KEY(session_id,workspace,path));
 

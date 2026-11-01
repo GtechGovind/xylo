@@ -161,6 +161,7 @@ impl ModelProvider for BedrockProvider {
                 _ = cancel.cancelled() => Err(ModelError::Interrupted),
                 response = provider.send(body) => response,
             }?;
+            yield StreamEvent::Metadata { model: provider.model.clone(), rate_limits: super::usage::remaining(response.headers()) };
             let mut bytes = response.bytes_stream();
             let mut buffer = Vec::new();
             let mut decoder = StreamDecoder::default();

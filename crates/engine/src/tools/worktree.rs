@@ -134,7 +134,20 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
     );
     broker.record_instruction_sources(&context.instruction_sources)?;
     context.set_skills_index(broker.project_skill_context().unwrap_or_default());
-    *broker.workspace.prompt.lock() = Some(crate::prompts::system(&context));
+    let base_prompt = crate::prompts::system(&context);
+    let (system, style_notice) = match broker.store.settings().and_then(|settings| {
+        xylo_runtime::workspace::output_styles::current(&selected, &settings.output_style)
+    }) {
+        Ok(style) => (
+            crate::prompts::output_styles::apply(base_prompt, &style),
+            None,
+        ),
+        Err(_) => (
+            base_prompt,
+            Some("The selected output style is unavailable in this checkout; using Default."),
+        ),
+    };
+    *broker.workspace.prompt.lock() = Some(system.clone());
     broker
         .workspace
         .revision
@@ -144,7 +157,7 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
         branch: branch.clone(),
     })?;
     Ok(
-        json!({"workspace":selected,"branch":branch,"kept":kept,"instructions":crate::prompts::system(&context),"note":"Future tools use this checkout. Re-read files before editing. Existing background tools keep their original checkout until they stop."}),
+        json!({"workspace":selected,"branch":branch,"kept":kept,"instructions":system,"output_style_notice":style_notice,"note":"Future tools use this checkout. Re-read files before editing. Existing background tools keep their original checkout until they stop."}),
     )
 }
 

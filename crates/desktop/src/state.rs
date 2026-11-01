@@ -164,6 +164,8 @@ pub struct TurnState {
     /// `None` while running or before the first turn.
     pub outcome: Option<TurnOutcome>,
     pub usage: Usage,
+    pub rate_limits: Option<(String, xylo_core::RateLimits)>,
+    pub active_model: Option<String>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     /// What the turn is doing now; `None` once it ends.
@@ -432,6 +434,10 @@ impl TurnState {
                 self.touch(self.row_of_call(action_id));
             }
             EngineEvent::ContextUsage { usage } => self.context = Some(usage),
+            EngineEvent::ModelMetadata { model, rate_limits } => {
+                self.rate_limits = rate_limits.map(|limits| (model.clone(), limits));
+                self.active_model = Some(model);
+            }
             EngineEvent::ToolFinished {
                 action_id,
                 result,

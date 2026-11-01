@@ -364,6 +364,9 @@ async fn integrated_worktree_shell_job_retains_checkout_until_process_cleanup() 
 async fn integrated_worktree_refresh_preserves_explicit_sdk_prompt() {
     let (dir, mut broker, mut events) = fixture(PermissionMode::FullAccess);
     initialize(dir.path());
+    let mut settings = broker.store.settings().unwrap();
+    settings.output_style = "learning".into();
+    broker.store.save_settings(&settings).unwrap();
     Arc::get_mut(&mut broker)
         .unwrap()
         .configure_run(&crate::RunOptions {
@@ -379,6 +382,7 @@ async fn integrated_worktree_refresh_preserves_explicit_sdk_prompt() {
     })
     .await;
     assert!(prompt.contains("Keep the SDK output contract"));
+    assert!(prompt.contains(include_str!("../../../prompts/output-style-learning.md").trim()));
 }
 
 struct IntegrationProvider(&'static str);

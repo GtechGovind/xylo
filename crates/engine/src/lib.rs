@@ -20,6 +20,7 @@ mod providers;
 mod steering;
 mod subagent;
 pub mod tools;
+mod usage_meter;
 
 pub use credentials::ProviderCredentialResolver;
 pub use engine::{AgentEngine, ProviderLayer};

@@ -51,6 +51,7 @@ mod settings_control;
 mod steering_control;
 mod turn_queue_control;
 mod update_control;
+mod usage_control;
 mod web_search_control;
 mod worker_control;
 mod worktree_control;
@@ -64,6 +65,19 @@ pub struct ConnectorMutationReceipt {
 
 #[derive(Clone)]
 pub enum HostEvent {
+    Usage {
+        request_id: Uuid,
+        session_id: Uuid,
+        result: std::result::Result<(xylo_services::UsageReport, Option<String>), String>,
+    },
+    OutputStyles {
+        request_id: Uuid,
+        result: std::result::Result<Vec<crate::workspace::output_styles::OutputStyle>, String>,
+    },
+    StatusLine {
+        request_id: Uuid,
+        result: std::result::Result<Option<String>, String>,
+    },
     ActionReviews {
         request_id: Uuid,
         result: std::result::Result<crate::ActionReviewPage, String>,
@@ -331,6 +345,9 @@ pub enum HostEvent {
 }
 
 enum HostCommand {
+    Usage(Uuid, Uuid, Vec<Uuid>, i64, i64, Option<PathBuf>),
+    OutputStyles(Uuid, PathBuf),
+    StatusLine(Uuid, PathBuf, Value),
     PreparedCancel(Vec<turn_queue_control::PreparedStop>),
     RefusedCancel,
     Action(action_control::ActionCommand),
@@ -495,6 +512,7 @@ impl HostClient {
                     )),
                 };
                 let state = Arc::new(HostState {
+                    status_line:Default::default(),
                     discovery: host_discovery,
                     provider_save_gate: Mutex::new(()),
                     paths,
@@ -1145,6 +1163,7 @@ fn startup_settings(store: &Store) -> Result<(AppSettings, bool)> {
 }
 
 struct HostState {
+    status_line: crate::status_line::Runner,
     discovery: Arc<provider_control::DiscoveryControl>,
     provider_save_gate: Mutex<()>,
     workspace: crate::workspace::WorkspaceService,
@@ -1699,6 +1718,14 @@ impl HostState {
                     .await?;
             }
             HostCommand::Worker(session, command) => self.worker_command(session, command).await?,
+            HostCommand::Usage(id, session, messages, start, end, workspace) => {
+                self.load_usage(id, session, messages, start, end, workspace)
+                    .await?
+            }
+            HostCommand::OutputStyles(id, workspace) => self.output_styles(id, workspace).await?,
+            HostCommand::StatusLine(id, workspace, input) => {
+                self.status_line(id, workspace, input).await?
+            }
             HostCommand::HistoryPage(id, before, limit) => {
                 let store = self.store.clone();
                 let page =
