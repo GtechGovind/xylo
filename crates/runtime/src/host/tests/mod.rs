@@ -111,6 +111,7 @@ pub(super) fn state() -> (tempfile::TempDir, Arc<HostState>, Receiver<HostEvent>
         memory: SqliteMemory::new(store.clone()),
         accounts,
         secrets: parking_lot::RwLock::new(Ok(secrets)),
+        inspection_worktrees: parking_lot::Mutex::new(HashMap::new()),
         store,
         settings: Mutex::new(AppSettings::default()),
         latest_project_open: std::sync::atomic::AtomicU64::new(0),

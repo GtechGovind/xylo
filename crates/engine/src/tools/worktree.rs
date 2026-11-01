@@ -94,7 +94,7 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
         let shared = broker.store.worktree_conversations()?.iter().any(|chat| {
             chat.id != broker.request.session_id && !chat.archived && chat.workspace == root
         });
-        let kept = keep
+        let mut kept = keep
             || shared
             // Persistent MCP and native language-server processes belong to
             // this worker, not its most recent turn. Manual removal retires it.
@@ -112,7 +112,11 @@ pub(super) fn execute(broker: &ToolBroker, name: &str, args: &Value) -> Result<V
                 .block_on(worktree::status(&root))?
                 .removable();
         if !kept {
-            broker.runtime.block_on(worktree::remove(&root, false))?;
+            match broker.runtime.block_on(worktree::remove(&root, false)) {
+                Ok(()) => {}
+                Err(error) if error.is::<worktree::InspectionInUse>() => kept = true,
+                Err(error) => return Err(error),
+            }
         }
         (tree.repository, None, kept)
     };
