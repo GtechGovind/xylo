@@ -391,3 +391,52 @@ fn record_replays_repaired_arguments_in_the_native_content() {
         items[0]["input"]
     );
 }
+
+#[derive(Default)]
+struct TerminalTools {
+    ran: Mutex<Vec<String>>,
+}
+impl ToolExecutor for TerminalTools {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        Vec::new()
+    }
+    fn deferred_count(&self) -> usize {
+        0
+    }
+    fn access(&self, _: &str, _: &Value) -> Option<Access> {
+        Some(Access::Writes)
+    }
+    fn execute(&self, id: &str, _: &str, _: Value) -> anyhow::Result<String> {
+        self.ran.lock().push(id.into());
+        anyhow::bail!("terminal hook")
+    }
+    fn pending_stop(&self) -> Option<String> {
+        (!self.ran.lock().is_empty()).then(|| "terminal hook".into())
+    }
+}
+
+#[tokio::test]
+async fn review_f_dispatch_stops_sequential_calls_and_keeps_all_results() {
+    let tools = Arc::new(TerminalTools::default());
+    let calls = ["first", "second"]
+        .into_iter()
+        .map(|id| {
+            (
+                id.into(),
+                Prepared::Run {
+                    name: "write".into(),
+                    arguments: json!({}),
+                    access: Access::Writes,
+                },
+            )
+        })
+        .collect();
+    let results = run_batch(tools.clone(), calls).await;
+    assert_eq!(*tools.ran.lock(), ["first"]);
+    assert_eq!(results.len(), 2);
+    assert!(results[1].content.contains("terminal hook"));
+    assert!(
+        tools.pending_stop().is_some(),
+        "Batch must preserve stop for model loop"
+    );
+}

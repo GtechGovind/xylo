@@ -333,3 +333,43 @@ fn malformed_hook_controls_fail_closed() {
     assert!(crate::hooks::configured(&settings, "PreToolUse", "file_write").is_err());
     assert!(EffectiveSettings::from_value(json!({"disableAllHooks":"true"})).is_err());
 }
+
+#[test]
+fn review_f_compound_shell_prefix_keeps_deny_and_ask_but_not_narrow_allow() {
+    for decision in [PermissionDecision::Deny, PermissionDecision::Ask] {
+        let mut value = json!({"permissions":{"allow":["Bash(*)"]}});
+        value["permissions"][decision.key()] = json!(["Bash(printf:*)"]);
+        let settings = EffectiveSettings::from_value(value).unwrap();
+        for command in [
+            "printf safe; true",
+            "printf; true",
+            "true && printf safe",
+            "printf safe | cat",
+            "echo $(printf safe)",
+            "printf safe\ntrue",
+        ] {
+            assert_eq!(
+                settings.evaluate("shell_command", &json!({"command":command})),
+                Some(decision),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            settings.evaluate(
+                "shell_command",
+                &json!({"command":"printf_other safe; true"})
+            ),
+            Some(PermissionDecision::Allow)
+        );
+    }
+    let settings =
+        EffectiveSettings::from_value(json!({"permissions":{"allow":["Bash(printf:*)"]}})).unwrap();
+    assert_eq!(
+        settings.evaluate("shell_command", &json!({"command":"printf safe; true"})),
+        None
+    );
+    assert_eq!(
+        settings.evaluate("shell_command", &json!({"command":"printf safe"})),
+        Some(PermissionDecision::Allow)
+    );
+}

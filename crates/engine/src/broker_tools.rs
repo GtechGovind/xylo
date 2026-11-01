@@ -42,7 +42,7 @@ impl BrokerTools {
 
 impl ToolExecutor for BrokerTools {
     fn pending_stop(&self) -> Option<String> {
-        self.broker.hook_stop.lock().take()
+        self.broker.hook_stop.lock().clone()
     }
     fn lifecycle(
         &self,

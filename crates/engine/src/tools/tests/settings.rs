@@ -274,3 +274,158 @@ async fn file_deny_reports_refusal_before_any_custom_callback() {
     assert!(!called.load(Ordering::SeqCst));
     assert!(refused.load(Ordering::SeqCst));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_f_compound_shell_deny_beats_full_access_and_broad_allow() {
+    let (directory, broker, _events) = fixture(PermissionMode::FullAccess);
+    std::fs::create_dir_all(directory.path().join(".xylo")).unwrap();
+    std::fs::write(
+        directory.path().join(".xylo/settings.json"),
+        json!({"permissions":{"deny":["Bash(printf:*)"],"allow":["Bash(*)"]}}).to_string(),
+    )
+    .unwrap();
+    let result = run(
+        &broker,
+        "compound-denied",
+        "shell_command",
+        json!({"command":"printf harmless > forbidden.txt; true"}),
+    )
+    .await;
+    assert!(result.is_err(), "Compound command bypassed deny");
+    assert!(!directory.path().join("forbidden.txt").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_f_compound_shell_ask_beats_full_access_and_broad_allow() {
+    let (directory, broker, mut events) = fixture(PermissionMode::FullAccess);
+    std::fs::create_dir_all(directory.path().join(".xylo")).unwrap();
+    std::fs::write(
+        directory.path().join(".xylo/settings.json"),
+        json!({"permissions":{"ask":["Bash(printf:*)"],"allow":["Bash(*)"]}}).to_string(),
+    )
+    .unwrap();
+    let task = broker.clone();
+    let execution = tokio::task::spawn_blocking(move || {
+        task.execute(
+            "compound-ask",
+            "shell_command",
+            json!({"command":"true; printf harmless > unapproved.txt"}),
+        )
+    });
+    let approval = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if let EngineEvent::ApprovalRequired { action_id, .. } = event {
+                return action_id;
+            }
+        }
+        panic!("Approval channel closed")
+    })
+    .await;
+    if let Ok(id) = &approval {
+        broker
+            .session
+            .approvals()
+            .decide_with(*id, false, false)
+            .unwrap();
+    } else {
+        broker.cancel.cancel();
+    }
+    let result = execution.await.unwrap();
+    assert!(approval.is_ok(), "Compound command bypassed ask");
+    assert!(result.is_err());
+    assert!(!directory.path().join("unapproved.txt").exists());
+}
+
+struct StopBatchProvider(std::sync::Arc<parking_lot::Mutex<Vec<crate::model::ModelRequest>>>);
+impl crate::model::ModelProvider for StopBatchProvider {
+    fn stream(
+        &self,
+        request: crate::model::ModelRequest,
+        _: CancellationToken,
+    ) -> crate::model::EventStream {
+        use crate::model::{FinishReason, StreamEvent};
+        let first = {
+            let mut requests = self.0.lock();
+            requests.push(request);
+            requests.len() == 1
+        };
+        let events = if first {
+            vec![
+                StreamEvent::ToolCall {
+                    index: 0,
+                    id: Some("first".into()),
+                    name: Some("file_write".into()),
+                    arguments: Some(json!({"path":"first.txt","content":"first"}).to_string()),
+                },
+                StreamEvent::ToolCall {
+                    index: 1,
+                    id: Some("second".into()),
+                    name: Some("shell_command".into()),
+                    arguments: Some(json!({"command":"printf second > second.txt"}).to_string()),
+                },
+                StreamEvent::Finished(FinishReason::ToolCalls),
+            ]
+        } else {
+            vec![
+                StreamEvent::Text("should not continue".into()),
+                StreamEvent::Finished(FinishReason::Stop),
+            ]
+        };
+        Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)))
+    }
+}
+
+async fn tool_boundary_stop_prevents_remaining_batch_and_model(event: &str) {
+    let (directory, broker, _events) = fixture(PermissionMode::FullAccess);
+    std::fs::create_dir_all(directory.path().join(".xylo")).unwrap();
+    let mut settings = json!({"hooks":{}});
+    settings["hooks"][event] = json!([{"matcher":"^Write$","hooks":[{"command":"printf '%s' '{\"continue\":false,\"stopReason\":\"fixture terminal stop\"}'"}]}]);
+    if event == "PermissionRequest" {
+        settings["permissions"] = json!({"ask":["Write(*)"]});
+    }
+    std::fs::write(
+        directory.path().join(".xylo/settings.json"),
+        settings.to_string(),
+    )
+    .unwrap();
+    let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (events, _receiver) = tokio::sync::mpsc::channel(128);
+    let agent = crate::agent_loop::AgentLoop {
+        provider: std::sync::Arc::new(StopBatchProvider(requests.clone())),
+        budget: crate::provider_guard::ContextBudget::new(&broker.request.provider),
+        summary_deadline: Duration::from_secs(5),
+        tools: std::sync::Arc::new(crate::broker_tools::BrokerTools::root(broker.clone())),
+        system: "fixture".into(),
+        max_tokens: 256,
+        max_model_calls: 4,
+        events,
+        journal: None,
+        permissions: None,
+        cancel: CancellationToken::new(),
+    };
+    let result = agent
+        .run(vec![crate::model::Message::user("request")])
+        .await;
+    assert!(!directory.path().join("first.txt").exists());
+    assert!(
+        !directory.path().join("second.txt").exists(),
+        "{event} failed to stop sequential dispatch"
+    );
+    assert_eq!(
+        requests.lock().len(),
+        1,
+        "{event} allowed another model request"
+    );
+    let failure = result.expect_err("Terminal hook must end the turn");
+    assert!(failure.error.to_string().contains("fixture terminal stop"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_f_pre_tool_stop_is_terminal_for_batch_and_model() {
+    tool_boundary_stop_prevents_remaining_batch_and_model("PreToolUse").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_f_permission_request_stop_is_terminal_for_batch_and_model() {
+    tool_boundary_stop_prevents_remaining_batch_and_model("PermissionRequest").await;
+}

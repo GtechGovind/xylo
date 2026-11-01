@@ -659,7 +659,11 @@ impl AgentLoop {
         .await?;
         let results = dispatch::run_batch(self.tools.clone(), prepared).await;
         messages.extend(results);
-        self.checkpoint(messages).await
+        self.checkpoint(messages).await?;
+        if let Some(reason) = self.tools.pending_stop() {
+            anyhow::bail!("{reason}");
+        }
+        Ok(())
     }
 
     /// Fits, sends and (when transient failures allow) retries one model

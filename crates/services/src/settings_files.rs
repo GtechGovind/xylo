@@ -96,11 +96,11 @@ impl EffectiveSettings {
         .find(|decision| {
             self.rules.iter().any(|rule| {
                 rule.decision == *decision
-                    && (matches_rule(&rule.pattern, name, &normalized)
+                    && (matches_rule_decision(&rule.pattern, name, &normalized, *decision)
                         || (*decision != PermissionDecision::Allow
                             || (rule.pattern.contains("(json:")
                                 || rule.pattern.contains("(fields:")))
-                            && matches_rule(&rule.pattern, name, arguments))
+                            && matches_rule_decision(&rule.pattern, name, arguments, *decision))
             })
         })
     }
@@ -446,6 +446,15 @@ fn glob(pattern: &str, text: &str) -> bool {
 }
 /// Matches a permission pattern without interpreting shell text as code.
 pub fn matches_rule(pattern: &str, name: &str, args: &Value) -> bool {
+    matches_rule_decision(pattern, name, args, PermissionDecision::Allow)
+}
+
+fn matches_rule_decision(
+    pattern: &str,
+    name: &str,
+    args: &Value,
+    decision: PermissionDecision,
+) -> bool {
     let (tool, selector) = pattern
         .split_once('(')
         .map_or((pattern, None), |(name, tail)| {
@@ -502,14 +511,26 @@ pub fn matches_rule(pattern: &str, name: &str, args: &Value) -> bool {
     };
     let Some(text) = text else { return false };
     if let Some(prefix) = selector.strip_suffix(":*") {
+        let starts = |part: &str| {
+            part == prefix
+                || part
+                    .strip_prefix(prefix)
+                    .is_some_and(|tail| tail.starts_with(char::is_whitespace))
+        };
+        if decision != PermissionDecision::Allow && matches!(name, "shell_command" | "run_command")
+        {
+            // Constraints must survive compound syntax. Treat every possible
+            // command boundary conservatively, including quoted separators:
+            // a false positive may ask/refuse, but never grants execution.
+            return text
+                .split([';', '&', '|', '\n', '\r', '`', '(', ')', '{', '}'])
+                .any(|part| starts(part.trim_start()));
+        }
         !text
             .chars()
             .any(|c| matches!(c, ';' | '&' | '|' | '\n' | '`'))
             && !text.contains("$(")
-            && (text == prefix
-                || text
-                    .strip_prefix(prefix)
-                    .is_some_and(|tail| tail.starts_with(char::is_whitespace)))
+            && starts(&text)
     } else {
         glob(selector, &text)
     }

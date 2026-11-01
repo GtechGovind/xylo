@@ -44,7 +44,8 @@ pub(crate) trait ToolExecutor: Send + Sync {
         Vec::new()
     }
 
-    /// A post-tool hook may stop the next model step without discarding a completed tool result.
+    /// A retained terminal hook stop prevents further dispatch and model steps.
+    /// Reading this value must not consume it; each scheduling boundary checks it.
     fn pending_stop(&self) -> Option<String> {
         None
     }
@@ -322,8 +323,17 @@ pub(crate) async fn run_batch(
                 results[slot] = Some(joined(handle).await);
             }
         }
+        if let Some(reason) = tools.pending_stop() {
+            results[index] = Some(error_result(format!("Not run: {reason}")));
+            continue;
+        }
         let executor = tools.clone();
         let handle = tokio::task::spawn_blocking(move || {
+            // A previously queued read may have stopped while this worker
+            // waited for a blocking-thread slot.
+            if let Some(reason) = executor.pending_stop() {
+                return error_result(format!("Not run: {reason}"));
+            }
             executor
                 .execute(&id, &name, arguments)
                 .unwrap_or_else(|error| error_result(format!("{error:#}")))

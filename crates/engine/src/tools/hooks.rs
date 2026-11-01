@@ -74,8 +74,8 @@ impl ToolBroker {
         result: Option<&Value>,
     ) -> Result<HookOutput> {
         let output = self.event_hooks(namespace, call_id, event, tool_name, arguments, result)?;
-        if event == "PostToolUse"
-            && (output.stop_reason.is_some() || output.decision == Some(PermissionDecision::Deny))
+        if output.stop_reason.is_some()
+            || event == "PostToolUse" && output.decision == Some(PermissionDecision::Deny)
         {
             *self.hook_stop.lock() = Some(
                 output
