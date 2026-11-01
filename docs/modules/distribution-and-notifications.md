@@ -20,6 +20,24 @@ Two small leaf crates used by `xylo-runtime` ([runtime](runtime.md): `updates.rs
 | `archive.rs` | Preflight of the macOS `.app` tar.gz layout before extraction |
 | `macos.rs` | Transactional bundle replacement and publisher checks (macOS only) |
 | `bin/xylo-release-verify.rs` | Offline build tool: `POLICY PLATFORM MANIFEST SIGNATURE ARTIFACT`; not an app sidecar |
+| `bin/xylo-signature-verify.rs` | Streams and verifies a download against the public key and `.sig`; not an app sidecar |
+
+## Release candidates and signatures
+
+Release-candidate tags (`v…-rc.…`) build native macOS, Windows, and Linux packages through `.github/workflows/release.yml`. The CI publisher waits for all three jobs. A locally verified macOS build can be published first with `publish_release.py --allow-partial`; its notes identify the pending platforms. CI adds the remaining downloads without replacing already published assets. The tag, Cargo package version, and `packager.json` version must agree.
+
+Every published download, checksum file, and platform receipt is signed with the project key. The encrypted private key and password are GitHub Actions secrets named `MINISIGN_KEY` and `MINISIGN_PASSWORD`; only the public key is checked in at [`.github/release-signing.pub`](../../.github/release-signing.pub). The local encrypted backup is outside the checkout, and its password is in the macOS login Keychain under service `com.qurkos.xylo.release`, account `MINISIGN_PASSWORD`. Do not put private keys in the repository or release uploads.
+
+Verify a downloaded file from the repository root:
+
+```sh
+cargo run --locked --release -p xylo-distribution --bin xylo-signature-verify -- \
+  .github/release-signing.pub /path/to/download.sig /path/to/download
+```
+
+The public key and signatures use cargo-packager's Base64 encoding of complete Minisign files. A project signature verifies download integrity and provenance; it does not provide an Apple Developer ID identity, Apple notarization, or a Windows Authenticode publisher certificate. Receipts and prerelease notes state that distinction explicitly. The initial RC uses project signatures while platform certificates are not configured.
+
+For Apple signing, configure `APPLE_CERTIFICATE` (Base64 PKCS#12), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` (app-specific), and `APPLE_TEAM_ID`. Use a Developer ID Application certificate. The packaging job validates the signed app and its notarization ticket before describing platform signing as verified. Windows publisher signing requires an issued certificate and a signing-provider setup; it is not enabled by a Minisign key.
 | `tests/mod.rs` | Tests |
 
 Depends on `cargo-packager-updater` (pinned `=0.2.3`, rustls), `minisign-verify`, `reqwest` (https only), `semver`, `sha2`, `fs2`, `tar`/`flate2`. Targets: `macos-{aarch64,x86_64}`, `windows-{x86_64,aarch64}`, `linux-{x86_64,aarch64}`.

@@ -6,8 +6,11 @@ import os
 from pathlib import Path
 import platform
 import secrets
+import shlex
 import subprocess
 import tempfile
+
+from release_assets import collect_assets
 
 
 def configure(config, environment, system):
@@ -36,6 +39,9 @@ def run():
     tag = os.environ.get("GITHUB_REF", "")
     if tag.startswith("refs/tags/v") and config["version"] != tag.removeprefix("refs/tags/v"):
         raise SystemExit("Release tag must match packager.json version")
+    if not minisign:
+        raise SystemExit("MINISIGN_KEY is required for verifiable release downloads")
+    config["outDir"] = f"dist/packages/{config['version']}/{platform.system().lower()}-{platform.machine().lower()}"
     binary_directory = Path(config["binariesDir"])
     suffix = ".exe" if platform.system() == "Windows" else ""
     for binary in config["binaries"]:
@@ -52,18 +58,34 @@ def run():
         environment.pop("CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD", None)
         print("::warning::MINISIGN_KEY is missing; update artifacts will be unsigned", flush=True)
     keychain = None
+    original_keychains = None
     with tempfile.TemporaryDirectory(prefix="xylo-signing-") as temporary:
+        if platform.system() == "Darwin":
+            # ICNS needs both standard and Retina representations; a bare
+            # 1024px PNG is not a valid 1x representation in cargo-packager.
+            iconset = Path(temporary) / "xylo.iconset"
+            iconset.mkdir()
+            for size in (16, 32, 128, 256, 512):
+                for scale in (1, 2):
+                    filename = f"icon_{size}x{size}" + ("@2x" if scale == 2 else "") + ".png"
+                    subprocess.run(["sips", "-z", str(size * scale), str(size * scale),
+                        "crates/desktop/assets/xylo-icon.png", "--out", str(iconset / filename)],
+                        check=True, stdout=subprocess.DEVNULL)
+            icon = Path(temporary) / "xylo.icns"
+            subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(icon)], check=True)
+            config["icons"] = [str(icon)]
         if apple:
             certificate = Path(temporary) / "certificate.p12"
             certificate.write_bytes(base64.b64decode(environment["APPLE_CERTIFICATE"], validate=True))
             certificate.chmod(0o600)
             keychain = str(Path(temporary) / "release.keychain-db")
             password = secrets.token_urlsafe(32)
+            original_keychains = shlex.split(security(["list-keychains", "-d", "user"]).stdout.decode())
             security(["create-keychain", "-p", password, keychain])
             security(["unlock-keychain", "-p", password, keychain])
             security(["import", str(certificate), "-k", keychain, "-P", environment.get("APPLE_CERTIFICATE_PASSWORD", ""), "-T", "/usr/bin/codesign"])
             security(["set-key-partition-list", "-S", "apple-tool:,apple:", "-s", "-k", password, keychain])
-            security(["list-keychains", "-d", "user", "-s", keychain])
+            security(["list-keychains", "-d", "user", "-s", *original_keychains, keychain])
             # The imported keychain supplies signing; do not ask packager to import again.
             environment.pop("APPLE_CERTIFICATE", None)
             environment.pop("APPLE_CERTIFICATE_PASSWORD", None)
@@ -77,8 +99,11 @@ def run():
         try:
             generated.write_text(json.dumps(config))
             subprocess.run(["cargo", "packager", "--config", str(generated), "--formats", environment["PACKAGE_FORMATS"]], env=environment, check=True)
+            collect_assets(config, environment, apple)
         finally:
             generated.unlink(missing_ok=True)
+            if original_keychains is not None:
+                security(["list-keychains", "-d", "user", "-s", *original_keychains], check=False)
             if keychain:
                 security(["delete-keychain", keychain], check=False)
 
