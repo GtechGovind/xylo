@@ -70,6 +70,106 @@ fn names(summary: &Value) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_discovery_routes_existing_browser_and_computer_requests() {
+    let (_directory, broker, _events) = fixture(PermissionMode::AskForApproval);
+    tokio::task::spawn_blocking(move || {
+        for (query, expected) in [
+            (
+                "open in my browser chrome can you control system and check?",
+                vec!["desktop_displays", "desktop_screenshot"],
+            ),
+            (
+                "control my existing Chrome browser window",
+                vec!["desktop_displays", "desktop_click"],
+            ),
+            (
+                "check my computer screen",
+                vec!["desktop_displays", "desktop_screenshot"],
+            ),
+            (
+                "type text into my existing Chrome window",
+                vec!["desktop_type"],
+            ),
+        ] {
+            let summary = search(&broker, query);
+            let found = names(&summary);
+            assert!(
+                found
+                    .first()
+                    .is_some_and(|name| name.starts_with("desktop_")),
+                "{query}: {summary}"
+            );
+            for name in expected {
+                assert!(
+                    found.iter().any(|found| found == name),
+                    "{query} must discover {name}: {summary}"
+                );
+            }
+        }
+        assert_eq!(
+            names(&search(&broker, "navigate isolated managed browser URL"))[0],
+            "browser_navigate"
+        );
+        assert_eq!(
+            names(&search(&broker, "read managed browser accessibility tree"))[0],
+            "browser_snapshot"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_discovery_guidance_resolves_to_real_permission_classified_tools() {
+    let (_directory, broker, _events) = fixture(PermissionMode::AskForApproval);
+    tokio::task::spawn_blocking(move || {
+        let workspace = broker.workspace_root();
+        let tools = BrokerTools::root(broker.clone());
+        for compact in [false, true] {
+            let mut context = crate::prompts::PromptContext::detect(
+                &workspace,
+                broker.mode(),
+                xylo_core::now_ms(),
+                broker.window().prompt_budget(),
+            );
+            context.compact = compact;
+            let prompt = crate::prompts::system(&context);
+            let references: Vec<_> = prompt
+                .split('`')
+                .enumerate()
+                .filter_map(|(index, text)| {
+                    (index % 2 == 1 && text.starts_with("desktop_")).then_some(text)
+                })
+                .collect();
+            assert!(
+                !references.is_empty(),
+                "Both prompt sizes must give an actionable native desktop discovery route"
+            );
+            for (name, arguments, access) in [
+                ("desktop_displays", json!({}), Access::ReadOnly),
+                ("desktop_screenshot", json!({}), Access::Writes),
+                ("desktop_click", json!({"x":10,"y":20}), Access::Writes),
+                ("desktop_type", json!({"text":"fixture"}), Access::Writes),
+            ] {
+                assert!(
+                    references.contains(&name),
+                    "The guidance must explain the discovery and input path: {name}"
+                );
+                let summary = search(&broker, name);
+                assert_eq!(names(&summary)[0], name);
+                broker.validate_updated_input(name, &arguments).unwrap();
+                assert_eq!(
+                    tools.access("call_tool", &json!({"name":name,"arguments":arguments})),
+                    Some(access)
+                );
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_ranks_the_most_relevant_tool_first_with_its_arguments() {
     let (_directory, broker, _events) = fixture(PermissionMode::AskForApproval);
     tokio::task::spawn_blocking(move || {

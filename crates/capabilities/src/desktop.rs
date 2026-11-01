@@ -65,28 +65,28 @@ pub fn definitions() -> Vec<ToolDefinition> {
     vec![
         definition(
             "desktop_displays",
-            "List native displays and actual OS capture availability.",
+            "Discover native displays before computer/system control of existing apps and browser windows (Chrome, Safari, Edge). Reports permission-check-on-use status, not an OS access grant.",
             json!({}),
             &[],
             false,
         ),
         definition(
             "desktop_screenshot",
-            "Capture a native display to a PNG artifact. OS screen-recording permission may be required.",
+            "Check the user's actual computer screen and existing browser windows (Chrome, Safari, Edge) with a native desktop PNG screenshot. OS screen-recording permission is checked on use.",
             json!({"display_id":{"type":"integer"}}),
             &[],
             true,
         ),
         definition(
             "desktop_click",
-            "Move pointer to absolute OS coordinates and left click using native input. Requires OS permission.",
+            "Control existing desktop apps and browser windows (Chrome, Safari, Edge): left click observed absolute screen coordinates with native mouse input. Requires OS accessibility permission.",
             json!({"x":{"type":"integer"},"y":{"type":"integer"}}),
             &["x", "y"],
             true,
         ),
         definition(
             "desktop_type",
-            "Type text through native OS input into the currently focused app.",
+            "Type text through native keyboard input into the focused desktop app or existing browser window (Chrome, Safari, Edge). Requires OS accessibility permission.",
             json!({"text":{"type":"string","maxLength":32768}}),
             &["text"],
             true,

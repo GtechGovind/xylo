@@ -271,8 +271,8 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ),
         def(
             "search_tools",
-            "Find tools that are not offered directly (documents, browser, environments, images and the tools of connected services and MCP servers). Returns the best matches, ranked, with their arguments",
-            json!({"query":{"type":"string","description":"Words for the action and its object, for example \"create github issue\" or \"browser screenshot\""}}),
+            "Find tools that are not offered directly (documents, managed browser, native desktop apps, environments, images and connected services/MCP servers). Returns ranked matches with their arguments",
+            json!({"query":{"type":"string","description":"Words for the action and its object, for example \"create github issue\", \"existing Chrome window\" or \"desktop screenshot\""}}),
             &["query"],
             false,
         ),
@@ -314,7 +314,7 @@ pub(super) fn compact_description(name: &str) -> Option<&'static str> {
             "Run bash in the sandbox; cd persists. run_in_background returns a job_id for shell_output. Network needs true and justification"
         }
         "search_tools" => {
-            "Find tools not listed here (create files, search code, git, memory, skills, browser, connectors) with their arguments"
+            "Find tools not listed here (create files, search code, git, memory, skills, browser, native desktop, connectors) with their arguments"
         }
         "call_tool" => "Run a tool found by search_tools with its arguments",
         _ => return None,
