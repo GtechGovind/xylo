@@ -6,33 +6,35 @@ use std::{ffi::OsString, path::PathBuf};
 pub enum Command {
     Version,
     Help,
-    Launch { data: Option<PathBuf> },
+    Launch { data: Option<PathBuf>, debug: bool },
 }
-
 impl Command {
     pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self> {
+        let arguments = arguments.into_iter().collect::<Vec<_>>();
+        if arguments == [OsString::from("--version")] {
+            return Ok(Self::Version);
+        }
+        if arguments == [OsString::from("--help")] || arguments == [OsString::from("-h")] {
+            return Ok(Self::Help);
+        }
         let mut arguments = arguments.into_iter();
-        let Some(option) = arguments.next() else {
-            return Ok(Self::Launch { data: None });
-        };
-        let command = match option.to_str() {
-            Some("--version") => Self::Version,
-            Some("--help" | "-h") => Self::Help,
-            Some("--data-dir") => {
-                let data = PathBuf::from(arguments.next().context("--data-dir requires a path")?);
-                ensure!(data.is_absolute(), "--data-dir requires an absolute path");
-                Self::Launch { data: Some(data) }
+        let mut data = None;
+        let mut debug = false;
+        while let Some(option) = arguments.next() {
+            match option.to_str() {
+                Some("--debug") if !debug => debug = true,
+                Some("--data-dir") if data.is_none() => {
+                    let path =
+                        PathBuf::from(arguments.next().context("--data-dir requires a path")?);
+                    ensure!(path.is_absolute(), "--data-dir requires an absolute path");
+                    data = Some(path);
+                }
+                _ => bail!("Unknown or duplicate startup option; use --help"),
             }
-            _ => bail!("Unknown startup option; use --help"),
-        };
-        ensure!(
-            arguments.next().is_none(),
-            "Unexpected startup arguments; use --help"
-        );
-        Ok(command)
+        }
+        Ok(Self::Launch { data, debug })
     }
 }
-
 #[cfg(test)]
 #[path = "startup/tests.rs"]
 mod tests;

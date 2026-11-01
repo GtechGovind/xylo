@@ -60,6 +60,7 @@ impl ToolExecutor for BrokerTools {
     }
 
     fn access(&self, name: &str, arguments: &Value) -> Option<Access> {
+        self.broker.observe_excluded(name);
         if !self.offered(name) {
             return None;
         }

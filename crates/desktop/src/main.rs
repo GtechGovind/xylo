@@ -40,7 +40,7 @@ fn quit(cx: &mut App) {
     }
 }
 fn main() -> anyhow::Result<()> {
-    let data = match startup::Command::parse(std::env::args_os().skip(1))? {
+    let (data, debug) = match startup::Command::parse(std::env::args_os().skip(1))? {
         startup::Command::Version => {
             println!(
                 "{} {}",
@@ -51,20 +51,19 @@ fn main() -> anyhow::Result<()> {
         }
         startup::Command::Help => {
             println!(
-                "Xylo {}\n\nUsage: xylo [--data-dir ABSOLUTE_PATH | --version | --help]\n\nWithout options, Xylo opens the existing application profile.",
+                "Xylo {}\n\nUsage: xylo [--data-dir ABSOLUTE_PATH] [--debug] | --version | --help\n\nWithout options, Xylo opens the existing application profile.",
                 env!("CARGO_PKG_VERSION")
             );
             return Ok(());
         }
-        startup::Command::Launch { data } => data,
+        startup::Command::Launch { data, debug } => (data, debug),
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-    let host = match data {
-        Some(data) => xylo_runtime::AppPaths::at(data).and_then(HostClient::spawn_at),
-        None => HostClient::spawn(),
+    let paths = match data {
+        Some(data) => xylo_runtime::AppPaths::at(data)?,
+        None => xylo_runtime::AppPaths::discover()?,
     };
+    let _observability = xylo_runtime::observability::Observability::init(&paths.data, debug)?;
+    let host = HostClient::spawn_at(paths);
     let application = gpui_kit::application()
         .with_assets(assets::AppAssets)
         .with_quit_mode(QuitMode::Explicit);

@@ -11,6 +11,8 @@ mod attachments;
 mod broker_tools;
 mod credentials;
 mod engine;
+mod run_options;
+pub use run_options::{CustomToolHandler, RefusalObserver, RunOptions};
 mod model;
 mod prompts;
 mod provider_guard;

@@ -243,6 +243,7 @@ impl Xylo {
     fn export_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let markdown = self.conversation_markdown();
         let file_name = format!("{}.md", export_file_stem(&markdown));
+        let session = self.session;
         cx.spawn_in(window, async move |view, cx| {
             let Some(file) = rfd::AsyncFileDialog::new()
                 .set_title("Export conversation")
@@ -254,26 +255,11 @@ impl Xylo {
                 return;
             };
             let path = file.path().to_path_buf();
-            let written = cx
-                .background_executor()
-                .spawn({
-                    let path = path.clone();
-                    async move { std::fs::write(path, markdown) }
-                })
-                .await;
             let _ = view.update(cx, |view, cx| {
-                match written {
-                    Ok(()) => {
-                        let name = path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        view.status = format!("Exported to {name}").into();
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "Conversation export failed");
-                        view.error = Some("The conversation could not be exported.".into());
-                    }
+                if let Some(host) = &view.host
+                    && let Err(error) = host.export_conversation(session, path)
+                {
+                    view.error = Some(error.to_string());
                 }
                 cx.notify();
             });
