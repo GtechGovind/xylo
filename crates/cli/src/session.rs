@@ -95,10 +95,7 @@ pub async fn serve(profile: &Profile, options: &Options, telemetry: &Observabili
         ensure!(!prompt.trim().is_empty(), "The prompt must not be empty");
         let span = tracing::info_span!("headless.run");
         policy_refused.store(false, Ordering::Release);
-        let mut provider = profile.settings.provider.clone();
-        if let Some(model) = &options.model {
-            provider.model = model.clone();
-        }
+        let mut provider = turn_provider(&profile.settings, options.model.as_deref());
         let script = std::env::var_os("XYLO_EVAL_SCRIPT")
             .map(|path| -> Result<_> {
                 Ok(serde_json::from_slice::<xylo_evals::scripted::Script>(
@@ -364,3 +361,15 @@ async fn read_commands(sender: mpsc::Sender<Result<Command>>) {
         }
     }
 }
+
+/// Headless requests use the same saved defaults as desktop and wakeups.
+fn turn_provider(settings: &xylo_core::AppSettings, model: Option<&str>) -> ProviderConfig {
+    let mut provider = settings.turn_provider();
+    if let Some(model) = model {
+        provider.model = model.to_owned();
+    }
+    provider
+}
+
+#[cfg(test)]
+mod tests;

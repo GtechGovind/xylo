@@ -726,7 +726,7 @@ fn start(
             network_hint: None,
         }),
     });
-    {
+    let process_lease = {
         let mut state = jobs.state.lock();
         if state
             .jobs
@@ -749,8 +749,11 @@ fn start(
             };
             state.jobs.remove(index);
         }
+        // Persist before publication/spawn; failure leaves no phantom running job.
+        let ownership = xylo_runtime::workspace::worktree::retain_process_workspace(&root)?;
         state.jobs.push_back(job.clone());
-    }
+        ownership
+    };
     jobs.publish(&job);
     let observer = {
         let jobs = jobs.clone();
@@ -778,6 +781,13 @@ fn start(
         .await;
         if let Some(failure) = sandbox::read_start_status(&status_file) {
             result = Err(xylo_runtime::process::NotStarted(failure.to_string()).into());
+        }
+        if let Some(lease) = process_lease
+            && let Err(error) = lease.release_after(&result)
+        {
+            result = Err(
+                error.context("Command finished, but checkout ownership could not be released")
+            );
         }
         let denied = sandbox::read_network_denials(&status_file);
         if !denied.is_empty() {

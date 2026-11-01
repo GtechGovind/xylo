@@ -102,6 +102,8 @@ pub async fn execute(
             id: attempt_id,
             complete: false,
         };
+        let ownership =
+            retain_hook_workspace(&service, package, component, &state.setup.workspace)?;
         let result = service
             .execute_component_bound(
                 package,
@@ -113,7 +115,11 @@ pub async fn execute(
                 cancel,
                 &state,
             )
-            .await?;
+            .await;
+        if let Some(ownership) = ownership {
+            ownership.release_after(&result)?;
+        }
+        let result = result?;
         let output = json!({"receipt_id":attempt_id,"component_status":service.component_status(package,component)?,"execution":result,"packages":service.list()?});
         store.finish_extension_execution(attempt_id, &output)?;
         receipt.complete = true;
@@ -196,6 +202,28 @@ pub async fn execute(
         Ok(json!({"packages":service.list()?,"sources":service.sources()?}))
     })
     .await?
+}
+
+/// Direct settings verification and engine dispatch share hook ownership.
+/// The bound execution still validates the package digest and setup before launch.
+pub fn retain_hook_workspace(
+    service: &ExtensionService,
+    package: &str,
+    component: &str,
+    workspace: &std::path::Path,
+) -> Result<Option<crate::workspace::worktree::ProcessWorkspaceLease>> {
+    let is_hook = service.list()?.iter().any(|candidate| {
+        candidate.id == package
+            && candidate
+                .components
+                .iter()
+                .any(|entry| entry.name == component && entry.kind == ComponentKind::Hooks)
+    });
+    if is_hook {
+        crate::workspace::worktree::retain_process_workspace(workspace)
+    } else {
+        Ok(None)
+    }
 }
 
 struct NativeReceiptGuard {

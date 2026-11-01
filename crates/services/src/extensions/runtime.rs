@@ -367,8 +367,7 @@ impl ExtensionService {
                 }
                 _ => unreachable!(),
             };
-            let mut result = result
-                .map_err(|error| anyhow::anyhow!(redacted(&format!("{error:#}"), &secrets)))?;
+            let mut result = result.map_err(|error| redact_execution_error(error, &secrets))?;
             // Policy control is extracted before data redaction. Credentials
             // that equal a policy word/key must never erase a hook denial.
             let hook_control = if plan.component.kind == ComponentKind::Hooks {
@@ -1057,7 +1056,6 @@ fn spawn_component(
     plan: &Plan,
     entry: &Entry,
     environment: BTreeMap<String, String>,
-    input: Option<&[u8]>,
 ) -> Result<OwnedProcess> {
     let (program, args) = command(plan, entry)?;
     let mut prepared = crate::sandbox::prepare_with_policy(
@@ -1069,9 +1067,6 @@ fn spawn_component(
         &plan.setup.allowed_domains,
     )?;
     crate::sandbox::set_child_environment(&mut prepared, &environment)?;
-    if let Some(bytes) = input {
-        crate::sandbox::set_child_input(&mut prepared, bytes)?;
-    }
     prepared
         .command
         .stdin(Stdio::piped())
@@ -1103,36 +1098,41 @@ async fn run_hook(
         !cancel.is_cancelled(),
         "Component execution cancelled before process start"
     );
-    let mut process = spawn_component(plan, entry, environment, Some(&bytes))?;
-    let _owner = process
-        .child
-        .stdin
-        .take()
-        .context("Hook owner pipe missing")?;
-    let stdout = process.child.stdout.take().context("Hook stdout missing")?;
-    let work = async {
-        let mut output = Vec::new();
-        stdout
-            .take(1024 * 1024 + 1)
-            .read_to_end(&mut output)
-            .await?;
-        ensure!(output.len() <= 1024 * 1024, "Hook output exceeds 1 MiB");
-        let status = process.child.wait().await?;
-        if status.code() == Some(2) {
-            return Ok(json!({"hookSpecificOutput":{"permissionDecision":"deny"},"exit_code":2}));
-        }
-        ensure!(
-            status.success(),
-            "Hook command failed (exit {:?}); inspect component dependencies and setup",
-            status.code()
-        );
-        let text = String::from_utf8(output).context("Hook output is not UTF-8")?;
-        let output: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"text":text}));
-        crate::hooks::HookOutput::parse(&output)?;
-        Ok::<Value, anyhow::Error>(output)
-    };
-    tokio::select! {_=cancel.cancelled()=>bail!("Hook execution cancelled; effects may be incomplete"),result=tokio::time::timeout(duration(plan),work)=>result.context("Hook execution timed out; effects may be incomplete")?}
+    let (program, args) = command(plan, entry)?;
+    let mut prepared = crate::sandbox::prepare_with_policy(
+        &program.to_string_lossy(),
+        &args,
+        &plan.setup.workspace,
+        std::slice::from_ref(&plan.root),
+        &plan.protected_paths,
+        &plan.setup.allowed_domains,
+    )?;
+    crate::sandbox::set_child_environment(&mut prepared, &environment)?;
+    crate::sandbox::set_child_input(&mut prepared, &bytes)?;
+    let (code, output) = crate::hooks::run_prepared(prepared, duration(plan), cancel).await?;
+    if code == Some(2) {
+        return Ok(json!({"hookSpecificOutput":{"permissionDecision":"deny"},"exit_code":2}));
+    }
+    ensure!(
+        code == Some(0),
+        "Hook command failed (exit {code:?}); inspect component dependencies and setup"
+    );
+    let text = String::from_utf8(output).context("Hook output is not UTF-8")?;
+    let output: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"text":text}));
+    crate::hooks::HookOutput::parse(&output)?;
+    Ok(output)
 }
+
+/// Redaction must not turn unknown process ownership into a releasable error.
+fn redact_execution_error(error: anyhow::Error, secrets: &[String]) -> anyhow::Error {
+    let message = redacted(&format!("{error:#}"), secrets);
+    if error.is::<crate::sandbox::CleanupUnknown>() {
+        crate::sandbox::CleanupUnknown(message).into()
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
 async fn write_lsp(stdin: &mut tokio::process::ChildStdin, message: Value) -> Result<()> {
     let bytes = serde_json::to_vec(&message)?;
     ensure!(bytes.len() <= 1024 * 1024, "LSP request exceeds 1 MiB");
@@ -1228,7 +1228,7 @@ async fn run_lsp(
         !cancel.is_cancelled(),
         "Component execution cancelled before process start"
     );
-    let mut process = spawn_component(plan, entry, environment, None)?;
+    let mut process = spawn_component(plan, entry, environment)?;
     let mut stdin = process.child.stdin.take().context("LSP stdin missing")?;
     let mut stdout = BufReader::new(process.child.stdout.take().context("LSP stdout missing")?);
     let work = async {
@@ -1339,3 +1339,6 @@ fn redact_value(value: &mut Value, secrets: &[String]) {
         _ => {}
     }
 }
+
+#[cfg(all(test, unix))]
+mod cleanup_tests;

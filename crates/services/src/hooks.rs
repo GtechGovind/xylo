@@ -237,6 +237,27 @@ pub async fn run(
         &protected,
     )?;
     crate::sandbox::set_child_input(&mut prepared, &bytes)?;
+    let (code, output) = run_prepared(prepared, command.timeout, cancel).await?;
+    if code == Some(2) {
+        return Ok(json!({"decision":"deny"}));
+    }
+    ensure!(code == Some(0), "Hook command failed (exit {code:?})");
+    if output.is_empty() {
+        return Ok(json!({}));
+    }
+    let value: Value = serde_json::from_slice(&output).context("Hook output must be JSON")?;
+    HookOutput::parse(&value)?;
+    Ok(value)
+}
+
+/// Shared guarded command lifecycle for configured and portable hooks. The
+/// bytes and original exit code let each caller preserve its public format.
+pub(crate) async fn run_prepared(
+    mut prepared: crate::sandbox::PreparedSandbox,
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<(Option<i32>, Vec<u8>)> {
+    ensure!(!cancel.is_cancelled(), "Hook cancelled before execution");
     prepared
         .command
         .stdin(Stdio::piped())
@@ -246,8 +267,13 @@ pub async fn run(
     #[cfg(unix)]
     prepared.command.process_group(0);
     let mut child = prepared.command.spawn().context("Start sandboxed hook")?;
-    let owner = child.stdin.take().context("Hook owner pipe missing")?;
-    let stdout = child.stdout.take().context("Hook stdout missing")?;
+    let owner = child.stdin.take().ok_or_else(|| {
+        crate::sandbox::CleanupUnknown("hook owner pipe missing after spawn".into())
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| crate::sandbox::CleanupUnknown("hook stdout missing after spawn".into()))?;
     let output = tokio::spawn(async move {
         let mut output = Vec::new();
         stdout
@@ -262,32 +288,25 @@ pub async fn run(
     // the owner pipe; the command receives its JSON through a separate file.
     let status = tokio::select! {
         _ = cancel.cancelled() => Err(anyhow::anyhow!("Hook execution cancelled; effects may be incomplete")),
-        result = tokio::time::timeout(command.timeout, child.wait()) =>
+        result = tokio::time::timeout(timeout, child.wait()) =>
             result.context("Hook execution timed out; effects may be incomplete")
                 .and_then(|result| result.context("Wait for sandboxed hook")),
     };
     drop(owner);
     let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     let cleanup_path = prepared.status_file.with_extension("cleanup");
-    crate::sandbox::wait_for_guard_cleanup(&cleanup_path).await?;
+    let cleanup = crate::sandbox::wait_for_guard_cleanup(&cleanup_path).await;
+    // Only this private launcher record proves that dispatch never occurred.
+    if let Some(failure) = crate::sandbox::read_start_status(&prepared.status_file) {
+        bail!("{failure}");
+    }
+    cleanup?;
     reaped.context("Sandboxed hook did not retire")??;
     let captured = tokio::time::timeout(Duration::from_secs(2), output).await;
     let status = status?;
     let output = captured.context("Hook output pipes did not close")???;
-    if let Some(failure) = crate::sandbox::read_start_status(&prepared.status_file) {
-        bail!("{failure}");
-    }
     let code = crate::sandbox::read_guard_exit_code(&cleanup_path).or_else(|| status.code());
-    if code == Some(2) {
-        return Ok(json!({"decision":"deny"}));
-    }
-    ensure!(code == Some(0), "Hook command failed (exit {code:?})");
-    if output.is_empty() {
-        return Ok(json!({}));
-    }
-    let value: Value = serde_json::from_slice(&output).context("Hook output must be JSON")?;
-    HookOutput::parse(&value)?;
-    Ok(value)
+    Ok((code, output))
 }
 
 #[cfg(all(test, unix))]

@@ -55,6 +55,7 @@ impl Runner {
                 Ok((temporary, prepared))
             })
             .await??;
+            let ownership = crate::workspace::worktree::retain_process_workspace(workspace)?;
             let output = crate::process::run_prepared_sandboxed_input(
                 prepared,
                 temporary.path(),
@@ -62,8 +63,11 @@ impl Runner {
                 cancel,
                 &input,
             )
-            .await?
-            .result;
+            .await;
+            if let Some(ownership) = ownership {
+                ownership.release_after(&output)?;
+            }
+            let output = output?.result;
             ensure!(
                 output.code == Some(0),
                 "Status command did not finish successfully"
