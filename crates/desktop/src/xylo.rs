@@ -63,6 +63,8 @@ mod chat;
 use app_status::{HostHealth, StatusLine, product_error};
 #[path = "xylo/context_panel.rs"]
 mod context_panel;
+#[path = "xylo/mcp_forms.rs"]
+mod mcp_forms;
 #[path = "xylo/memory.rs"]
 mod memory;
 #[path = "xylo/memory_form.rs"]
@@ -224,6 +226,8 @@ pub struct Xylo {
     sidebar_state: sidebar::SidebarUi,
     messages: Vec<ChatMessage>,
     turns: BTreeMap<Uuid, TurnState>,
+    mcp_forms: BTreeMap<Uuid, mcp_forms::Form>,
+    mcp_commands: Vec<xylo_runtime::host::McpPromptCommand>,
     composer: Entity<TextareaState>,
     editor: Entity<EditorState>,
     editor_path: Option<PathBuf>,
@@ -268,6 +272,7 @@ pub struct Xylo {
     connector_args: Entity<TextareaState>,
     connector_pending: Option<Uuid>,
     connector_pending_save: bool,
+    connector_signing_in: bool,
     connector_editing: Option<Uuid>,
     connector_credential: Entity<InputState>,
     connector_transport: String,
@@ -499,6 +504,8 @@ impl Xylo {
             sidebar_state: Default::default(),
             messages: vec![],
             turns: BTreeMap::new(),
+            mcp_forms: BTreeMap::new(),
+            mcp_commands: Vec::new(),
             composer,
             editor,
             editor_path: None,
@@ -549,6 +556,7 @@ impl Xylo {
             }),
             connector_pending: None,
             connector_pending_save: false,
+            connector_signing_in: false,
             connector_editing: None,
             connector_credential: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -1161,6 +1169,25 @@ impl Xylo {
             }
             HostEvent::MemoryExport { request_id, result } => {
                 self.memory_exported(request_id, result, cx)
+            }
+            HostEvent::McpCommands {
+                request_id,
+                workspace,
+                connector_id,
+                commands,
+            } => {
+                if self.connector_inspection_request == Some(request_id)
+                    && self.workspace == workspace
+                {
+                    self.mcp_commands
+                        .retain(|command| command.connector_id != connector_id);
+                    self.mcp_commands.extend(commands);
+                }
+            }
+            HostEvent::ConnectorAuthorization { request_id, url } => {
+                if self.connector_pending == Some(request_id) {
+                    cx.open_url(&url);
+                }
             }
             HostEvent::Connectors(connectors) => self.connectors = connectors,
             HostEvent::ConnectorMutation { request_id, result } => {

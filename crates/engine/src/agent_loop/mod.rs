@@ -586,6 +586,12 @@ impl AgentLoop {
         .await?;
         let results = dispatch::run_batch(self.tools.clone(), prepared).await;
         messages.extend(results);
+        messages.extend(
+            self.tools
+                .take_instruction_notes()
+                .iter()
+                .map(|text| application_note(text)),
+        );
         self.checkpoint(messages).await
     }
 

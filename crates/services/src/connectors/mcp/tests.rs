@@ -387,7 +387,9 @@ async fn http_fixture(
 }
 
 /// Reads one HTTP/1.1 request with a `Content-Length` body.
-async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
+pub(super) async fn read_http_request(
+    socket: &mut tokio::net::TcpStream,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut buffer = Vec::new();
     let header_end = loop {
         if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {

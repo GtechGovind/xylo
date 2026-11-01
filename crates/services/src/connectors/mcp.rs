@@ -12,6 +12,9 @@
 //! closes stdin and waits briefly for the server to exit), and only then is the
 //! sandboxed process group killed. The first lines a local server writes to
 //! stderr are kept and attached to connection errors.
+mod handler;
+mod legacy;
+mod metadata;
 use crate::{CredentialVault, Store};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::{Stream, StreamExt};
@@ -178,12 +181,13 @@ impl StderrState {
     }
 }
 
-type Client = RunningService<RoleClient, ()>;
+type Client = RunningService<RoleClient, handler::Handler>;
 struct Session {
     client: Option<Client>,
     fingerprint: String,
     touched: Instant,
     process: Option<LocalProcess>,
+    route: Arc<std::sync::RwLock<Option<handler::Route>>>,
 }
 impl Session {
     /// Closes the client gracefully within [`CLOSE_GRACE`], then kills the
@@ -212,6 +216,8 @@ struct Pool {
     configuration_gates: Mutex<HashMap<Uuid, Weak<Mutex<()>>>>,
     idle_timeout_ms: AtomicU64,
     reaper_started: AtomicBool,
+    forms: Arc<handler::Forms>,
+    revision: Arc<AtomicU64>,
 }
 impl Pool {
     fn idle_timeout(&self) -> Duration {
@@ -278,6 +284,7 @@ impl Pool {
 pub struct ConnectorBroker {
     pool: Arc<Pool>,
     local_scope: Option<ConnectorLaunchScope>,
+    route: Option<handler::Route>,
 }
 impl ConnectorBroker {
     /// Creates an empty pool with the default [`MCP_IDLE_TIMEOUT`].
@@ -291,9 +298,34 @@ impl ConnectorBroker {
                 configuration_gates: Mutex::new(HashMap::new()),
                 idle_timeout_ms: AtomicU64::new(duration_ms(MCP_IDLE_TIMEOUT)),
                 reaper_started: AtomicBool::new(false),
+                forms: Arc::default(),
+                revision: Arc::default(),
             }),
             local_scope: None,
+            route: None,
         }
+    }
+    /// Routes server forms only to the active chat; absent routes decline requests.
+    pub fn with_chat(
+        mut self,
+        events: tokio::sync::mpsc::Sender<xylo_core::EngineEvent>,
+        cancel: CancellationToken,
+    ) -> Self {
+        self.route = Some(handler::Route { events, cancel });
+        self
+    }
+    /// Responds to a pending form; no model-facing tool can call this API.
+    pub fn answer_form(
+        &self,
+        id: Uuid,
+        action: xylo_core::McpFormAction,
+        content: Option<Value>,
+    ) -> Result<()> {
+        self.pool.forms.answer(id, action, content)
+    }
+    /// Advances when server notifications replace a persisted tool catalog.
+    pub fn catalog_revision(&self) -> u64 {
+        self.pool.revision.load(Ordering::Acquire)
     }
     /// Changes how long unused connections stay open. Applies to every clone.
     pub fn with_idle_timeout(self, idle: Duration) -> Self {
@@ -359,6 +391,7 @@ impl ConnectorBroker {
                     fingerprint: String::new(),
                     touched: Instant::now(),
                     process: None,
+                    route: Arc::default(),
                 }))
             })
             .clone())
@@ -374,9 +407,26 @@ impl ConnectorBroker {
             !cancel.is_cancelled(),
             "Connector initialization cancelled before dispatch"
         );
+        if let Ok(mut route) = session.route.write() {
+            *route = self.route.clone();
+        }
         let fingerprint = Self::fingerprint(config, local_scope)?;
-        if session.fingerprint == fingerprint
-            && session.client.as_ref().is_some_and(|c| !c.is_closed())
+        let secret = if let Some(reference) = &config.credential_ref {
+            Some(super::oauth::connector_access_token(&self.pool.vault, reference, cancel).await?)
+        } else {
+            None
+        };
+        let live_fingerprint = format!(
+            "{fingerprint}:{}",
+            hex::encode(Sha256::digest(
+                secret.as_deref().unwrap_or_default().as_bytes()
+            ))
+        );
+        if session.fingerprint == live_fingerprint
+            && session
+                .client
+                .as_ref()
+                .is_some_and(|client| !client.is_closed())
         {
             session.touched = Instant::now();
             return Ok(());
@@ -384,15 +434,15 @@ impl ConnectorBroker {
         if let Err(error) = session.close().await {
             tracing::debug!("Closing replaced MCP connection: {error:#}");
         }
-        let secret = if let Some(reference) = config.credential_ref.clone() {
-            let vault = self.pool.vault.clone();
-            Some(
-                tokio::task::spawn_blocking(move || vault.get(&reference))
-                    .await??
-                    .context("Connector credential is missing")?,
-            )
-        } else {
-            None
+        let handler = handler::Handler {
+            store: self.pool.store.clone(),
+            config: config.clone(),
+            fingerprint,
+            route: session.route.clone(),
+            forms: self.pool.forms.clone(),
+            revision: self.pool.revision.clone(),
+            refreshing: Arc::default(),
+            notifications: Arc::default(),
         };
         let stderr = StderrTail::default();
         let connect = async {
@@ -439,11 +489,21 @@ impl ConnectorBroker {
                         pid: transport.id(),
                         _temporary: prepared.temporary,
                     };
-                    let client =
-                        ().serve(transport)
-                            .await
-                            .context("Initialize sandboxed local MCP server")?;
+                    let client = handler
+                        .clone()
+                        .serve(transport)
+                        .await
+                        .context("Initialize sandboxed local MCP server")?;
                     Ok((client, Some(owned)))
+                }
+                "sse" => {
+                    let transport = legacy::connect(&config.endpoint, secret.as_deref()).await?;
+                    let client = handler
+                        .clone()
+                        .serve(transport)
+                        .await
+                        .context("Initialize legacy MCP server")?;
+                    Ok((client, None))
                 }
                 "http" | "streamable_http" => {
                     validate_endpoint(&config.endpoint)?;
@@ -460,7 +520,8 @@ impl ConnectorBroker {
                         .retry(reqwest::retry::never())
                         .redirect(reqwest::redirect::Policy::none())
                         .build()?;
-                    let client = ()
+                    let client = handler
+                        .clone()
                         .serve(StreamableHttpClientTransport::with_client(
                             BoundedHttpClient(http),
                             transport,
@@ -481,11 +542,19 @@ impl ConnectorBroker {
         };
         let (client, process) = match connected {
             Ok(connected) => connected,
-            Err(error) => return Err(stderr.annotate(error, secret.as_deref()).await),
+            Err(error) => {
+                let mut message = format!("{:#}", stderr.annotate(error, secret.as_deref()).await);
+                if let Some(scope) = local_scope {
+                    for value in scope.environment.values().filter(|value| !value.is_empty()) {
+                        message = message.replace(value, "[REDACTED]");
+                    }
+                }
+                return Err(anyhow!(message));
+            }
         };
         session.client = Some(client);
         session.process = process;
-        session.fingerprint = fingerprint;
+        session.fingerprint = live_fingerprint;
         session.touched = Instant::now();
         self.pool.start_reaper();
         Ok(())
@@ -559,6 +628,11 @@ impl ConnectorBroker {
                 return Err(error);
             }
         };
+        let has_prompts = session
+            .client
+            .as_ref()
+            .and_then(|client| client.peer_info())
+            .is_some_and(|info| info.capabilities.prompts.is_some());
         session.touched = Instant::now();
         drop(session);
         let store = self.pool.store.clone();
@@ -566,6 +640,14 @@ impl ConnectorBroker {
         let json = serde_json::to_string(&result)?;
         let fingerprint = Self::fingerprint(config, local_scope)?;
         tokio::task::spawn_blocking(move || save_catalog(&store, id, fingerprint, json)).await??;
+        drop(_permit);
+        if has_prompts {
+            let mut broker = self.clone();
+            broker.local_scope = local_scope.cloned();
+            let _ = broker
+                .metadata(config, "prompts/list", serde_json::json!({}), cancel)
+                .await;
+        }
         Ok(result)
     }
     /// Records `tools` as `config`'s discovered catalog for this broker's
@@ -1150,3 +1232,6 @@ pub(crate) fn validate_endpoint(endpoint: &str) -> Result<url::Url> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod completeness_tests;

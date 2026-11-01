@@ -52,6 +52,10 @@ pub(super) fn group_summary<'a>(tools: impl IntoIterator<Item = &'a ToolCard>) -
 }
 fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
     match name {
+        "connector_resources" | "connector_resource_read" => {
+            ("Read", "MCP resource", "MCP resources")
+        }
+        "connector_prompts" | "connector_prompt_get" => ("Loaded", "MCP prompt", "MCP prompts"),
         "lsp" => ("Inspected", "code location", "code locations"),
         "file_read" | "read_file" => ("Read", "file", "files"),
         "extension_resource" => ("Read", "skill file", "skill files"),

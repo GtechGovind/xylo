@@ -838,3 +838,5 @@ fn small_budgets_shrink_instructions_and_the_skills_index() {
     assert!(index.ends_with("more skills not listed)"));
     assert!(skills_index(skills(), usize::MAX).len() <= SKILLS_INDEX_BYTES);
 }
+
+mod project_discovery;

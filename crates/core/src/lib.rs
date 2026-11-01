@@ -547,6 +547,11 @@ pub enum WorkerCommand {
         key: WorkerCredential,
     },
     Shutdown,
+    RespondMcpElicitation {
+        request_id: Uuid,
+        action: McpFormAction,
+        content: Option<Value>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -774,6 +779,12 @@ pub enum EngineEvent {
         action_id: Uuid,
         name: String,
         arguments: Value,
+    },
+    McpElicitation {
+        request: McpFormRequest,
+    },
+    McpElicitationClosed {
+        request_id: Uuid,
     },
 }
 
@@ -1004,3 +1015,6 @@ mod tests;
 
 /// Public headless CLI and SDK protocol.
 pub mod stdio;
+
+mod mcp;
+pub use mcp::*;

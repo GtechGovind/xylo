@@ -72,6 +72,7 @@ async fn concurrent_refreshes_of_one_credential_exchange_once() {
         .set(reference, &serde_json::to_string(&initial).unwrap())
         .unwrap();
     let config = OAuthConfig {
+        resource: None,
         authorization_endpoint: endpoint.clone(),
         token_endpoint: endpoint,
         client_id: "fixture".into(),
@@ -113,6 +114,7 @@ fn state_comparison_requires_an_exact_match() {
 #[tokio::test]
 async fn completing_with_a_wrong_state_is_rejected_before_any_exchange() {
     let config = OAuthConfig {
+        resource: None,
         authorization_endpoint: "https://auth.example.com/authorize".into(),
         token_endpoint: "https://auth.example.com/token".into(),
         client_id: "fixture".into(),

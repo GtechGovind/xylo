@@ -41,6 +41,9 @@ impl BrokerTools {
 }
 
 impl ToolExecutor for BrokerTools {
+    fn take_instruction_notes(&self) -> Vec<String> {
+        self.broker.take_instruction_notes()
+    }
     fn schemas(&self) -> Vec<ToolSchema> {
         self.broker
             .initial_definitions()

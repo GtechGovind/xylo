@@ -28,7 +28,7 @@ use std::path::Path;
 use xylo_core::{MemoryOrigin, PermissionMode};
 
 pub use environment::{GitInfo, utc_date};
-pub use instructions::project_instructions;
+pub use instructions::{ScopedInstructions, project_instructions};
 pub use skills::{BundledSkill, bundled_skill, bundled_skills, skills_index};
 
 const SYSTEM: &str = include_str!("../../prompts/system.md");

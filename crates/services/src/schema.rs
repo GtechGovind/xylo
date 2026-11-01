@@ -51,6 +51,8 @@ CREATE TABLE extension_action_bindings(action_id TEXT PRIMARY KEY REFERENCES act
 CREATE TABLE extension_execution_receipts(id TEXT PRIMARY KEY,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL);
 
 CREATE TABLE connectors(id TEXT PRIMARY KEY,name TEXT NOT NULL,json TEXT NOT NULL);
+CREATE TABLE project_mcp_consents(workspace TEXT NOT NULL,fingerprint TEXT NOT NULL,PRIMARY KEY(workspace,fingerprint));
+CREATE TABLE connector_prompts(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,json TEXT NOT NULL);
 CREATE TABLE connector_tools(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,json TEXT NOT NULL,updated_at INTEGER NOT NULL);
 
 CREATE TABLE memories(id TEXT PRIMARY KEY,scope TEXT NOT NULL,content TEXT NOT NULL,json TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,embedding_model TEXT);

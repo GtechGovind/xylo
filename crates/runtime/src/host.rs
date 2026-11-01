@@ -34,6 +34,7 @@ use uuid::Uuid;
 use xylo_core::*;
 use xylo_helper_client::HelperClient;
 use xylo_resources::{ResourceLease, ResourceManager, TaskDemand};
+pub use xylo_services::McpPromptCommand;
 use xylo_services::{ConnectorBroker, CredentialVault, SqliteMemory, Store};
 mod action_control;
 mod credential_control;
@@ -41,6 +42,7 @@ mod document_control;
 mod export_control;
 mod fact_control;
 mod image_control;
+mod mcp_control;
 mod notice_control;
 mod provider_control;
 mod settings_control;
@@ -267,6 +269,16 @@ pub enum HostEvent {
         item: crate::turn_queue::QueuedTurn,
     },
     Connectors(Vec<ConnectorConfig>),
+    McpCommands {
+        request_id: Uuid,
+        workspace: Option<PathBuf>,
+        connector_id: Uuid,
+        commands: Vec<xylo_services::McpPromptCommand>,
+    },
+    ConnectorAuthorization {
+        request_id: Uuid,
+        url: String,
+    },
     ConnectorMutation {
         request_id: Uuid,
         result: std::result::Result<ConnectorMutationReceipt, String>,
@@ -357,6 +369,7 @@ enum HostCommand {
     RunQueuedTurn(Uuid, Uuid, Uuid),
     Connectors,
     SaveConnector(ConnectorConfig),
+    ConnectorSignIn(Uuid, Uuid, Option<String>),
     MutateConnector(Uuid, Option<ConnectorConfig>, Option<Uuid>, Option<String>),
     ConnectorTools(Uuid, Uuid, Option<PathBuf>),
     Schedules,
@@ -852,6 +865,15 @@ impl HostClient {
     }
     pub fn connectors(&self) -> Result<()> {
         self.enqueue(HostCommand::Connectors)
+    }
+    /// Starts explicit standards-based browser sign-in for a saved remote MCP server.
+    pub fn connector_sign_in(
+        &self,
+        request_id: Uuid,
+        id: Uuid,
+        client_id: Option<String>,
+    ) -> Result<()> {
+        self.enqueue(HostCommand::ConnectorSignIn(request_id, id, client_id))
     }
     pub fn save_connector(&self, config: ConnectorConfig) -> Result<()> {
         self.enqueue(HostCommand::SaveConnector(config))
@@ -1864,6 +1886,9 @@ impl HostState {
                     .await?;
                 self.report_embedding_failure().await;
             }
+            HostCommand::ConnectorSignIn(request_id, id, client_id) => {
+                self.connector_sign_in(request_id, id, client_id).await?
+            }
             HostCommand::Connectors => {
                 let store = self.store.clone();
                 let rows = tokio::task::spawn_blocking(move || store.connectors()).await??;
@@ -1955,21 +1980,34 @@ impl HostState {
                         .into_iter()
                         .find(|config| config.id == id)
                         .context("Connection no longer exists")?;
-                    if config.transport == "stdio" {
+                    let broker = if config.transport == "stdio" {
                         let workspace = workspace
                             .clone()
                             .context("Choose a project before inspecting a local MCP connection")?;
-                        let scope = xylo_services::ConnectorLaunchScope {
-                            workspace,
-                            protected_paths: vec![self.paths.data.clone()],
-                            ..Default::default()
-                        };
-                        connectors
-                            .tools_scoped(&config, &scope, &Default::default())
-                            .await
+                        connectors.as_ref().clone().with_local_scope(
+                            xylo_services::ConnectorLaunchScope {
+                                workspace,
+                                protected_paths: vec![self.paths.data.clone()],
+                                ..Default::default()
+                            },
+                        )
                     } else {
-                        connectors.tools(&config, &Default::default()).await
-                    }
+                        connectors.as_ref().clone()
+                    };
+                    let tools = broker.tools(&config, &Default::default()).await?;
+                    let commands = xylo_services::mcp_prompt_commands(
+                        &config,
+                        &broker.cached_prompts(&config)?,
+                    );
+                    self.events
+                        .send(HostEvent::McpCommands {
+                            request_id,
+                            workspace: workspace.clone(),
+                            connector_id: id,
+                            commands,
+                        })
+                        .await?;
+                    Ok::<_, anyhow::Error>(tools)
                 }
                 .await;
                 let event = match result {

@@ -3,6 +3,7 @@
 mod archive;
 mod capture;
 mod capture_fs;
+mod devcontainer;
 mod native;
 mod operations;
 mod storage;
@@ -205,7 +206,15 @@ pub async fn execute_management(
     match name {
         "helper_environment_list" => {
             let _: Empty = serde_json::from_value(args.clone())?;
-            list(&manager, &cancel).await
+            let mut value = list(&manager, &cancel).await?;
+            match devcontainer::discover(&config.workspace) {
+                Ok(offer) => value["devcontainer"] = serde_json::to_value(offer)?,
+                Err(error) => value["devcontainer_error"] = json!(error.to_string()),
+            }
+            Ok(value)
+        }
+        "helper_environment_devcontainer_create" => {
+            devcontainer::create(&manager, &config.workspace, args, cancel).await
         }
         "helper_environment_status" => {
             let request: Identity = serde_json::from_value(args.clone())?;

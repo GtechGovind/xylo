@@ -5,10 +5,12 @@
 //! concurrent refreshes with the same token would leave the loser holding a
 //! revoked credential. A waiter re-reads the stored record after acquiring the
 //! gate and skips its own exchange when another caller already rotated it.
+mod discovery;
 use super::mcp::validate_endpoint;
 use crate::CredentialVault;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+pub use discovery::*;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,6 +28,8 @@ pub struct OAuthConfig {
     pub token_endpoint: String,
     pub client_id: String,
     pub scopes: Vec<String>,
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 /// Token material is deliberately not Debug. Persist only through CredentialVault.
 #[derive(Clone, Serialize, Deserialize)]
@@ -84,6 +88,10 @@ impl PendingOAuth {
             .append_pair("state", &state)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
+        if let Some(resource) = &config.resource {
+            validate_endpoint(resource)?;
+            endpoint.query_pairs_mut().append_pair("resource", resource);
+        }
         Ok(Self {
             authorization_url: endpoint.to_string(),
             state,
@@ -226,6 +234,9 @@ async fn exchange(
         .build()?;
     let mut body = form.to_vec();
     body.push(("client_id", &config.client_id));
+    if let Some(resource) = &config.resource {
+        body.push(("resource", resource));
+    }
     let response = tokio::select! {_ = cancel.cancelled()=>bail!("OAuth exchange cancelled"),result=http.post(&config.token_endpoint).form(&body).send()=>result?};
     ensure!(
         response.status().is_success(),
@@ -283,3 +294,6 @@ async fn exchange(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod discovery_tests;

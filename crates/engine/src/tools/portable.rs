@@ -18,6 +18,7 @@ pub(super) fn service(broker: &ToolBroker) -> ExtensionService {
             .unwrap_or(&broker.artifacts)
             .join("extensions"),
     )
+    .for_workspace(broker.discovery_root())
 }
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![

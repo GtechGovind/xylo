@@ -141,6 +141,19 @@ impl ToolSession {
             .clone()
     }
 
+    /// Answers a user-visible MCP form; unknown or expired requests are refused.
+    pub fn answer_mcp_form(
+        &self,
+        id: Uuid,
+        action: xylo_core::McpFormAction,
+        content: Option<Value>,
+    ) -> Result<()> {
+        self.connectors
+            .get()
+            .context("No MCP form is waiting")?
+            .answer_form(id, action, content)
+    }
+
     /// Closes every MCP connection; call when the worker exits.
     pub async fn shutdown(&self) {
         if let Some(lsp) = self.lsp.get() {

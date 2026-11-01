@@ -11,11 +11,13 @@ use std::{
 #[derive(Clone)]
 pub struct ExtensionService {
     pub(super) root: PathBuf,
+    pub(super) workspace: Option<PathBuf>,
 }
 impl ExtensionService {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
+            workspace: None,
         }
     }
     pub(super) fn lock(&self) -> Result<fs::File> {
@@ -42,7 +44,11 @@ impl ExtensionService {
     }
     pub fn list(&self) -> Result<Vec<ExtensionPackage>> {
         let _lock = self.lock()?;
-        self.read_catalog()
+        Ok(self
+            .read_catalog()?
+            .into_iter()
+            .filter(|package| self.in_scope(package))
+            .collect())
     }
     pub(super) fn read_catalog(&self) -> Result<Vec<ExtensionPackage>> {
         match fs::read(self.root.join("catalog.json")) {
@@ -259,7 +265,11 @@ impl ExtensionService {
     pub fn skill_metadata(&self) -> Result<Vec<SkillMetadata>> {
         let _lock = self.lock()?;
         let mut output = Vec::new();
-        for p in self.read_catalog()?.into_iter().filter(|p| p.enabled) {
+        for p in self
+            .read_catalog()?
+            .into_iter()
+            .filter(|p| p.enabled && self.in_scope(p))
+        {
             let root = self.package_root(&p)?;
             for c in &p.components {
                 if !matches!(
@@ -291,7 +301,7 @@ impl ExtensionService {
         let p = self
             .read_catalog()?
             .into_iter()
-            .find(|p| p.id == package_id && p.enabled)
+            .find(|p| p.id == package_id && p.enabled && self.in_scope(p))
             .context("Extension is disabled or removed")?;
         let c = p
             .components
@@ -407,7 +417,7 @@ impl ExtensionService {
         let p = self
             .read_catalog()?
             .into_iter()
-            .find(|p| p.id == id && p.enabled)
+            .find(|p| p.id == id && p.enabled && self.in_scope(p))
             .context("Extension is disabled or removed")?;
         let path = safe_path(&self.package_root(&p)?, relative)?;
         ensure!(
@@ -425,7 +435,7 @@ pub(super) fn decodes<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Opt
         Err(e) => Err(e.into()),
     }
 }
-fn copy_tree(
+pub(super) fn copy_tree(
     source: &Path,
     target: &Path,
     total: &mut u64,

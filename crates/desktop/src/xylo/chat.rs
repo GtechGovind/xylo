@@ -291,6 +291,7 @@ impl Xylo {
             .child(self.recovery_banner(cx))
             .child(pane)
             .child(self.history_later_footer(cx))
+            .child(self.mcp_form_cards(cx))
             .child(
                 div()
                     .w_full()
@@ -312,8 +313,20 @@ impl Xylo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        match &event {
+            EngineEvent::McpElicitation { request } => {
+                self.mcp_form_open(session, request.clone(), window, cx)
+            }
+            EngineEvent::McpElicitationClosed { request_id } => {
+                self.mcp_forms.remove(request_id);
+            }
+            _ => {}
+        }
         self.log(match &event {
-            EngineEvent::Delta { .. } | EngineEvent::ThinkingDelta { .. } => String::new(),
+            EngineEvent::McpElicitation { .. }
+            | EngineEvent::McpElicitationClosed { .. }
+            | EngineEvent::Delta { .. }
+            | EngineEvent::ThinkingDelta { .. } => String::new(),
             EngineEvent::CustomToolRequested {
                 name, action_id, ..
             } => format!("Custom tool requested: {name} ({action_id})"),

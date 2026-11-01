@@ -320,8 +320,15 @@ impl AgentEngine {
             tracing::warn!(error=%error, "Invoked skills unavailable");
             Vec::new()
         });
-        crate::prompts::recalled_context(&facts, &procedures, &skills)
-            .map(|note| crate::agent_loop::application_note(&note))
+        let mut note =
+            crate::prompts::recalled_context(&facts, &procedures, &skills).unwrap_or_default();
+        if let Ok(mcp) = broker.mcp_invocations()
+            && !mcp.is_empty()
+        {
+            note.push('\n');
+            note.push_str(&mcp);
+        }
+        (!note.trim().is_empty()).then(|| crate::agent_loop::application_note(&note))
     }
 
     /// `note`, or in a tiny window whose recall budget

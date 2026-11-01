@@ -26,6 +26,43 @@ impl Xylo {
             );
         }
         page = page.children(self.environment_status_notices(cx));
+        if let Some(offer) = &self.environments.devcontainer {
+            let offer = offer.clone();
+            let client = self
+                .environments
+                .clients
+                .iter()
+                .find(|client| matches!(client.runtime.as_str(), "docker" | "podman"));
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child("Development container found")
+                .child(format!(
+                    "Source: {}\n{}\nBuild context: {}\nWorkspace: {}\nAfter creation: {}",
+                    offer["source"]
+                        .as_str()
+                        .unwrap_or(".devcontainer/devcontainer.json"),
+                    offer["image"]
+                        .as_str()
+                        .or_else(|| offer["dockerfile"].as_str())
+                        .unwrap_or("Build the repository Dockerfile"),
+                    offer["context"].as_str().unwrap_or("Project"),
+                    offer["workspace_folder"].as_str().unwrap_or("/workspace"),
+                    offer["post_create"]
+                ));
+            card = card.child("Create a container, mount this project with write access, and run its setup command. Building or pulling images may access the network.");
+            if let Some(client) = client {
+                let executable = client.executable.clone();
+                let runtime = client.runtime.clone();
+                card = card.child(settings_ui::primary_button("devcontainer-create", "Create container environment").disabled(busy).on_click(cx.listener(move |view,_,_,cx| {
+                    view.environment_request("helper_environment_devcontainer_create", json!({"operation_id":Uuid::new_v4(),"offer":offer,"executable":executable,"runtime":runtime}), RequestKind::List, cx);
+                })));
+            } else {
+                card = card.child("Install Docker or Podman to use this configuration.");
+            }
+            page = page.child(settings_ui::section("Project setup", None, card));
+        }
         if !self.environments.loaded {
             page = page.child(settings_ui::loading_list(
                 3,
