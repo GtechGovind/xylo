@@ -43,6 +43,7 @@
 //!   prompt, and a root loop shows each recovery note to the user as it is
 //!   added.
 mod dispatch;
+mod fallback;
 mod recovery;
 mod retry;
 mod stall;
@@ -267,15 +268,15 @@ impl AgentLoop {
     /// Runs the loop from `messages` (the conversation without the system
     /// prompt) until the model answers without tools.
     pub(crate) async fn run(&self, messages: Vec<Message>) -> Result<LoopOutcome, LoopFailure> {
+        let fallback = self
+            .restored_fallback()
+            .await
+            .map_err(|error| LoopFailure {
+                error,
+                streamed: String::new(),
+            })?;
         let mut run = Run {
-            fallback: self
-                .provider
-                .fallback()
-                .filter(|(model, _)| {
-                    let note = application_note(&retry::fallback_note(model));
-                    messages.iter().any(|message| message == &note)
-                })
-                .map(|(_, provider)| provider),
+            fallback,
             started: Instant::now(),
             usage: Usage::default(),
             streamed: String::new(),
@@ -673,6 +674,7 @@ impl AgentLoop {
                         let note = retry::fallback_note(&model);
                         messages.push(application_note(&note));
                         self.checkpoint(messages).await?;
+                        self.persist_fallback(&model).await?;
                         if self.root() {
                             self.emit(EngineEvent::HarnessNote {
                                 kind: NoteKind::Fallback,

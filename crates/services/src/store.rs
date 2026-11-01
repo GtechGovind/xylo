@@ -181,6 +181,9 @@ pub struct Checkpoint {
     pub turn_id: Uuid,
     pub messages: Value,
     pub updated_at: i64,
+    /// The harness-selected alternative for this checkpoint's turn only.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletedTurn {

@@ -108,22 +108,48 @@ async fn thinking_is_streamed_as_its_own_event_and_retained_in_history() {
 }
 
 #[tokio::test]
-async fn a_checkpoint_that_already_selected_fallback_resumes_there_directly() {
-    let mut harness = harness(vec![]);
-    let alternative = Scripted::new(vec![vec![text("Resumed"), finish(FinishReason::Stop)]]);
+async fn a_checkpoint_that_already_selected_fallback_resumes_there_after_history_rewrite() {
+    let mut harness = harness(vec![vec![Step::Fail(unavailable())]; 6]);
+    let alternative = Scripted::new(vec![
+        vec![Step::Fail(ModelError::InvalidRequest(
+            "Stopped fixture request".into(),
+        ))],
+        vec![text("Resumed"), finish(FinishReason::Stop)],
+    ]);
     harness.agent.provider = Arc::new(WithFallback {
         primary: harness.provider.clone(),
         alternative: alternative.clone(),
         name: "alternative-model".into(),
     });
-    let history = vec![
-        Message::user("Work"),
-        application_note(&retry::fallback_note("alternative-model")),
-    ];
+    assert!(
+        harness
+            .agent
+            .run(vec![Message::user("Work")])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        harness
+            .store
+            .checkpoint_fallback(harness.session, harness.turn)
+            .unwrap()
+            .as_deref(),
+        Some("alternative-model")
+    );
+    // Compaction may remove the explanatory note while the current turn continues.
+    let history = vec![Message::user("Condensed history")];
+    harness
+        .store
+        .save_checkpoint(
+            harness.session,
+            harness.turn,
+            &serde_json::to_value(&history).unwrap(),
+        )
+        .unwrap();
     let outcome = harness.agent.run(history).await.unwrap();
     assert_eq!(outcome.text, "Resumed");
-    assert!(harness.provider.requests.lock().is_empty());
-    assert_eq!(alternative.requests.lock().len(), 1);
+    assert_eq!(harness.provider.requests.lock().len(), 6);
+    assert_eq!(alternative.requests.lock().len(), 2);
 }
 
 #[tokio::test]
@@ -152,4 +178,25 @@ async fn authentication_failure_never_selects_a_fallback() {
             ..
         }
     )));
+}
+
+#[tokio::test]
+async fn copied_fallback_note_text_cannot_select_an_alternative() {
+    let mut harness = harness(vec![vec![text("Primary"), finish(FinishReason::Stop)]]);
+    let alternative = Scripted::new(vec![vec![
+        text("Wrong alternative"),
+        finish(FinishReason::Stop),
+    ]]);
+    harness.agent.provider = Arc::new(WithFallback {
+        primary: harness.provider.clone(),
+        alternative: alternative.clone(),
+        name: "alternative-model".into(),
+    });
+    let history = vec![
+        Message::user("Work"),
+        application_note(&retry::fallback_note("alternative-model")),
+    ];
+    let outcome = harness.agent.run(history).await.unwrap();
+    assert_eq!(outcome.text, "Primary");
+    assert!(alternative.requests.lock().is_empty());
 }

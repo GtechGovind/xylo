@@ -261,3 +261,28 @@ fn gemini_pro_utility_requests_respect_the_minimum_thinking_budget() {
         128
     );
 }
+
+#[test]
+fn flash_lite_boundaries_match_complete_request_snapshots() {
+    let snapshots: Value =
+        serde_json::from_str(include_str!("fixtures/flash_lite_boundaries.json")).unwrap();
+    let cases = [
+        ("lowest-64", 64, Reasoning::Lowest),
+        ("lowest-512", 512, Reasoning::Lowest),
+        ("lowest-513", 513, Reasoning::Lowest),
+        ("configured-64", 64, Reasoning::Configured),
+        ("configured-511", 511, Reasoning::Configured),
+        ("configured-512", 512, Reasoning::Configured),
+        ("configured-513", 513, Reasoning::Configured),
+        ("configured-1024", 1024, Reasoning::Configured),
+        ("configured-1025", 1025, Reasoning::Configured),
+    ];
+    let mut provider = provider(ApiFamily::Gemini, "http://127.0.0.1:8080".into());
+    provider.config.model = "gemini-2.5-flash-lite".into();
+    provider.config.reasoning_effort = Some("low".into());
+    for (key, limit, reasoning) in cases {
+        let body =
+            request::body(&provider, &[Message::user("Hello")], &[], limit, reasoning).unwrap();
+        assert_eq!(body, snapshots[key], "{key}");
+    }
+}

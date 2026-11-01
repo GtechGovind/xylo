@@ -23,7 +23,7 @@ pub(crate) fn delay(error: &ModelError, attempt: u32) -> Option<Duration> {
     }
 }
 
-/// A stable checkpoint marker for the chosen fallback model.
+/// The explanatory application note for a chosen fallback model.
 pub(crate) fn fallback_note(model: &str) -> String {
     format!(
         "The primary model is unavailable after retries. Continue this turn using the configured fallback model {model}."

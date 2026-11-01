@@ -64,16 +64,25 @@ pub(super) fn apply(
             body["generationConfig"]["thinkingConfig"] = if config.model.starts_with("gemini-3") {
                 json!({"thinkingLevel":if matches!(effort, "none" | "minimal" | "low") { "low" } else { "high" },"includeThoughts":true})
             } else {
-                // Pro's protocol minimum still applies to short utility requests.
-                let minimum = if config.model.contains("pro") { 128 } else { 0 };
+                // Each model's positive budget minimum also applies to short requests.
+                let minimum = if config.model.contains("pro") {
+                    128
+                } else if config.model.contains("flash-lite") {
+                    512
+                } else {
+                    0
+                };
                 let maximum = if config.model.contains("flash") {
                     24576
                 } else {
                     32768
                 };
-                let budget = budget
-                    .min(max_tokens.saturating_sub(1))
-                    .clamp(minimum, maximum);
+                let bounded = budget.min(max_tokens.saturating_sub(1));
+                let budget = if !config.model.contains("pro") && bounded < minimum {
+                    0
+                } else {
+                    bounded.clamp(minimum, maximum)
+                };
                 json!({"thinkingBudget":budget,"includeThoughts":true})
             };
         }
