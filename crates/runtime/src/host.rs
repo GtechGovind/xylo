@@ -78,6 +78,22 @@ pub enum HostEvent {
         request_id: Uuid,
         result: std::result::Result<Option<String>, String>,
     },
+    Permissions {
+        session: Uuid,
+        mode: PermissionMode,
+        revision: u64,
+    },
+    InteractionReply {
+        session: Uuid,
+        action_id: Uuid,
+        result: std::result::Result<(), String>,
+    },
+    PlanModes {
+        session: Uuid,
+        action_id: Uuid,
+        modes: Vec<PermissionMode>,
+        scheduled: bool,
+    },
     ActionReviews {
         request_id: Uuid,
         result: std::result::Result<crate::ActionReviewPage, String>,
@@ -348,6 +364,8 @@ enum HostCommand {
     Usage(Uuid, Uuid, Vec<Uuid>, i64, i64, Option<PathBuf>),
     OutputStyles(Uuid, PathBuf),
     StatusLine(Uuid, PathBuf, Value),
+    StartLoop(Uuid, PathBuf, String),
+    StopWakeups(Uuid),
     PreparedCancel(Vec<turn_queue_control::PreparedStop>),
     RefusedCancel,
     Action(action_control::ActionCommand),
@@ -980,6 +998,14 @@ impl HostClient {
         workspace: Option<PathBuf>,
     ) -> Result<()> {
         self.enqueue(HostCommand::ConnectorTools(request_id, id, workspace))
+    }
+    /// Starts `/loop [interval] prompt` in the selected conversation.
+    pub fn start_loop(&self, session: Uuid, workspace: PathBuf, command: String) -> Result<()> {
+        self.enqueue(HostCommand::StartLoop(session, workspace, command))
+    }
+    /// Stops all future wakeups belonging to this conversation.
+    pub fn stop_wakeups(&self, session: Uuid) -> Result<()> {
+        self.enqueue(HostCommand::StopWakeups(session))
     }
     pub fn list_schedules(&self) -> Result<()> {
         self.enqueue(HostCommand::Schedules)
@@ -2145,6 +2171,10 @@ impl HostState {
                 };
                 self.events.send(event).await?;
             }
+            HostCommand::StartLoop(session, workspace, command) => {
+                self.start_loop(session, workspace, command).await?
+            }
+            HostCommand::StopWakeups(session) => self.stop_wakeups(session).await?,
             HostCommand::Schedules => self.send_schedules().await?,
             HostCommand::CreateSchedule(prompt, cron, workspace) => {
                 self.scheduler(workspace)?.create(prompt, cron).await?;
@@ -2565,7 +2595,6 @@ impl HostState {
                 WorkerCommand::RunAuthorized { .. }
                     | WorkerCommand::ProviderCredentialUpdated { .. }
                     | WorkerCommand::Unlock { .. }
-                    | WorkerCommand::SetPermissions { .. }
                     | WorkerCommand::Hello
                     | WorkerCommand::Cancel
             ),
@@ -2602,7 +2631,51 @@ impl HostState {
                 .decide(session, &worker, action_id, allow, remember)
                 .await;
         }
+        if let WorkerCommand::Answer { action_id, answer } = command {
+            let result = async {
+                let worker = worker.context("This task is no longer running")?;
+                // Keep the cap and reply ordered with concurrent settings propagation.
+                let _permission_order = worker.permission_order.lock().await;
+                let answer = self.cap_plan_answer(session, answer).await?;
+                worker
+                    .send_control(
+                        session,
+                        Uuid::new_v4(),
+                        WorkerCommand::Answer { action_id, answer },
+                    )
+                    .await
+            }
+            .await;
+            if let Err(error) = result {
+                self.events
+                    .send(HostEvent::InteractionReply {
+                        session,
+                        action_id,
+                        result: Err(error.to_string()),
+                    })
+                    .await?;
+            }
+            return Ok(());
+        }
         let worker = worker.context("This task is no longer running")?;
+        if let WorkerCommand::SetPermissions { mode } = command {
+            let _permission_order = worker.permission_order.lock().await;
+            ensure!(
+                !mode.allows_writes() || mode == self.settings.lock().await.permissions,
+                "Choose the permission preset through application settings"
+            );
+            let mode = self.cap_interaction_mode(session, mode).await?;
+            worker.record_mode(mode);
+            worker
+                .send_control(
+                    session,
+                    Uuid::new_v4(),
+                    WorkerCommand::SetPermissions { mode },
+                )
+                .await?;
+            self.events.send(worker.permission_event(session)).await?;
+            return Ok(());
+        }
         worker.send_control(session, Uuid::new_v4(), command).await
     }
 
@@ -2772,6 +2845,12 @@ impl HostState {
         if let Some(conversation) =
             tokio::task::spawn_blocking(move || store.conversation(session)).await??
         {
+            if self.scheduled.lock().await.contains_key(&session) {
+                ensure!(
+                    !conversation.archived,
+                    "Conversation wakeups cannot run in an archived chat"
+                );
+            }
             ensure!(
                 tokio::fs::canonicalize(&conversation.workspace).await? == workspace,
                 "This chat belongs to another project"
@@ -2875,8 +2954,13 @@ impl HostState {
         // runs with the current mode (unattended scheduled turns never with
         // Full access). Later changes reach the worker as
         // SetPermissions, ordered after this Run by the workers lock.
-        turn.permissions = effective_mode(self.settings.lock().await.permissions, scheduled);
-        *worker.mode.lock() = turn.permissions;
+        turn.permissions = self
+            .wakeup_permission(
+                session,
+                effective_mode(self.settings.lock().await.permissions, scheduled),
+            )
+            .await?;
+        worker.record_mode(turn.permissions);
         if automatic {
             ensure!(
                 !worker.queue_stopped.load(Ordering::Acquire),
@@ -2912,6 +2996,7 @@ impl HostState {
             credential,
         };
         permit.send(Envelope::new(request_id, Some(session), 0, command));
+        self.events.send(worker.permission_event(session)).await?;
         let cancelled = {
             let mut starting = self.queued.lock();
             starting.remove(&session);
@@ -3544,9 +3629,16 @@ impl HostState {
                         tracing::warn!(%error,"Renew active schedule");
                     }
                 } else {
+                    let turn_id = scheduler
+                        .list()
+                        .await
+                        .ok()
+                        .and_then(|tasks| tasks.into_iter().find(|task| task.id == id))
+                        .and_then(|task| task.claim.map(|claim| claim.occurrence))
+                        .unwrap_or(session);
                     let store = self.store.clone();
                     let completed =
-                        tokio::task::spawn_blocking(move || store.completed_turn(session, session))
+                        tokio::task::spawn_blocking(move || store.completed_turn(session, turn_id))
                             .await;
                     let result = match completed {
                         Ok(Ok(Some(_))) => self.complete_schedule(session).await,
@@ -3566,6 +3658,18 @@ impl HostState {
             match scheduler.claim_due().await {
                 Ok(tasks) => {
                     for task in tasks {
+                        if task.wakeup.is_some() {
+                            if let Err(error) = self.dispatch_wakeup(task.clone()).await {
+                                let _ = scheduler.pause(task.id).await;
+                                let _ = self
+                                    .events
+                                    .send(HostEvent::Status(format!(
+                                        "Conversation wakeup paused: {error:#}"
+                                    )))
+                                    .await;
+                            }
+                            continue;
+                        }
                         let Some(occurrence) = task.claim.map(|claim| claim.occurrence) else {
                             continue;
                         };
@@ -3753,3 +3857,5 @@ fn native_executable(name: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests;
+
+mod interaction_control;

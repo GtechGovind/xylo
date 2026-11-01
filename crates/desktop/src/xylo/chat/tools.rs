@@ -23,6 +23,8 @@ pub(super) fn tool_icon(name: &str) -> AppIcon {
         "worktree_enter" | "worktree_exit" => AppIcon::Branch,
         "git_status" | "git_diff" | "git_log" | "git_commit" => AppIcon::Branch,
         "web_fetch" | "web_search" | "browser" => AppIcon::Web,
+        "ask_user" => AppIcon::Tool,
+        "exit_plan_mode" | "schedule_wakeup" => AppIcon::Plan,
         crate::state::PLAN_TOOL => AppIcon::Plan,
         "connector_resources"
         | "connector_resource_read"
@@ -428,6 +430,12 @@ impl Xylo {
     /// The decision card: what the agent wants to do, a preview of it, and
     /// Allow / Deny with their shortcuts.
     fn approval_panel(&self, i: usize, tool: &ToolCard, cx: &mut Context<Self>) -> AnyElement {
+        if tool.name == "ask_user" {
+            return self.question_card(i, tool, cx);
+        }
+        if tool.name == "exit_plan_mode" {
+            return self.plan_decision_card(i, tool, cx);
+        }
         let id = tool.id;
         let incomplete = tool.input.get("diff_truncated").and_then(Value::as_bool) == Some(true);
         let shortcut = if cfg!(target_os = "macos") {

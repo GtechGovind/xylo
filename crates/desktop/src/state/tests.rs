@@ -532,3 +532,6 @@ fn shell_jobs_continue_across_completed_and_new_turns() {
     assert!(!state.shell_jobs[0].running);
     assert!(state.running);
 }
+
+#[path = "tests/interaction.rs"]
+mod interaction;

@@ -730,7 +730,7 @@ impl Xylo {
                         ("permission-setting", index),
                         mode.label(),
                         mode.description(),
-                        self.settings.permissions == mode,
+                        self.current_permission_mode() == mode,
                     )
                     .caution(mode == PermissionMode::FullAccess)
                     .on_choose(move |_, cx| {

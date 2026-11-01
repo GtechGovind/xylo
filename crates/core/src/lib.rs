@@ -259,15 +259,18 @@ pub enum PermissionMode {
     FullAccess,
     /// Read and search only; any write is refused.
     ReadOnly,
+    /// Inspect the project and propose a plan without changing it.
+    Plan,
 }
 
 impl PermissionMode {
     /// Presentation order for menus and settings.
-    pub const ALL: [PermissionMode; 4] = [
+    pub const ALL: [PermissionMode; 5] = [
         PermissionMode::AskForApproval,
         PermissionMode::ApproveForMe,
         PermissionMode::FullAccess,
         PermissionMode::ReadOnly,
+        PermissionMode::Plan,
     ];
 
     /// The one product label for this mode.
@@ -277,6 +280,7 @@ impl PermissionMode {
             PermissionMode::ApproveForMe => "Approve for me",
             PermissionMode::FullAccess => "Full access",
             PermissionMode::ReadOnly => "Read only",
+            PermissionMode::Plan => "Plan",
         }
     }
 
@@ -291,12 +295,13 @@ impl PermissionMode {
                 "Unrestricted access to the internet and any file on your computer"
             }
             PermissionMode::ReadOnly => "Read and search only; nothing is changed",
+            PermissionMode::Plan => "Explore and propose a plan before making changes",
         }
     }
 
     /// Whether the agent may change anything at all.
     pub fn allows_writes(self) -> bool {
-        self != PermissionMode::ReadOnly
+        !matches!(self, PermissionMode::ReadOnly | PermissionMode::Plan)
     }
 
     /// Whether commands run inside the OS sandbox.
@@ -586,6 +591,11 @@ pub enum WorkerCommand {
         action: McpFormAction,
         content: Option<Value>,
     },
+    /// Answers one pending conversation interaction.
+    Answer {
+        action_id: Uuid,
+        answer: InteractionAnswer,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -845,6 +855,16 @@ pub enum EngineEvent {
     McpElicitationClosed {
         request_id: Uuid,
     },
+    /// A bounded set of questions awaiting the user.
+    QuestionRequired {
+        action_id: Uuid,
+        questions: Vec<UserQuestion>,
+    },
+    /// A proposed plan awaiting an explicit continuation choice.
+    PlanRequired {
+        action_id: Uuid,
+        plan: String,
+    },
 }
 
 /// Numeric remaining quota reported by a provider, never inferred from usage.
@@ -1103,3 +1123,5 @@ pub mod stdio;
 
 mod mcp;
 pub use mcp::*;
+mod interaction;
+pub use interaction::{InteractionAnswer, QuestionAnswer, QuestionOption, UserQuestion};

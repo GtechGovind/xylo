@@ -222,7 +222,11 @@ async fn main() -> Result<()> {
                 // later changes arrive as SetPermissions.
                 permissions.set(turn.permissions);
                 let engine = AgentEngine::new(store.clone(), paths.clone(), tools)
-                    .with_served_contexts(served_contexts.clone());
+                    .with_served_contexts(served_contexts.clone())
+                    .with_run_options(xylo_engine::RunOptions {
+                        interactive: true,
+                        ..Default::default()
+                    });
                 let engine = Arc::new(match credential {
                     Some(credential) => engine
                         .with_provider_credential(credential)
@@ -399,6 +403,23 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
+            }
+            WorkerCommand::Answer { action_id, answer } => {
+                let result = session
+                    .as_ref()
+                    .context("This task is no longer running")
+                    .and_then(|tools| tools.answer(action_id, answer));
+                let event = match result {
+                    Ok(()) => EngineEvent::Status {
+                        text: "Answer accepted".into(),
+                    },
+                    Err(error) => EngineEvent::Error {
+                        message: format!("Answer could not be applied: {error:#}"),
+                        retryable: false,
+                        kind: ErrorKind::Internal,
+                    },
+                };
+                send(&output, &sequence, request_id, session_id, event).await?;
             }
             WorkerCommand::KillJob { job_id } => {
                 let stopped = session_id

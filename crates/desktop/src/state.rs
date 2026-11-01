@@ -29,6 +29,8 @@ pub struct ToolCard {
     pub result: Option<String>,
     pub presentation: tool_presentation::ToolPresentation,
     pub approval: bool,
+    /// Draft choices for a pending question card.
+    pub question_answers: Vec<xylo_core::QuestionAnswer>,
     /// What "always allow" would cover, when the action can be remembered.
     pub rule: Option<String>,
     /// Why the current permission mode asks before this action.
@@ -54,6 +56,7 @@ impl ToolCard {
             input,
             result: None,
             approval: false,
+            question_answers: Vec::new(),
             rule: None,
             reason: None,
             parent_id,
@@ -431,6 +434,27 @@ impl TurnState {
                 if reason.is_some() {
                     card.reason = reason;
                 }
+                self.touch(self.row_of_call(action_id));
+            }
+            EngineEvent::QuestionRequired {
+                action_id,
+                questions,
+            } => {
+                let count = questions.len();
+                let input = serde_json::json!({"questions":questions});
+                let card = self.card(action_id, "ask_user".into(), input.clone(), None);
+                card.approval = true;
+                card.input = input;
+                card.refresh_presentation();
+                card.question_answers = vec![xylo_core::QuestionAnswer::default(); count];
+                self.touch(self.row_of_call(action_id));
+            }
+            EngineEvent::PlanRequired { action_id, plan } => {
+                let input = serde_json::json!({"plan":plan});
+                let card = self.card(action_id, "exit_plan_mode".into(), input.clone(), None);
+                card.input = input;
+                card.refresh_presentation();
+                card.approval = true;
                 self.touch(self.row_of_call(action_id));
             }
             EngineEvent::ContextUsage { usage } => self.context = Some(usage),

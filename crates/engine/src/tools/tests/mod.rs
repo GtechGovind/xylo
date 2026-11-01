@@ -2030,3 +2030,4 @@ mod project_discovery;
 mod settings;
 
 mod catalog_revocation;
+mod interaction;

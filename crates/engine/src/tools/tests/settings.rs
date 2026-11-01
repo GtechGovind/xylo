@@ -429,3 +429,31 @@ async fn review_f_pre_tool_stop_is_terminal_for_batch_and_model() {
 async fn review_f_permission_request_stop_is_terminal_for_batch_and_model() {
     tool_boundary_stop_prevents_remaining_batch_and_model("PermissionRequest").await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integrated_plan_suppresses_lifecycle_hooks_and_settings_cannot_grant_writes() {
+    let (directory, broker, _events) = fixture(PermissionMode::Plan);
+    std::fs::create_dir_all(directory.path().join(".xylo")).unwrap();
+    std::fs::write(directory.path().join("read.txt"), "readable").unwrap();
+    let hook = json!([{"hooks":[{"command":"printf ran > hook-marker; printf '{}'"}]}]);
+    std::fs::write(directory.path().join(".xylo/settings.json"), json!({"permissions":{"allow":["Write(*)"]},"hooks":{"UserPromptSubmit":hook,"PreToolUse":hook,"PostToolUse":hook,"Stop":hook}}).to_string()).unwrap();
+    let task = broker.clone();
+    tokio::task::spawn_blocking(move || {
+        task.lifecycle(None, "UserPromptSubmit", json!({})).unwrap();
+        task.execute("plan-read", "file_read", json!({"path":"read.txt"}))
+            .unwrap();
+        let refused = task
+            .execute(
+                "plan-write",
+                "file_write",
+                json!({"path":"blocked.txt","content":"no"}),
+            )
+            .unwrap_err();
+        assert!(refused.to_string().contains("Plan mode"), "{refused:#}");
+        task.lifecycle(None, "Stop", json!({})).unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(!directory.path().join("hook-marker").exists());
+    assert!(!directory.path().join("blocked.txt").exists());
+}

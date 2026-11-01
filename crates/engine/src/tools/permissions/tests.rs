@@ -298,7 +298,7 @@ fn presets_follow_the_codex_table() {
 }
 
 #[test]
-fn enabled_hooks_run_in_every_mode() {
+fn enabled_hooks_run_except_in_plan_mode() {
     for mode in PermissionMode::ALL {
         let workspace = std::env::temp_dir();
         let verdict = decide(
@@ -315,7 +315,11 @@ fn enabled_hooks_run_in_every_mode() {
                 untrusted_input: false,
             },
         );
-        assert_eq!(verdict, Verdict::Allow, "{mode:?}");
+        if mode == PermissionMode::Plan {
+            assert!(matches!(verdict, Verdict::Refuse(_)));
+        } else {
+            assert_eq!(verdict, Verdict::Allow, "{mode:?}");
+        }
     }
 }
 

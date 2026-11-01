@@ -210,7 +210,17 @@ impl Xylo {
                             .text_color(rgb(muted()))
                             .child(format!(
                                 "{project} · {} · {when}",
-                                cadence_label(&task.cron, zone)
+                                task.wakeup.as_ref().map_or_else(
+                                    || cadence_label(&task.cron, zone),
+                                    |wakeup| format!(
+                                        "{} · {}",
+                                        wakeup.reason,
+                                        wakeup.interval_seconds.map_or_else(
+                                            || "once".into(),
+                                            |seconds| format!("every {seconds}s")
+                                        )
+                                    )
+                                )
                             )),
                     ),
             )

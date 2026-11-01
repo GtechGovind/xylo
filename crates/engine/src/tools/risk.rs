@@ -158,6 +158,8 @@ const TOOL_RISKS: &[(Tools, Option<&str>)] = {
             Family("environment_"),
             Some("Runs in a remote or container environment outside the sandbox"),
         ),
+        (Named("ask_user"), None),
+        (Named("exit_plan_mode"), None),
         (Named("schedule_list"), None),
         (
             Named("schedule_create"),

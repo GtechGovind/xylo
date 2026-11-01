@@ -100,7 +100,7 @@ pub(crate) trait ToolExecutor: Send + Sync {
 }
 
 /// Exact names other agents use for Xylo's tools.
-const ALIASES: [(&str, &str); 22] = [
+const ALIASES: [(&str, &str); 24] = [
     ("WebFetch", "web_fetch"),
     ("WebSearch", "web_search"),
     ("webfetch", "web_fetch"),
@@ -109,6 +109,8 @@ const ALIASES: [(&str, &str); 22] = [
     ("exitworktree", "worktree_exit"),
     ("readmcpresource", "connector_resource_read"),
     ("listmcpresources", "connector_resources"),
+    ("askuserquestion", "ask_user"),
+    ("exitplanmode", "exit_plan_mode"),
     ("read", "file_read"),
     ("write", "file_write"),
     ("edit", "file_edit"),

@@ -18,6 +18,8 @@ pub type RefusalObserver = Arc<dyn Fn(&str) + Send + Sync>;
 /// Run constraints applied before advertising and dispatching any tool.
 #[derive(Clone, Default)]
 pub struct RunOptions {
+    /// Allows waiting for QuestionRequired and PlanRequired replies. Headless defaults decline.
+    pub interactive: bool,
     pub allowed_tools: Option<Vec<String>>,
     pub disallowed_tools: Vec<String>,
     pub max_turns: Option<u32>,

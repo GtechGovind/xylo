@@ -694,3 +694,215 @@ fn an_answer_cut_off_by_the_output_limit_is_archived_as_truncated(cx: &mut TestA
         assert_eq!(view.messages[0].status, MessageStatus::Truncated);
     });
 }
+
+#[gpui_kit::test]
+fn interaction_oversize_text_remains_editable_without_dispatch(cx: &mut TestAppContext) {
+    with_view(cx, |view, window, cx| {
+        use xylo_core::{InteractionAnswer, QuestionAnswer};
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        view.validation_worker_commands = Some(sender);
+        for answer in [
+            InteractionAnswer::Questions {
+                answers: vec![QuestionAnswer {
+                    selected: vec![],
+                    other: Some("é".repeat(4097)),
+                }],
+            },
+            InteractionAnswer::KeepPlanning {
+                feedback: "x".repeat(8193),
+            },
+        ] {
+            let id = Uuid::new_v4();
+            engine(
+                view,
+                Some(view.session),
+                EngineEvent::PlanRequired {
+                    action_id: id,
+                    plan: "Plan".into(),
+                },
+                window,
+                cx,
+            );
+            view.answer_interaction(id, answer, cx);
+            assert!(
+                receiver.try_recv().is_err(),
+                "Oversize answer was dispatched"
+            );
+            assert!(
+                view.turns[&view.session]
+                    .tools
+                    .iter()
+                    .find(|c| c.id == id)
+                    .unwrap()
+                    .approval
+            );
+        }
+    });
+}
+
+#[gpui_kit::test]
+fn interaction_rejected_reply_retains_draft_and_allows_retry(cx: &mut TestAppContext) {
+    with_view(cx, |view, window, cx| {
+        use xylo_core::InteractionAnswer;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        view.validation_worker_commands = Some(sender);
+        let id = Uuid::new_v4();
+        engine(
+            view,
+            Some(view.session),
+            EngineEvent::PlanRequired {
+                action_id: id,
+                plan: "Plan".into(),
+            },
+            window,
+            cx,
+        );
+        view.answer_interaction(
+            id,
+            InteractionAnswer::KeepPlanning {
+                feedback: "Review again".into(),
+            },
+            cx,
+        );
+        receiver.try_recv().unwrap();
+        assert!(
+            view.turns[&view.session].tools[0].approval,
+            "Keep editable until accepted"
+        );
+        view.event(
+            HostEvent::InteractionReply {
+                session: view.session,
+                action_id: id,
+                result: Err("Rejected by gate".into()),
+            },
+            window,
+            cx,
+        );
+        assert!(view.turns[&view.session].tools[0].approval);
+        view.answer_interaction(
+            id,
+            InteractionAnswer::KeepPlanning {
+                feedback: "é".repeat(4096),
+            },
+            cx,
+        );
+        receiver.try_recv().unwrap();
+        view.event(
+            HostEvent::InteractionReply {
+                session: view.session,
+                action_id: id,
+                result: Ok(()),
+            },
+            window,
+            cx,
+        );
+        assert!(!view.turns[&view.session].tools[0].approval);
+    });
+}
+
+#[gpui_kit::test]
+fn interaction_failed_local_delivery_keeps_the_card(cx: &mut TestAppContext) {
+    with_view(cx, |view, window, cx| {
+        let id = Uuid::new_v4();
+        engine(
+            view,
+            Some(view.session),
+            EngineEvent::PlanRequired {
+                action_id: id,
+                plan: "Plan".into(),
+            },
+            window,
+            cx,
+        );
+        view.answer_interaction(id, xylo_core::InteractionAnswer::Reject, cx);
+        assert!(view.turns[&view.session].tools[0].approval);
+        assert!(view.error.is_some());
+    });
+}
+
+#[gpui_kit::test]
+fn interaction_selecting_saved_plan_after_approval_sends_restrictive_transition(
+    cx: &mut TestAppContext,
+) {
+    with_view(cx, |view, window, cx| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        view.validation_worker_commands = Some(sender);
+        view.settings.permissions = xylo_core::PermissionMode::Plan;
+        let id = Uuid::new_v4();
+        engine(
+            view,
+            Some(view.session),
+            EngineEvent::PlanRequired {
+                action_id: id,
+                plan: "Continue".into(),
+            },
+            window,
+            cx,
+        );
+        view.event(
+            HostEvent::InteractionReply {
+                session: view.session,
+                action_id: id,
+                result: Ok(()),
+            },
+            window,
+            cx,
+        );
+        view.event(
+            HostEvent::Permissions {
+                session: view.session,
+                mode: xylo_core::PermissionMode::AskForApproval,
+                revision: 10,
+            },
+            window,
+            cx,
+        );
+        assert_eq!(
+            view.current_permission_mode(),
+            xylo_core::PermissionMode::AskForApproval
+        );
+        assert_eq!(
+            view.settings.permissions,
+            xylo_core::PermissionMode::Plan,
+            "Plan approval does not elevate global settings"
+        );
+        view.set_permission_mode(xylo_core::PermissionMode::Plan, cx);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok((
+                _,
+                WorkerCommand::SetPermissions {
+                    mode: xylo_core::PermissionMode::Plan
+                }
+            ))
+        ));
+        view.event(
+            HostEvent::Permissions {
+                session: view.session,
+                mode: xylo_core::PermissionMode::Plan,
+                revision: 11,
+            },
+            window,
+            cx,
+        );
+        view.event(
+            HostEvent::Permissions {
+                session: view.session,
+                mode: xylo_core::PermissionMode::AskForApproval,
+                revision: 10,
+            },
+            window,
+            cx,
+        );
+        assert_eq!(
+            view.current_permission_mode(),
+            xylo_core::PermissionMode::Plan
+        );
+        view.session = Uuid::new_v4();
+        assert_eq!(
+            view.current_permission_mode(),
+            xylo_core::PermissionMode::Plan,
+            "Another chat keeps its own mode"
+        );
+    });
+}

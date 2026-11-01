@@ -7,6 +7,7 @@ fn permission_modes_use_snake_case_names() {
         (PermissionMode::ApproveForMe, "\"approve_for_me\""),
         (PermissionMode::FullAccess, "\"full_access\""),
         (PermissionMode::ReadOnly, "\"read_only\""),
+        (PermissionMode::Plan, "\"plan\""),
     ] {
         assert_eq!(serde_json::to_string(&mode).unwrap(), name);
         assert_eq!(serde_json::from_str::<PermissionMode>(name).unwrap(), mode);
@@ -15,9 +16,12 @@ fn permission_modes_use_snake_case_names() {
 }
 
 #[test]
-fn only_full_access_runs_unsandboxed_and_only_read_only_refuses_writes() {
+fn only_full_access_runs_unsandboxed_and_read_only_and_plan_refuse_writes() {
     for mode in PermissionMode::ALL {
         assert_eq!(mode.sandboxed(), mode != PermissionMode::FullAccess);
-        assert_eq!(mode.allows_writes(), mode != PermissionMode::ReadOnly);
+        assert_eq!(
+            mode.allows_writes(),
+            !matches!(mode, PermissionMode::ReadOnly | PermissionMode::Plan)
+        );
     }
 }

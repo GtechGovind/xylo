@@ -415,6 +415,14 @@ while IFS= read -r line; do
       fi
       [ "$mode" = delayed ] && sleep 1
       emit "$run" "{\"event\":\"approval_required\",\"action_id\":\"$ACTION\",\"name\":\"file_write\",\"arguments\":{},\"rule\":\"Edits in this project\",\"rule_key\":\"write:project\"}" ;;
+    *'"command":"answer"'*)
+      if [ "$answered" != yes ]; then
+        answered=yes
+        emit "$rid" '{"event":"error","message":"Invalid answer; retry","retryable":false,"kind":"internal"}'
+        emit "$run" "{\"event\":\"plan_required\",\"action_id\":\"$ACTION\",\"plan\":\"Review again\"}"
+      else
+        emit "$rid" '{"event":"status","text":"Answer accepted"}'
+      fi ;;
     *'"command":"approve"'*)
       [ "$mode" = refuse ] && emit "$rid" '{"event":"error","message":"Approval is no longer pending","retryable":false,"kind":"internal"}' ;;
     *'"command":"cancel"'*)
@@ -480,6 +488,168 @@ done
         })
         .await
         .expect("expected host event did not arrive")
+    }
+
+    #[tokio::test]
+    async fn interaction_plan_acceptance_publishes_mode_then_plan_is_delivered() {
+        let (_directory, host, events, session) = running("honor").await;
+        host.settings.lock().await.permissions = PermissionMode::Plan;
+        host.control_worker(
+            Some(session),
+            WorkerCommand::SetPermissions {
+                mode: PermissionMode::Plan,
+            },
+        )
+        .await
+        .unwrap();
+        let id = Uuid::new_v4();
+        // The fixture rejects the first answer so the same pending request is retried.
+        host.control_worker(
+            Some(session),
+            WorkerCommand::Answer {
+                action_id: id,
+                answer: xylo_core::InteractionAnswer::Reject,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for(&events, |event| {
+            matches!(event, HostEvent::InteractionReply { result: Err(_), .. })
+        })
+        .await;
+        wait_for(&events, |event| {
+            matches!(event, HostEvent::PlanModes { .. })
+        })
+        .await;
+        host.control_worker(
+            Some(session),
+            WorkerCommand::Answer {
+                action_id: id,
+                answer: xylo_core::InteractionAnswer::ApprovePlan {
+                    mode: PermissionMode::AskForApproval,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let event = wait_for(&events, |event| {
+            matches!(
+                event,
+                HostEvent::Permissions {
+                    mode: PermissionMode::AskForApproval,
+                    ..
+                }
+            )
+        })
+        .await;
+        let HostEvent::Permissions {
+            revision: accepted, ..
+        } = event
+        else {
+            unreachable!()
+        };
+        wait_for(&events, |event| {
+            matches!(event, HostEvent::InteractionReply { result: Ok(()), .. })
+        })
+        .await;
+        assert_eq!(host.settings.lock().await.permissions, PermissionMode::Plan);
+        host.control_worker(
+            Some(session),
+            WorkerCommand::SetPermissions {
+                mode: PermissionMode::Plan,
+            },
+        )
+        .await
+        .unwrap();
+        let event = wait_for(&events, |event| {
+            matches!(
+                event,
+                HostEvent::Permissions {
+                    mode: PermissionMode::Plan,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(matches!(event, HostEvent::Permissions { revision, .. } if revision > accepted));
+        assert_eq!(
+            *host.workers.lock().await[&session].mode.lock(),
+            PermissionMode::Plan
+        );
+        stop(&host, session).await;
+    }
+
+    #[tokio::test]
+    async fn interaction_answer_reply_retry_keeps_host_mode_consistent() {
+        let (_directory, host, events, session) = running("honor").await;
+        let workspace = host.workers.lock().await[&session]
+            .workspace
+            .lock()
+            .clone()
+            .unwrap();
+        host.settings.lock().await.permissions = PermissionMode::AskForApproval;
+        host.start_loop(session, workspace, "/loop check".into())
+            .await
+            .unwrap();
+        let task = host
+            .default_scheduler()
+            .unwrap()
+            .list()
+            .await
+            .unwrap()
+            .remove(0);
+        host.scheduled.lock().await.insert(session, task.id);
+        let id = Uuid::new_v4();
+        for (current, accepted, expected) in [
+            (
+                PermissionMode::FullAccess,
+                false,
+                PermissionMode::AskForApproval,
+            ),
+            (
+                PermissionMode::FullAccess,
+                true,
+                PermissionMode::AskForApproval,
+            ),
+            (PermissionMode::ReadOnly, true, PermissionMode::ReadOnly),
+        ] {
+            host.settings.lock().await.permissions = current;
+            host.control_worker(
+                Some(session),
+                WorkerCommand::Answer {
+                    action_id: id,
+                    answer: xylo_core::InteractionAnswer::ApprovePlan {
+                        mode: PermissionMode::FullAccess,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let event = wait_for(&events, |event| matches!(event, HostEvent::InteractionReply { action_id, .. } if *action_id == id)).await;
+            assert!(
+                matches!(event, HostEvent::InteractionReply { result, .. } if result.is_ok() == accepted)
+            );
+            if accepted {
+                assert_eq!(*host.workers.lock().await[&session].mode.lock(), expected);
+            } else {
+                let event = wait_for(&events, |event| {
+                    matches!(event, HostEvent::PlanModes { .. })
+                })
+                .await;
+                let HostEvent::PlanModes {
+                    modes, scheduled, ..
+                } = event
+                else {
+                    unreachable!()
+                };
+                assert!(scheduled);
+                assert!(modes.contains(&PermissionMode::AskForApproval));
+                assert!(modes.contains(&PermissionMode::ReadOnly));
+                assert!(!modes.contains(&PermissionMode::FullAccess));
+                assert!(!modes.contains(&PermissionMode::ApproveForMe));
+            }
+        }
+        stop(&host, session).await;
     }
 
     #[tokio::test]
@@ -747,4 +917,41 @@ fn a_worker_with_a_live_shell_job_is_not_retired_as_idle() {
         Instant::now() + IDLE_WORKER_TTL + Duration::from_secs(1),
     );
     assert!(worker.stop.is_cancelled());
+}
+
+#[tokio::test]
+async fn interaction_late_plan_receipt_cannot_replace_newer_permissions_or_turn() {
+    let (_directory, host, _events) = state();
+    let session = Uuid::new_v4();
+    let (mut incoming, _exit) = crate::host::tests::draft::mock_worker(&host, session, 4).await;
+    let worker = host.workers.lock().await[&session].clone();
+    worker.record_mode(PermissionMode::AskForApproval);
+    for newer in [PermissionMode::ReadOnly, PermissionMode::Plan] {
+        let request = Uuid::new_v4();
+        worker
+            .send_control(
+                session,
+                request,
+                WorkerCommand::Answer {
+                    action_id: Uuid::new_v4(),
+                    answer: xylo_core::InteractionAnswer::ApprovePlan {
+                        mode: PermissionMode::FullAccess,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        incoming.recv().await.unwrap();
+        let Control::Answer {
+            mode: Some(mode),
+            revision,
+            ..
+        } = worker.take_control(request).unwrap()
+        else {
+            panic!("Missing answer correlation")
+        };
+        worker.record_mode(newer);
+        worker.acknowledge_plan_mode(mode, revision);
+        assert_eq!(*worker.mode.lock(), newer);
+    }
 }

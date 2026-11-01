@@ -565,3 +565,40 @@ async fn integrated_worktree_instructions_persist_exposure_and_reach_parent_boun
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn integrated_headless_questions_remain_noninteractive_after_worktree_rebind() {
+    let (dir, mut broker, mut events) = fixture(PermissionMode::FullAccess);
+    initialize(dir.path());
+    Arc::get_mut(&mut broker)
+        .unwrap()
+        .configure_run(&crate::RunOptions {
+            interactive: false,
+            ..Default::default()
+        })
+        .unwrap();
+    approve_integration(broker.clone(), &mut events, |execution| {
+        execution
+            .execute(
+                "enter-headless",
+                "worktree_enter",
+                json!({"name":"headless-scope"}),
+            )
+            .unwrap();
+    })
+    .await;
+    let execution = broker.clone();
+    let mut task = tokio::task::spawn_blocking(move || {
+        execution.execute("headless-question", "ask_user", json!({"questions":[{"header":"Scope","question":"Which change?","options":[{"label":"Small","description":"One file"},{"label":"Broad","description":"All files"}],"multi_select":false}]}))
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await;
+    if result.is_err() {
+        broker.cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+    let output = result
+        .expect("Headless rebound must not wait for a user")
+        .unwrap()
+        .unwrap();
+    assert!(output.contains("No interactive client"), "{output}");
+}

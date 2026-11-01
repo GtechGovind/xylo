@@ -338,6 +338,7 @@ fn permission_policy(mode: PermissionMode) -> &'static str {
         PermissionMode::ApproveForMe => PERMISSION_APPROVE_FOR_ME,
         PermissionMode::FullAccess => PERMISSION_FULL_ACCESS,
         PermissionMode::ReadOnly => PERMISSION_READ_ONLY,
+        PermissionMode::Plan => include_str!("../../prompts/permissions/plan.md"),
     };
     text.trim_end()
 }

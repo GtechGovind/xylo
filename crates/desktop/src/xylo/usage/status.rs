@@ -66,7 +66,7 @@ impl Xylo {
         let text = format!(
             "{} · {} · {} · {} · {} · {} jobs",
             model,
-            self.settings.permissions.label(),
+            self.current_permission_mode().label(),
             percent,
             cost_label(cost),
             branch,
@@ -147,7 +147,7 @@ impl Xylo {
             .get(&session)
             .and_then(|turn| turn.active_model.as_deref())
             .unwrap_or(&self.settings.provider.model);
-        let payload = serde_json::json!({"session_id":session,"model":model,"mode":self.settings.permissions,"context_used":context.map(|context|context.used()),"context_capacity":context.map(|context|context.capacity),"estimated_cost":self.usage_ui.report.as_ref().filter(|(id,_)|*id==session).map(|(_,report)|report.conversation.estimated_usd),"branch":self.usage_ui.branch,"running_jobs":self.running_job_count()});
+        let payload = serde_json::json!({"session_id":session,"model":model,"mode":self.current_permission_mode(),"context_used":context.map(|context|context.used()),"context_capacity":context.map(|context|context.capacity),"estimated_cost":self.usage_ui.report.as_ref().filter(|(id,_)|*id==session).map(|(_,report)|report.conversation.estimated_usd),"branch":self.usage_ui.branch,"running_jobs":self.running_job_count()});
         self.usage_ui.status_request = Some((id, session, workspace.clone(), command));
         self.usage_ui.status_last = Some(std::time::Instant::now());
         self.host_call(cx, |host| host.status_line(id, workspace, payload));

@@ -28,6 +28,7 @@ use xylo_engine::{FinishReason, ToolCall};
 pub fn builtin() -> Vec<Task> {
     vec![
         tool_loop(),
+        plan_interaction(),
         project_discovery::scoped_instructions(),
         code_tool_safety(),
         shell_working_directory(),
@@ -852,6 +853,44 @@ fn web_fetch() -> Task {
         ),
         ModelReply::calls(2, [("web_fetch", json!({"url":"{web_fixture}"}))]),
         ModelReply::text("Read the offline documentation page as untrusted content."),
+    ]);
+    task
+}
+
+/// A headless plan request declines without escaping the read-only boundary.
+fn plan_interaction() -> Task {
+    let mut task = task(
+        "plan-interaction",
+        "Decline unanswered planning interactions safely",
+        "Propose a plan and wait for approval before editing.",
+        |trial| {
+            vec![
+                completed(trial),
+                Check::expect(
+                    "plan_stays_read_only",
+                    trial.file("forbidden.txt").is_none(),
+                    "An unanswered plan cannot authorize a file write",
+                ),
+            ]
+        },
+    );
+    task.mode = PermissionMode::Plan;
+    task.script = Script::replies([
+        ModelReply::calls(
+            1,
+            [(
+                "exit_plan_mode",
+                json!({"plan":"Create forbidden.txt after approval."}),
+            )],
+        ),
+        ModelReply::calls(
+            2,
+            [(
+                "file_write",
+                json!({"path":"forbidden.txt","content":"must not exist"}),
+            )],
+        ),
+        ModelReply::text("Plan was not approved; no files changed."),
     ]);
     task
 }

@@ -33,6 +33,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Replies to control commands arrive quickly; older entries are forgotten.
 const CONTROL_LEDGER_CAPACITY: usize = 128;
 const FORCED_STOP_NOTICE: &str = "The task did not stop in time, so Xylo ended it. Actions it had started are listed for review.";
+// Revisions remain ordered when a chat receives a replacement worker.
+static NEXT_PERMISSION_REVISION: AtomicU64 = AtomicU64::new(1);
 const LOST_DECISION: &str = "The task is no longer running, so this decision was not applied.";
 
 /// The mode a turn runs with. Scheduled turns run unattended, so Full access
@@ -58,7 +60,14 @@ pub(super) struct PendingApproval {
 /// What a non-Run command sent to a worker was, so its reply can be routed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Control {
-    Approve { action_id: Uuid },
+    Approve {
+        action_id: Uuid,
+    },
+    Answer {
+        action_id: Uuid,
+        mode: Option<PermissionMode>,
+        revision: u64,
+    },
     Cancel,
     Permissions,
     Other,
@@ -69,6 +78,14 @@ impl Control {
         match command {
             WorkerCommand::Approve { action_id, .. } => Control::Approve {
                 action_id: *action_id,
+            },
+            WorkerCommand::Answer { action_id, answer } => Control::Answer {
+                action_id: *action_id,
+                revision: 0,
+                mode: match answer {
+                    xylo_core::InteractionAnswer::ApprovePlan { mode } => Some(*mode),
+                    _ => None,
+                },
             },
             WorkerCommand::Cancel => Control::Cancel,
             WorkerCommand::SetPermissions { .. } => Control::Permissions,
@@ -125,6 +142,8 @@ pub(super) struct WorkerHandle {
     running_jobs: Arc<parking_lot::Mutex<std::collections::HashSet<Uuid>>>,
     /// Permission mode last sent to the worker, after [`effective_mode`].
     pub(super) mode: Arc<parking_lot::Mutex<PermissionMode>>,
+    permission_revision: Arc<AtomicU64>,
+    pub(super) permission_order: Arc<Mutex<()>>,
     /// Set when the host killed the process because it ignored Stop.
     pub(super) forced_stop: Arc<AtomicBool>,
     /// Worktree removal requested graceful shutdown. Keep this process owned
@@ -161,6 +180,8 @@ impl WorkerHandle {
             last_used: Arc::new(parking_lot::Mutex::new(Instant::now())),
             running_jobs: Arc::default(),
             mode: Arc::default(),
+            permission_revision: Arc::default(),
+            permission_order: Arc::default(),
             forced_stop: Arc::default(),
             worktree_retiring: Arc::default(),
             stop_sent: Arc::default(),
@@ -219,11 +240,43 @@ impl WorkerHandle {
         request_id: Uuid,
         command: WorkerCommand,
     ) -> Result<()> {
-        self.record_control(request_id, Control::of(&command));
+        let mut control = Control::of(&command);
+        if let Control::Answer { revision, .. } = &mut control {
+            *revision = self.permission_revision.load(Ordering::Acquire);
+        }
+        self.record_control(request_id, control);
         self.commands
             .send(Envelope::new(request_id, Some(session), 0, command))
             .await
             .context("This task is no longer running")
+    }
+
+    /// New settings or a new turn supersede earlier plan acknowledgements.
+    pub(super) fn record_mode(&self, mode: PermissionMode) {
+        let mut stored = self.mode.lock();
+        self.permission_revision.store(
+            NEXT_PERMISSION_REVISION.fetch_add(1, Ordering::AcqRel),
+            Ordering::Release,
+        );
+        *stored = mode;
+    }
+
+    fn acknowledge_plan_mode(&self, mode: PermissionMode, revision: u64) -> bool {
+        let mut stored = self.mode.lock();
+        if self.permission_revision.load(Ordering::Acquire) != revision {
+            return false;
+        }
+        *stored = mode;
+        true
+    }
+
+    pub(super) fn permission_event(&self, session: Uuid) -> HostEvent {
+        let mode = self.mode.lock();
+        HostEvent::Permissions {
+            session,
+            mode: *mode,
+            revision: self.permission_revision.load(Ordering::Acquire),
+        }
     }
 
     /// Asks the process to exit and ends it. Idle workers have no turn to
@@ -528,8 +581,18 @@ impl HostState {
             .map(|(session, worker)| (*session, worker.clone()))
             .collect();
         for (session, worker) in workers {
-            let mode = effective_mode(setting, scheduled.contains(&session));
-            *worker.mode.lock() = mode;
+            let _permission_order = worker.permission_order.lock().await;
+            let mode = match self
+                .wakeup_permission(
+                    session,
+                    effective_mode(setting, scheduled.contains(&session)),
+                )
+                .await
+            {
+                Ok(mode) => mode,
+                Err(_) => PermissionMode::ReadOnly,
+            };
+            worker.record_mode(mode);
             let delivered = tokio::time::timeout(
                 Duration::from_secs(2),
                 worker.send_control(
@@ -539,6 +602,9 @@ impl HostState {
                 ),
             )
             .await;
+            if matches!(delivered, Ok(Ok(()))) {
+                let _ = self.events.send(worker.permission_event(session)).await;
+            }
             if !matches!(delivered, Ok(Ok(()))) && worker.active.load(Ordering::Acquire) {
                 let _ = self
                     .events
@@ -757,6 +823,35 @@ impl WorkerReader {
                 self.renew_credentials(envelope.request_id, *request_id, *generation, *force);
                 return true;
             }
+            EngineEvent::PlanRequired { action_id, .. } => {
+                let action_id = *action_id;
+                let scheduled = self.is_scheduled().await;
+                let mut modes = Vec::new();
+                if let Some(host) = self.host.upgrade() {
+                    for mode in PermissionMode::ALL
+                        .into_iter()
+                        .filter(|m| *m != PermissionMode::Plan)
+                    {
+                        if matches!(host.cap_plan_answer(self.session, xylo_core::InteractionAnswer::ApprovePlan { mode }).await, Ok(xylo_core::InteractionAnswer::ApprovePlan { mode: capped }) if capped == mode)
+                        {
+                            modes.push(mode);
+                        }
+                    }
+                }
+                if !self.forward_run_event(envelope).await {
+                    return false;
+                }
+                return self
+                    .events
+                    .send(HostEvent::PlanModes {
+                        session: self.session,
+                        action_id,
+                        modes,
+                        scheduled,
+                    })
+                    .await
+                    .is_ok();
+            }
             EngineEvent::ApprovalRequired {
                 action_id,
                 name,
@@ -784,8 +879,19 @@ impl WorkerReader {
                     }
                 }
             }
-            EngineEvent::ToolFinished { action_id, .. } => {
+            EngineEvent::ToolFinished {
+                action_id,
+                name,
+                success,
+                ..
+            } => {
                 self.worker.approvals.lock().remove(action_id);
+                if name == "schedule_wakeup"
+                    && *success
+                    && let Ok(tasks) = self.scheduler.list().await
+                {
+                    let _ = self.events.send(HostEvent::Schedules(tasks)).await;
+                }
             }
             _ => {}
         }
@@ -804,6 +910,15 @@ impl WorkerReader {
             EngineEvent::Completed { .. } | EngineEvent::Cancelled | EngineEvent::Error { .. }
         );
         let scheduled = terminal && self.is_scheduled().await;
+        if matches!(
+            envelope.payload,
+            EngineEvent::Error { .. } | EngineEvent::Cancelled
+        ) && let Err(error) =
+            interaction_control::pause_schedule(&self.scheduler, &self.scheduled, self.session)
+                .await
+        {
+            tracing::error!(%error, "Pause failed conversation wakeup");
+        }
         if matches!(envelope.payload, EngineEvent::Completed { .. })
             && let Err(error) =
                 acknowledge_schedule(&self.scheduler, &self.scheduled, self.session).await
@@ -900,6 +1015,37 @@ impl WorkerReader {
                         },
                     ),
                     None => HostEvent::Status(format!("Your decision was not applied: {message}")),
+                }
+            }
+            (Some(Control::Answer { action_id, .. }), EngineEvent::Error { message, .. }) => {
+                HostEvent::InteractionReply {
+                    session: self.session,
+                    action_id,
+                    result: Err(message),
+                }
+            }
+            (
+                Some(Control::Answer {
+                    action_id,
+                    mode,
+                    revision,
+                }),
+                EngineEvent::Status { .. },
+            ) => {
+                if let Some(mode) = mode
+                    && self.worker.acknowledge_plan_mode(mode, revision)
+                    && self
+                        .events
+                        .send(self.worker.permission_event(self.session))
+                        .await
+                        .is_err()
+                {
+                    return false;
+                }
+                HostEvent::InteractionReply {
+                    session: self.session,
+                    action_id,
+                    result: Ok(()),
                 }
             }
             (Some(Control::Cancel), payload @ EngineEvent::Status { .. }) => {

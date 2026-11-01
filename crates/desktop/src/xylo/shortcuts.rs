@@ -16,7 +16,8 @@ actions!(
         AllowPendingAction,
         DenyOrStop,
         EscapePressed,
-        FocusComposer
+        FocusComposer,
+        CyclePermissions
     ]
 );
 /// Expands to the platform's primary-modifier chord as a `&'static str`
@@ -47,6 +48,7 @@ pub(super) fn bind(cx: &mut App) {
         // xylo while the composer is focused.
         KeyBinding::new(chord!("shift-enter"), AllowPendingAction, Some("Xylo")),
         KeyBinding::new(chord!("."), DenyOrStop, Some("Xylo")),
+        KeyBinding::new("shift-tab", CyclePermissions, Some("Xylo")),
         KeyBinding::new("escape", EscapePressed, Some("Xylo")),
         KeyBinding::new(chord!("l"), FocusComposer, Some("Xylo")),
     ]);

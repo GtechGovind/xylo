@@ -179,3 +179,9 @@ async fn worktree_approval_task_passes_offline() {
     let (_, result) = graded(&task).await;
     assert!(result.passed, "{}", explain(&result));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interaction_plan_declines_offline_without_granting_write_authority() {
+    let (_, result) = graded(&find("plan-interaction").unwrap()).await;
+    assert!(result.passed, "{}", explain(&result));
+}

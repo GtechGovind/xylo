@@ -103,6 +103,9 @@ impl ToolBroker {
         arguments: &Value,
         result: Option<&Value>,
     ) -> Result<HookOutput> {
+        if self.mode() == xylo_core::PermissionMode::Plan {
+            return Ok(HookOutput::default());
+        }
         let root = self.workspace_root();
         if root != self.request.workspace {
             return self

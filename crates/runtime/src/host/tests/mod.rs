@@ -1557,3 +1557,5 @@ fn host_derived_settings_commit_keeps_live_project_fields() {
     assert_eq!(copy.last_workspace, live.last_workspace);
     assert_eq!(copy.ui.open_projects, live.ui.open_projects);
 }
+
+mod interaction;
