@@ -902,3 +902,18 @@ mod tests;
 
 #[cfg(test)]
 mod coding_scope_tests;
+
+/// Original exit code reported by the trusted helper before the watchdog
+/// releases its group identity anchor. Only accept it after a successful fence;
+/// cancellation/owner loss has no code and must retain the caller's error.
+/// `path` is the private `XYLO_SANDBOX_CLEANUP_STATUS` path, never command output.
+pub fn read_guard_exit_code(path: &std::path::Path) -> Option<i32> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    (value["state"].as_str()? == "done")
+        .then(|| {
+            value["code"]
+                .as_i64()
+                .and_then(|code| i32::try_from(code).ok())
+        })
+        .flatten()
+}

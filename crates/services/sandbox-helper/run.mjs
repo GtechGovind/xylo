@@ -37,6 +37,7 @@ const singleLine = value => String(value?.message ?? value).replace(/\s+/g, ' ')
 // inherited by the program, so no descendant can keep the worker alive.
 const guardParent = process.env.XYLO_SANDBOX_PARENT_GUARD === '1';
 let manager;
+let ownerWatcher;
 let child;
 let statusFile;
 let unavailableReported = false;
@@ -53,11 +54,17 @@ async function guardOwner() {
     watcher.once('message', message => {
       if (message?.ready !== true) return;
       clearTimeout(timer);
-      watcher.disconnect();
-      watcher.unref();
+      // Keep this IPC handle referenced: this helper is the live group anchor
+      // until the watchdog releases it with its single final group kill.
+      ownerWatcher = watcher;
       resolve();
     });
   });
+}
+
+function finish(code) {
+  process.exitCode = code;
+  if (ownerWatcher?.connected) ownerWatcher.send({ finish: true, code });
 }
 
 function record(entry) {
@@ -69,8 +76,8 @@ async function unavailable(reason) {
   if (unavailableReported) return;
   unavailableReported = true;
   record({ kind: 'unavailable', reason: singleLine(reason) });
-  process.exitCode = UNAVAILABLE_EXIT;
   await manager?.reset().catch(() => {});
+  finish(UNAVAILABLE_EXIT);
 }
 
 function networkDecision(unrestricted) {
@@ -166,7 +173,7 @@ try {
   child.once('exit', async (code, signal) => {
     if (guardParent) process.stdin.destroy();
     await manager.reset();
-    if (!failed) process.exitCode = spawnFailed ? SPAWN_FAILED_EXIT : code ?? (signal ? 130 : 1);
+    if (!failed) finish(spawnFailed ? SPAWN_FAILED_EXIT : code ?? (signal ? 130 : 1));
   });
   for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => child?.kill(signal));
 } catch (error) {

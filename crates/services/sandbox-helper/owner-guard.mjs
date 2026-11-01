@@ -3,14 +3,20 @@
 import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fenceOwnedGroup } from './owner-fence.mjs';
 
 const group = Number(process.argv[2]);
 const status = process.argv[3];
 if (!Number.isSafeInteger(group) || group <= 1 || group === process.pid || !status) throw new Error('Invalid owned process group');
+let code;
+let released = false;
 const record = state => {
-  try { writeFileSync(status, JSON.stringify({ state, group, watchdog: process.pid }), { mode: 0o600 }); } catch {}
+  try { writeFileSync(status, JSON.stringify({ state, group, watchdog: process.pid, code }), { mode: 0o600 }); } catch {}
 };
 const signal = name => {
+  if (released || !process.connected) throw new Error('Owned process group lost its helper anchor');
+  // Revoke authority before the syscall that releases our identity anchor.
+  if (name === 'SIGKILL') released = true;
   try { process.kill(-group, name); return true; }
   catch (error) { if (error.code === 'ESRCH') return false; throw error; }
 };
@@ -31,24 +37,23 @@ async function stop() {
   if (stopping) return;
   stopping = true;
   process.stdin.destroy();
-  const deadline = performance.now() + 2000;
   try {
-    // A one-shot kill can race fork. First freeze every live member so no
-    // parent can create another child, then kill and verify the empty group.
-    while (signal('SIGSTOP')) {
-      const live = members();
-      if (live.length === 0) break;
-      if (live.every(state => state.startsWith('T'))) signal('SIGKILL');
-      if (performance.now() >= deadline) throw new Error('Owned process group did not stop');
-      await delay(10);
-    }
+    await fenceOwnedGroup({ signal, members, anchored: () => process.connected && !released, delay, now: () => performance.now() });
     record('done');
   } catch {
-    try { signal('SIGKILL'); } catch {}
+    if (!released && process.connected) { try { signal('SIGKILL'); } catch {} }
     record('failed');
     process.exitCode = 1;
   }
 }
+process.on('message', message => {
+  if (message?.finish === true && Number.isInteger(message.code)) {
+    code = message.code;
+    void stop();
+  }
+});
+// Unexpected anchor loss is a failure, never permission to signal its old ID.
+process.on('disconnect', () => { if (!stopping) void stop(); });
 process.stdin.on('end', stop);
 process.stdin.on('error', stop);
 process.stdin.resume();

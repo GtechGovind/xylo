@@ -151,37 +151,29 @@ async fn cancellation_terminates_child() {
     assert!(result.is_err());
 }
 
-/// Last-resort cleanup for a failing fixture; never targets an unrelated group.
-struct FixtureGroup(u32);
-impl Drop for FixtureGroup {
-    fn drop(&mut self) {
-        for _ in 0..8 {
-            // SAFETY: this group was created by this test's child spawn.
-            unsafe {
-                libc::kill(-(self.0 as i32), libc::SIGSTOP);
-                libc::kill(-(self.0 as i32), libc::SIGKILL);
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+/// On assertion failure, owner/task handles drop first and request the trusted
+/// fence. Never signal a numeric ID from a fixture after that identity retires.
+struct FixtureOwner(Option<std::path::PathBuf>);
+impl FixtureOwner {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self(Some(path))
+    }
+    fn disarm(&mut self) {
+        self.0 = None;
     }
 }
-
-/// Covers startup/assertion failures before a fixture can read its owned IDs.
-struct FixtureOwner(std::path::PathBuf);
 impl Drop for FixtureOwner {
     fn drop(&mut self) {
-        if let Ok(bytes) = std::fs::read(&self.0)
-            && let Ok(status) = serde_json::from_slice::<serde_json::Value>(&bytes)
-        {
-            for key in ["group", "watchdog"] {
-                if let Some(id) = status[key]
-                    .as_u64()
-                    .and_then(|id| u32::try_from(id).ok())
-                    .filter(|id| *id > 1)
-                {
-                    drop(FixtureGroup(id));
-                }
+        let Some(path) = &self.0 else { return };
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if let Ok(bytes) = std::fs::read(path)
+                && let Ok(status) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && matches!(status["state"].as_str(), Some("done" | "failed"))
+            {
+                return;
             }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -242,16 +234,16 @@ async fn guarded_sandbox_kills_descendants_when_its_owner_pipe_closes() {
             temporary,
             status_file,
         } = prepared;
-        let _owner_cleanup = FixtureOwner(status_file.with_extension("cleanup"));
+        let mut owner_cleanup = FixtureOwner::new(status_file.with_extension("cleanup"));
         command
             .env("XYLO_SANDBOX_PARENT_GUARD", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .process_group(0)
-            .kill_on_drop(true);
+            .kill_on_drop(false);
         let mut child = command.spawn().unwrap();
-        let cleanup = FixtureGroup(child.id().unwrap());
+        let group = child.id().unwrap();
         let owner = child.stdin.take().unwrap();
         let mut output = BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
@@ -275,13 +267,14 @@ async fn guarded_sandbox_kills_descendants_when_its_owner_pipe_closes() {
             .unwrap()
             .unwrap();
         assert!(
-            live_group(cleanup.0).is_empty(),
+            live_group(group).is_empty(),
             "orphan at fork boundary {iteration}"
         );
         let guard: serde_json::Value =
             serde_json::from_slice(&std::fs::read(status_file.with_extension("cleanup")).unwrap())
                 .unwrap();
         watchdog_exited(&guard).await;
+        owner_cleanup.disarm();
         drop(temporary);
     }
 }
@@ -300,7 +293,7 @@ async fn guarded_cancellation_and_future_drop_fence_forking_descendants() {
         .unwrap();
         let status = prepared.status_file.with_extension("cleanup");
         let _temporary = prepared.temporary;
-        let _owner_cleanup = FixtureOwner(status.clone());
+        let mut owner_cleanup = FixtureOwner::new(status.clone());
         let (ready, mut output) = tokio::sync::mpsc::unbounded_channel();
         let observer: OutputObserver = Arc::new(move |_, bytes| {
             let _ = ready.send(bytes.to_vec());
@@ -319,6 +312,7 @@ async fn guarded_cancellation_and_future_drop_fence_forking_descendants() {
             )
             .await
         });
+        let _task_guard = AbortDrain(task.abort_handle());
         tokio::time::timeout(Duration::from_secs(20), async {
             while let Some(bytes) = output.recv().await {
                 if bytes.windows(5).any(|part| part == b"ready") {
@@ -331,7 +325,7 @@ async fn guarded_cancellation_and_future_drop_fence_forking_descendants() {
         .unwrap();
         let guard: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&status).unwrap()).unwrap();
-        let cleanup = FixtureGroup(guard["group"].as_u64().unwrap() as u32);
+        let group = guard["group"].as_u64().unwrap() as u32;
         if iteration % 2 == 0 {
             cancel.cancel();
             assert!(
@@ -342,14 +336,14 @@ async fn guarded_cancellation_and_future_drop_fence_forking_descendants() {
                     .is_err()
             );
             assert!(
-                live_group(cleanup.0).is_empty(),
+                live_group(group).is_empty(),
                 "cancellation returned before its fork fence"
             );
         } else {
             task.abort();
             let _ = task.await;
             tokio::time::timeout(Duration::from_secs(3), async {
-                while !live_group(cleanup.0).is_empty() {
+                while !live_group(group).is_empty() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
@@ -357,6 +351,7 @@ async fn guarded_cancellation_and_future_drop_fence_forking_descendants() {
             .unwrap();
         }
         watchdog_exited(&guard).await;
+        owner_cleanup.disarm();
     }
 }
 
@@ -373,7 +368,7 @@ async fn guarded_normal_exit_drains_output_and_cleans_background_descendants() {
         )
         .unwrap();
         let status = prepared.status_file.with_extension("cleanup");
-        let _owner_cleanup = FixtureOwner(status.clone());
+        let mut owner_cleanup = FixtureOwner::new(status.clone());
         let result = run_prepared_observed(
             prepared.command,
             dir.path(),
@@ -386,12 +381,13 @@ async fn guarded_normal_exit_drains_output_and_cleans_background_descendants() {
         .unwrap();
         let guard: serde_json::Value =
             serde_json::from_slice(&std::fs::read(status).unwrap()).unwrap();
-        let cleanup = FixtureGroup(guard["group"].as_u64().unwrap() as u32);
+        let group = guard["group"].as_u64().unwrap() as u32;
         assert_eq!(result.code, Some(7));
         assert_eq!(result.stdout, "complete\n");
         assert_eq!(guard["state"], "done");
-        assert!(live_group(cleanup.0).is_empty());
+        assert!(live_group(group).is_empty());
         watchdog_exited(&guard).await;
+        owner_cleanup.disarm();
     }
 }
 
@@ -516,7 +512,7 @@ async fn guarded_start_failure_and_early_owner_loss_retire_the_watchdog() {
         )
         .unwrap();
         let cleanup_status = prepared.status_file.with_extension("cleanup");
-        let _fixture_cleanup = FixtureOwner(cleanup_status.clone());
+        let mut owner_cleanup = FixtureOwner::new(cleanup_status.clone());
         if early_owner_loss {
             let mut command = prepared.command;
             command
@@ -525,9 +521,8 @@ async fn guarded_start_failure_and_early_owner_loss_retire_the_watchdog() {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .process_group(0)
-                .kill_on_drop(true);
+                .kill_on_drop(false);
             let mut child = command.spawn().unwrap();
-            let _group = FixtureGroup(child.id().unwrap());
             drop(child.stdin.take());
             tokio::time::timeout(Duration::from_secs(5), child.wait())
                 .await
@@ -552,5 +547,6 @@ async fn guarded_start_failure_and_early_owner_loss_retire_the_watchdog() {
         assert_eq!(guard["state"], "done");
         assert!(live_group(guard["group"].as_u64().unwrap() as u32).is_empty());
         watchdog_exited(&guard).await;
+        owner_cleanup.disarm();
     }
 }
