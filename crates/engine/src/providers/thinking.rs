@@ -3,6 +3,44 @@ use crate::model::Reasoning;
 use serde_json::{Value, json};
 use xylo_core::{ApiFamily, ProviderConfig};
 
+pub(super) const BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// Client-side compaction, policy updates and tool changes can invalidate the
+/// prefix that signed thinking was produced against. Let Anthropic discard
+/// only that stale reasoning; do not edit opaque signatures or stored history.
+/// https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+pub(super) fn allow_replay_prefix_changes(config: &ProviderConfig, body: &mut Value) {
+    if config.family != ApiFamily::Anthropic
+        || !body["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "assistant"
+                    && message["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            matches!(
+                                block["type"].as_str(),
+                                Some("thinking" | "redacted_thinking")
+                            )
+                        })
+                    })
+            })
+        })
+    {
+        return;
+    }
+    // An empty effort catalog omits controls, but these models still default
+    // to adaptive thinking. Make that mode explicit for block_binding without
+    // inventing an effort. Legacy/unknown implicit modes stay unchanged.
+    if body.get("thinking").is_none() && config.default_adaptive_thinking() {
+        body["thinking"] = json!({"type":"adaptive"});
+    }
+    if matches!(
+        body["thinking"]["type"].as_str(),
+        Some("adaptive" | "enabled")
+    ) {
+        body["thinking"]["block_binding"] = json!({"prefix_mismatch_behavior":"drop_block"});
+    }
+}
+
 pub(super) fn apply(
     config: &ProviderConfig,
     reasoning: Reasoning,

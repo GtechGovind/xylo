@@ -179,6 +179,7 @@ pub(super) fn body(
         }
     }
     super::thinking::apply(&provider.config, reasoning, max_tokens, &mut body);
+    super::thinking::allow_replay_prefix_changes(&provider.config, &mut body);
     Ok(body)
 }
 

@@ -1675,5 +1675,6 @@ fn context_overflow_is_recognised_from_codes_and_messages() {
 }
 
 mod thinking;
+mod thinking_binding;
 mod tool_images;
 mod usage_headers;

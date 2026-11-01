@@ -4,18 +4,38 @@ use crate::{ApiFamily, AppSettings, ProviderConfig};
 impl ProviderConfig {
     /// Whether the Claude model accepts adaptive thinking and effort.
     pub fn adaptive_thinking(&self) -> bool {
-        let model = self.model.replace('.', "-").to_ascii_lowercase();
-        matches!(self.family, ApiFamily::Anthropic)
-            && [
+        self.default_adaptive_thinking()
+            || self.anthropic_model(&[
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-opus-4-7",
                 "claude-opus-4-8",
-                "claude-opus-5",
-                "claude-sonnet-5",
-            ]
-            .iter()
-            .any(|prefix| model.starts_with(prefix))
+            ])
+    }
+
+    /// Whether omitting thinking controls still selects adaptive thinking.
+    /// Older adaptive-capable models default off and must not be enabled just
+    /// to attach replay controls.
+    /// https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting
+    pub fn default_adaptive_thinking(&self) -> bool {
+        self.anthropic_model(&[
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-haiku-5-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+        ])
+    }
+
+    fn anthropic_model(&self, prefixes: &[&str]) -> bool {
+        let model = self.model.replace('.', "-").to_ascii_lowercase();
+        matches!(self.family, ApiFamily::Anthropic)
+            && prefixes.iter().any(|prefix| {
+                model
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+            })
     }
 
     /// Native protocol choices when a catalog does not advertise them.

@@ -138,19 +138,39 @@ impl NativeProvider {
     }
 
     async fn send(&self, body: &Value) -> Result<reqwest::Response, ModelError> {
-        let response = self
+        let mut request = self
             .client
             .post(self.endpoint.stream_url.clone())
             .header("accept", "text/event-stream")
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| ModelError::Provider {
-                // Once request transmission may have started, replay is unsafe.
-                retryable: error.is_connect(),
-                retry_after: None,
-                message: format!("Provider transport failed: {}", error.without_url()),
-            })?;
+            .json(body);
+        // The binding field requires this beta. Pair it with the actual body
+        // so first turns and requests with no signed replay remain unchanged.
+        if self.endpoint.protocol == ProviderProtocol::AnthropicMessages
+            && body.pointer("/thinking/block_binding").is_some()
+        {
+            let previous = self
+                .search_headers
+                .get("anthropic-beta")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if !previous
+                .split(',')
+                .any(|value| value.trim() == thinking::BINDING_BETA)
+            {
+                let beta = if previous.is_empty() {
+                    thinking::BINDING_BETA.to_owned()
+                } else {
+                    format!("{previous},{}", thinking::BINDING_BETA)
+                };
+                request = request.header("anthropic-beta", beta);
+            }
+        }
+        let response = request.send().await.map_err(|error| ModelError::Provider {
+            // Once request transmission may have started, replay is unsafe.
+            retryable: error.is_connect(),
+            retry_after: None,
+            message: format!("Provider transport failed: {}", error.without_url()),
+        })?;
         if response.status().is_success() {
             return Ok(response);
         }
