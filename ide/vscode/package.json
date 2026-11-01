@@ -1,7 +1,7 @@
 {
   "name": "xylo-ide-bridge",
   "displayName": "Xylo IDE Bridge",
-  "description": "Attach your VS Code selection and diagnostics to Xylo.",
+  "description": "Expose trusted VS Code selection and diagnostics through a local MCP bridge.",
   "version": "0.1.0",
   "publisher": "xylo",
   "private": true,
