@@ -100,19 +100,33 @@ impl Xylo {
     }
 
     pub(super) fn running_job_count(&self) -> usize {
-        0
-    } // A supplies the per-chat job registry at integration.
+        self.turns.get(&self.session).map_or(0, |turn| {
+            turn.shell_jobs.iter().filter(|job| job.running).count()
+        })
+    }
 
     pub(super) fn refresh_status_command(&mut self, cx: &mut Context<Self>) {
-        if self
+        let command = self
             .settings
             .status_line_command
-            .as_ref()
-            .is_none_or(|command| command.trim().is_empty())
-        {
+            .clone()
+            .filter(|command| !command.trim().is_empty());
+        let Some(command) = command else {
             self.usage_ui.status_text = None;
             self.usage_ui.status_tick = None;
+            self.usage_ui.status_context = None;
             return;
+        };
+        let Some(workspace) = self.workspace.clone() else {
+            self.usage_ui.status_text = None;
+            self.usage_ui.status_context = None;
+            return;
+        };
+        let context = (self.session, workspace.clone(), command.clone());
+        if self.usage_ui.status_context.as_ref() != Some(&context) {
+            self.usage_ui.status_text = None;
+            self.usage_ui.status_last = None;
+            self.usage_ui.status_context = Some(context);
         }
         if self.usage_ui.status_request.is_some()
             || self
@@ -122,17 +136,19 @@ impl Xylo {
         {
             return;
         }
-        let Some(workspace) = self.workspace.clone() else {
-            return;
-        };
         let id = Uuid::new_v4();
         let session = self.session;
         let context = self
             .turns
             .get(&session)
             .and_then(|turn| turn.context.as_ref());
-        let payload = serde_json::json!({"session_id":session,"model":self.settings.provider.model,"mode":self.settings.permissions,"context_used":context.map(|context|context.used()),"context_capacity":context.map(|context|context.capacity),"estimated_cost":self.usage_ui.report.as_ref().filter(|(id,_)|*id==session).map(|(_,report)|report.conversation.estimated_usd),"branch":self.usage_ui.branch,"running_jobs":self.running_job_count()});
-        self.usage_ui.status_request = Some((id, session));
+        let model = self
+            .turns
+            .get(&session)
+            .and_then(|turn| turn.active_model.as_deref())
+            .unwrap_or(&self.settings.provider.model);
+        let payload = serde_json::json!({"session_id":session,"model":model,"mode":self.settings.permissions,"context_used":context.map(|context|context.used()),"context_capacity":context.map(|context|context.capacity),"estimated_cost":self.usage_ui.report.as_ref().filter(|(id,_)|*id==session).map(|(_,report)|report.conversation.estimated_usd),"branch":self.usage_ui.branch,"running_jobs":self.running_job_count()});
+        self.usage_ui.status_request = Some((id, session, workspace.clone(), command));
         self.usage_ui.status_last = Some(std::time::Instant::now());
         self.host_call(cx, |host| host.status_line(id, workspace, payload));
         self.usage_ui.status_tick = Some(cx.spawn(async move |view, cx| {
@@ -152,16 +168,21 @@ impl Xylo {
         result: Result<Option<String>, String>,
         cx: &mut Context<Self>,
     ) {
-        let Some((pending, session)) = self.usage_ui.status_request else {
+        let Some((pending, session, workspace, command)) = self.usage_ui.status_request.take()
+        else {
             return;
         };
         if pending != id {
+            self.usage_ui.status_request = Some((pending, session, workspace, command));
             return;
         }
-        self.usage_ui.status_request = None;
-        if session == self.session && self.settings.status_line_command.is_some() {
+        if session == self.session
+            && self.workspace.as_ref() == Some(&workspace)
+            && self.settings.status_line_command.as_ref() == Some(&command)
+        {
             self.usage_ui.status_text = match result {
-                Ok(text) => text,
+                Ok(Some(text)) => Some(text),
+                Ok(None) => self.usage_ui.status_text.clone(),
                 Err(_) => Some("Status command failed · check General settings".into()),
             };
         }

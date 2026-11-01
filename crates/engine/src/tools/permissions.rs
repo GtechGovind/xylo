@@ -19,7 +19,7 @@
 //!   project, every connector call, the desktop, network access and every
 //!   writing tool except the [`PROJECT_WRITES`] (file edits, memory and skill
 //!   proposals). Risky in-process edits therefore ask in both presets.
-//! - **Full access** asks for nothing; commands run without the sandbox.
+//! - **Full access** asks for nothing; coding commands retain their sandbox.
 //! - **Read only** refuses every write (network access included) and treats
 //!   reads like "Ask for approval".
 //!
@@ -100,6 +100,9 @@ pub struct ToolSession {
     permissions: PermissionCell,
     vault: CredentialVault,
     connectors: Arc<OnceLock<ConnectorBroker>>,
+    pub(crate) reads: Arc<super::read_state::ReadState>,
+    pub(crate) lsp: Arc<OnceLock<xylo_runtime::lsp::AgentService>>,
+    pub(super) shell_jobs: super::shell_jobs::ShellJobs,
 }
 
 impl ToolSession {
@@ -111,7 +114,20 @@ impl ToolSession {
             permissions,
             vault,
             connectors: Arc::default(),
+            reads: Arc::default(),
+            lsp: Arc::default(),
+            shell_jobs: super::shell_jobs::ShellJobs::default(),
         }
+    }
+
+    /// Delivers shell updates beyond a single model turn.
+    pub fn set_job_events(&self, events: super::shell_jobs::JobEvents) {
+        self.shell_jobs.set_events(events);
+    }
+
+    /// Stops a job only when it belongs to this conversation.
+    pub fn kill_job(&self, session: Uuid, job: Uuid) -> Result<()> {
+        self.shell_jobs.kill(session, job)
     }
 
     /// Where approval decisions are delivered.
@@ -139,6 +155,10 @@ impl ToolSession {
 
     /// Closes every MCP connection; call when the worker exits.
     pub async fn shutdown(&self) {
+        if let Some(lsp) = self.lsp.get() {
+            lsp.shutdown().await;
+        }
+        self.shell_jobs.shutdown().await;
         if let Some(connectors) = self.connectors.get() {
             connectors.shutdown().await;
         }
@@ -231,7 +251,10 @@ pub(crate) struct Call<'a> {
     pub(crate) writes: bool,
     pub(crate) origin: Origin,
     pub(crate) reach: &'a Reach,
+    /// The project boundary, independent of a command's working directory.
     pub(crate) workspace: &'a Path,
+    /// The immutable command directory captured before approval and hooks.
+    pub(crate) cwd: Option<&'a Path>,
     /// The justification of a command that asked for internet access.
     pub(crate) network: Option<&'a str>,
     /// The conversation has read content from outside the project. Only
@@ -249,8 +272,41 @@ pub(crate) enum Verdict {
     Refuse(String),
 }
 
+/// Native language servers inherit account file and network access.
+pub(crate) const NATIVE_LSP_REASON: &str = "Runs a native language server outside the sandbox, with your account's file and network access";
+
 /// Decides whether a call runs, asks or is refused under `mode`.
 pub(crate) fn decide(mode: PermissionMode, call: &Call) -> Verdict {
+    // Reading code and running an unrestricted native server are separate
+    // authorities, including for hooks and already-running server sessions.
+    if call.name == "lsp" {
+        return match mode {
+            PermissionMode::ReadOnly => Verdict::Refuse("Native language-server execution requires write permission; this task is read-only".into()),
+            PermissionMode::FullAccess => Verdict::Allow,
+            PermissionMode::AskForApproval | PermissionMode::ApproveForMe => Verdict::Ask(match call.reach {
+                Reach::Outside(path) => format!("{NATIVE_LSP_REASON}; reads files outside the project: {}",path.display()),
+                Reach::Project => NATIVE_LSP_REASON.into(),
+            }),
+        };
+    }
+
+    if SANDBOXED_COMMANDS.contains(&call.name)
+        && let Reach::Outside(path) = call.reach
+    {
+        return match mode {
+            PermissionMode::ReadOnly => Verdict::Refuse(
+                "Outside shell commands require write permission; this task is read-only".into(),
+            ),
+            PermissionMode::FullAccess => Verdict::Allow,
+            _ => Verdict::Ask(format!(
+                "Run in the sandbox with read and write access to {}{}",
+                path.display(),
+                call.network
+                    .map(|why| format!("; network access: {why}"))
+                    .unwrap_or_default()
+            )),
+        };
+    }
     if call.origin == Origin::Hook {
         return Verdict::Allow;
     }
@@ -310,7 +366,11 @@ fn approve_for_me(call: &Call) -> Verdict {
             );
         }
     }
-    match risk::assess(call.name, call.arguments, call.workspace) {
+    match risk::assess(
+        call.name,
+        call.arguments,
+        call.cwd.unwrap_or(call.workspace),
+    ) {
         Some(reason) => Verdict::Ask(reason),
         None => Verdict::Allow,
     }
@@ -329,17 +389,36 @@ fn network(mode: PermissionMode, call: &Call, justification: &str) -> Verdict {
             "{} requires write permission; this task is read-only",
             call.name
         )),
+        PermissionMode::AskForApproval | PermissionMode::ApproveForMe
+            if call
+                .arguments
+                .get("allow_local_binding")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            Verdict::Ask(format!(
+                "Local listening and localhost access: {justification}"
+            ))
+        }
         PermissionMode::AskForApproval => Verdict::Ask(format!("Network access: {justification}")),
         PermissionMode::ApproveForMe => {
-            match risk::routine_fetch(call.name, call.arguments, call.workspace) {
+            match risk::routine_fetch(
+                call.name,
+                call.arguments,
+                call.cwd.unwrap_or(call.workspace),
+            ) {
                 Fetch::Routine => Verdict::Allow,
                 Fetch::Configured(reason) => Verdict::Ask(reason),
                 // Anything beyond a plain download may run project or
                 // dependency code (build scripts, tests, install hooks)
                 // with the internet open.
                 Fetch::Other => Verdict::Ask(
-                    risk::assess(call.name, call.arguments, call.workspace)
-                        .unwrap_or_else(|| format!("Network access: {justification}")),
+                    risk::assess(
+                        call.name,
+                        call.arguments,
+                        call.cwd.unwrap_or(call.workspace),
+                    )
+                    .unwrap_or_else(|| format!("Network access: {justification}")),
                 ),
             }
         }
@@ -355,8 +434,10 @@ const SANDBOXED_COMMANDS: &[&str] = &["run_command", "shell_command"];
 /// assessment flags them, as "Approve for me" does: no sandbox sees them, so
 /// an edit to `.envrc`, a CI workflow or `.cargo/config.toml` asks.
 const PROJECT_WRITES: &[&str] = &[
+    "shell_kill",
     "file_write",
     "file_edit",
+    "notebook_edit",
     "memory_remember",
     "skill_propose",
 ];
@@ -416,6 +497,28 @@ const RULE_LABEL_CHARS: usize = 160;
 /// The "always allow" rule for `call`, if one may cover it. A memory write
 /// after untrusted input has none: each one is reviewed.
 pub(crate) fn approval_rule_for(call: &Call) -> Option<(String, String)> {
+    if SANDBOXED_COMMANDS.contains(&call.name)
+        && (matches!(call.reach, Reach::Outside(_))
+            || (call.network.is_some()
+                && matches!(
+                    risk::routine_fetch(
+                        call.name,
+                        call.arguments,
+                        call.cwd.unwrap_or(call.workspace)
+                    ),
+                    Fetch::Configured(_)
+                )))
+    {
+        return None;
+    }
+    if call
+        .arguments
+        .get("allow_local_binding")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return None;
+    }
     if call.name == "memory_remember" && call.untrusted_input {
         return None;
     }
@@ -441,13 +544,27 @@ fn rule(
     workspace: &Path,
 ) -> Option<(String, String)> {
     let text = |key: &str| arguments.get(key).and_then(Value::as_str);
+    if name == "lsp" {
+        let scope = match reach {
+            Reach::Project => workspace,
+            Reach::Outside(path) => path.parent().unwrap_or(path),
+        };
+        let identity = serde_json::to_string(&(workspace, scope)).ok()?;
+        return Some((
+            format!("native-lsp:{identity}"),
+            format!(
+                "native language-server execution outside the sandbox with file and network access in {}",
+                scope.display()
+            ),
+        ));
+    }
     if let Reach::Outside(path) = reach {
         let folder = if path.is_dir() {
             path.as_path()
         } else {
             path.parent().unwrap_or(path)
         };
-        let (kind, label) = if matches!(name, "file_write" | "file_edit") {
+        let (kind, label) = if matches!(name, "file_write" | "file_edit" | "notebook_edit") {
             ("edit", "file edits")
         } else {
             ("read", "reading files")
@@ -463,13 +580,15 @@ fn rule(
     match name {
         // Risky project files (secrets, hooks, CI, tool configuration) get a
         // rule of their own that ordinary edits never cover.
-        "file_write" | "file_edit" => match risk::assess(name, arguments, workspace) {
-            Some(_) => {
-                let shown = risk::project_relative(workspace, text("path")?)?;
-                Some((format!("edit:{shown}"), format!("edits to `{shown}`")))
+        "file_write" | "file_edit" | "notebook_edit" => {
+            match risk::assess(name, arguments, workspace) {
+                Some(_) => {
+                    let shown = risk::project_relative(workspace, text("path")?)?;
+                    Some((format!("edit:{shown}"), format!("edits to `{shown}`")))
+                }
+                None => Some(("edit".into(), "file edits in this project".into())),
             }
-            None => Some(("edit".into(), "file edits in this project".into())),
-        },
+        }
         "run_command" => {
             let (key, label) = command_rule(arguments, workspace)?;
             Some((format!("run:{key}"), label))

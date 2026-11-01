@@ -3,19 +3,40 @@
   "version": "0.1.0",
   "identifier": "com.qurkos.xylo",
   "description": "Workspace for AI conversations, coding and tools",
-  "authors": ["Govind Yadav <gtech.govind2000@gmail.com>"],
+  "authors": [
+    "Govind Yadav <gtech.govind2000@gmail.com>"
+  ],
   "licenseFile": "LICENSE",
   "beforePackagingCommand": "npm ci --prefix crates/services/sandbox-helper --ignore-scripts --no-audit --no-fund",
   "binariesDir": "target/release",
   "outDir": "dist",
   "binaries": [
-    { "path": "xylo", "main": true },
-    { "path": "xylo-worker" },
-    { "path": "xylo-helper" }
+    {
+      "path": "xylo",
+      "main": true
+    },
+    {
+      "path": "xylo-worker"
+    },
+    {
+      "path": "xylo-helper"
+    },
+    {
+      "path": "xylo-cli"
+    }
   ],
   "resources": [
-    { "src": "crates/services/sandbox-helper", "target": "sandbox-helper" },
-    { "src": "LICENSE", "target": "licenses/LICENSE" },
-    { "src": "NOTICE", "target": "licenses/NOTICE" }
+    {
+      "src": "crates/services/sandbox-helper",
+      "target": "sandbox-helper"
+    },
+    {
+      "src": "LICENSE",
+      "target": "licenses/LICENSE"
+    },
+    {
+      "src": "NOTICE",
+      "target": "licenses/NOTICE"
+    }
   ]
 }

@@ -52,6 +52,7 @@ fn history_and_checkpoint_survive_reopen() {
     let (directory, store, session) = database();
     let turn = Uuid::new_v4();
     let message = ChatMessage {
+        reasoning: None,
         attachments: Vec::new(),
         id: Uuid::new_v4(),
         session_id: session,
@@ -88,6 +89,7 @@ fn history_pages_preserve_append_order_with_tied_timestamps_and_concurrent_appen
     for index in 1..=6 {
         store
             .append_message(&ChatMessage {
+                reasoning: None,
                 attachments: Vec::new(),
                 id: Uuid::new_v4(),
                 session_id: session,
@@ -110,6 +112,7 @@ fn history_pages_preserve_append_order_with_tied_timestamps_and_concurrent_appen
     assert!(newest.has_more);
     store
         .append_message(&ChatMessage {
+            reasoning: None,
             attachments: Vec::new(),
             id: Uuid::new_v4(),
             session_id: session,
@@ -1346,4 +1349,24 @@ fn archived_chats_leave_the_list_and_pins_survive_turns() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn provider_reasoning_is_saved_separately_from_the_answer_and_reloaded() {
+    let (_directory, store, session) = database();
+    let turn = Uuid::new_v4();
+    store
+        .complete_turn_with_reasoning(
+            session,
+            turn,
+            &json!([]),
+            "Answer",
+            &xylo_core::Usage::default(),
+            xylo_core::MessageStatus::Complete,
+            Some("Consider this".into()),
+        )
+        .unwrap();
+    let messages = store.messages(session, 10).unwrap();
+    assert_eq!(messages[0].content, "Answer");
+    assert_eq!(messages[0].reasoning.as_deref(), Some("Consider this"));
 }

@@ -62,3 +62,82 @@ fn styles_and_price_forms_change_only_their_selected_settings(cx: &mut TestAppCo
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn status_counts_only_live_jobs_in_the_active_conversation(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (window, view) = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, _| {
+            let job = xylo_core::ShellJob {
+                id: uuid::Uuid::new_v4(),
+                turn_id: uuid::Uuid::new_v4(),
+                command: "fixture".into(),
+                cwd: "/project".into(),
+                log_path: "/log".into(),
+                running: true,
+                exit_code: None,
+                output: String::new(),
+                error: None,
+            };
+            let mut finished = job.clone();
+            finished.id = uuid::Uuid::new_v4();
+            finished.running = false;
+            view.turns.entry(view.session).or_default().shell_jobs = vec![job.clone(), finished];
+            view.turns
+                .entry(uuid::Uuid::new_v4())
+                .or_default()
+                .shell_jobs = vec![job];
+            assert_eq!(view.running_job_count(), 1);
+        })
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn status_ignores_results_from_a_replaced_command_or_workspace(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (window, view) = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            view.workspace = Some("/project".into());
+            view.settings.status_line_command = Some("printf new".into());
+            let id = uuid::Uuid::new_v4();
+            view.usage_ui.status_request =
+                Some((id, view.session, "/project".into(), "printf old".into()));
+            view.status_line_received(id, Ok(Some("old command".into())), cx);
+            assert!(view.usage_ui.status_text.is_none());
+            view.usage_ui.status_request = Some((
+                id,
+                view.session,
+                "/previous-project".into(),
+                "printf new".into(),
+            ));
+            view.status_line_received(id, Ok(Some("old project".into())), cx);
+            assert!(view.usage_ui.status_text.is_none());
+            view.usage_ui.status_request =
+                Some((id, view.session, "/project".into(), "printf new".into()));
+            view.status_line_received(id, Ok(Some("current".into())), cx);
+            assert_eq!(view.usage_ui.status_text.as_deref(), Some("current"));
+            view.usage_ui.status_request =
+                Some((id, view.session, "/project".into(), "printf new".into()));
+            view.status_line_received(id, Ok(None), cx);
+            assert_eq!(
+                view.usage_ui.status_text.as_deref(),
+                Some("current"),
+                "A throttled refresh preserves the latest valid line"
+            );
+        })
+    })
+    .unwrap();
+}

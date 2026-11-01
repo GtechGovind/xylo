@@ -156,6 +156,9 @@ fn catalog_entries(
             let saved = previous.get(model.as_str()).copied();
             let mut provider = source.clone();
             provider.model = (*model).clone();
+            provider.fallback_model = saved
+                .and_then(|saved| saved.fallback_model.clone())
+                .or_else(|| source.fallback_model.clone());
             provider.reasoning_options = reasoning_options.get(*model).cloned();
             provider.default_reasoning_effort = default_reasoning_efforts.get(*model).cloned();
             provider.reasoning_effort = saved
@@ -661,6 +664,7 @@ impl Xylo {
                 .collect();
             page = page.child(settings_ui::list_container(rows));
         }
+        page = page.child(self.fallback_model_settings(cx));
         page.child(self.pricing_settings(cx)).into_any_element()
     }
 }

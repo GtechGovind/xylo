@@ -2,6 +2,8 @@
 //! share a bounded native transport, and are released after their documents close.
 //! Project files never select executable commands; overrides live in app data.
 
+mod agent;
+pub use agent::AgentService;
 mod client;
 mod service;
 mod transport;

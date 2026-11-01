@@ -58,6 +58,41 @@ impl Store {
         })
     }
 
+    /// The harness-selected alternative for the current checkpoint of this turn.
+    /// Historical conversation text cannot supply or change this selection.
+    pub fn checkpoint_fallback(&self, session_id: Uuid, turn_id: Uuid) -> Result<Option<String>> {
+        self.call(move |conn| {
+            let model: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT fallback_model FROM checkpoints WHERE session_id=?1 AND turn_id=?2",
+                    params![session_id.to_string(), turn_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(model.flatten())
+        })
+    }
+
+    /// Records an observed fallback only on the authenticated current-turn header.
+    /// A stale writer cannot select a model for a newer turn.
+    pub fn select_checkpoint_fallback(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        model: &str,
+    ) -> Result<()> {
+        ensure!(!model.trim().is_empty(), "Fallback model must not be empty");
+        let model = model.to_owned();
+        self.call(move |conn| {
+            let changed = conn.execute(
+                "UPDATE checkpoints SET fallback_model=?3,revision=revision+1 WHERE session_id=?1 AND turn_id=?2",
+                params![session_id.to_string(), turn_id.to_string(), model],
+            )?;
+            ensure!(changed == 1, "Fallback selection requires the current turn's checkpoint");
+            Ok(())
+        })
+    }
+
     /// The checkpoint of `session`, if it has one.
     pub fn checkpoint(&self, session_id: Uuid) -> Result<Option<Checkpoint>> {
         self.call(move |conn| {
@@ -74,6 +109,7 @@ impl Store {
                 turn_id: Uuid::parse_str(&header.turn_id)?,
                 messages: Value::Array(messages),
                 updated_at: header.updated_at,
+                fallback_model: header.fallback_model,
             }))
         })
     }
@@ -94,12 +130,13 @@ struct Header {
     length: usize,
     revision: u64,
     updated_at: i64,
+    fallback_model: Option<String>,
 }
 
 fn header(conn: &Connection, session_id: Uuid) -> Result<Option<Header>> {
     Ok(conn
         .query_row(
-            "SELECT turn_id,length,revision,updated_at FROM checkpoints WHERE session_id=?1",
+            "SELECT turn_id,length,revision,updated_at,fallback_model FROM checkpoints WHERE session_id=?1",
             [session_id.to_string()],
             |row| {
                 Ok(Header {
@@ -107,6 +144,7 @@ fn header(conn: &Connection, session_id: Uuid) -> Result<Option<Header>> {
                     length: crate::store::row_usize(row, 1)?,
                     revision: row.get::<_, i64>(2)? as u64,
                     updated_at: row.get(3)?,
+                    fallback_model: row.get(4)?,
                 })
             },
         )
@@ -157,7 +195,8 @@ pub(crate) fn write_rows(
     let session = session_id.to_string();
     conn.execute(
         "INSERT INTO checkpoints(session_id,turn_id,length,revision,updated_at) VALUES(?1,?2,?3,?4,?5)
-         ON CONFLICT(session_id) DO UPDATE SET turn_id=excluded.turn_id,length=excluded.length,revision=excluded.revision,updated_at=excluded.updated_at",
+         ON CONFLICT(session_id) DO UPDATE SET turn_id=excluded.turn_id,length=excluded.length,revision=excluded.revision,updated_at=excluded.updated_at,
+         fallback_model=CASE WHEN checkpoints.turn_id=excluded.turn_id THEN checkpoints.fallback_model ELSE NULL END",
         params![session, turn_id.to_string(), messages.len() as i64, revision as i64, timestamp],
     )?;
     conn.execute(

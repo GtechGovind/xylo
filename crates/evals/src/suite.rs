@@ -26,6 +26,8 @@ use xylo_engine::{FinishReason, ToolCall};
 pub fn builtin() -> Vec<Task> {
     vec![
         tool_loop(),
+        code_tool_safety(),
+        shell_working_directory(),
         length_continuation(),
         truncated_call(),
         empty_answer(),
@@ -109,7 +111,7 @@ fn tool_loop() -> Task {
             2,
             [(
                 "file_edit",
-                json!({"path": "src/lib.rs", "old_string": "a - b", "new_string": "a + b"}),
+                json!({"path": "src/lib.rs", "edits":[{"old_string": "a - b", "new_string": "a + b"}]}),
             )],
         ),
         ModelReply::text("Fixed: `add` in src/lib.rs now returns a + b."),
@@ -373,7 +375,7 @@ fn tiny_window() -> Task {
                 2,
                 [(
                     "file_edit",
-                    json!({"path": "src/lib.rs", "old_string": "a - b", "new_string": "a + b"}),
+                    json!({"path": "src/lib.rs", "edits":[{"old_string": "a - b", "new_string": "a + b"}]}),
                 )],
             ),
             ModelReply::text("Fixed: `add` in src/lib.rs returned a - b; it now returns a + b")
@@ -689,3 +691,83 @@ fn memory_from_tool_output() -> Task {
 
 #[cfg(test)]
 mod tests;
+
+/// Blind edits and a failing replacement cannot partly change a file.
+fn code_tool_safety() -> Task {
+    let mut task = task(
+        "code-tool-safety",
+        "Blind edits are refused and multi-edits apply all or none",
+        "Read notes.txt and atomically replace both words.",
+        |trial| {
+            vec![
+                completed(trial),
+                Check::expect(
+                    "atomic_edits",
+                    trial.file("notes.txt").as_deref() == Some("three four\n"),
+                    format!("{:?}", trial.file("notes.txt")),
+                ),
+            ]
+        },
+    );
+    task.files = vec![("notes.txt", "one two\n".into())];
+    task.script = Script::replies([
+        ModelReply::calls(
+            1,
+            [(
+                "file_edit",
+                json!({"path":"notes.txt","edits":[{"old_string":"one","new_string":"blind"}]}),
+            )],
+        ),
+        ModelReply::calls(2, [("file_read", json!({"path":"notes.txt"}))]),
+        ModelReply::calls(
+            3,
+            [(
+                "file_edit",
+                json!({"path":"notes.txt","edits":[{"old_string":"one","new_string":"partial"},{"old_string":"absent","new_string":"wrong"}]}),
+            )],
+        ),
+        ModelReply::calls(
+            4,
+            [(
+                "file_edit",
+                json!({"path":"notes.txt","edits":[{"old_string":"one","new_string":"three"},{"old_string":"two","new_string":"four"}]}),
+            )],
+        ),
+        ModelReply::text("Both edits were applied atomically."),
+    ]);
+    task
+}
+
+/// Shell working-directory state survives separate model calls and argv execution.
+fn shell_working_directory() -> Task {
+    let mut task = task(
+        "shell-working-directory",
+        "Keep shell cwd between tool calls",
+        "Enter sub and write a proof file there using the shell.",
+        |trial| {
+            vec![
+                completed(trial),
+                Check::expect(
+                    "persistent_cwd",
+                    trial.file("sub/proof.txt").as_deref() == Some("persisted"),
+                    "The second shell must write inside sub",
+                ),
+            ]
+        },
+    );
+    task.files = vec![("sub/README.md", "Working directory fixture".into())];
+    task.script = Script::replies([
+        ModelReply::calls(1, [("shell_command", json!({"command":"cd sub"}))]),
+        ModelReply::calls(2, [("run_command", json!({"program":"pwd","args":[]}))]),
+        ModelReply::calls(
+            3,
+            [(
+                "shell_command",
+                json!({"command":"printf persisted > proof.txt"}),
+            )],
+        ),
+        ModelReply::calls(4, [("shell_jobs", json!({}))]),
+        ModelReply::text("Created sub/proof.txt from the persistent shell directory."),
+    ]);
+    task
+}

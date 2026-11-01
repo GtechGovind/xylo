@@ -38,6 +38,7 @@ use xylo_services::{ConnectorBroker, CredentialVault, SqliteMemory, Store};
 mod action_control;
 mod credential_control;
 mod document_control;
+mod export_control;
 mod fact_control;
 mod image_control;
 mod notice_control;
@@ -388,6 +389,7 @@ enum HostCommand {
     SetConversationPinned(Uuid, bool),
     SetConversationArchived(Uuid, bool),
     RemoveProvider(ProviderConfig),
+    ExportConversation(Uuid, PathBuf),
     Shutdown,
 }
 
@@ -831,6 +833,10 @@ impl HostClient {
     }
     pub fn open_file(&self, request_id: Uuid, path: PathBuf) -> Result<()> {
         self.enqueue(HostCommand::OpenFile(request_id, path))
+    }
+    /// Exports the complete stored conversation to Markdown and adjacent JSONL.
+    pub fn export_conversation(&self, session: Uuid, path: PathBuf) -> Result<()> {
+        self.enqueue(HostCommand::ExportConversation(session, path))
     }
     pub fn save_file(&self, path: PathBuf, content: String) -> Result<()> {
         self.enqueue(HostCommand::Save(path, content))
@@ -1796,6 +1802,9 @@ impl HostState {
                     })
                     .await?;
             }
+            HostCommand::ExportConversation(session, path) => {
+                self.export_conversation(session, path).await?
+            }
             HostCommand::Save(path, content) => {
                 let result = self.save_project_file(path.clone(), content).await;
                 let event = match result {
@@ -2539,6 +2548,9 @@ impl HostState {
         draft_request_id: Option<Uuid>,
         queued_item: Option<QueuedAdmission>,
     ) -> Result<Option<crate::drafts::DraftAdmission>> {
+        if turn.provider.fallback_model.is_none() {
+            turn.provider.fallback_model = self.store.settings()?.fallback_model;
+        }
         let session = turn.session_id;
         let cancellation = {
             let mut queued = self.queued.lock();

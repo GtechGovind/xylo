@@ -68,6 +68,7 @@ pub type ProviderLayer =
 
 /// Xylo's native agent engine.
 pub struct AgentEngine {
+    options: crate::RunOptions,
     store: Store,
     paths: AppPaths,
     session: ToolSession,
@@ -87,6 +88,7 @@ impl AgentEngine {
     /// permission mode and the unlocked secret vault.
     pub fn new(store: Store, paths: AppPaths, session: ToolSession) -> Self {
         Self {
+            options: Default::default(),
             steering: SteeringControl::new(store.clone()),
             provider_credential: None,
             credential_resolver: None,
@@ -96,6 +98,12 @@ impl AgentEngine {
             paths,
             session,
         }
+    }
+
+    /// Applies headless constraints to every root and delegated broker.
+    pub fn with_run_options(mut self, options: crate::RunOptions) -> Self {
+        self.options = options;
+        self
     }
 
     /// Wakes the running turn to apply newly queued guidance at its next
@@ -139,11 +147,30 @@ impl AgentEngine {
     }
 
     fn provider(&self, config: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
-        let provider = self.configured_provider(config)?;
-        Ok(match &self.provider_layer {
+        let wrap = |provider| match &self.provider_layer {
             Some(layer) => layer(provider),
             None => provider,
-        })
+        };
+        let primary = wrap(self.configured_provider(config)?);
+        let Some(model) = config
+            .fallback_model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty() && *model != config.model)
+        else {
+            return Ok(primary);
+        };
+        let mut alternative = config.clone();
+        alternative.model = model.to_owned();
+        alternative.fallback_model = None;
+        alternative.reasoning_options = None;
+        alternative.default_reasoning_effort = None;
+        alternative.reasoning_effort = None;
+        alternative.served_context_tokens = None;
+        Ok(Arc::new(crate::providers::fallback::WithFallback {
+            primary,
+            alternative: wrap(self.configured_provider(&alternative)?),
+            name: model.to_owned(),
+        }))
     }
 
     fn configured_provider(&self, config: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
@@ -176,14 +203,16 @@ impl AgentEngine {
         events: mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
     ) -> Result<ToolBroker> {
-        ToolBroker::new(
+        let mut broker = ToolBroker::new(
             request.clone(),
             self.store.clone(),
             self.capability_config(request)?,
             self.session.clone(),
             events,
             cancel,
-        )
+        )?;
+        broker.configure_run(&self.options)?;
+        Ok(broker)
     }
 
     /// The conversation to continue: the checkpoint with every pending tool
@@ -486,7 +515,8 @@ impl AgentEngine {
             managed_endpoint(&self.paths, &request.provider.endpoint)?,
         );
         let summary_deadline = guarded.timeout();
-        let provider: Arc<dyn ModelProvider> = Arc::new(guarded);
+        let usage_meter = crate::usage_meter::Meter::default();
+        let provider = usage_meter.wrap(Arc::new(guarded), request.provider.model.clone());
         let budget = ContextBudget::new(&request.provider);
         let mut messages = self
             .restored_messages(&request, events.clone(), cancel.clone())
@@ -504,7 +534,7 @@ impl AgentEngine {
         let mode = self.session.permissions().get();
         let (prompting, prompted) = (broker.clone(), request.clone());
         let settings_store = self.store.clone();
-        let (system, prices) = blocking(move || {
+        let (mut system, prices) = blocking(move || {
             let settings = settings_store.settings()?;
             let style = xylo_runtime::workspace::output_styles::current(
                 &prompted.workspace,
@@ -517,6 +547,10 @@ impl AgentEngine {
             Ok((system, settings.pricing_overrides))
         })
         .await?;
+        if !self.options.append_system_prompt.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&self.options.append_system_prompt);
+        }
         // Model calls admit their own memory when the model runs locally;
         // a child holds no lease of its own while it waits on tools.
         let resources = xylo_resources::ResourceManager::new();
@@ -549,7 +583,11 @@ impl AgentEngine {
             tools: Arc::new(BrokerTools::root(broker.clone())),
             system,
             max_tokens: request.provider.output_tokens,
-            max_model_calls: MAX_MODEL_CALLS,
+            max_model_calls: self
+                .options
+                .max_turns
+                .unwrap_or(MAX_MODEL_CALLS)
+                .min(MAX_MODEL_CALLS),
             events: events.clone(),
             permissions: Some((self.session.permissions().clone(), mode)),
             journal: Some(Journal::new(
@@ -565,6 +603,7 @@ impl AgentEngine {
         match outcome {
             Ok(mut outcome) => {
                 shutdown?;
+                usage_meter.apply(&mut outcome.usage);
                 let mut estimate = xylo_core::pricing::estimate(&outcome.usage.calls, &prices);
                 if outcome.usage.calls.is_empty() {
                     estimate.unpriced_calls = 1;
@@ -573,6 +612,20 @@ impl AgentEngine {
                 if outcome.stopped_early {
                     tracing::warn!(session_id=%request.session_id, "Turn reached its step limit");
                 }
+                let start = outcome
+                    .messages
+                    .iter()
+                    .rposition(|message| {
+                        message.role == Role::User
+                            && message.content == user_message(&request).content
+                    })
+                    .unwrap_or(0);
+                let thinking = outcome.messages[start..]
+                    .iter()
+                    .filter_map(|message| message.reasoning.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let reasoning = (!thinking.is_empty()).then_some(thinking);
                 let (store, value) = (self.store.clone(), serde_json::to_value(&outcome.messages)?);
                 let (text, usage) = (outcome.text.clone(), outcome.usage.clone());
                 // An answer the output limit still cut off is kept as far as
@@ -583,7 +636,9 @@ impl AgentEngine {
                     MessageStatus::Complete
                 };
                 blocking(move || {
-                    store.complete_turn_as(session, turn, &value, &text, &usage, status)
+                    store.complete_turn_with_reasoning(
+                        session, turn, &value, &text, &usage, status, reasoning,
+                    )
                 })
                 .await?;
                 learning_turn.completed = true; // Receipt and evidence job committed atomically.

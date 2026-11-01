@@ -25,7 +25,7 @@
 import { spawn } from 'node:child_process';
 import { appendFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const UNAVAILABLE_EXIT = 125;
@@ -33,6 +33,13 @@ const SPAWN_FAILED_EXIT = 127;
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 const singleLine = value => String(value?.message ?? value).replace(/\s+/g, ' ').trim();
 
+// The owning worker holds this pipe for a coding job's lifetime. It is not
+// inherited by the program, so no descendant can keep the worker alive.
+const guardParent = process.env.XYLO_SANDBOX_PARENT_GUARD === '1';
+if (guardParent) {
+  process.stdin.on('end', () => { try { process.kill(-process.pid, 'SIGKILL'); } catch {} });
+  process.stdin.resume();
+}
 let manager;
 let child;
 let statusFile;
@@ -44,6 +51,7 @@ function record(entry) {
 }
 
 async function unavailable(reason) {
+  if (guardParent) process.stdin.destroy();
   if (unavailableReported) return;
   unavailableReported = true;
   record({ kind: 'unavailable', reason: singleLine(reason) });
@@ -102,6 +110,16 @@ try {
   if (!statusFile) throw new Error('Missing status file');
   const control = dirname(statusFile);
   const workspace = realpathSync(spec.workspace);
+  // Only the trusted coding launcher may grant one explicitly reviewed root.
+  // Canonical identity must still match when the helper starts after approval.
+  const requestedCwd = guardParent ? process.env.XYLO_SANDBOX_CWD : undefined;
+  const cwd = requestedCwd ? realpathSync(requestedCwd) : workspace;
+  if (requestedCwd && cwd !== requestedCwd) throw new Error('Reviewed shell working directory changed');
+  const requestedWriteRoot = guardParent ? process.env.XYLO_SANDBOX_WRITE_ROOT : undefined;
+  const writeRoot = requestedWriteRoot ? realpathSync(requestedWriteRoot) : undefined;
+  if (writeRoot && writeRoot !== requestedWriteRoot) throw new Error('Approved outside directory changed');
+  const writable = [workspace, ...(writeRoot ? [writeRoot] : [])];
+  if (!writable.some(root => cwd === root || cwd.startsWith(root.endsWith(sep) ? root : root + sep))) throw new Error('Shell working directory is outside the approved scope');
   if (typeof spec.program !== 'string' || !spec.program) throw new Error('Invalid program');
   if (!Array.isArray(spec.args) || !spec.args.every(a => typeof a === 'string')) throw new Error('Invalid argument array');
   const allowed = [...(spec.read_roots ?? []), ...(spec.toolchain_read_roots ?? [])].map(p => realpathSync(p));
@@ -111,16 +129,16 @@ try {
   const network = spec.network ?? 'none';
   if (network !== 'none' && network !== 'unrestricted') throw new Error('Invalid network policy');
   await manager.initialize({
-    network: { allowedDomains: spec.allowed_domains ?? [], deniedDomains: [] },
+    network: { allowedDomains: spec.allowed_domains ?? [], deniedDomains: [], allowLocalBinding: guardParent && process.env.XYLO_SANDBOX_LOCAL_BINDING === '1' },
     filesystem: {
       denyRead: [homedir(), control, ...(spec.protected_paths ?? [])],
-      allowRead: [workspace, ...allowed, helperDirectory, process.execPath],
-      allowWrite: [workspace, spec.temporary],
-      denyWrite: [join(workspace, '.git'), join(workspace, '.agents'), join(workspace, '.claude'), join(workspace, '.codex'), control, ...allowed, ...(spec.protected_paths ?? []), ...(spec.trusted_paths ?? [])],
+      allowRead: [...writable, ...allowed, helperDirectory, process.execPath],
+      allowWrite: [...writable, spec.temporary],
+      denyWrite: [...writable.flatMap(root => ['.git', '.agents', '.claude', '.codex'].map(name => join(root, name))), control, ...allowed, ...(spec.protected_paths ?? []), ...(spec.trusted_paths ?? [])],
     },
   }, networkDecision(network === 'unrestricted'));
   const wrapped = await manager.wrapWithSandbox([process.execPath, childEntry, spec.program, ...spec.args].map(quote).join(' '));
-  child = spawn(wrapped, { shell: '/bin/sh', cwd: workspace, stdio: ['inherit', 'inherit', 'inherit', 'pipe'], env: { ...process.env, XYLO_SANDBOX_CHILD_ENV: JSON.stringify({ TMPDIR: spec.temporary, ...codingEnvironment, ...childEnvironment }), TMPDIR: spec.temporary } });
+  child = spawn(wrapped, { shell: '/bin/sh', cwd, stdio: [guardParent ? 'ignore' : 'inherit', 'inherit', 'inherit', 'pipe'], env: { ...process.env, XYLO_SANDBOX_CHILD_ENV: JSON.stringify({ TMPDIR: spec.temporary, ...codingEnvironment, ...childEnvironment }), TMPDIR: spec.temporary } });
   let failed = false;
   let spawnFailed = false;
   readControl(child.stdio[3], reason => {
@@ -130,10 +148,12 @@ try {
   });
   child.once('error', async error => { failed = true; await unavailable(`could not start the sandbox wrapper: ${singleLine(error)}`); });
   child.once('exit', async (code, signal) => {
+    if (guardParent) process.stdin.destroy();
     await manager.reset();
     if (!failed) process.exitCode = spawnFailed ? SPAWN_FAILED_EXIT : code ?? (signal ? 130 : 1);
   });
   for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => child?.kill(signal));
 } catch (error) {
+  if (guardParent) process.stdin.destroy();
   await unavailable(error);
 }

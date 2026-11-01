@@ -726,6 +726,115 @@ impl Xylo {
     }
 }
 
+impl Xylo {
+    /// Alternative models remain within the authorized active connection.
+    pub(super) fn fallback_model_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let weak = cx.entity().downgrade();
+        let mut section = div().flex().flex_col().gap_3().child(settings_ui::section("Model", Some("Continue with another model on this connection when the primary stays unavailable after retries.".into()), div()));
+        for global in [false, true] {
+            let current = if global {
+                &self.settings.fallback_model
+            } else {
+                &self.settings.provider.fallback_model
+            };
+            let label = current
+                .as_deref()
+                .unwrap_or(if global {
+                    "None"
+                } else {
+                    "Use global fallback"
+                })
+                .to_owned();
+            let view = weak.clone();
+            section = section.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(if global {
+                        "Global fallback"
+                    } else {
+                        "Provider fallback"
+                    })
+                    .child(
+                        MenuButton::new(if global {
+                            "global-fallback-picker"
+                        } else {
+                            "provider-fallback-picker"
+                        })
+                        .ghost()
+                        .child(label)
+                        .dropdown_menu(move |mut menu, _, cx| {
+                            let Ok(settings) = view.update(cx, |view, _| view.settings.clone())
+                            else {
+                                return menu;
+                            };
+                            let mut choices = vec![(
+                                if global {
+                                    "None".to_owned()
+                                } else {
+                                    "Use global fallback".to_owned()
+                                },
+                                None,
+                            )];
+                            for provider in &settings.providers {
+                                if super::providers::same_connection(provider, &settings.provider)
+                                    && provider.model != settings.provider.model
+                                    && !choices.iter().any(|(_, choice)| {
+                                        choice.as_deref() == Some(provider.model.as_str())
+                                    })
+                                {
+                                    choices.push((
+                                        provider.model.clone(),
+                                        Some(provider.model.clone()),
+                                    ));
+                                }
+                            }
+                            for (label, choice) in choices {
+                                let checked = if global {
+                                    settings.fallback_model == choice
+                                } else {
+                                    settings.provider.fallback_model == choice
+                                };
+                                let view = view.clone();
+                                menu =
+                                    menu.item(PopupMenuItem::new(label).checked(checked).on_click(
+                                        move |_, _, cx| {
+                                            let _ = view.update(cx, |view, cx| {
+                                                if global {
+                                                    view.settings.fallback_model = choice.clone();
+                                                } else {
+                                                    view.settings.provider.fallback_model =
+                                                        choice.clone();
+                                                    let source = view.settings.provider.clone();
+                                                    for provider in &mut view.settings.providers {
+                                                        if super::providers::same_connection(
+                                                            provider, &source,
+                                                        ) {
+                                                            provider.fallback_model =
+                                                                choice.clone();
+                                                        }
+                                                    }
+                                                }
+                                                let settings = view.settings.clone();
+                                                view.host_call(cx, |host| {
+                                                    host.save_settings(settings)
+                                                });
+                                                cx.notify();
+                                            });
+                                        },
+                                    ));
+                            }
+                            menu
+                        }),
+                    ),
+            );
+        }
+        section.into_any_element()
+    }
+}
+
 #[cfg(test)]
 #[path = "model_picker/tests.rs"]
 mod tests;

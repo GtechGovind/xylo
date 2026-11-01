@@ -6,6 +6,7 @@
 //! updates the live permission mode every broker reads at each tool call.
 
 mod credentials;
+mod shell_events;
 mod steering;
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -330,30 +331,34 @@ async fn main() -> Result<()> {
                 .await?;
             }
             WorkerCommand::SetPermissions { mode } => permissions.set(mode),
-            WorkerCommand::Unlock { key } => match unlock(&paths, &key) {
-                Ok(vault) => {
-                    // A repeated Unlock replaces the vault; close the old
-                    // session's connections, which hold the old secrets.
-                    if let Some(previous) = session.take() {
-                        previous.shutdown().await;
+            WorkerCommand::Unlock { key } => {
+                match unlock(&paths, &key) {
+                    Ok(vault) => {
+                        // A repeated Unlock replaces the vault; close the old
+                        // session's connections, which hold the old secrets.
+                        if let Some(previous) = session.take() {
+                            previous.shutdown().await;
+                        }
+                        let tools = ToolSession::new(permissions.clone(), vault);
+                        tools.set_job_events(shell_events::sink(output.clone(), sequence.clone()));
+                        session = Some(tools);
                     }
-                    session = Some(ToolSession::new(permissions.clone(), vault));
+                    Err(error) => {
+                        send(
+                            &output,
+                            &sequence,
+                            request_id,
+                            session_id,
+                            EngineEvent::Error {
+                                message: format!("Could not unlock the secret vault: {error:#}"),
+                                retryable: false,
+                                kind: ErrorKind::Authentication,
+                            },
+                        )
+                        .await?
+                    }
                 }
-                Err(error) => {
-                    send(
-                        &output,
-                        &sequence,
-                        request_id,
-                        session_id,
-                        EngineEvent::Error {
-                            message: format!("Could not unlock the secret vault: {error:#}"),
-                            retryable: false,
-                            kind: ErrorKind::Authentication,
-                        },
-                    )
-                    .await?
-                }
-            },
+            }
             WorkerCommand::SteerDurable { guidance } => {
                 let session = guidance.session_id;
                 let reply = steering::answer(store.clone(), active.as_ref(), guidance).await;
@@ -379,6 +384,30 @@ async fn main() -> Result<()> {
                         session_id,
                         EngineEvent::Error {
                             message: format!("Approval for action {action_id} failed: {error:#}"),
+                            retryable: false,
+                            kind: ErrorKind::Internal,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            WorkerCommand::KillJob { job_id } => {
+                let stopped = session_id
+                    .context("Select a conversation to stop its job")
+                    .and_then(|id| {
+                        session
+                            .as_ref()
+                            .context("Worker is locked")?
+                            .kill_job(id, job_id)
+                    });
+                if let Err(error) = stopped {
+                    send(
+                        &output,
+                        &sequence,
+                        request_id,
+                        session_id,
+                        EngineEvent::Error {
+                            message: format!("Could not stop shell job: {error:#}"),
                             retryable: false,
                             kind: ErrorKind::Internal,
                         },

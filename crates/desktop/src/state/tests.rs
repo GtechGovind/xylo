@@ -481,3 +481,54 @@ fn a_new_turn_archives_the_previous_transcript_and_keeps_helpers() {
     assert_eq!(state.earlier_subagents.len(), 1);
     assert_eq!(state.outcome, None);
 }
+
+#[test]
+fn thinking_stays_separate_from_answer_text_and_survives_completion() {
+    let mut state = TurnState::default();
+    state.apply(EngineEvent::Started);
+    state.apply(EngineEvent::ThinkingDelta {
+        text: "Consider ".into(),
+    });
+    state.apply(EngineEvent::ThinkingDelta {
+        text: "this".into(),
+    });
+    delta(&mut state, "Answer");
+    state.apply(EngineEvent::Completed {
+        text: "Answer".into(),
+        usage: Usage::default(),
+    });
+    assert_eq!(state.transcript_text(), "Answer");
+    assert!(matches!(&state.segments[0], Segment::Thinking(text) if text == "Consider this"));
+    assert_eq!(state.reply().unwrap().0, "Answer");
+}
+
+#[test]
+fn shell_jobs_continue_across_completed_and_new_turns() {
+    let mut state = TurnState::default();
+    let mut job = xylo_core::ShellJob {
+        id: Uuid::new_v4(),
+        turn_id: Uuid::new_v4(),
+        command: "npm run dev".into(),
+        cwd: "/project".into(),
+        log_path: "/data/job.log".into(),
+        running: true,
+        exit_code: None,
+        output: "Ready".into(),
+        error: None,
+    };
+    state.apply(EngineEvent::Started);
+    state.apply(EngineEvent::ShellJobUpdated { job: job.clone() });
+    state.apply(EngineEvent::Completed {
+        text: "Server started".into(),
+        usage: Default::default(),
+    });
+    state.apply(EngineEvent::Started);
+    assert_eq!(state.shell_jobs.len(), 1);
+    assert!(state.shell_jobs[0].running);
+    job.running = false;
+    job.exit_code = Some(0);
+    state.apply(EngineEvent::ShellJobUpdated { job });
+    assert_eq!(state.shell_jobs.len(), 1);
+    assert!(!state.shell_jobs[0].running);
+    assert!(state.running);
+}

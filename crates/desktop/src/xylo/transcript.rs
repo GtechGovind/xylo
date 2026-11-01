@@ -52,6 +52,7 @@ pub(super) fn group_summary<'a>(tools: impl IntoIterator<Item = &'a ToolCard>) -
 }
 fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
     match name {
+        "lsp" => ("Inspected", "code location", "code locations"),
         "file_read" | "read_file" => ("Read", "file", "files"),
         "extension_resource" => ("Read", "skill file", "skill files"),
         "search_project" | "find_files" | "grep" | "glob" | "find" => {
@@ -59,7 +60,12 @@ fn tool_category(name: &str) -> (&'static str, &'static str, &'static str) {
         }
         "files_list" => ("Listed", "folder", "folders"),
         "run_command" | "shell_command" | "terminal" => ("Ran", "command", "commands"),
-        "file_write" | "file_edit" | "write_file" | "edit_file" => ("Edited", "file", "files"),
+        "file_write" | "file_edit" | "notebook_edit" | "write_file" | "edit_file" => {
+            ("Edited", "file", "files")
+        }
+        "shell_output" => ("Read", "job output", "job outputs"),
+        "shell_kill" => ("Stopped", "shell job", "shell jobs"),
+        "shell_jobs" => ("Listed", "shell job", "shell jobs"),
         "web_fetch" | "web_search" | "browser" => ("Fetched", "page", "pages"),
         "memory_search" | "memory_remember" => ("Used memory", "time", "times"),
         "extension_skill" => ("Used", "skill", "skills"),
@@ -221,6 +227,14 @@ impl Xylo {
             Segment::Tools(ids) => self.tool_group_row(turn, ids, window, cx),
             Segment::Subagent(id) => self.subagent_row(turn, *id, window, cx),
             Segment::Note { text, .. } => note_row(text.clone()),
+            Segment::Thinking(text) => self.thinking_block(
+                Uuid::new_v5(
+                    &self.session,
+                    format!("thinking-{}-{index}", turn.started_at.unwrap_or_default()).as_bytes(),
+                ),
+                text.clone(),
+                cx,
+            ),
         };
         motion::fade_slide_in(
             ElementId::NamedInteger(format!("live-row-{}", self.session).into(), index as u64),

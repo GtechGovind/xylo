@@ -1,0 +1,1 @@
+{"steps":[{"step":"reply","tool_calls":[{"id":"list","name":"files_list","arguments":"{\"path\":\".\"}"}],"finish":"tool_calls"},{"step":"reply","text":"Listed the workspace."}]}

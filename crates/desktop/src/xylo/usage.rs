@@ -16,11 +16,12 @@ use xylo_runtime::{UsageReport, UsageTotals};
 pub(super) struct UsageUi {
     pub report: Option<(Uuid, UsageReport)>,
     pub branch: Option<String>,
-    pending: Option<Uuid>,
-    key: Option<(Uuid, Vec<Uuid>, i64)>,
+    pending: Option<(Uuid, Option<PathBuf>)>,
+    key: Option<(Uuid, Vec<Uuid>, i64, Option<PathBuf>)>,
     pub styles: Vec<OutputStyle>,
     style_request: Option<(Uuid, PathBuf)>,
-    status_request: Option<(Uuid, Uuid)>,
+    status_request: Option<(Uuid, Uuid, PathBuf, String)>,
+    status_context: Option<(Uuid, PathBuf, String)>,
     status_tick: Option<Task<()>>,
     status_last: Option<std::time::Instant>,
     pub status_text: Option<String>,
@@ -30,6 +31,9 @@ pub(super) struct UsageUi {
     pub editing_price: bool,
     pub editing_command: bool,
     pub form_error: Option<String>,
+    pub command_error: Option<String>,
+    pub report_error: Option<String>,
+    pub style_error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -80,6 +84,7 @@ impl UsageUi {
             .collect(),
             style_request: None,
             status_request: None,
+            status_context: None,
             status_tick: None,
             status_last: None,
             status_text: None,
@@ -89,6 +94,9 @@ impl UsageUi {
             editing_price: false,
             editing_command: false,
             form_error: None,
+            command_error: None,
+            report_error: None,
+            style_error: None,
         }
     }
 }
@@ -163,12 +171,12 @@ impl Xylo {
         if let Some(turn) = self.turns.get(&self.session) {
             ids.push(chat::live_answer_key(self.session, turn));
         }
-        let key = (self.session, ids.clone(), start);
+        let key = (self.session, ids.clone(), start, self.workspace.clone());
         if self.usage_ui.pending.is_none() && self.usage_ui.key.as_ref() != Some(&key) {
             let id = Uuid::new_v4();
             let session = self.session;
             let workspace = self.workspace.clone();
-            self.usage_ui.pending = Some(id);
+            self.usage_ui.pending = Some((id, workspace.clone()));
             self.usage_ui.key = Some(key);
             self.host_call(cx, |host| {
                 host.load_usage(id, session, ids, start, end, workspace)
@@ -188,17 +196,21 @@ impl Xylo {
         result: Result<(UsageReport, Option<String>), String>,
         cx: &mut Context<Self>,
     ) {
-        if self.usage_ui.pending != Some(id) {
+        let Some((pending, root)) = self.usage_ui.pending.take() else {
+            return;
+        };
+        if pending != id {
+            self.usage_ui.pending = Some((pending, root));
             return;
         }
-        self.usage_ui.pending = None;
-        if session == self.session {
+        if session == self.session && root == self.workspace {
             match result {
                 Ok((report, branch)) => {
                     self.usage_ui.report = Some((session, report));
                     self.usage_ui.branch = branch;
+                    self.usage_ui.report_error = None;
                 }
-                Err(error) => self.usage_ui.form_error = Some(error),
+                Err(error) => self.usage_ui.report_error = Some(error),
             }
         }
         cx.notify();
@@ -248,7 +260,13 @@ impl Xylo {
             .as_ref()
             .filter(|(session, _)| *session == self.session)
         else {
-            return subtitle("Usage appears after the first completed answer.").into_any_element();
+            return subtitle(
+                self.usage_ui
+                    .report_error
+                    .clone()
+                    .unwrap_or_else(|| "Usage appears after the first completed answer.".into()),
+            )
+            .into_any_element();
         };
         div()
             .flex()
@@ -261,7 +279,13 @@ impl Xylo {
                 totals_label(&report.conversation)
             ))
             .child(format!("Today · {}", totals_label(&report.daily)))
-            .child("Estimates cover reported model tokens; service and tool fees may differ.")
+            .child("Estimates cover reported turn tokens, including helpers. Title generation, service and tool fees are excluded.")
+            .children(
+                self.usage_ui
+                    .report_error
+                    .as_ref()
+                    .map(|error| settings_ui::inline_error(error)),
+            )
             .into_any_element()
     }
 
@@ -289,8 +313,11 @@ impl Xylo {
         }
         if self.workspace.as_ref() == Some(&root) {
             match result {
-                Ok(styles) => self.usage_ui.styles = styles,
-                Err(error) => self.usage_ui.form_error = Some(error),
+                Ok(styles) => {
+                    self.usage_ui.styles = styles;
+                    self.usage_ui.style_error = None;
+                }
+                Err(error) => self.usage_ui.style_error = Some(error),
             }
         }
         cx.notify();
@@ -305,7 +332,7 @@ impl Xylo {
             .map(|style| style.label.as_str())
             .unwrap_or("Choose style");
         let weak = cx.entity().downgrade();
-        MenuButton::new("output-style-picker")
+        let picker = MenuButton::new("output-style-picker")
             .ghost()
             .accessibility_label(format!("Output style: {selected}"))
             .child(format!("Output style · {selected}"))
@@ -330,7 +357,18 @@ impl Xylo {
                     ));
                 }
                 menu
-            })
+            });
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(picker)
+            .children(
+                self.usage_ui
+                    .style_error
+                    .as_ref()
+                    .map(|error| settings_ui::inline_error(error)),
+            )
             .into_any_element()
     }
 

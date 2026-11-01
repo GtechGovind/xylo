@@ -329,6 +329,7 @@ async fn approve_for_me_honours_a_read_only_hint_only_from_a_trusted_server() {
                     origin: Origin::Model,
                     reach: &Reach::Project,
                     workspace: &broker.request.workspace,
+                    cwd: None,
                     network: None,
                     untrusted_input: false,
                 },

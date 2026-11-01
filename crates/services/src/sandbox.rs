@@ -210,9 +210,43 @@ pub fn prepare_coding_with_network(
         read_roots,
         protected_paths,
         &[],
-        Some(network),
+        Some(CodingPolicy {
+            network,
+            write_root: None,
+        }),
     )
 }
+
+/// Prepares a coding command with one explicitly approved writable directory.
+/// That directory cannot supply the trusted launcher or its helper programs.
+pub fn prepare_coding_with_scope(
+    program: &str,
+    args: &[String],
+    workspace: &Path,
+    write_root: Option<&Path>,
+    protected_paths: &[PathBuf],
+    network: Network,
+) -> Result<PreparedSandbox> {
+    prepare_internal(
+        program,
+        args,
+        workspace,
+        &[],
+        protected_paths,
+        &[],
+        Some(CodingPolicy {
+            network,
+            write_root,
+        }),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CodingPolicy<'a> {
+    network: Network,
+    write_root: Option<&'a Path>,
+}
+
 fn prepare_internal(
     program: &str,
     args: &[String],
@@ -220,7 +254,7 @@ fn prepare_internal(
     read_roots: &[PathBuf],
     protected_paths: &[PathBuf],
     allowed_domains: &[String],
-    coding: Option<Network>,
+    coding: Option<CodingPolicy<'_>>,
 ) -> Result<PreparedSandbox> {
     ensure!(
         cfg!(any(target_os = "macos", target_os = "linux")),
@@ -229,14 +263,20 @@ fn prepare_internal(
     let workspace = workspace
         .canonicalize()
         .context("Sandbox workspace unavailable")?;
+    let write_root = coding
+        .and_then(|policy| policy.write_root)
+        .map(Path::canonicalize)
+        .transpose()?;
+    let mut launch_exclusions = read_roots.to_vec();
+    launch_exclusions.extend(write_root.iter().cloned());
     let helper = helper_path()?;
     let node = runtime_node()?;
     ensure!(
         !node.starts_with(&workspace)
-            && !read_roots
+            && !launch_exclusions
                 .iter()
                 .any(|root| root.canonicalize().is_ok_and(|root| node.starts_with(root))),
-        "Sandbox launcher must be installed outside the mutable project and plugin packages"
+        "Sandbox launcher must be installed outside the mutable project, approved writable directories and plugin packages"
     );
     // `tmp` is the child's writable TMPDIR; `control` holds the status file
     // and is denied to the child for both reading and writing.
@@ -253,17 +293,17 @@ fn prepare_internal(
     builder.create(&control)?;
     let status_file = control.join("status");
     let (toolchain_read_roots, coding_environment) = match coding {
-        Some(network) => rust_toolchain_scope(
+        Some(policy) => rust_toolchain_scope(
             &child_temporary,
             &workspace,
             protected_paths,
             program,
             args,
-            network,
+            policy.network,
         )?,
         None => (Vec::new(), std::collections::BTreeMap::new()),
     };
-    let network = match coding.unwrap_or_default() {
+    let network = match coding.map(|policy| policy.network).unwrap_or_default() {
         Network::None => "none",
         Network::Unrestricted => "unrestricted",
     };
@@ -275,7 +315,14 @@ fn prepare_internal(
         .current_dir(&workspace)
         .env_clear()
         .kill_on_drop(true);
-    let safe_path = launcher_path(std::env::var_os("PATH").as_deref(), &workspace, read_roots)?;
+    if let Some(root) = write_root {
+        command.env("XYLO_SANDBOX_WRITE_ROOT", root);
+    }
+    let safe_path = launcher_path(
+        std::env::var_os("PATH").as_deref(),
+        &workspace,
+        &launch_exclusions,
+    )?;
     let mut directories = vec![
         node.parent()
             .context("Node runtime directory missing")?

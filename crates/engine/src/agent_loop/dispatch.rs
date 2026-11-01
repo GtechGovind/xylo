@@ -39,6 +39,11 @@ pub(crate) enum Access {
 /// The tools a loop may call. Execution is blocking and exactly-once per
 /// call id: the implementation journals every dispatch.
 pub(crate) trait ToolExecutor: Send + Sync {
+    /// Pending harness notes from work that outlives a tool call.
+    fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
+        Vec::new()
+    }
+
     /// Tools offered directly to the model right now. Re-read before every
     /// model call, because the permission mode can change mid-task.
     fn schemas(&self) -> Vec<ToolSchema>;
@@ -70,16 +75,21 @@ pub(crate) trait ToolExecutor: Send + Sync {
 }
 
 /// Exact names other agents use for Xylo's tools.
-const ALIASES: [(&str, &str); 9] = [
+const ALIASES: [(&str, &str); 14] = [
     ("read", "file_read"),
     ("write", "file_write"),
     ("edit", "file_edit"),
+    ("notebookedit", "notebook_edit"),
+    ("lsp", "lsp"),
     ("bash", "shell_command"),
     ("shell", "shell_command"),
     ("grep", "search_project"),
     ("glob", "find_files"),
     ("ls", "files_list"),
     ("todo", "todo_write"),
+    ("bashoutput", "shell_output"),
+    ("killshell", "shell_kill"),
+    ("taskoutput", "shell_output"),
 ];
 
 /// A call ready to run, or the error result the model receives instead.

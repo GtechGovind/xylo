@@ -480,11 +480,16 @@ async fn serve(
                         (status, "application/json", body.to_string(), false)
                     }
                 };
+                let retry = if status == 529 {
+                    "Retry-After: 0\r\n"
+                } else {
+                    ""
+                };
                 let head = if hold {
                     format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\n\r\n")
                 } else {
                     format!(
-                        "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\n{retry}Content-Length: {}\r\nConnection: close\r\n\r\n",
                         payload.len()
                     )
                 };
@@ -1522,3 +1527,6 @@ async fn a_4k_window_sends_identical_prompt_and_tool_bytes_across_turns() {
     );
     assert_eq!(first["max_tokens"], second["max_tokens"]);
 }
+
+mod headless;
+mod provider_fallback;

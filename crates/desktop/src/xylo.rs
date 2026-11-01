@@ -81,6 +81,7 @@ mod quit;
 mod settings;
 #[path = "xylo/settings_ui.rs"]
 mod settings_ui;
+mod shell_jobs;
 #[path = "xylo/usage.rs"]
 mod usage;
 #[path = "xylo/work_panel.rs"]

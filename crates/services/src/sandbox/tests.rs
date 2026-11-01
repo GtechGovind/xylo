@@ -268,3 +268,25 @@ fn sandbox_does_not_inherit_provider_environment() {
         .contains(&k.as_str())
     }));
 }
+
+#[test]
+fn coding_write_scope_cannot_contain_the_trusted_launcher() {
+    let project = tempfile::tempdir().unwrap();
+    let node = runtime_node().unwrap();
+    let result = prepare_coding_with_scope(
+        "/bin/sh",
+        &[],
+        project.path(),
+        node.parent(),
+        &[],
+        Network::None,
+    );
+    let error = match result {
+        Ok(_) => panic!("mutable scope accepted the launcher"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("approved writable directories"),
+        "{error}"
+    );
+}

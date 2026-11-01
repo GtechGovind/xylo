@@ -12,6 +12,7 @@ mod attachments;
 pub use attachments::*;
 mod image_generation;
 pub use image_generation::*;
+mod provider_controls;
 mod steering;
 pub use steering::*;
 
@@ -88,6 +89,9 @@ pub struct ProviderConfig {
     pub managed_local: bool,
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
+    /// An alternative model on this same authorized connection.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -108,6 +112,7 @@ impl Default for ProviderConfig {
             discovery_url: None,
             managed_local: false,
             headers: Default::default(),
+            fallback_model: None,
         }
     }
 }
@@ -130,7 +135,8 @@ impl ProviderConfig {
         if !matches!(
             self.family,
             ApiFamily::OpenAiChat | ApiFamily::OpenAiResponses | ApiFamily::Azure
-        ) {
+        ) && self.native_reasoning_efforts().is_empty()
+        {
             return Vec::new();
         }
         if let Some(options) = &self.reasoning_options {
@@ -141,6 +147,12 @@ impl ProviderConfig {
                 }
             }
             return supported;
+        }
+        if !matches!(
+            self.family,
+            ApiFamily::OpenAiChat | ApiFamily::OpenAiResponses | ApiFamily::Azure
+        ) {
+            return self.native_reasoning_efforts();
         }
         let model = self.model.to_ascii_lowercase();
         let is = |name: &str| {
@@ -334,6 +346,9 @@ pub struct AppSettings {
     pub output_style: String,
     #[serde(default)]
     pub status_line_command: Option<String>,
+    /// Default alternative model ID, used on the active authorized connection.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -437,6 +452,7 @@ impl Default for AppSettings {
             pricing_overrides: Default::default(),
             output_style: default_output_style(),
             status_line_command: None,
+            fallback_model: None,
         }
     }
 }
@@ -545,6 +561,10 @@ pub enum WorkerCommand {
         key: WorkerCredential,
     },
     Shutdown,
+    /// Stops one shell job owned by this conversation.
+    KillJob {
+        job_id: Uuid,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -679,6 +699,12 @@ pub enum NoteKind {
     StallWarning,
     /// The turn crossed 75% or 90% of its step limit.
     StepBudget,
+    /// The turn continued on its configured alternative model.
+    Fallback,
+    /// A background shell job finished.
+    ShellJob,
+    /// A shell working directory was reset to its project.
+    WorkingDirectory,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -771,6 +797,20 @@ pub enum EngineEvent {
         model: String,
         rate_limits: Option<RateLimits>,
     },
+    /// Visible provider reasoning, separate from the answer.
+    ThinkingDelta {
+        text: String,
+    },
+    /// A registered SDK tool is authorized and ready for client execution.
+    CustomToolRequested {
+        action_id: Uuid,
+        name: String,
+        arguments: Value,
+    },
+    /// An update from a shell job, including after the turn has ended.
+    ShellJobUpdated {
+        job: ShellJob,
+    },
 }
 
 /// Numeric remaining quota reported by a provider, never inferred from usage.
@@ -781,6 +821,21 @@ pub struct RateLimits {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub observed_at_ms: i64,
+}
+
+/// Live state of a conversation-owned shell job. The output is a bounded tail;
+/// the complete log is kept on disk at `log_path`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShellJob {
+    pub id: Uuid,
+    pub turn_id: Uuid,
+    pub command: String,
+    pub cwd: PathBuf,
+    pub log_path: PathBuf,
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    pub output: String,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -828,6 +883,7 @@ pub enum MessageStatus {
 }
 
 /// Stable keyset pagination in most-recently-updated order; IDs break timestamp ties.
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConversationCursor {
     pub updated_at: i64,
@@ -852,6 +908,9 @@ pub struct ChatMessage {
     pub attachments: Vec<ImageAttachment>,
     #[serde(default, skip_serializing_if = "is_complete")]
     pub status: MessageStatus,
+    /// Provider reasoning shown only when the reader opens Thinking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 fn is_complete(status: &MessageStatus) -> bool {
@@ -1004,3 +1063,6 @@ pub struct TeamTask {
 
 #[cfg(test)]
 mod tests;
+
+/// Public headless CLI and SDK protocol.
+pub mod stdio;

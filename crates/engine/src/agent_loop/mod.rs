@@ -43,6 +43,7 @@
 //!   prompt, and a root loop shows each recovery note to the user as it is
 //!   added.
 mod dispatch;
+mod fallback;
 mod recovery;
 mod retry;
 mod stall;
@@ -199,6 +200,7 @@ impl LoopFailure {
 
 /// Per-run bookkeeping.
 struct Run {
+    fallback: Option<Arc<dyn ModelProvider>>,
     started: Instant,
     usage: Usage,
     streamed: String,
@@ -267,7 +269,15 @@ impl AgentLoop {
     /// Runs the loop from `messages` (the conversation without the system
     /// prompt) until the model answers without tools.
     pub(crate) async fn run(&self, messages: Vec<Message>) -> Result<LoopOutcome, LoopFailure> {
+        let fallback = self
+            .restored_fallback()
+            .await
+            .map_err(|error| LoopFailure {
+                error,
+                streamed: String::new(),
+            })?;
         let mut run = Run {
+            fallback,
             started: Instant::now(),
             usage: Usage::default(),
             active_model: String::new(),
@@ -319,6 +329,10 @@ impl AgentLoop {
                 return Err(ModelError::Interrupted.into());
             }
             self.apply_guidance(messages).await?;
+            for (kind, text) in self.tools.take_notes() {
+                messages.push(application_note(&text));
+                self.show_note(kind, text).await?;
+            }
             if let Some((cell, _)) = &self.permissions {
                 let mode = cell.get();
                 if announced != Some(mode) {
@@ -665,6 +679,26 @@ impl AgentLoop {
                 };
                 attempt += 1;
                 let Some(delay) = retry::delay(&error, attempt) else {
+                    if run.fallback.is_none()
+                        && retry::permits_fallback(&error)
+                        && let Some((model, provider)) = self.provider.fallback()
+                    {
+                        run.fallback = Some(provider);
+                        let note = retry::fallback_note(&model);
+                        messages.push(application_note(&note));
+                        self.checkpoint(messages).await?;
+                        self.persist_fallback(&model).await?;
+                        if self.root() {
+                            self.emit(EngineEvent::HarnessNote {
+                                kind: NoteKind::Fallback,
+                                text: format!(
+                                    "Primary model unavailable. Continuing with {model}."
+                                ),
+                            })
+                            .await?;
+                        }
+                        continue 'fitting;
+                    }
                     return Err(error.into());
                 };
                 tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, %error, "Retrying model request");
@@ -757,7 +791,11 @@ impl AgentLoop {
         shown: &mut String,
         run: &mut Run,
     ) -> Result<ModelResponse, StreamFailure> {
-        let mut stream = self.provider.stream(request, self.cancel.clone());
+        let mut stream = run
+            .fallback
+            .as_ref()
+            .unwrap_or(&self.provider)
+            .stream(request, self.cancel.clone());
         let mut response = Assembler::default();
         run.active_model.clear();
         let mut attempt_text = String::new();
@@ -822,6 +860,13 @@ impl AgentLoop {
                         last_flush = Instant::now();
                     }
                 }
+            }
+            if let StreamEvent::Reasoning(text) = &event
+                && self.root()
+            {
+                self.emit(EngineEvent::ThinkingDelta { text: text.clone() })
+                    .await
+                    .map_err(StreamFailure::Fatal)?;
             }
             saw_calls |= matches!(event, StreamEvent::ToolCall { .. });
             response.push(event);

@@ -18,11 +18,17 @@
 mod builtin;
 pub(crate) mod catalog;
 mod code;
+mod file_read;
+mod headless;
 mod image_generation;
 pub(crate) mod lookup;
+mod lsp;
+mod notebook;
 mod permissions;
 mod portable;
+mod read_state;
 mod risk;
+pub mod shell_jobs;
 use crate::{prompts, provider_guard::EffectiveWindow};
 use anyhow::{Context, Result, bail, ensure};
 pub(crate) use code::shell_name;
@@ -148,6 +154,7 @@ const PROJECT_LOCAL_TOOLS: &[&str] = &[
     "search_tools",
     "agent_delegate",
     "connector_list",
+    "notebook_edit",
 ];
 
 /// Largest approval or start presentation; long arguments are excerpted so an
@@ -165,6 +172,10 @@ pub struct ToolBroker {
     /// connectors); the live mode filters them again at every read.
     advertised: Vec<ToolDefinition>,
     allowed_tools: Option<std::collections::HashSet<String>>,
+    custom_tools: Vec<ToolDefinition>,
+    custom_handler: Option<crate::CustomToolHandler>,
+    on_refusal: Option<crate::RefusalObserver>,
+    policy_excluded: std::collections::HashSet<String>,
     session: ToolSession,
     /// "Always allow" rule keys in force for this turn, shared with children.
     rules: RuleSet,
@@ -195,6 +206,10 @@ impl ToolBroker {
         cancel: CancellationToken,
     ) -> Result<Self> {
         let artifacts = config.artifacts.clone();
+        if let Some(data) = artifacts.parent() {
+            session.shell_jobs.configure(request.session_id, data);
+        }
+        session.shell_jobs.turn_events(request.session_id, &events);
         let capabilities = CapabilityService::new(config.clone())?;
         let image_generation = image_generation::Configuration::load(&artifacts);
         let mut definitions = builtin::definitions();
@@ -249,6 +264,10 @@ impl ToolBroker {
             definitions,
             advertised,
             allowed_tools: None,
+            custom_tools: Vec::new(),
+            custom_handler: None,
+            on_refusal: None,
+            policy_excluded: Default::default(),
             session,
             parent_id: None,
             events,
@@ -279,6 +298,12 @@ impl ToolBroker {
         child.parent_id = Some(parent_action_id);
         child.served_context = self.served_context.clone();
         child.lookup = self.lookup.child();
+        child.allowed_tools = self.allowed_tools.clone();
+        child.definitions = self.definitions.clone();
+        child.custom_tools = self.custom_tools.clone();
+        child.custom_handler = self.custom_handler.clone();
+        child.on_refusal = self.on_refusal.clone();
+        child.policy_excluded = self.policy_excluded.clone();
         Ok(child)
     }
     pub(crate) fn restrict_tools(&mut self, requested: &[String]) -> Result<()> {
@@ -304,15 +329,28 @@ impl ToolBroker {
             };
             allowed.extend(names.iter().map(|name| name.to_string()));
         }
+        self.policy_excluded.extend(
+            self.definitions
+                .iter()
+                .filter(|definition| !allowed.contains(&definition.name))
+                .map(|definition| definition.name.clone()),
+        );
         self.definitions
             .retain(|definition| allowed.contains(&definition.name));
         self.advertised
             .retain(|definition| allowed.contains(&definition.name));
+        if let Some(previous) = &self.allowed_tools {
+            allowed.retain(|name| previous.contains(name));
+        }
         self.allowed_tools = Some(allowed);
         Ok(())
     }
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    pub(crate) fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {
+        self.session.shell_jobs.take_notes(self.request.session_id)
     }
 
     pub fn definitions(&self) -> &[ToolDefinition] {
@@ -447,7 +485,9 @@ impl ToolBroker {
                 if small {
                     SMALL_WINDOW_CORE_TOOLS.contains(&name)
                 } else {
-                    CORE_TOOLS.contains(&name) || configured(name)
+                    CORE_TOOLS.contains(&name)
+                        || configured(name)
+                        || self.custom_tools.iter().any(|tool| tool.name == name)
                 }
             })
             .cloned()
@@ -559,12 +599,19 @@ impl ToolBroker {
                 origin,
             );
         }
-        ensure!(
-            self.allowed_tools
-                .as_ref()
-                .is_none_or(|allowed| allowed.contains(name)),
-            "This child is not authorized to call tool '{name}'"
-        );
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(name))
+        {
+            let reason = format!(
+                "Tool '{name}' is not authorized: excluded by the allowed/disallowed tool policy"
+            );
+            if let Some(refused) = &self.on_refusal {
+                refused(&reason);
+            }
+            bail!(reason);
+        }
         let key = Self::journal_key(namespace, call_id);
         if let Some(action) =
             self.store
@@ -594,7 +641,19 @@ impl ToolBroker {
             !(name.starts_with("plugin_") && arguments.get("capabilities").is_some()),
             "Plugins run only with the grants reviewed in Settings; remove `capabilities`"
         );
-        let reach = self.reach(name, &arguments);
+        let shell_context = matches!(name, "shell_command" | "run_command")
+            .then(|| shell_jobs::prepare(self, &arguments))
+            .transpose()?;
+        let reach = if self.custom_tools.iter().any(|tool| tool.name == name) {
+            Reach::Outside(std::path::PathBuf::from("SDK client"))
+        } else if let Some(path) = shell_context
+            .as_ref()
+            .and_then(|context| context.outside.as_ref())
+        {
+            Reach::Outside(path.clone())
+        } else {
+            self.reach(name, &arguments)
+        };
         let network = if matches!(name, "run_command" | "shell_command") {
             builtin::network_request(&arguments)?
         } else {
@@ -613,13 +672,19 @@ impl ToolBroker {
             origin,
             reach: &reach,
             workspace: &self.request.workspace,
+            cwd: shell_context.as_ref().map(|context| context.cwd.as_path()),
             network,
             untrusted_input: exposure.is_some_and(MemoryOrigin::untrusted),
         };
         let verdict = permissions::decide(mode, &call);
         let rule = permissions::approval_rule_for(&call);
         let ask = match verdict {
-            Verdict::Refuse(message) => bail!(message),
+            Verdict::Refuse(message) => {
+                if let Some(refused) = &self.on_refusal {
+                    refused(&message);
+                }
+                bail!(message)
+            }
             Verdict::Allow => None,
             Verdict::Ask(reason) => {
                 let remembered = rule
@@ -639,7 +704,6 @@ impl ToolBroker {
         }
         let access = builtin::Access {
             outside: matches!(reach, Reach::Outside(_)),
-            sandboxed: mode.sandboxed(),
             network: network.is_some(),
         };
         let component_snapshot = if name == "extension_component" && definition.writes {
@@ -656,19 +720,31 @@ impl ToolBroker {
         };
         // Held from preview to write: a concurrent edit of the same file waits
         // and then plans against the content this one leaves behind.
-        let _edit_lock = if matches!(name, "file_write" | "file_edit") {
+        let _edit_lock = if matches!(name, "file_write" | "file_edit" | "notebook_edit") {
             let target = builtin::write_target(self, builtin::text(&arguments, "path")?, access)?;
             Some(builtin::EditLock::acquire(&target, &self.cancel)?)
         } else {
             None
         };
-        let presentation = self.presentation(
+        let write_revision = if matches!(name, "file_write" | "file_edit" | "notebook_edit") {
+            let path = builtin::write_target(self, builtin::text(&arguments, "path")?, access)?;
+            Some(read_state::WriteRevision::capture(&path)?)
+        } else {
+            None
+        };
+        let mut presentation = self.presentation(
             name,
             &arguments,
             access,
             skill_snapshot.as_ref(),
             component_snapshot.as_ref(),
         )?;
+        if let Some(context) = &shell_context {
+            presentation["cwd"] = json!(context.cwd);
+            if let Some(scope) = &context.outside {
+                presentation["outside_scope"] = json!(scope);
+            }
+        }
         let id = Uuid::new_v4();
         // Native clients can close inherited descriptors and outlive a crashed
         // worker. Only proven in-process writes qualify for generic review.
@@ -774,7 +850,12 @@ impl ToolBroker {
                         ))
                     })?;
             }
-            let result = if name == "search_tools" {
+            if let Some(revision) = &write_revision {
+                revision.check()?;
+            }
+            let result = if self.custom_tools.iter().any(|tool| tool.name == name) {
+                headless::execute(self, id, name, &arguments)?
+            } else if name == "search_tools" {
                 self.search_tools(namespace, &arguments)
             } else if name == "agent_delegate" {
                 // End the registration guard before the blocking callback;
@@ -806,7 +887,13 @@ impl ToolBroker {
             } else if let Some(memory_origin) = memory_origin {
                 builtin::remember(self, &arguments, memory_origin)?
             } else if builtin::handles(name) {
-                builtin::execute(self, name, &arguments, access)?
+                match name {
+                    "shell_command" | "run_command" | "shell_output" | "shell_kill"
+                    | "shell_jobs" => {
+                        shell_jobs::execute(self, name, &arguments, access, shell_context)?
+                    }
+                    _ => builtin::execute(self, name, &arguments, access)?,
+                }
             } else {
                 let operation = async {
                     let _reservation = if let Some(demand) = xylo_resources::capability_demand(name)
@@ -991,6 +1078,7 @@ impl ToolBroker {
             session,
             &[
                 "file_read",
+                "lsp",
                 "files_list",
                 "find_files",
                 "search_project",
@@ -1000,7 +1088,7 @@ impl ToolBroker {
                 "extension_resource",
                 "skill_read",
             ],
-            &["memory_search"],
+            &["memory_search", "file_edit", "file_write"],
         )?;
         actions
             .iter()
@@ -1020,6 +1108,20 @@ impl ToolBroker {
             return Ok(MemoryOrigin::WebContent);
         }
         Ok(match name {
+            // Server responses can include dependency documentation and other
+            // outside text regardless of the requested document's location.
+            "lsp" => MemoryOrigin::ToolOutput,
+            "file_edit" | "file_write"
+                if action.result.as_ref().is_some_and(|result| {
+                    result
+                        .pointer("/summary/lsp_observation")
+                        .or_else(|| result.get("lsp_observation"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                }) =>
+            {
+                MemoryOrigin::ToolOutput
+            }
             "run_command" | "shell_command"
                 if arguments.get("network").and_then(Value::as_bool) == Some(true) =>
             {
@@ -1093,8 +1195,10 @@ impl ToolBroker {
     /// then reports the real error, and still refuses to leave the project.
     fn reach(&self, name: &str, arguments: &Value) -> Reach {
         let (requested, writing) = match name {
-            "file_read" => (arguments.get("path").and_then(Value::as_str), false),
-            "file_write" | "file_edit" => (arguments.get("path").and_then(Value::as_str), true),
+            "file_read" | "lsp" => (arguments.get("path").and_then(Value::as_str), false),
+            "file_write" | "file_edit" | "notebook_edit" => {
+                (arguments.get("path").and_then(Value::as_str), true)
+            }
             "files_list" | "find_files" | "search_project" => (
                 Some(arguments.get("path").and_then(Value::as_str).unwrap_or(".")),
                 false,
@@ -1132,7 +1236,7 @@ impl ToolBroker {
             },
             // Show the actual change, and reject an inapplicable edit before
             // any intent or approval exists.
-            "file_write" | "file_edit" => {
+            "file_write" | "file_edit" | "notebook_edit" => {
                 return builtin::change_preview(self, name, arguments, access);
             }
             // Installed plugins show their reviewed grants and budgets.
@@ -1713,6 +1817,10 @@ impl ToolBroker {
     /// field and point at the saved complete result, which file_read can page
     /// through.
     pub(crate) fn model_result(&self, id: Uuid, result: Value) -> Value {
+        let images = result
+            .get("images")
+            .or_else(|| result.pointer("/summary/images"))
+            .cloned();
         let model_bytes = self.window().tool_result_bytes();
         let Ok(encoded) = serde_json::to_vec(&result) else {
             return self.bound_result(id, result);
@@ -1757,6 +1865,9 @@ impl ToolBroker {
                     );
                 }
             }
+        }
+        if let Some(images) = images {
+            shortened["images"] = images;
         }
         shortened
     }
@@ -2013,6 +2124,11 @@ const FETCHING_GIT: &[&str] = &["fetch", "pull", "clone", "ls-remote", "submodul
 /// is lexical and conservative; anything it cannot read counts as leaving
 /// the project.
 fn command_stays_in_project(name: &str, arguments: &Value, workspace: &std::path::Path) -> bool {
+    // Directory overrides can grant outside access. Keep their output untrusted
+    // in the durable journal, including later calls inheriting that directory.
+    if arguments.get("cwd").is_some() {
+        return false;
+    }
     let words: Vec<String> = if name == "shell_command" {
         let Some(command) = arguments.get("command").and_then(Value::as_str) else {
             return false;

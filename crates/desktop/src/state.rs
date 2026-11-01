@@ -88,6 +88,8 @@ pub enum Segment {
     /// Assistant text streamed between tool batches. Shared so an unchanged
     /// segment hands the markdown view the same string every frame.
     Text(SharedString),
+    /// Provider reasoning, disclosed separately from the answer.
+    Thinking(SharedString),
     /// Consecutive top-level tool calls, in start order.
     Tools(Vec<Uuid>),
     /// A helper agent started by an `agent_delegate` call with this id.
@@ -155,6 +157,8 @@ pub struct TurnState {
     pub subagents: Vec<Subagent>,
     /// Helpers of earlier turns in this chat, newest last, for the Subagents panel.
     pub earlier_subagents: Vec<Subagent>,
+    /// Shell jobs survive the turn that started them.
+    pub shell_jobs: Vec<xylo_core::ShellJob>,
     /// The latest engine status note.
     pub status: Option<String>,
     /// `None` while running or before the first turn.
@@ -349,10 +353,22 @@ impl TurnState {
             self.flush_text();
         }
         match event {
+            EngineEvent::CustomToolRequested { .. } => return,
             EngineEvent::Ready { .. }
             | EngineEvent::TitleUpdated { .. }
             | EngineEvent::Steering { .. }
             | EngineEvent::ProviderCredentialRequested { .. } => return,
+            EngineEvent::ShellJobUpdated { job } => {
+                if let Some(current) = self
+                    .shell_jobs
+                    .iter_mut()
+                    .find(|current| current.id == job.id)
+                {
+                    *current = job;
+                } else {
+                    self.shell_jobs.push(job);
+                }
+            }
             EngineEvent::Started => {
                 // Admission may already have opened this turn with `Preparing`.
                 if !(self.running && self.segments.is_empty() && self.tools.is_empty()) {
@@ -370,6 +386,14 @@ impl TurnState {
                 self.phase_since = now_ms();
             }
             EngineEvent::Delta { text } => self.push_text(&text),
+            EngineEvent::ThinkingDelta { text } => {
+                if let Some(Segment::Thinking(previous)) = self.segments.last_mut() {
+                    *previous = format!("{previous}{text}").into();
+                } else {
+                    self.segments.push(Segment::Thinking(text.into()));
+                }
+                self.touch(self.segments.len());
+            }
             EngineEvent::Status { text } => self.status = Some(text),
             EngineEvent::HarnessNote { kind, text } => {
                 self.segments.push(Segment::Note {
@@ -685,6 +709,7 @@ fn delegate_summary(card: &ToolCard) -> Option<SharedString> {
 
 pub fn message(session_id: Uuid, role: &str, content: String) -> ChatMessage {
     ChatMessage {
+        reasoning: None,
         id: Uuid::new_v4(),
         session_id,
         role: role.into(),
