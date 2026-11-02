@@ -1192,6 +1192,9 @@ async fn checking_a_cancelled_command_reports_its_settled_outcome_not_running() 
     // The caller gives up and checks at once, while the cancelled run is still
     // stopping the client and recording its receipt.
     call.abort();
+    // abort() only schedules cancellation. Await the caller's drop so its
+    // cancellation guard has fired before asking about the retained work.
+    assert!(call.await.unwrap_err().is_cancelled());
     let started = std::time::Instant::now();
     let receipt: EnvironmentReceipt = serde_json::from_value(
         management(
