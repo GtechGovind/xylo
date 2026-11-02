@@ -605,22 +605,30 @@ async fn status_inner(tree: &Worktree) -> Result<WorktreeStatus> {
         unpushed,
     })
 }
-/// Removes only a registered Xylo worktree. Force is an explicit destructive
-/// override; branches are retained so committed history remains recoverable.
-pub async fn remove(path: &Path, force: bool) -> Result<()> {
-    let tree = inspect(path)?;
-    let _lock = lock(&tree.repository)?;
-    let _inspection = inspection_lock(&tree)?;
-    match fs2::FileExt::try_lock_exclusive(&_inspection) {
+fn removal_inspection_lock(tree: &Worktree) -> Result<OperationLock> {
+    let inspection = inspection_lock(tree)?;
+    match fs2::FileExt::try_lock_exclusive(&inspection) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             return Err(InspectionInUse.into());
         }
         Err(error) => return Err(error.into()),
     }
-    if _inspection.metadata()?.len() != 0 {
+    // This is only a removal check, not a live process lease. Release it
+    // explicitly on every return, including dirty/unpushed-work refusals.
+    let inspection = OperationLock(inspection);
+    if inspection.0.metadata()?.len() != 0 {
         return Err(InspectionInUse.into());
     }
+    Ok(inspection)
+}
+
+/// Removes only a registered Xylo worktree. Force is an explicit destructive
+/// override; branches are retained so committed history remains recoverable.
+pub async fn remove(path: &Path, force: bool) -> Result<()> {
+    let tree = inspect(path)?;
+    let _lock = lock(&tree.repository)?;
+    let _inspection = removal_inspection_lock(&tree)?;
     // Even explicit force must not enter a nested repository natively.
     reject_submodules(&tree).await?;
     ensure!(

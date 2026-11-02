@@ -134,6 +134,20 @@ fn completed_operation_releases_lock_even_with_an_inherited_descriptor() {
 }
 
 #[tokio::test]
+async fn completed_removal_check_releases_inherited_inspection_lock() {
+    let repo = repo();
+    let tree = create(repo.path(), "removal-lock", "HEAD").await.unwrap();
+    let inspection = removal_inspection_lock(&tree).unwrap();
+    let inherited = inspection.0.try_clone().unwrap();
+    let error = remove(&tree.path, false).await.unwrap_err();
+    assert!(error.is::<InspectionInUse>());
+    drop(inspection);
+    remove(&tree.path, false).await.unwrap();
+    assert!(!tree.path.exists());
+    drop(inherited);
+}
+
+#[tokio::test]
 async fn lifecycle_preserves_main_and_refuses_dirty_or_unpushed() {
     let repo = repo();
     let tree = create(repo.path(), "test", "HEAD").await.unwrap();
