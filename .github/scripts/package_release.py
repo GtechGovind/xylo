@@ -16,10 +16,19 @@ from release_assets import collect_assets
 def configure(config, environment, system):
     """Return independent signing decisions and a manifest with public identity."""
     config = json.loads(json.dumps(config))
+    if system == "Darwin":
+        # LICENSE and NOTICE are already bundled resources. A DMG licenseFile
+        # adds an interactive agreement that blocks unattended verification.
+        config.pop("licenseFile", None)
     apple_names = ("APPLE_CERTIFICATE", "APPLE_SIGNING_IDENTITY", "APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID")
     apple = system == "Darwin" and all(environment.get(name) for name in apple_names)
     if apple:
         config.setdefault("macos", {})["signingIdentity"] = environment["APPLE_SIGNING_IDENTITY"]
+    elif system == "Darwin":
+        # Linker signatures cover individual Mach-O files, not the finished
+        # app's Info.plist and resources. Seal the complete bundle even when
+        # a Developer ID certificate is unavailable.
+        config.setdefault("macos", {})["signingIdentity"] = "-"
     else:
         config.get("macos", {}).pop("signingIdentity", None)
     return config, apple, bool(environment.get("MINISIGN_KEY"))
@@ -115,7 +124,7 @@ def run():
             environment.pop("APPLE_CERTIFICATE", None)
             environment.pop("APPLE_CERTIFICATE_PASSWORD", None)
         elif platform.system() == "Darwin":
-            print("::warning::APPLE_* secrets are incomplete; Apple signing and notarization skipped", flush=True)
+            print("::warning::Using ad-hoc bundle signing; Developer ID signing and notarization are not configured", flush=True)
             for name in tuple(environment):
                 if name.startswith("APPLE_"):
                     environment.pop(name)

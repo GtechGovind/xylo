@@ -53,6 +53,16 @@ with tempfile.TemporaryDirectory(prefix='xylo-bundle-', dir=out) as temporary:
     shutil.copytree(helper, resources / 'sandbox-helper', ignore=shutil.ignore_patterns('.git'))
     for name in ('LICENSE', 'NOTICE'):
         shutil.copy2(root / name, resources / name)
+    # Sign nested native code first, then seal the completed app's resources.
+    # Rust's linker signature alone is not a valid application-bundle seal.
+    for path in sorted(stage.rglob('*'), key=lambda item: len(item.parts), reverse=True):
+        if path.is_file() and not path.is_symlink():
+            with path.open('rb') as handle:
+                magic = handle.read(4)
+            if magic in (b'\xfe\xed\xfa\xce', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'\xce\xfa\xed\xfe', b'\xcf\xfa\xed\xfe'):
+                subprocess.run(['codesign', '--force', '--sign', '-', str(path)], check=True)
+    subprocess.run(['codesign', '--force', '--sign', '-', str(stage)], check=True)
+    subprocess.run(['codesign', '--verify', '--deep', '--strict', str(stage)], check=True)
     destination = out / 'Xylo.app'
     # Stage the complete bundle before replacing the local build.
     if destination.exists():

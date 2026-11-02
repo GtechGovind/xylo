@@ -1,7 +1,7 @@
 {
   "name": "xylo",
   "productName": "Xylo",
-  "version": "0.1.1-rc.3",
+  "version": "0.1.1-rc.4",
   "identifier": "com.qurkos.xylo",
   "icons": ["crates/desktop/assets/xylo-icon.png"],
   "description": "Workspace for AI conversations, coding and tools",

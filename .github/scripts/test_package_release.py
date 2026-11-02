@@ -5,13 +5,16 @@ from unittest.mock import patch
 from package_release import configure, linux_dependencies
 
 class SigningTests(unittest.TestCase):
-    def test_missing_keys_skip_each_signing_system_independently(self):
-        config = {"macos": {"signingIdentity": "old"}}
+    def test_missing_apple_credentials_still_seal_the_macos_bundle(self):
+        config = {"macos": {"signingIdentity": "old"}, "licenseFile": "LICENSE"}
         result, apple, minisign = configure(config, {"MINISIGN_KEY": "key"}, "Darwin")
         self.assertFalse(apple)
         self.assertTrue(minisign)
-        self.assertNotIn("signingIdentity", result["macos"])
+        self.assertEqual(result["macos"]["signingIdentity"], "-")
         self.assertEqual(config["macos"]["signingIdentity"], "old")
+        self.assertNotIn("licenseFile", result)
+        self.assertEqual(configure(config, {}, "Windows")[0]["licenseFile"], "LICENSE")
+        self.assertNotIn("signingIdentity", configure(config, {}, "Linux")[0]["macos"])
 
     def test_complete_apple_credentials_enable_signing_only_on_macos(self):
         environment = dict.fromkeys(("APPLE_CERTIFICATE", "APPLE_SIGNING_IDENTITY", "APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID"), "configured")

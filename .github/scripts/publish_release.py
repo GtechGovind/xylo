@@ -93,7 +93,11 @@ This release includes the native chat and composer polish, clearer file edits an
 
 Every download has a SHA-256 checksum and a project-key signature (`.sig`). The verification public key is included as `Xylo-release-signing.pub`. These are cargo-packager/Minisign signatures; **they do not provide Apple notarization or Windows publisher trust**. This preview may display operating-system security warnings.
 
+macOS app bundles are also sealed and checked with `codesign --verify --deep --strict`, including the copies inside the DMG and app archive. Without Developer ID credentials this is an ad-hoc signature, not Apple publisher verification. If macOS blocks this preview because the developer cannot be verified, follow [Apple's Open Anyway instructions](https://support.apple.com/102445) in System Settings → Privacy & Security. No global Gatekeeper changes are required.
+
 {platform_status}
+
+Available architectures: macOS Apple Silicon (`arm64`), Windows `x64`, and Linux `x64`. Linux packages target Ubuntu 24.04 and require glibc 2.39 or later; the AppImage does not bundle glibc.
 
 The macOS `.app.tar.gz` preserves the app bundle's executable permissions. The `.dmg`, Windows installer, and Linux `.deb`/`.AppImage` are native packages. Executable tools require Node.js 22.12 or later. Linux also requires `bubblewrap`, `socat`, and `ripgrep`; the `.deb` declares these dependencies, while AppImage users install them separately. Linux host policy must allow Bubblewrap to create user and network namespaces; some Ubuntu installations require AppArmor configuration.
 

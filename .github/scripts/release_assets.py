@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import platform
+import plistlib
 import shutil
 import subprocess
 import tarfile
@@ -20,6 +21,49 @@ def sha256(path):
 def platform_name(system, machine):
     return {"Darwin": "macos", "Windows": "windows", "Linux": "linux"}[system], {
         "arm64": "arm64", "aarch64": "arm64", "amd64": "x64", "x86_64": "x64"}[machine.lower()]
+
+
+def verify_macos_bundle(app, version):
+    """Validate the sealed application, independently of download signatures."""
+    info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+    if info.get("CFBundleShortVersionString") != version or info.get("CFBundleIdentifier") != "com.qurkos.xylo":
+        raise ValueError("macOS app has the wrong version or bundle identifier")
+    for name in ("xylo", "xylo-worker", "xylo-helper", "xylo-cli"):
+        binary = app / "Contents/MacOS" / name
+        if not binary.is_file() or not binary.stat().st_mode & 0o111:
+            raise ValueError(f"macOS app is missing executable {name}")
+    helper = app / "Contents/Resources/sandbox-helper"
+    if not (helper / "run.mjs").is_file() or not (helper / "node_modules").is_dir():
+        raise ValueError("macOS app is missing sandbox helper dependencies")
+    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+
+
+def verify_macos_packages(app, dmg, archive, version, notarized):
+    verify_macos_bundle(app, version)
+    if notarized:
+        subprocess.run(["xcrun", "stapler", "validate", str(app)], check=True)
+    subprocess.run(["hdiutil", "verify", str(dmg)], check=True, stdout=subprocess.DEVNULL)
+    with tempfile.TemporaryDirectory(prefix="xylo-macos-package-check-") as temporary:
+        root = Path(temporary)
+        extracted = root / "archive"
+        extracted.mkdir()
+        # Use macOS's archive reader, including on its bundled Python 3.9.
+        # This is the archive created from our validated app just above.
+        subprocess.run(["tar", "-xzf", str(archive.resolve()), "-C", str(extracted)], check=True)
+        verify_macos_bundle(extracted / "Xylo.app", version)
+        mount = root / "disk"
+        mount.mkdir()
+        subprocess.run(["hdiutil", "attach", str(dmg.resolve()), "-readonly", "-nobrowse",
+            "-noautoopen", "-mountpoint", str(mount)], check=True, stdout=subprocess.DEVNULL)
+        try:
+            installed = mount / "Xylo.app"
+            verify_macos_bundle(installed, version)
+            reported = subprocess.check_output([str(installed / "Contents/MacOS/xylo-cli"), "--version"], text=True)
+            if f"xylo-cli {version} " not in reported:
+                raise ValueError("macOS package reports the wrong application version")
+        finally:
+            subprocess.run(["hdiutil", "detach", str(mount)], check=True, stdout=subprocess.DEVNULL)
+    print("Verified macOS bundle signatures, DMG, app archive and packaged CLI startup", flush=True)
 
 
 def verify_linux_packages(downloads, version):
@@ -78,13 +122,11 @@ def collect_assets(config, environment, apple):
         apps = list(packages.rglob("*.app"))
         if len(apps) != 1:
             raise ValueError("Expected one macOS app bundle")
-        if apple:
-            subprocess.run(["codesign", "--verify", "--deep", "--strict", str(apps[0])], check=True)
-            subprocess.run(["xcrun", "stapler", "validate", str(apps[0])], check=True)
         archive = destination / (prefix + ".app.tar.gz")
         with tarfile.open(archive, "w:gz") as output:
             output.add(apps[0], arcname="Xylo.app")
         downloads.append(archive)
+        verify_macos_packages(apps[0], downloads[0], archive, version, apple)
     public = Path(".github/release-signing.pub")
     verifier = Path("target/release/xylo-signature-verify" + (".exe" if system == "Windows" else ""))
     checksum = destination / (prefix + ".sha256")
@@ -92,7 +134,7 @@ def collect_assets(config, environment, apple):
     receipt = destination / (prefix + ".json")
     receipt.write_text(json.dumps({"version": version, "commit": environment.get("GITHUB_SHA", "local"),
         "platform": name, "arch": arch, "artifact_signatures": "verified",
-        "platform_signing": "not_applicable" if system == "Linux" else ("verified" if apple else "not_configured"),
+        "platform_signing": "not_applicable" if system == "Linux" else ("verified" if apple else ("ad_hoc" if system == "Darwin" else "not_configured")),
         "files": [{"name": path.name, "sha256": sha256(path), "size": path.stat().st_size} for path in downloads]}, indent=2) + "\n")
     for path in [*downloads, checksum, receipt]:
         subprocess.run(["cargo", "packager", "signer", "sign", str(path)], env=environment, check=True)

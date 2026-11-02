@@ -1,11 +1,45 @@
 import json
 from pathlib import Path
+import plistlib
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from publish_release import validate_receipts, wait_for_ci
-from release_assets import platform_name, sha256
+from release_assets import platform_name, sha256, verify_macos_bundle
+
+
+@unittest.skipUnless(sys.platform == 'darwin', 'Requires native macOS codesign')
+class MacBundleIntegrityTests(unittest.TestCase):
+    def test_linker_signature_is_insufficient_and_tampered_resources_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / 'Xylo.app'
+            executables = app / 'Contents/MacOS'
+            helper = app / 'Contents/Resources/sandbox-helper'
+            executables.mkdir(parents=True)
+            (helper / 'node_modules').mkdir(parents=True)
+            (helper / 'run.mjs').write_text('// original helper\n')
+            (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+                'CFBundleExecutable': 'xylo', 'CFBundleIdentifier': 'com.qurkos.xylo',
+                'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': '0.0.0-test'}))
+            binary = root / 'fixture'
+            subprocess.run(['cc', '-x', 'c', '-', '-o', str(binary)],
+                input='int main(void) { return 0; }\n', text=True, check=True)
+            for name in ('xylo', 'xylo-worker', 'xylo-helper', 'xylo-cli'):
+                shutil.copy2(binary, executables / name)
+            with self.assertRaises(subprocess.CalledProcessError):
+                verify_macos_bundle(app, '0.0.0-test')
+            for executable in executables.iterdir():
+                subprocess.run(['codesign', '--force', '--sign', '-', str(executable)], check=True)
+            subprocess.run(['codesign', '--force', '--sign', '-', str(app)], check=True)
+            verify_macos_bundle(app, '0.0.0-test')
+            (helper / 'run.mjs').write_text('// changed after signing\n')
+            with self.assertRaises(subprocess.CalledProcessError):
+                verify_macos_bundle(app, '0.0.0-test')
 
 
 class ReleaseAssetsTests(unittest.TestCase):
