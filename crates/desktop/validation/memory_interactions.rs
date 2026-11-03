@@ -424,7 +424,7 @@ mod xylo {
                         .update(cx, |input, cx| input.focus(window, cx))
                 });
                 window.render_frame(cx);
-                window.press("cmd-a", cx);
+                window.press(if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" }, cx);
                 window.input("Still unsaved, now edited", cx);
             })
             .unwrap();
@@ -468,7 +468,18 @@ mod xylo {
                 .unwrap();
             let scope = project.to_string_lossy().to_string();
             let (window, view, client) = launch(cx, paths.clone());
-            wait(cx, &view, |view, _| view.workspace_ready);
+            // Enter Memory starts scoped draft reads and an extension snapshot.
+            // Finish that startup work before locking SQLite; otherwise a
+            // legitimate setup guard can reject the project switch below.
+            wait(cx, &view, |view, _| {
+                let key = view.current_draft_key();
+                view.workspace.as_ref() == Some(&project)
+                    && view.workspace_ready
+                    && view.memory_form_ready()
+                    && view.drafts.validation_revision(&key).is_some()
+                    && view.drafts.validation_load(&key).is_none()
+                    && !view.management_busy()
+            });
             let lock = rusqlite::Connection::open(&paths.database).unwrap();
             lock.execute_batch("BEGIN IMMEDIATE").unwrap();
             cx.update_window(window, |_, window, cx| {
@@ -485,6 +496,10 @@ mod xylo {
                         input.set_value("New typing must survive the older save", window, cx)
                     });
                     view.set_workspace(other.clone(), window, cx);
+                    assert_eq!(
+                        view.workspace.as_ref(), Some(&other),
+                        "switch to other project failed: {:?}", view.error
+                    );
                     view.memory_content.update(cx, |input, cx| {
                         input.set_value("Other project text stays here", window, cx)
                     });
@@ -493,16 +508,26 @@ mod xylo {
             .unwrap();
             lock.execute_batch("COMMIT").unwrap();
             wait(cx, &view, |view, _| {
-                !view.facts.busy() && view.validation_memory_form_clean(&scope)
+                view.workspace.as_ref() == Some(&other)
+                    && view.workspace_ready
+                    && !view.management_busy()
+                    && !view.facts.busy()
+                    && view.validation_memory_form_clean(&scope)
             });
             cx.update_window(window, |_, window, cx| {
                 view.update(cx, |view, cx| {
-                    view.set_workspace(project.clone(), window, cx)
+                    view.set_workspace(project.clone(), window, cx);
+                    assert_eq!(
+                        view.workspace.as_ref(), Some(&project),
+                        "return to original project failed: {:?}", view.error
+                    );
                 })
             })
             .unwrap();
             wait(cx, &view, |view, _| {
-                view.memory_form_ready() && view.workspace_ready
+                view.workspace.as_ref() == Some(&project)
+                    && view.memory_form_ready()
+                    && view.workspace_ready
             });
             cx.update(|cx| {
                 assert_eq!(

@@ -62,21 +62,29 @@ pub fn create() -> Result<(TrayIcon, async_channel::Receiver<Event>)> {
 /// macOS receives only the mark as an alpha template; other platforms use
 /// the rounded application tile. Transparent corners must stay transparent.
 fn tray_image() -> image::RgbaImage {
-    // Supersampling keeps the small mark smooth at menu-bar scale.
-    let image = crate::ui::brand_pixels(96);
     #[cfg(target_os = "macos")]
-    let image = {
-        let mut image = image;
-        for pixel in image.pixels_mut() {
-            let alpha = if pixel.0[..3] == [255, 255, 255] {
-                pixel.0[3]
-            } else {
-                0
-            };
-            *pixel = image::Rgba([0, 0, 0, alpha]);
-        }
-        image
-    };
+    {
+        tray_template_image()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::ui::brand_pixels(24)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn tray_template_image() -> image::RgbaImage {
+    // Extract the mark before resampling; filtering the indigo tile first
+    // would blend its edge into the mark and erode the monochrome template.
+    let mut image = crate::ui::brand_pixels(1024);
+    for pixel in image.pixels_mut() {
+        let alpha = if pixel.0[..3] == [255, 255, 255] {
+            pixel.0[3]
+        } else {
+            0
+        };
+        *pixel = image::Rgba([0, 0, 0, alpha]);
+    }
     image::imageops::resize(&image, 24, 24, image::imageops::FilterType::Lanczos3)
 }
 
@@ -86,11 +94,11 @@ fn tray_icon() -> Result<Icon> {
     Ok(Icon::from_rgba(image.into_raw(), width, height)?)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     #[test]
     fn menu_bar_template_is_a_smooth_mark_with_no_background_tile() {
-        let image = super::tray_image();
+        let image = super::tray_template_image();
         assert_eq!(image.dimensions(), (24, 24));
         for edge in 0..24 {
             for (x, y) in [(edge, 0), (edge, 23), (0, edge), (23, edge)] {

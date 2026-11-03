@@ -132,6 +132,64 @@ fn streaming_appends_in_place_and_shows_once_per_flush() {
 }
 
 #[test]
+fn reasoning_streams_without_rebuilding_and_keeps_text_boundaries() {
+    let mut state = TurnState::default();
+    state.apply(EngineEvent::Started);
+    for _ in 0..1000 {
+        state.apply(EngineEvent::ThinkingDelta {
+            text: "考える ".into(),
+        });
+    }
+    assert_eq!(state.segments, vec![Segment::Thinking("".into())]);
+    state.flush_text();
+    assert_eq!(
+        state.segments,
+        vec![Segment::Thinking("考える ".repeat(1000).into())]
+    );
+    state.take_changed_rows();
+    state.apply(EngineEvent::ThinkingDelta {
+        text: "first".into(),
+    });
+    delta(&mut state, "Answer");
+    state.apply(EngineEvent::ThinkingDelta {
+        text: "Second".into(),
+    });
+    state.apply(EngineEvent::ThinkingDelta {
+        text: " thought".into(),
+    });
+    assert_eq!(state.transcript_text(), "Answer");
+    state.apply(EngineEvent::Cancelled);
+    assert_eq!(
+        state.segments,
+        vec![
+            Segment::Thinking(format!("{}first", "考える ".repeat(1000)).into()),
+            Segment::Text("Answer".into()),
+            Segment::Thinking("Second thought".into()),
+        ]
+    );
+    assert_eq!(
+        state.take_changed_rows(),
+        Some(0),
+        "Terminal state remeasures all rows"
+    );
+    state.apply(EngineEvent::Started);
+    state.apply(EngineEvent::ThinkingDelta {
+        text: "Fresh".into(),
+    });
+    state.apply(EngineEvent::Completed {
+        text: "Done".into(),
+        usage: Usage::default(),
+    });
+    assert_eq!(
+        state.segments,
+        vec![
+            Segment::Thinking("Fresh".into()),
+            Segment::Text("Done".into())
+        ]
+    );
+}
+
+#[test]
 fn only_rows_from_the_first_change_onward_are_remeasured() {
     let mut state = TurnState::default();
     state.apply(EngineEvent::Started);

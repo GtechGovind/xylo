@@ -1,12 +1,20 @@
 #![cfg(unix)]
 
 use super::*;
+
+mod protocol_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/test_support.rs"));
+}
+
 #[tokio::test]
 async fn agent_requests_start_on_demand_and_report_current_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.py");
     std::fs::write(&path, "BAD_TYPE").unwrap();
-    std::fs::write(dir.path().join("language-servers.json"),json!({"servers":[{"languages":["python"],"executable":"/usr/bin/python3","args":[concat!(env!("CARGO_MANIFEST_DIR"),"/src/lsp/agent/test_server.py")]}]}).to_string()).unwrap();
+    std::fs::write(
+        dir.path().join("language-servers.json"),
+        json!({"servers":[{"languages":["python"],"executable":protocol_fixture::executable("lsp"),"args":[]}]}).to_string(),
+    ).unwrap();
     let service = AgentService::new(dir.path().to_owned());
     assert!(service.manager.servers.lock().await.is_empty());
     let root = dir.path().canonicalize().unwrap();
@@ -106,7 +114,10 @@ fn version_fixture(flag: &str) -> (tempfile::TempDir, PathBuf, AgentService) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.py");
     std::fs::write(&path, "valid").unwrap();
-    std::fs::write(dir.path().join("language-servers.json"),json!({"servers":[{"languages":["python"],"executable":"/usr/bin/python3","args":[concat!(env!("CARGO_MANIFEST_DIR"),"/src/lsp/agent/test_server.py"),flag]}]}).to_string()).unwrap();
+    std::fs::write(
+        dir.path().join("language-servers.json"),
+        json!({"servers":[{"languages":["python"],"executable":protocol_fixture::executable("lsp"),"args":[flag]}]}).to_string(),
+    ).unwrap();
     let service = AgentService::new(dir.path().to_owned());
     (dir, path, service)
 }

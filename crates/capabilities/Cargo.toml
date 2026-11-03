@@ -14,7 +14,9 @@ tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 tracing.workspace = true
-chromiumoxide = { version = "0.9.1", default-features = false, features = ["bytes"] }
+# Private local CDP transport for Xylo's source-built, bundled Obscura runtime.
+async-tungstenite = { version = "=0.32.1", default-features = false, features = ["tokio-runtime", "futures-03-sink"] }
+base64 = "0.22.1"
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "image_025", "thread_safe"] }

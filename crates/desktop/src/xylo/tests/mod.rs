@@ -1,5 +1,6 @@
 use super::{language, park_terminal, truncate};
 use std::{collections::BTreeMap, path::Path};
+mod ui_review;
 #[test]
 fn leaving_a_project_parks_its_terminal_under_the_root() {
     let mut cache = BTreeMap::new();

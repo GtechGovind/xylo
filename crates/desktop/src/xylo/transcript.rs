@@ -159,6 +159,28 @@ pub(super) fn has_work(turn: &TurnState) -> bool {
     })
 }
 
+/// Reuse the usual single reasoning segment so unrelated frames keep the
+/// markdown cache. Only turns with separate reasoning passages need joining.
+fn thinking_text(turn: &TurnState) -> SharedString {
+    let mut passages = turn.segments.iter().filter_map(|segment| match segment {
+        Segment::Thinking(text) if !text.trim().is_empty() => Some(text),
+        _ => None,
+    });
+    let Some(first) = passages.next() else {
+        return SharedString::default();
+    };
+    let Some(second) = passages.next() else {
+        return first.clone();
+    };
+    std::iter::once(first)
+        .chain(std::iter::once(second))
+        .chain(passages)
+        .map(|text| text.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .into()
+}
+
 /// A harness note in the transcript: quiet, one line per sentence, marked as
 /// coming from Xylo rather than the model.
 fn note_row(text: SharedString) -> AnyElement {
@@ -231,10 +253,6 @@ impl Xylo {
         {
             return div().into_any_element();
         }
-        if !turn.running && !has_work(turn) && matches!(turn.segments[index], Segment::Thinking(_))
-        {
-            return div().into_any_element();
-        }
         let row = match &turn.segments[index] {
             Segment::Text(text) => text_segment(
                 self.session,
@@ -252,22 +270,13 @@ impl Xylo {
                 if first != Some(index) {
                     return div().into_any_element();
                 }
-                let text = turn
-                    .segments
-                    .iter()
-                    .filter_map(|segment| match segment {
-                        Segment::Thinking(text) if !text.trim().is_empty() => Some(text.as_ref()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
                 self.thinking_block(
                     Uuid::new_v5(
                         &self.session,
                         format!("thinking-{}-{index}", turn.started_at.unwrap_or_default())
                             .as_bytes(),
                     ),
-                    text.into(),
+                    thinking_text(turn),
                     window,
                     cx,
                 )

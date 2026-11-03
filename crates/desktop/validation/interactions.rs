@@ -226,7 +226,7 @@ mod xylo {
             });
             (window, view)
         }
-        fn wait_for_history(
+        pub(super) fn wait_for_history(
             cx: &mut TestAppContext,
             view: &gpui_kit::Entity<Xylo>,
             description: &str,
@@ -648,14 +648,15 @@ mod xylo {
                     assert!(!view.terminal_visible);
                 });
                 window.render_frame(cx);
-                assert!(window.try_find("work-tab-files").is_none());
+                assert!(window.try_find("native-work-pane").is_none());
                 window.click("toggle-work-panel", cx);
                 window.render_frame(cx);
-                assert!(window.try_find("work-tab-files").is_some());
+                assert!(window.find("native-work-pane").visible());
+                assert!(window.find("work-tab-details").visible());
                 // Other pages never show the panel, its toggle or the chat menu.
                 view.update(cx, |view, cx| view.navigate(Page::Drafts, cx));
                 window.render_frame(cx);
-                assert!(window.try_find("work-tab-files").is_none());
+                assert!(window.try_find("native-work-pane").is_none());
                 assert!(window.try_find("toggle-work-panel").is_none());
                 assert!(window.try_find("terminal-workspace").is_none());
                 assert_eq!(window.find("toolbar-title").label(), Some("Saved drafts"));
@@ -907,41 +908,134 @@ mod xylo {
                 .unwrap()
             })
         }
+        struct ArchiveFixture {
+            window: AnyWindowHandle,
+            view: Entity<Xylo>,
+            workspace: PathBuf,
+            paths: xylo_runtime::AppPaths,
+            store: xylo_services::Store,
+            client: xylo_runtime::host::HostClient,
+            _temporary: tempfile::TempDir,
+        }
+        impl ArchiveFixture {
+            fn new(cx: &mut TestAppContext) -> Self {
+                cx.executor().allow_parking();
+                let temporary = tempfile::tempdir().unwrap();
+                let base = temporary.path().canonicalize().unwrap();
+                let workspace = base.join("project");
+                std::fs::create_dir(&workspace).unwrap();
+                let paths = xylo_runtime::AppPaths::at(base.join("profile")).unwrap();
+                let store = xylo_services::Store::open(&paths.database).unwrap();
+                store
+                    .save_settings(&xylo_core::AppSettings {
+                        last_workspace: Some(workspace.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let host = xylo_runtime::host::HostClient::spawn_at(paths.clone()).unwrap();
+                let client = host.0.clone();
+                cx.update(gpui_kit::init);
+                let (window, view) = cx.update(|cx| {
+                    gpui_kit::open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                                origin: Default::default(),
+                                size: size(px(1380.), px(880.)),
+                            })),
+                            ..Default::default()
+                        },
+                        cx,
+                        |window, cx| cx.new(|cx| Xylo::new(Ok(host), window, cx)),
+                    )
+                    .unwrap()
+                });
+                super::native_tests::wait_for_history(
+                    cx,
+                    &view,
+                    "archive fixture startup",
+                    |view, _| {
+                        view.settings_loaded && view.workspace_ready && view.conversations_loaded
+                    },
+                );
+                Self {
+                    window,
+                    view,
+                    workspace,
+                    paths,
+                    store,
+                    client,
+                    _temporary: temporary,
+                }
+            }
+            fn shutdown(&self, cx: &mut TestAppContext) {
+                self.client.shutdown().unwrap();
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(self.paths.data.join("host.lock"))
+                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    cx.run_until_parked();
+                    if lock.try_lock().is_ok() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Archive fixture host did not stop"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
         #[gpui_kit::test]
         fn short_chat_messages_do_not_reserve_empty_attachment_or_action_space(
             cx: &mut TestAppContext,
         ) {
             let (handle, view) = fixture(cx);
-            cx.update_window(handle, |_, window, cx| {
-                view.update(cx, |view, cx| {
-                    view.error = None;
-                    view.settings.ui.sidebar_visible = false;
-                    view.messages = vec![
-                        super::message(view.session, "user", "hi".into()),
-                        super::message(view.session, "assistant", "Hi! What can I help you with?".into()),
-                        super::message(view.session, "user", "Study this project and explain the agent flow.".into()),
-                    ];
-                    view.sync_history_list(cx);
-                });
-                window.render_frame(cx);
-                let user = window.find(("chat-message", 1usize)).bounds();
-                let answer = window.find(("chat-message", 2usize)).bounds();
-                let next = window.find(("chat-message", 3usize)).bounds();
-                assert!(user.size.height <= px(40.), "A short user message must hug its text, not reserve invisible controls: {user:?}");
-                assert!(answer.size.height <= px(50.), "A short answer must not reserve an empty attachment strip: {answer:?}");
-                assert!(answer.top() - user.bottom() <= px(24.), "Turn spacing must stay compact");
-                // The gap under an answer holds its 28 px action row clear of the text.
-                assert!(next.top() - answer.bottom() <= px(32.), "Followup spacing must stay compact");
-                window.hover(("message-body", 1usize), cx);
-                window.click(("copy-message", 1usize), cx);
-                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "hi");
-                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("changed".into()));
-                window.hover(("message-body", 3usize), cx);
-                assert_eq!(window.find(("copy-message", 1usize)).focused(), Some(true));
-                assert!(window.find(("copy-message", 1usize)).visible(), "Keyboard focus must reveal the copy action after pointer leaves");
-                window.press("enter", cx);
-                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "hi");
-            }).unwrap();
+            for (width, height, split) in [(1380., 880., false), (1000., 680., true)] {
+                cx.update_window(handle, |_, window, cx| {
+                    window.resize(size(px(width), px(height)));
+                    window.bounds_changed(cx);
+                    view.update(cx, |view, cx| {
+                        view.error = None;
+                        view.settings.ui.sidebar_visible = split;
+                        view.settings.ui.sidebar_width = 222.;
+                        view.settings.ui.work_panel_open = split;
+                        view.settings.ui.work_panel_width = 460.;
+                        view.messages = vec![
+                            super::message(view.session, "user", "hi".into()),
+                            super::message(view.session, "assistant", "Hi! What can I help you with?".into()),
+                            super::message(view.session, "user", "Study this project and explain the agent flow.".into()),
+                        ];
+                        view.sync_history_list(cx);
+                    });
+                    window.render_frame(cx);
+                    let user = window.find(("chat-message", 1usize)).bounds();
+                    let bubble = window.find(("message-body", 1usize)).bounds();
+                    let answer = window.find(("chat-message", 2usize)).bounds();
+                    let next = window.find(("chat-message", 3usize)).bounds();
+                    let copy = window.find(("copy-message", 1usize)).bounds();
+                    let answer_copy = window.find(("copy-message", 2usize)).bounds();
+                    assert!(user.size.height <= px(40.), "{width}/split={split}: A short user message must hug its text: row={user:?}, bubble={bubble:?}, copy={copy:?}");
+                    assert!(answer.size.height <= px(50.), "{width}/split={split}: A short answer must not reserve an empty attachment strip: {answer:?}");
+                    assert!(copy.left() >= user.left() && copy.right() <= bubble.left() && copy.top() >= user.top() && copy.bottom() <= user.bottom(), "{width}/split={split}: User controls must stay beside the bubble inside the hit area: row={user:?}, bubble={bubble:?}, copy={copy:?}");
+                    assert!(answer.top() - user.bottom() <= px(24.), "{width}/split={split}: Turn spacing must stay compact: user={user:?}, answer={answer:?}");
+                    assert!(answer_copy.top() >= answer.bottom() && answer_copy.bottom() <= next.top(), "{width}/split={split}: Answer controls must not overlap either turn: answer={answer:?}, copy={answer_copy:?}, next={next:?}");
+                    assert!(next.top() - answer.bottom() <= answer_copy.size.height + px(8.), "{width}/split={split}: Followup spacing must hold only the action row and a small gap: answer={answer:?}, copy={answer_copy:?}, next={next:?}");
+                    window.hover(("message-body", 1usize), cx);
+                    window.hover(("copy-message", 1usize), cx);
+                    assert!(window.find(("copy-message", 1usize)).visible(), "Moving from the bubble to its action must retain hover visibility");
+                    window.click(("copy-message", 1usize), cx);
+                    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "hi");
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("changed".into()));
+                    window.hover(("message-body", 3usize), cx);
+                    assert_eq!(window.find(("copy-message", 1usize)).focused(), Some(true));
+                    assert!(window.find(("copy-message", 1usize)).visible(), "Keyboard focus must reveal the copy action after pointer leaves");
+                    window.press("enter", cx);
+                    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "hi");
+                }).unwrap();
+            }
         }
         #[gpui_kit::test]
         fn sidebar_project_action_and_chat_rows_share_consistent_geometry(cx: &mut TestAppContext) {
@@ -972,11 +1066,12 @@ mod xylo {
         }
         #[gpui_kit::test]
         fn archiving_the_open_chat_moves_to_a_new_chat_and_offers_undo(cx: &mut TestAppContext) {
-            let (handle, view) = fixture(cx);
+            let fixture = ArchiveFixture::new(cx);
+            let (handle, view) = (fixture.window, fixture.view.clone());
+            let open = uuid::Uuid::new_v4();
+            let pinned = uuid::Uuid::new_v4();
             cx.update_window(handle, |_, window, cx| {
-                let root = PathBuf::from("/fixture/xylo");
-                let open = uuid::Uuid::new_v4();
-                let pinned = uuid::Uuid::new_v4();
+                let root = fixture.workspace.clone();
                 view.update(cx, |view, _| {
                     view.workspace = Some(root.clone());
                     view.settings.ui.sidebar_visible = true;
@@ -1002,6 +1097,9 @@ mod xylo {
                             updated_at: 1,
                         },
                     ];
+                    for chat in &view.conversations {
+                        fixture.store.upsert_conversation(chat).unwrap();
+                    }
                     view.sidebar_state.dirty = true;
                 });
                 window.render_frame(cx);
@@ -1037,15 +1135,34 @@ mod xylo {
                 assert!(view.read(cx).conversations.iter().all(|chat| !chat.pinned));
             })
             .unwrap();
+            super::native_tests::wait_for_history(
+                cx,
+                &view,
+                "archive undo and unpin persistence",
+                |_, _| {
+                    fixture
+                        .store
+                        .conversation(open)
+                        .unwrap()
+                        .is_some_and(|chat| !chat.archived)
+                        && fixture
+                            .store
+                            .conversation(pinned)
+                            .unwrap()
+                            .is_some_and(|chat| !chat.pinned)
+                },
+            );
+            fixture.shutdown(cx);
         }
         #[gpui_kit::test]
         fn archive_waits_for_busy_chats_blocked_switches_and_stale_pages(cx: &mut TestAppContext) {
-            let (handle, view) = fixture(cx);
+            let fixture = ArchiveFixture::new(cx);
+            let (handle, view) = (fixture.window, fixture.view.clone());
+            let open = uuid::Uuid::new_v4();
+            let busy = uuid::Uuid::new_v4();
+            let older = uuid::Uuid::new_v4();
             cx.update_window(handle, |_, window, cx| {
-                let root = PathBuf::from("/fixture/xylo");
-                let open = uuid::Uuid::new_v4();
-                let busy = uuid::Uuid::new_v4();
-                let older = uuid::Uuid::new_v4();
+                let root = fixture.workspace.clone();
                 let chat = |id, title: &str, updated_at| Conversation {
                     title_source: Default::default(),
                     pinned: false,
@@ -1060,6 +1177,9 @@ mod xylo {
                     chat(busy, "Busy chat", 2),
                     chat(older, "Older chat", 1),
                 ];
+                for chat in &listed {
+                    fixture.store.upsert_conversation(chat).unwrap();
+                }
                 view.update(cx, |view, cx| {
                     view.workspace = Some(root.clone());
                     view.session = open;
@@ -1104,6 +1224,21 @@ mod xylo {
                 });
             })
             .unwrap();
+            super::native_tests::wait_for_history(
+                cx,
+                &view,
+                "older chat archive persistence",
+                |_, _| {
+                    fixture
+                        .store
+                        .conversation(older)
+                        .unwrap()
+                        .is_some_and(|chat| chat.archived)
+                },
+            );
+            assert!(!fixture.store.conversation(open).unwrap().unwrap().archived);
+            assert!(!fixture.store.conversation(busy).unwrap().unwrap().archived);
+            fixture.shutdown(cx);
         }
         #[gpui_kit::test]
         fn settings_routes_and_controls_preserve_the_active_chat(cx: &mut TestAppContext) {
@@ -1230,12 +1365,18 @@ mod xylo {
                         cx.notify();
                     });
                     window.render_frame(cx);
-                    assert!(window.try_find("work-tab-files").is_some());
+                    assert!(window.find("native-work-pane").visible());
+                    let selected = if page == Page::Files {
+                        "work-tab-files"
+                    } else {
+                        "work-tab-changes"
+                    };
+                    assert!(window.find(selected).visible());
                     window.click("toggle-work-panel", cx);
                     assert_eq!(view.read(cx).page, Page::Chat);
                     assert!(!view.read(cx).settings.ui.work_panel_open);
                     window.render_frame(cx);
-                    assert!(window.try_find("work-tab-files").is_none());
+                    assert!(window.try_find("native-work-pane").is_none());
                 })
                 .unwrap();
             }

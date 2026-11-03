@@ -46,6 +46,7 @@ mod history_search;
 use history_search::HistorySearchUi;
 #[path = "xylo/shortcuts.rs"]
 mod shortcuts;
+pub(crate) use shortcuts::QuitApplication;
 use shortcuts::*;
 #[path = "xylo/assets.rs"]
 mod assets;
@@ -1043,6 +1044,32 @@ impl Xylo {
                         return;
                     }
                     self.workspace = Some(root.clone());
+                    if requested != root {
+                        self.settings
+                            .ui
+                            .open_projects
+                            .retain(|path| path != &requested);
+                        if let Some(preferences) = self
+                            .settings
+                            .ui
+                            .project_panels
+                            .remove(&requested)
+                            .or_else(|| self.settings.ui.project_panels.get(&root).cloned())
+                        {
+                            self.settings.ui.work_panel_open = preferences.open;
+                            self.settings.ui.work_panel = preferences.panel.clone();
+                            self.settings.ui.work_panel_width = preferences.width;
+                            self.settings
+                                .ui
+                                .project_panels
+                                .insert(root.clone(), preferences);
+                        }
+                        if self.sidebar_state.collapsed.remove(&requested) {
+                            self.sidebar_state.collapsed.insert(root.clone());
+                        }
+                        self.settings.ui.collapsed_projects =
+                            self.sidebar_state.collapsed.iter().cloned().collect();
+                    }
                     if !self.settings.ui.open_projects.contains(&root) {
                         self.settings.ui.open_projects.push(root.clone());
                     }
@@ -1485,10 +1512,19 @@ impl Xylo {
                 return;
             }
             let session = self.session;
-            self.host_call(cx, |host| host.start_loop(session, workspace, command));
-            self.composer
-                .update(cx, |input, cx| input.set_value("", window, cx));
-            self.draft_changed(cx);
+            let result = self
+                .host
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("The task service is unavailable. Restart Xylo to reconnect.")
+                })
+                .and_then(|host| host.start_loop(session, workspace, command));
+            if result.is_ok() {
+                self.composer
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.draft_changed(cx);
+            }
+            self.result(result, cx);
             return;
         }
         self.submit_persisted_draft(window, cx);
@@ -1517,7 +1553,6 @@ impl Xylo {
     }
     fn conversation_page(&mut self, page: ConversationPage, cx: &mut Context<Self>) {
         let advance = self.conversations_loading_more || self.conversations.is_empty();
-        let before = self.conversations.clone();
         let listed: BTreeSet<Uuid> = page.conversations.iter().map(|chat| chat.id).collect();
         let mut merged: BTreeMap<_, _> = self
             .conversations
@@ -1547,7 +1582,6 @@ impl Xylo {
             self.conversations_has_more = page.has_more;
         }
         self.conversations_loading_more = false;
-        self.note_conversation_changes(&before);
         self.conversations_loaded = true;
         self.sidebar_state.dirty = true;
         cx.notify();
@@ -1556,11 +1590,13 @@ impl Xylo {
         if !self.draft_before_switch(cx) {
             return;
         }
+        self.new_chat_after_draft_check(cx);
+    }
+    fn new_chat_after_draft_check(&mut self, cx: &mut Context<Self>) {
         self.stash_history();
         self.session = Uuid::new_v4();
         self.draft_switch_deferred(cx);
         self.messages.clear();
-        self.sidebar_state.note_new_chat(self.session);
         self.sidebar_state.dirty = true;
         self.page = Page::Chat;
         self.settings_open = false;
@@ -1984,13 +2020,7 @@ impl Render for Xylo {
         let mut toolbar = div()
             .id("chat-toolbar")
             .test_support()
-            .h(px(if narrow_chat_toolbar {
-                54.
-            } else if chat_toolbar {
-                64.
-            } else {
-                52.
-            }))
+            .h(px(52.))
             .when(chat_toolbar, |bar| {
                 bar.border_b_1().border_color(rgb(border()))
             })
@@ -2130,6 +2160,9 @@ impl Render for Xylo {
                 }
             }))
             .on_action(cx.listener(|view, _: &NewConversation, _, cx| view.new_chat(cx)))
+            .on_action(
+                cx.listener(|view, _: &QuitApplication, window, cx| view.request_quit(window, cx)),
+            )
             .on_action(cx.listener(|view, _: &ToggleProjectTerminal, window, cx| {
                 view.toggle_terminal(window, cx)
             }))
@@ -2172,11 +2205,10 @@ impl Render for Xylo {
                         }
                         Panel::Files => {
                             let total = f32::from(event.bounds.size.width);
-                            let work_width = view.effective_work_panel_width(total);
-                            let left = total - work_width;
-                            view.settings.ui.files_width =
-                                (f32::from(event.event.position.x - event.bounds.origin.x) - left)
-                                    .clamp(130., (work_width * 0.45).clamp(130., 480.));
+                            view.settings.ui.files_width = view.files_width_at_pointer(
+                                total,
+                                f32::from(event.event.position.x - event.bounds.origin.x),
+                            );
                         }
                         Panel::Work => {
                             view.settings.ui.work_panel_width =

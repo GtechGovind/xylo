@@ -549,8 +549,8 @@ impl ToolBroker {
         *self.delegate.lock() = Some(handler);
     }
     /// The tools to offer the model directly: a stable core set plus
-    /// capabilities the user configured (browser, local inference, speech, a
-    /// saved image provider and existing connectors), or only
+    /// the bundled browser and configured capabilities (local inference,
+    /// speech, a saved image provider and existing connectors), or only
     /// [`SMALL_WINDOW_CORE_TOOLS`] when the model's window is small, or the
     /// compact forms of [`TINY_WINDOW_CORE_TOOLS`] when it is tiny. The list
     /// does not depend on the permission mode: tools are gated at dispatch,
@@ -574,7 +574,7 @@ impl ToolBroker {
             .iter()
             .any(|definition| definition.name == "connector_call");
         let configured = |name: &str| {
-            (name.starts_with("browser_") && config.chromium.is_some())
+            name.starts_with("browser_")
                 || (name.starts_with("local_inference_") && config.llama.is_some())
                 || (name.starts_with("speech_")
                     && (config.whisper.is_some() || config.sherpa.is_some()))

@@ -10,6 +10,7 @@ actions!(
     [
         SaveCurrentFile,
         NewConversation,
+        QuitApplication,
         FindConversation,
         FindProject,
         ToggleProjectTerminal,
@@ -40,6 +41,7 @@ pub(super) fn bind(cx: &mut App) {
         ),
         KeyBinding::new(chord!("s"), SaveCurrentFile, Some("Xylo")),
         KeyBinding::new(chord!("n"), NewConversation, Some("Xylo")),
+        KeyBinding::new(chord!("q"), QuitApplication, Some("Xylo")),
         KeyBinding::new(chord!("k"), FindConversation, Some("Xylo")),
         KeyBinding::new(chord!("shift-f"), FindProject, Some("Xylo")),
         KeyBinding::new(chord!("j"), ToggleProjectTerminal, Some("Xylo")),
@@ -59,7 +61,7 @@ impl Xylo {
         } else if self.sidebar_state.renaming_focused(window, cx) {
             self.cancel_rename(cx);
         } else if self.history_search.is_open() {
-            self.close_history_search(cx);
+            self.close_history_search(window, cx);
         } else if self.escape_targets_task(window, cx) {
             self.deny_or_stop(cx);
         } else {
@@ -74,6 +76,14 @@ impl Xylo {
             && !self.settings_open
             && !self.model_picker.open
             && !self.history_search.is_open()
+            && (!self
+                .turns
+                .get(&self.session)
+                .is_some_and(|turn| turn.pending_approvals().next().is_some())
+                || self
+                    .histories
+                    .get(&self.session)
+                    .is_some_and(|history| history.at_latest()))
             && (self
                 .composer
                 .read(cx)

@@ -431,6 +431,13 @@ impl Xylo {
                                 .gap(px(14.))
                                 .child(
                                     div()
+                                        .id("chat-output-title")
+                                        .test_support()
+                                        .min_w_0()
+                                        .flex_shrink_0()
+                                        .max_h(px(40.))
+                                        .overflow_hidden()
+                                        .line_clamp(2)
                                         .text_size(px(12.))
                                         .text_color(rgb(muted()))
                                         .font_family(mono(cx))
@@ -596,6 +603,42 @@ mod tests {
 mod response_tests {
     use super::{OutputTarget, Uuid, Xylo};
     use gpui_kit::{AppContext, WindowOptions};
+
+    #[gpui_kit::test]
+    fn multiline_command_titles_keep_output_and_controls_in_the_dialog(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt;
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("fixture")), window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.error = None;
+                view.show_action_output(
+                    view.session,
+                    Uuid::new_v4(),
+                    "echo 'Long Unicode command 界'\n".repeat(200),
+                    "Retained output".into(),
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            let dialog = window.find("chat-full-output").bounds();
+            let title = window.find("chat-output-title").bounds();
+            let output = window.find("chat-output-page").bounds();
+            let copy = window.find("copy-full-chat-output").bounds();
+            assert!(title.size.height <= gpui_kit::px(40.), "Title must stay bounded: title={title:?}, output={output:?}, dialog={dialog:?}");
+            assert!(output.size.height > gpui_kit::px(100.), "Title must leave a readable output viewport: title={title:?}, output={output:?}, dialog={dialog:?}");
+            assert!(copy.top() >= output.bottom() && copy.bottom() <= dialog.bottom(), "Output controls must stay inside the dialog: copy={copy:?}, output={output:?}, dialog={dialog:?}");
+        })
+        .unwrap();
+    }
+
     #[gpui_kit::test]
     fn owned_output_finishes_loading_while_another_chat_is_open(cx: &mut gpui_kit::TestAppContext) {
         cx.update(gpui_kit::init);

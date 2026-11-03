@@ -3,6 +3,14 @@ use crate::VaultKey;
 use rmcp::model::ToolAnnotations;
 use serde_json::json;
 
+#[cfg(unix)]
+mod protocol_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../runtime/test_support.rs"
+    ));
+}
+
 fn annotations(read_only: Option<bool>, destructive: Option<bool>) -> ToolAnnotations {
     let mut annotations = ToolAnnotations::default();
     annotations.read_only_hint = read_only;
@@ -41,32 +49,16 @@ struct Fixture {
     config: ConnectorConfig,
 }
 
-/// A sandboxed Python MCP server. It logs launches, cancellation notices and
+/// A sandboxed Rust MCP server. It logs launches, cancellation notices and
 /// stdin EOF to `events.txt` in its working directory so tests can observe
 /// the lifecycle from outside.
 #[cfg(unix)]
-fn fixture(server_body: &str) -> Fixture {
-    use std::os::unix::fs::PermissionsExt;
+fn fixture(kind: &str) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let workspace = directory.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let script = directory.path().join("fixture-mcp");
-    std::fs::write(
-        &script,
-        format!(
-            r#"#!/usr/bin/python3
-import json,sys
-def log(event):
-    with open('events.txt','a') as events: events.write(event+'\n')
-def reply(request,result):
-    print(json.dumps({{'jsonrpc':'2.0','id':request['id'],'result':result}}),flush=True)
-log('launch')
-{server_body}
-"#
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    protocol_fixture::install(kind, &script);
     let store = Store::open(directory.path().join("xylo.db")).unwrap();
     let vault = CredentialVault::unlocked(directory.path(), VaultKey::from_bytes([9; 32])).unwrap();
     let broker = ConnectorBroker::new(store, vault).with_local_scope(ConnectorLaunchScope {
@@ -93,25 +85,6 @@ log('launch')
 }
 
 #[cfg(unix)]
-const SERVE_LOOP: &str = r#"
-while True:
-    line=sys.stdin.readline()
-    if not line:
-        log('eof'); break
-    request=json.loads(line)
-    method=request.get('method')
-    if method=='notifications/cancelled':
-        log('cancelled:'+str(request['params'].get('requestId'))); continue
-    if 'id' not in request: continue
-    if method=='initialize':
-        reply(request,{'protocolVersion':request['params']['protocolVersion'],'capabilities':{'tools':{}},'serverInfo':{'name':'lifecycle','version':'1'}})
-    elif method=='tools/call' and request['params']['name']=='slow':
-        log('slow-call:'+str(request['id']))
-    elif method=='tools/call':
-        reply(request,{'content':[{'type':'text','text':'ok'}]})
-"#;
-
-#[cfg(unix)]
 fn events(fixture: &Fixture) -> Vec<String> {
     std::fs::read_to_string(fixture.workspace.join("events.txt"))
         .unwrap_or_default()
@@ -123,9 +96,7 @@ fn events(fixture: &Fixture) -> Vec<String> {
 #[cfg(unix)]
 #[tokio::test]
 async fn initialization_failure_reports_the_servers_stderr() {
-    let fixture = fixture(
-        "sys.stderr.write('fixture: missing runtime dependency libfixture\\n'); sys.stderr.flush(); sys.exit(3)",
-    );
+    let fixture = fixture("failure");
     let error = fixture
         .broker
         .call(
@@ -147,7 +118,7 @@ async fn initialization_failure_reports_the_servers_stderr() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelled_call_notifies_the_server_and_closes_stdin_before_kill() {
-    let fixture = fixture(SERVE_LOOP);
+    let fixture = fixture("lifecycle");
     let cancel = CancellationToken::new();
     let trigger = cancel.clone();
     // Cancel only once the server has the request, however slow the sandboxed
@@ -190,7 +161,7 @@ async fn cancelled_call_notifies_the_server_and_closes_stdin_before_kill() {
 #[cfg(unix)]
 #[tokio::test]
 async fn connections_survive_across_broker_clones_until_idle() {
-    let fixture = fixture(SERVE_LOOP);
+    let fixture = fixture("lifecycle");
     let broker = fixture
         .broker
         .clone()
@@ -493,7 +464,7 @@ fn sse_parser_joins_data_and_handles_split_crlf() {
 #[cfg(unix)]
 #[tokio::test]
 async fn local_mcp_lifetime_is_visible_until_disconnect_and_busy_state_is_conservative() {
-    let fixture = fixture(SERVE_LOOP);
+    let fixture = fixture("lifecycle");
     let before = fixture.broker.may_have_local_processes();
     fixture
         .broker

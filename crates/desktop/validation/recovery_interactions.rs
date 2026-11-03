@@ -197,7 +197,7 @@ mod xylo {
                         .update(cx, |input, cx| input.focus(window, cx));
                 });
                 window.render_frame(cx);
-                window.press("cmd-a", cx);
+                window.press(if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" }, cx);
                 window.input("Keep working", cx);
             })
             .unwrap();

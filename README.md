@@ -45,7 +45,9 @@ Xylo keeps conversations, project files and practical tools together. Bring a lo
 | **Work with documents**    | Edit supported DOCX content and multi-sheet XLSX files, save a separate copy, and recover retained drafts. |
 | **Connect your tools**     | Add MCP connections, review plugin permissions, and configure SSH or container environments.               |
 
-Browser actions, images, voice and local model tools extend the workspace through services that start when used. Some features need an explicit asset download, a configured service or an operating system permission. The implementation and qualification status are described below and in the project source.
+Browser actions, images, voice and local model tools extend the workspace through services that start when used. Xylo's sole managed browser is the source-built, render-enabled **Obscura v0.2.6** component, packaged as the sibling `xylo-obscura` executable (`.exe` on Windows) and supervised through private local IPC. It is not a browser URL, cloud service, MCP connection, optional asset download or custom executable setting; there is no installed Chrome/Chromium/Edge fallback. Seven browser tools support navigation, snapshots, click, type, wait, screenshots and close; browser downloads are unsupported. Private-network access is blocked by default; `browser_allow_private_network: true` explicitly enables broad loopback/private-network access, not a per-host allowlist.
+
+Other features may need an explicit asset download, configured service or operating system permission. Browser implementation is integrated into the build/package, but real-browser and cross-platform runtime qualification remain separate release gates; see [the integration record](docs/obscura-integration-plan.md).
 
 Xylo uses a native interface, background execution and automatic local resource scheduling. Responsiveness is a design priority; performance measurements are still being qualified.
 
@@ -74,16 +76,19 @@ Choose the provider and model under **Settings → Providers**. Credentials use 
 **Xylo is in development preview.** Find release candidates and their signing status on the [Releases page](https://github.com/GtechGovind/xylo/releases), or build from source with standard Cargo commands:
 
 ```sh
-cargo app
+cargo build --locked
 npm ci --prefix crates/services/sandbox-helper --ignore-scripts --no-audit --no-fund
 cargo run --locked --bin xylo
 ```
 
-On macOS, `python3 scripts/bundle-macos.py` builds a complete release app at `dist/Xylo.app`.
-The bundle includes its worker, helper and CLI, and remains usable after cleaning the Cargo cache.
+On macOS, `cargo bundle-macos` builds a complete release app at `dist/Xylo.app` using Rust build tooling.
+The bundle includes its worker, helper, CLI and Obscura browser component, and remains usable after cleaning the Cargo cache.
 
+Windows builds embed the application icon in `xylo.exe` for Explorer, the title bar and taskbar, including builds with `--no-default-features`. Rebuild and restart to update an already-running executable. On Linux, X11 receives window-icon pixels directly; Wayland resolves the icon through `xylo.desktop` and the installed `xylo` hicolor icon. Install the DEB or integrate the AppImage with your desktop for Wayland launcher icons; a source-only `cargo run` without a desktop entry may show a generic icon. Linux release verification checks the launcher identity, hicolor PNG and AppImage root icon entries.
 
-The pinned Rust toolchain is selected by `rust-toolchain.toml`. Run `cargo app` from the repository root to build the four shipped binaries; evaluation tools are built only when requested. Use `cargo check -p xylo --locked` for a faster compile check and `cargo app-release` for an optimized build. Application builds use the checked-in assets and do not require a packager or updater configuration. Automatic updates are disabled until a trusted release feed is configured.
+The pinned Rust toolchain is selected by `rust-toolchain.toml`. Standard `cargo build --locked` builds the application binaries and bundled browser through the desktop crate's default `bundled-browser` feature; evaluation tools are opt-in. Use `cargo build --locked --release` for an optimized build. `cargo app` and `cargo app-release` remain convenience aliases, not required build wrappers. The browser builder is Rust, invoked by Cargo's `build.rs`; a browser build failure stops the build rather than silently omitting it. Builds require Git, Rust/Cargo and native C/C++ build tools, with build-time network access for pinned upstream source, locked crates and the versioned upstream V8 static-library archive. Rust downloads that archive and supplies its local path to upstream Cargo, bypassing upstream's interpreter-based download/source-build paths. No Python installation is required. Obscura's Rust code is compiled from source; V8 itself remains a prebuilt native dependency, not pure Rust.
+
+For a fast application compile check without building the browser, use `cargo check -p xylo --locked --no-default-features`; ordinary `cargo check` retains the default browser feature. `cargo test --locked -p xylo-build` tests build planning offline without fetching browser sources. Browser outputs are cached with revision, target, profile and binary-hash validation; initial native builds can be lengthy. Application builds otherwise use the checked-in assets and do not require a packager or updater configuration. Automatic updates are disabled until a trusted release feed is configured.
 
 Native UI checks share the root build cache and should be run by target, for example `cargo native-test --test composer-interactions`. See [Native validation](crates/desktop/validation/README.md) for focused checks and cache cleanup.
 
@@ -128,7 +133,7 @@ Every push and pull request runs the same gates on **macOS 15 and Ubuntu 24.04**
 | Lints, zero tolerance       | `cargo clippy --workspace --all-targets --locked -- -D warnings`    |
 | Tests                       | `cargo test --workspace --locked`                                   |
 | Headless acceptance         | `xylo-cli` run against a scripted provider fixture, output asserted |
-| Release signing policy      | `python3 -m unittest discover -s .github/scripts -p 'test_*.py'`    |
+| Release signing policy      | `cargo test --locked --manifest-path crates/release-tool/Cargo.toml` |
 | Dependency advisories       | `cargo audit` (pinned `cargo-audit` version)                        |
 
 Native UI behavior and rendering are checked separately per target, for example `cargo native-test --test composer-interactions`; see [Native validation](crates/desktop/validation/README.md).

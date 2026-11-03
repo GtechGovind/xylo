@@ -6,7 +6,7 @@
 
 - **Stdout carries protocol frames only; diagnostics go to stderr** (`main.rs` routes `tracing` to stderr).
 - The transport is stdin/stdout of a child process. It is never a network listener (`protocol.rs` docs).
-- `helper-client` depends only on `anyhow`, `serde`, `serde_json`, `tokio`, `tokio-util` and `uuid`. Its docs state it has no dependency on Chromium, document engines, Wasmtime or model runtimes. `helper` adds `xylo-capabilities`, `tracing-subscriber` and `fs2`.
+- `helper-client` depends only on `anyhow`, `serde`, `serde_json`, `tokio`, `tokio-util` and `uuid`. Its docs state it has no dependency on browser engines, document engines, Wasmtime or model runtimes. `helper` adds `xylo-capabilities`, `tracing-subscriber` and `fs2`.
 - The workspace dependent of `xylo-helper-client` found in `Cargo.toml` files is `runtime`; the helper binary is bundled as `Contents/MacOS/xylo-helper` per `crates/distribution` tests and `packager.json`.
 
 ## Module map
@@ -62,9 +62,11 @@ Dispatch rules for each request:
 
 ### Configuration
 
-- Config lives at `<data>/capabilities.json`, **at most 1 MiB**. A corrupt or old-format file is deleted and replaced with defaults rather than migrated.
+- Config lives at `<data>/capabilities.json`, **at most 1 MiB**. Invalid configurations reset to defaults. Unknown legacy fields such as `chromium` are ignored without deleting a valid file or resetting unrelated settings, and disappear on the next save.
 - **A file cannot move the permission boundary**: `workspace`, `artifacts` (`<data>/artifacts`) and `management_root` (`<data>/native-management`) are always overwritten after loading.
 - `helper_configure` replaces; `helper_patch_config` merges recursively and rejects unknown top-level keys; `helper_reload_config` reloads from disk. Each takes a write lock on the service, a 5 s `capabilities.lock` file lock (`Capability configuration is busy` on timeout), and `prepare_configuration_change()`, so a busy chat leaves configuration intact. The new service is built (validating budgets) before an atomic save: temp file with mode `0600`, `sync_all`, rename, directory sync.
+- Both configure and patch reject `chromium`, `obscura` and `browser_url` explicitly: there is no custom executable, browser endpoint or backend selector. `browser_allow_private_network` is an explicit broad boolean opt-in (default `false`) for loopback/private-network access, not a per-host grant.
+- The render-enabled Obscura v0.2.6 component is source-built and packaged as the sibling `xylo-obscura` executable (`.exe` on Windows), launched on use through private local IPC. It is not an asset download, cloud service, MCP connection or installed-browser fallback. Seven browser tools are available; `browser_download` is unsupported before launch.
 - Construction starts no heavy native service. `helper_release_resources` shuts down the managed browser and llama server; the process exiting releases the rest.
 
 ### Shutdown order

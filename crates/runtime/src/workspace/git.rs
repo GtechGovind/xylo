@@ -1,5 +1,7 @@
 //! Read-only Git inspection for the native workspace; never runs on the UI thread.
 pub mod hunks;
+#[cfg(windows)]
+mod windows;
 
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -151,6 +153,17 @@ pub(super) fn metadata_link(source: &Path, target: &Path) -> Result<()> {
     }
     Ok(())
 }
+// Read views may snapshot files: unlike managed-worktree operations they must
+// never write metadata back. Windows symlinks require a privilege that ordinary
+// users need not have; use unprivileged directory junctions and file copies.
+fn read_metadata_link(source: &Path, target: &Path) -> Result<()> {
+    #[cfg(unix)]
+    metadata_link(source, target)?;
+    #[cfg(windows)]
+    windows::read_metadata_link(source, target)?;
+    Ok(())
+}
+
 /// A neutral metadata view stays alive for the complete native command.
 struct NativeGit {
     command: tokio::process::Command,
@@ -175,9 +188,9 @@ fn prepare_native(root: &Path) -> Result<NativeGit> {
         overlay.path().join("HEAD"),
         bounded_text(&directory.join("HEAD"), 4096)?,
     )?;
-    metadata_link(&directory.join("index"), &overlay.path().join("index"))?;
+    read_metadata_link(&directory.join("index"), &overlay.path().join("index"))?;
     for name in ["objects", "refs", "packed-refs", "shallow"] {
-        metadata_link(&common.join(name), &overlay.path().join(name))?;
+        read_metadata_link(&common.join(name), &overlay.path().join(name))?;
     }
     let original = bounded_text(&common.join("config"), 1024 * 1024)?;
     let mut section = String::new();

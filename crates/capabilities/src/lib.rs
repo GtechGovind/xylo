@@ -36,7 +36,9 @@ pub struct CapabilityConfig {
     /// Application-owned catalogs and lifecycle receipts. The process host
     /// replaces this path; imported capability settings cannot redirect it.
     pub management_root: Option<PathBuf>,
-    pub chromium: Option<PathBuf>,
+    /// Broad opt-in to browser access to loopback and private networks.
+    /// The bundled browser blocks these destinations by default.
+    pub browser_allow_private_network: bool,
     pub pdfium_library: Option<PathBuf>,
     pub llama: Option<models::LlamaConfig>,
     pub whisper: Option<models::SpeechHelper>,
@@ -53,7 +55,7 @@ impl Default for CapabilityConfig {
             artifacts: workspace.join("artifacts"),
             workspace,
             management_root: None,
-            chromium: None,
+            browser_allow_private_network: false,
             pdfium_library: None,
             llama: None,
             whisper: None,

@@ -39,7 +39,15 @@ tempfile = "3"
 sha2 = "0.11"
 hex = "0.4"
 
+[build-dependencies]
+xylo-build = { path = "../..", optional = true }
+embed-resource = "=3.0.12"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+
 [features]
+default = ["bundled-browser"]
+# Build and stage the pinned browser alongside normal Cargo app artifacts.
+bundled-browser = ["dep:xylo-build"]
 # Test-only accessors used by the native validation crate in `validation/`,
 # which compiles these sources with this feature on. Never enabled in the app.
 validation = []

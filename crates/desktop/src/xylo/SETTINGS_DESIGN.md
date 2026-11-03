@@ -120,9 +120,9 @@ available (accent), Disabled (neutral), Error (danger).
   `crate::motion::progress_bar`.
 - Row-level outcomes use `SettingRow::feedback`; page-level failures use
   `inline_error`. Toasts are for global events only.
-- Motion comes from `crate::motion` and respects reduced motion: pages rise
-  in, sub-pages (with a breadcrumb) slide in, list items fade in. All of it is
-  built into the primitives; pages add only `fade_on_change` for status text
+- Navigation and list rows appear immediately, without entrance animation.
+  Useful feedback comes from `crate::motion` and respects reduced motion;
+  pages add only `fade_on_change` for status text
   replaced in place and `collapse` for disclosures.
 
 ## Empty states and destructive actions

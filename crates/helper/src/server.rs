@@ -196,8 +196,8 @@ fn load_configuration(data: &Path, workspace: &Path) -> Result<CapabilityConfig>
             bytes.len() as u64 <= CONFIG_BYTES,
             "Capability configuration exceeds 1MiB budget"
         );
-        // A configuration from an older format or a corrupt one is deleted
-        // and replaced by defaults rather than migrated.
+        // Unknown legacy fields (including chromium) are ignored by serde,
+        // preserving unrelated settings. Only invalid configurations reset.
         match serde_json::from_slice::<CapabilityConfig>(&bytes) {
             Ok(config) => config,
             Err(_) => {
@@ -280,6 +280,14 @@ fn replace_configuration(
     workspace: &Path,
     provided: Option<(Value, bool)>,
 ) -> Result<CapabilityService> {
+    if let Some((value, _)) = &provided {
+        for key in ["chromium", "obscura", "browser_url"] {
+            ensure!(
+                value.get(key).is_none(),
+                "Unsupported browser setting: {key}; Xylo uses only the bundled xylo-obscura runtime, not custom paths or URLs"
+            );
+        }
+    }
     let persist = provided.is_some();
     let mut config = match provided {
         Some((value, true)) => {

@@ -455,6 +455,42 @@ mod xylo {
         }
 
         #[gpui_kit::test]
+        fn chat_home_starters_fit_with_task_details_at_minimum_window_size(
+            cx: &mut TestAppContext,
+        ) {
+            let (window, view) = open(cx);
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    model(view, cx);
+                    view.workspace = Some("/fixture/project".into());
+                    view.workspace_ready = true;
+                    view.settings.ui.sidebar_visible = true;
+                    view.settings.ui.work_panel_open = true;
+                    view.settings.ui.work_panel = "details".into();
+                    view.drafts = super::drafts::DraftUi::new(window);
+                    cx.notify();
+                });
+                window.resize(size(px(1000.), px(680.)));
+                window.bounds_changed(cx);
+                window.render_frame(cx);
+                window.render_frame(cx);
+                let content = window.find("chat-home-content").bounds();
+                let composer = window.find("image-drop-target").bounds();
+                for index in 0..3usize {
+                    let starter = window.find(("chat-home-starter", index)).bounds();
+                    assert!(
+                        starter.top() >= content.top() && starter.bottom() <= content.bottom(),
+                        "starter {index} is clipped: {starter:?}, home={content:?}"
+                    );
+                    assert!(starter.left() >= content.left() && starter.right() <= content.right());
+                }
+                assert!(content.bottom() <= composer.top());
+                assert!(composer.bottom() <= px(680.));
+            })
+            .unwrap();
+        }
+
+        #[gpui_kit::test]
         fn chat_home_starters_populate_editable_drafts_without_execution(cx: &mut TestAppContext) {
             let (window, view) = open(cx);
             cx.update_window(window, |_, window, cx| {
@@ -1322,6 +1358,180 @@ mod xylo {
             }).unwrap();
         }
         #[gpui_kit::test]
+        fn empty_queue_feedback_stays_above_composer_without_queue_controls(
+            cx: &mut TestAppContext,
+        ) {
+            let (handle, view) = open(cx);
+            cx.update_window(handle, |_, window, cx| {
+                cx.set_reduce_motion(true);
+                let item = uuid::Uuid::new_v4();
+                view.update(cx, |view, cx| {
+                    local_interaction_fixture(view, window, cx);
+                    view.settings_open = false;
+                    view.validation_queue_restore_ack(
+                        view.session, item, Err("queue full".into()), window, cx,
+                    );
+                    view.turns.get_mut(&view.session).unwrap().apply(EngineEvent::Phase {
+                        phase: xylo_core::TurnPhase::Thinking,
+                    });
+                    view.invalidate_live_history();
+                    view.sync_history_list(cx);
+                    cx.notify();
+                });
+                for (width, height) in [(1000., 680.), (1380., 880.)] {
+                    window.resize(size(px(width), px(height)));
+                    window.bounds_changed(cx);
+                    window.render_frame(cx);
+                    assert!(window.try_find("next-messages-header").is_none());
+                    assert!(window.try_find("pause-queue").is_none());
+                    assert!(window.find("undo-remove-queued").visible());
+                    assert!(window.find("dismiss-queue-removal").visible());
+                    assert!(window.find("queue-notice").visible());
+                    let panel = window.find("pending-messages-panel").bounds();
+                    let feedback = window.find("queue-removal-feedback").bounds();
+                    let composer = window.find("image-drop-target").bounds();
+                    assert!(
+                        panel.bottom() <= composer.top(),
+                        "Full feedback panel overlaps composer at {width}x{height}: {panel:?}, {composer:?}"
+                    );
+                    assert!(
+                        feedback.top() >= panel.top() && feedback.bottom() <= panel.bottom(),
+                        "Undo must remain inside its panel: {feedback:?}, {panel:?}"
+                    );
+                    assert!(window.find("current-task-status").visible());
+                    assert!(window.find("turn-activity").visible());
+                    let state = view.read(cx);
+                    assert_eq!(state.turns[&state.session].phase, Some(xylo_core::TurnPhase::Thinking));
+                }
+                window.click("dismiss-queue-removal", cx);
+                window.render_frame(cx);
+                assert!(window.try_find("undo-remove-queued").is_none());
+                assert!(window.try_find("queue-removal-feedback").is_none());
+                assert!(window.try_find("dismiss-queue-removal").is_none());
+                assert!(window.find("queue-notice").visible());
+                assert!(window.find("pending-messages-panel").visible());
+                assert!(window.try_find("next-messages-header").is_none());
+                assert!(window.try_find("pause-queue").is_none());
+                {
+                    let state = view.read(cx);
+                    assert_eq!(state.composer.read(cx).value().as_ref(), "Keep this main draft");
+                    assert!(state.turn_queue.items.get(&state.session).is_none_or(Vec::is_empty));
+                    assert!(state.running(), "Dismissing feedback must not stop the current task");
+                }
+                view.update(cx, |view, cx| {
+                    view.validation_queue_restore_ack(view.session, item, Ok(vec![]), window, cx);
+                });
+                window.render_frame(cx);
+                assert!(window.try_find("queue-notice").is_none());
+                assert!(window.try_find("pending-messages-panel").is_none());
+                assert!(window.find("current-task-status").visible());
+            })
+            .unwrap();
+        }
+
+        #[gpui_kit::test]
+        fn recovery_only_panel_retains_payload_without_queue_controls(cx: &mut TestAppContext) {
+            let (handle, view) = open(cx);
+            cx.update_window(handle, |_, window, cx| {
+                let id = view.update(cx, |view, cx| {
+                    let (_, image) = local_interaction_fixture(view, window, cx);
+                    let id = uuid::Uuid::new_v4();
+                    let item = xylo_runtime::turn_queue::QueuedTurn {
+                        id,
+                        paused: false,
+                        reason: None,
+                        turn: xylo_core::TurnRequest {
+                            session_id: view.session,
+                            turn_id: id,
+                            workspace: "/recovered-fixture".into(),
+                            prompt: "Retain complete recovered input".into(),
+                            attachments: vec![image.clone()],
+                            provider: view.settings.provider.clone(),
+                            permissions: view.settings.permissions,
+                        },
+                    };
+                    view.validation_queue_edit_ack(item, Ok(vec![]), window, cx);
+                    // Clear the acknowledgement notice without consuming the recovery payload.
+                    view.validation_queue_restore_ack(view.session, id, Ok(vec![]), window, cx);
+                    let recovered = view.validation_recovered_queue_edit(view.session).unwrap();
+                    assert_eq!(recovered.text, "Retain complete recovered input");
+                    assert_eq!(recovered.attachments, vec![image]);
+                    id
+                });
+                for (width, height) in [(1000., 680.), (1380., 880.)] {
+                    window.resize(size(px(width), px(height)));
+                    window.bounds_changed(cx);
+                    window.render_frame(cx);
+                    assert!(window.try_find("next-messages-header").is_none());
+                    assert!(window.try_find("pause-queue").is_none());
+                    assert!(window.try_find("queue-notice").is_none());
+                    assert!(window.try_find("undo-remove-queued").is_none());
+                    assert!(window.find("queue-edit-recovery").visible());
+                    assert!(
+                        window
+                            .find(gpui_kit::ElementId::Name(
+                                format!("recover-queue-edit-{id}").into()
+                            ))
+                            .visible()
+                    );
+                    let panel = window.find("pending-messages-panel").bounds();
+                    assert!(panel.bottom() <= window.find("image-drop-target").bounds().top());
+                }
+            })
+            .unwrap();
+        }
+
+        #[gpui_kit::test]
+        fn guidance_only_panel_retains_payload_without_queue_controls(cx: &mut TestAppContext) {
+            let (handle, view) = open(cx);
+            cx.update_window(handle, |_, window, cx| {
+                let id = view.update(cx, |view, cx| {
+                    local_interaction_fixture(view, window, cx);
+                    let id = uuid::Uuid::new_v4();
+                    view.validation_track_queued_guidance(xylo_runtime::turn_queue::QueuedTurn {
+                        id,
+                        paused: false,
+                        reason: None,
+                        turn: xylo_core::TurnRequest {
+                            session_id: view.session,
+                            turn_id: id,
+                            workspace: "/fixture".into(),
+                            prompt: "Keep this queued task direction".into(),
+                            attachments: vec![],
+                            provider: view.settings.provider.clone(),
+                            permissions: view.settings.permissions,
+                        },
+                    });
+                    cx.notify();
+                    id
+                });
+                for (width, height) in [(1000., 680.), (1380., 880.)] {
+                    window.resize(size(px(width), px(height)));
+                    window.bounds_changed(cx);
+                    window.render_frame(cx);
+                    assert!(window.try_find("next-messages-header").is_none());
+                    assert!(window.try_find("pause-queue").is_none());
+                    assert!(window.try_find("queue-notice").is_none());
+                    assert!(window.try_find("undo-remove-queued").is_none());
+                    assert!(
+                        window
+                            .find(gpui_kit::SharedString::from(format!(
+                                "pending-queued-guidance-{id}"
+                            )))
+                            .visible()
+                    );
+                    let panel = window.find("pending-messages-panel").bounds();
+                    assert!(panel.bottom() <= window.find("image-drop-target").bounds().top());
+                    assert_eq!(
+                        view.read(cx).composer.read(cx).value().as_ref(),
+                        "Keep this main draft"
+                    );
+                }
+            })
+            .unwrap();
+        }
+
+        #[gpui_kit::test]
         fn queue_restore_ack_clears_undo_only_after_success(cx: &mut TestAppContext) {
             let (window, view) = open(cx);
             cx.update_window(window, |_, window, cx| {
@@ -1380,23 +1590,42 @@ mod xylo {
                     let ids = [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
                     for (index, id) in ids.into_iter().enumerate() {
                         let item = xylo_runtime::turn_queue::QueuedTurn {
-                            id, paused: false, reason: None,
+                            id,
+                            paused: false,
+                            reason: None,
                             turn: xylo_core::TurnRequest {
-                                session_id: view.session, turn_id: id,
+                                session_id: view.session,
+                                turn_id: id,
                                 workspace: view.workspace.clone().unwrap(),
-                                prompt: format!("Keep queued message {index}"), attachments: vec![],
-                                provider: view.settings.provider.clone(), permissions: view.settings.permissions,
+                                prompt: format!("Keep queued message {index}"),
+                                attachments: vec![],
+                                provider: view.settings.provider.clone(),
+                                permissions: view.settings.permissions,
                             },
                         };
                         view.validation_queue_edit_ack(item, Ok(vec![]), window, cx);
                     }
-                    for id in ids { assert!(view.validation_recovered_queue_ids().contains(&id)); }
-                    assert_eq!(view.composer.read(cx).value().as_ref(), "Keep the approved colors and refine the composer spacing.");
+                    for id in ids {
+                        assert!(view.validation_recovered_queue_ids().contains(&id));
+                    }
+                    assert_eq!(
+                        view.composer.read(cx).value().as_ref(),
+                        "Keep the approved colors and refine the composer spacing."
+                    );
                     ids
                 });
                 window.render_frame(cx);
-                for id in ids { assert!(window.find(gpui_kit::ElementId::Name(format!("recover-queue-edit-{id}").into())).visible()); }
-            }).unwrap();
+                for id in ids {
+                    assert!(
+                        window
+                            .find(gpui_kit::ElementId::Name(
+                                format!("recover-queue-edit-{id}").into()
+                            ))
+                            .visible()
+                    );
+                }
+            })
+            .unwrap();
         }
         #[gpui_kit::test]
         fn queue_edit_start_race_recovers_payload_without_submission(cx: &mut TestAppContext) {
@@ -1568,6 +1797,156 @@ mod xylo {
                 });
                 window.render_frame(cx);
                 assert!(window.find("queue-notice").visible());
+            })
+            .unwrap();
+        }
+
+        fn action_race_queue_item(view: &Xylo) -> xylo_runtime::turn_queue::QueuedTurn {
+            let id = uuid::Uuid::new_v4();
+            xylo_runtime::turn_queue::QueuedTurn {
+                id,
+                paused: false,
+                reason: None,
+                turn: xylo_core::TurnRequest {
+                    session_id: view.session,
+                    turn_id: id,
+                    workspace: view.workspace.clone().unwrap(),
+                    prompt: "Review this queued task".into(),
+                    provider: view.settings.provider.clone(),
+                    permissions: view.settings.permissions,
+                    attachments: vec![],
+                },
+            }
+        }
+
+        #[gpui_kit::test]
+        fn pending_queue_operation_cannot_be_hijacked_by_edit(cx: &mut TestAppContext) {
+            let (handle, view) = open(cx);
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    local_interaction_fixture(view, window, cx);
+                    view.workspace = Some(std::path::PathBuf::from("/fixture"));
+                    let item = action_race_queue_item(view);
+                    view.turn_queue
+                        .items
+                        .insert(view.session, vec![item.clone()]);
+                    assert!(view.running());
+                    assert!(item.turn.attachments.is_empty());
+                    assert!(item.turn.prompt.len() <= xylo_core::MAX_STEERING_BYTES);
+                    assert!(
+                        !view.validation_edit_queued_turn_while_pending(item, cx),
+                        "Edit must not attach its payload to an existing Send/Remove request"
+                    );
+                    cx.notify();
+                });
+                window.render_frame(cx);
+                window.click(("preview-queued", 0usize), cx);
+                window.render_frame(cx);
+                assert!(window.find("queued-message-dialog").visible());
+                assert_eq!(
+                    window.find("send-queued-dialog").label(),
+                    Some("Update task")
+                );
+                for id in [
+                    "edit-queued-dialog",
+                    "send-queued-dialog",
+                    "remove-queued-dialog",
+                ] {
+                    assert_eq!(window.find(id).disabled(), Some(true), "{id}");
+                }
+                let view = view.read(cx);
+                assert_eq!(
+                    view.composer.read(cx).value().as_ref(),
+                    "Keep this main draft"
+                );
+                assert!(view.validation_recovered_queue_ids().is_empty());
+            })
+            .unwrap();
+        }
+
+        #[gpui_kit::test]
+        fn pending_queue_restore_disables_undo_and_dismiss_until_failure(cx: &mut TestAppContext) {
+            let (handle, view) = open(cx);
+            cx.update_window(handle, |_, window, cx| {
+                let (request, session) = view.update(cx, |view, cx| {
+                    local_interaction_fixture(view, window, cx);
+                    let session = view.session;
+                    let request =
+                        view.validation_queue_restore_pending(session, uuid::Uuid::new_v4());
+                    cx.notify();
+                    (request, session)
+                });
+                window.render_frame(cx);
+                for id in ["undo-remove-queued", "dismiss-queue-removal"] {
+                    assert_eq!(window.find(id).disabled(), Some(true), "{id}");
+                }
+                window.click("dismiss-queue-removal", cx);
+                window.render_frame(cx);
+                assert!(window.find("undo-remove-queued").visible());
+                view.update(cx, |view, cx| {
+                    view.turn_queue_result(
+                        request,
+                        session,
+                        Err("Retry restore".into()),
+                        window,
+                        cx,
+                    );
+                });
+                window.render_frame(cx);
+                for id in ["undo-remove-queued", "dismiss-queue-removal"] {
+                    assert!(window.find(id).visible());
+                    assert_ne!(
+                        window.find(id).disabled(),
+                        Some(true),
+                        "{id} must allow retry"
+                    );
+                }
+                window.click("dismiss-queue-removal", cx);
+                window.render_frame(cx);
+                assert!(window.try_find("undo-remove-queued").is_none());
+            })
+            .unwrap();
+        }
+
+        #[gpui_kit::test]
+        fn pending_queue_pause_disables_toggle_until_acknowledgement(cx: &mut TestAppContext) {
+            let (handle, view) = open(cx);
+            cx.update_window(handle, |_, window, cx| {
+                let (request, session, mut item) = view.update(cx, |view, cx| {
+                    local_interaction_fixture(view, window, cx);
+                    view.workspace = Some(std::path::PathBuf::from("/fixture"));
+                    let item = action_race_queue_item(view);
+                    view.turn_queue
+                        .items
+                        .insert(view.session, vec![item.clone()]);
+                    let request = view.validation_queue_pause_pending(view.session);
+                    cx.notify();
+                    (request, view.session, item)
+                });
+                window.render_frame(cx);
+                assert_eq!(window.find("pause-queue").label(), Some("Pause"));
+                assert_eq!(window.find("pause-queue").disabled(), Some(true));
+                item.paused = true;
+                view.update(cx, |view, cx| {
+                    view.turn_queue_result(request, session, Ok(vec![item.clone()]), window, cx);
+                });
+                window.render_frame(cx);
+                assert_ne!(window.find("pause-queue").disabled(), Some(true));
+                assert_eq!(window.find("pause-queue").label(), Some("Resume"));
+                let request = view.update(cx, |view, cx| {
+                    let request = view.validation_queue_pause_pending(session);
+                    cx.notify();
+                    request
+                });
+                window.render_frame(cx);
+                assert_eq!(window.find("pause-queue").disabled(), Some(true));
+                item.paused = false;
+                view.update(cx, |view, cx| {
+                    view.turn_queue_result(request, session, Ok(vec![item]), window, cx);
+                });
+                window.render_frame(cx);
+                assert_ne!(window.find("pause-queue").disabled(), Some(true));
+                assert_eq!(window.find("pause-queue").label(), Some("Pause"));
             })
             .unwrap();
         }
@@ -1758,9 +2137,18 @@ mod xylo {
                     window.resize(size(px(width), px(height)));
                     window.bounds_changed(cx);
                     window.render_frame(cx);
+                    let panel = window.find("pending-messages-panel").bounds();
                     let queue = window.find("composer-pending").bounds();
                     let composer = window.find("image-drop-target").bounds();
                     let status = window.find("composer-status-line").bounds();
+                    assert!(
+                        panel.bottom() <= composer.top(),
+                        "The full pending messages panel belongs above the composer: {panel:?}, {composer:?}"
+                    );
+                    assert!(
+                        queue.top() >= panel.top() && queue.bottom() <= panel.bottom(),
+                        "Pending message rows must remain inside the full panel: {queue:?}, {panel:?}"
+                    );
                     assert!(
                         queue.bottom() <= composer.top(),
                         "Pending messages belong above the composer"

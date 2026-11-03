@@ -4,7 +4,7 @@
 //! application code. Native primitives from the toolkit are reused only for
 //! behaviour: text editing, focus, keyboard and accessibility semantics.
 //!
-//! The look is Xylo's own. Cool, quiet neutrals keep long sessions restful;
+//! The look is Xylo's own. Quiet, neutral surfaces keep long sessions restful;
 //! a single indigo accent (trust, focus) marks the one thing to act on, with
 //! mint reserved for success so progress reads at a glance. Display text is a
 //! tight sans; generous radii soften every control the user touches.
@@ -13,49 +13,17 @@ use gpui_kit::component::Icon;
 use gpui_kit::{prelude::*, *};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Xylo's mark drawn directly in Rust for the window icon: a white prompt
-/// chevron with a spark, on an indigo tile.
+/// One canonical logo for packaged icons, the Dock, X11 and the system tray.
+/// Rust resizes the same embedded artwork used by the Windows resource and
+/// the packager, preserving its padding and optical alignment at every size.
 pub fn brand_pixels(size: u32) -> image::RgbaImage {
-    let canvas = size as f32;
-    let inset = canvas * 0.08;
-    let s = canvas - 2. * inset;
-    let radius = s * 0.25;
-    let stroke = (s / 11.).max(1.);
-    // Chevron ">" in the lower-left two thirds; spark centre upper-right.
-    let (ax, ay) = (s * 0.22, s * 0.30);
-    let (bx, by) = (s * 0.46, s * 0.52);
-    let (cx, cy) = (s * 0.22, s * 0.74);
-    let (sx, sy, sr) = (s * 0.72, s * 0.30, s * 0.17);
-    let segment = |x: f32, y: f32, x1: f32, y1: f32, x2: f32, y2: f32| {
-        let (dx, dy) = (x2 - x1, y2 - y1);
-        let t = (((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy)).clamp(0., 1.);
-        let (px, py) = (x1 + t * dx, y1 + t * dy);
-        ((x - px).powi(2) + (y - py).powi(2)).sqrt()
-    };
-    image::RgbaImage::from_fn(size, size, |x, y| {
-        let (fx, fy) = (x as f32 + 0.5 - inset, y as f32 + 0.5 - inset);
-        // An inset rounded tile keeps the Dock silhouette and visual weight
-        // consistent with native macOS icons. Fractional coverage softens edges.
-        let qx = (fx - s * 0.5).abs() - (s * 0.5 - radius);
-        let qy = (fy - s * 0.5).abs() - (s * 0.5 - radius);
-        let distance = qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - radius;
-        let alpha = ((0.5 - distance).clamp(0., 1.) * 255.).round() as u8;
-        if alpha == 0 {
-            return image::Rgba([0, 0, 0, 0]);
-        }
-        let chevron = segment(fx, fy, ax, ay, bx, by) <= stroke / 2.
-            || segment(fx, fy, bx, by, cx, cy) <= stroke / 2.;
-        let underline = segment(fx, fy, s * 0.50, s * 0.80, s * 0.82, s * 0.80) <= stroke / 2.;
-        // Four-point spark: |dx|^0.5 + |dy|^0.5 <= r^0.5 gives the concave star.
-        let (dx, dy) = ((fx - sx).abs(), (fy - sy).abs());
-        let spark = dx.sqrt() + dy.sqrt() <= sr.sqrt();
-        let mark = chevron || underline || spark;
-        image::Rgba(if mark {
-            [0xff, 0xff, 0xff, alpha]
-        } else {
-            [0x5b, 0x5f, 0xe6, alpha]
-        })
-    })
+    let source = image::load_from_memory_with_format(
+        include_bytes!("../assets/xylo-icon.png"),
+        image::ImageFormat::Png,
+    )
+    .expect("embedded Xylo logo must be a valid PNG")
+    .to_rgba8();
+    image::imageops::resize(&source, size, size, image::imageops::FilterType::Lanczos3)
 }
 
 // ---------------------------------------------------------------------------
@@ -77,50 +45,50 @@ fn color(light: u32, dark: u32) -> u32 {
 // Colour tokens
 // ---------------------------------------------------------------------------
 //
-// Surfaces are a warm neutral scale. `bg` is the conversation canvas, `panel`
+// Surfaces are a neutral scale. `bg` is the conversation canvas, `panel`
 // is anything raised above it (composer, cards, menus) and `sidebar` sits
 // slightly behind the canvas.
 
 /// Conversation canvas.
 pub fn bg() -> u32 {
-    color(0xf6f7fa, 0x0f1117)
+    color(0xfafafa, 0x18181b)
 }
 /// Raised surface: composer, cards, popovers, inputs.
 pub fn panel() -> u32 {
-    color(0xffffff, 0x181b23)
+    color(0xffffff, 0x242427)
 }
 /// Navigation rail behind the canvas.
 pub fn sidebar() -> u32 {
-    color(0xeff1f6, 0x0b0d13)
+    color(0xf0f0f2, 0x202023)
 }
 /// Recessed surface inside a panel (code, tool output, user bubble).
 pub fn well() -> u32 {
-    color(0xeceef4, 0x222633)
+    color(0xf0f0f3, 0x2e2e32)
 }
 /// Hairline separators.
 pub fn border() -> u32 {
-    color(0xe3e6ee, 0x272c38)
+    color(0xe2e2e7, 0x343438)
 }
 /// Emphasised separators and control outlines.
 pub fn border_strong() -> u32 {
-    color(0xcfd4e0, 0x353b4a)
+    color(0xcdcdd4, 0x48484e)
 }
 /// Primary text.
 pub fn text() -> u32 {
-    color(0x15171d, 0xeceef4)
+    color(0x1d1d1f, 0xf5f5f7)
 }
 /// Secondary text that still carries content.
 pub fn text_secondary() -> u32 {
-    color(0x3b4049, 0xb9bfcc)
+    color(0x424248, 0xc6c6ce)
 }
 /// Captions, metadata and placeholders.
 pub fn muted() -> u32 {
-    color(0x565d6a, 0xa3aab8)
+    color(0x5d5d65, 0xafafb8)
 }
 /// Faint text for tertiary metadata. Still readable (4.5:1 or better on the
 /// canvas and panel in both themes); `muted` stays one step stronger.
 pub fn faint() -> u32 {
-    color(0x666d7b, 0x8a92a2)
+    color(0x686871, 0xa0a0aa)
 }
 /// The single brand accent.
 pub fn brand() -> u32 {
@@ -140,7 +108,7 @@ pub fn danger_foreground() -> u32 {
 }
 /// Accent tinted surface.
 pub fn brand_soft() -> u32 {
-    color(0xeceeff, 0x24264a)
+    color(0xefedff, 0x302d49)
 }
 /// Alias kept for existing call sites.
 pub fn accent() -> u32 {
@@ -155,18 +123,18 @@ pub fn lavender() -> u32 {
     brand_soft()
 }
 pub fn selected() -> u32 {
-    color(0xe3e6f3, 0x242a3a)
+    color(0xe0e0e6, 0x38383e)
 }
 pub fn hover() -> u32 {
-    color(0xe6e9f1, 0x1c2029)
+    color(0xe7e7ec, 0x303035)
 }
 /// Hover on the raised `panel` surface.
 pub fn hover_panel() -> u32 {
-    color(0xf2f4f8, 0x20242e)
+    color(0xf5f5f7, 0x303035)
 }
 /// Pressed state on neutral surfaces.
 pub fn pressed() -> u32 {
-    color(0xdadfeb, 0x2a3040)
+    color(0xdadadf, 0x404046)
 }
 /// Status and change colours; each meets 4.5:1 against its panel in both themes.
 pub fn success() -> u32 {
@@ -188,7 +156,7 @@ pub fn success_bg() -> u32 {
     color(0xe6f7f2, 0x16302a)
 }
 pub fn code_bg() -> u32 {
-    color(0xeff1f6, 0x0b0d13)
+    color(0xf0f0f3, 0x202023)
 }
 pub fn diff_added_bg() -> u32 {
     color(0xe4f6ef, 0x16302a)
@@ -259,11 +227,6 @@ pub fn brand_mark(size: f32) -> Div {
         .text_color(rgb(brand_foreground()))
         .child(Icon::new(XyloMark).size(px(size * 0.72)))
 }
-/// Outline variant of the mark for inline use next to assistant turns.
-pub fn brand_glyph(size: f32) -> Icon {
-    Icon::new(XyloMark).size(px(size)).text_color(rgb(brand()))
-}
-
 /// Circular initial avatar for the person.
 pub fn avatar(initial: impl Into<SharedString>, size: f32) -> Div {
     div()
@@ -351,33 +314,6 @@ pub fn pill(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui_ki
         .cursor_pointer()
         .hover(|style| style.bg(rgb(hover_panel())).text_color(rgb(text())))
         .active(|style| style.bg(rgb(pressed())))
-        .child(label)
-}
-/// Outlined suggestion chip with an optional leading glyph.
-pub fn chip_with(
-    id: impl Into<ElementId>,
-    glyph: Option<Icon>,
-    label: impl Into<SharedString>,
-) -> gpui_kit::base::Button {
-    let label: SharedString = label.into();
-    focus_ring(gpui_kit::base::Button::new(id))
-        .accessibility_label(label.clone())
-        .h(px(36.))
-        .px(px(14.))
-        .rounded_full()
-        .border_color(rgb(border_strong()))
-        .focus_visible(|style| style.border_color(rgb(brand())))
-        .bg(rgb(panel()))
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .text_size(px(13.))
-        .text_color(rgb(text_secondary()))
-        .cursor_pointer()
-        .hover(|style| style.bg(rgb(hover_panel())).text_color(rgb(text())))
-        .when_some(glyph, |button, glyph| {
-            button.child(glyph.size(px(14.)).text_color(rgb(accent_text())))
-        })
         .child(label)
 }
 /// Circular brand-coloured send control.
@@ -490,7 +426,7 @@ pub fn nav_item(
         .hover(|d| d.bg(rgb(hover())).text_color(rgb(text())))
         .active(|d| d.bg(rgb(pressed())))
         .child(crate::icons::icon(name).text_color(rgb(if active {
-            crate::icons::hover_color()
+            accent_text()
         } else {
             crate::icons::rest_color()
         })))
@@ -516,6 +452,7 @@ pub fn recent_item(
         .bg(rgb(if active { selected() } else { sidebar() }))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(hover())).text_color(rgb(text())))
+        .active(|style| style.bg(rgb(pressed())))
         .flex()
         .items_center()
         .gap_2()

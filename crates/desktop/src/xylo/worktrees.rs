@@ -120,7 +120,21 @@ impl Xylo {
                             .set_description(format!("Delete {} and all uncommitted or ignored files in it? Git branches and commits are retained.", path.display()))
                             .set_buttons(rfd::MessageButtons::OkCancel).show().await;
                         if decision == rfd::MessageDialogResult::Ok {
-                            let _ = this.update_in(cx, |view, _, cx| { if let Some(host) = &view.host { let result = host.remove_worktree(path, true); view.result(result, cx); } });
+                            let _ = this.update_in(cx, |view, _, cx| {
+                                // The user can open this checkout or a terminal while
+                                // the native confirmation dialog is awaiting its answer.
+                                if view.workspace.as_ref() == Some(&path)
+                                    || view.terminal_cache.contains_key(&path)
+                                {
+                                    view.error = Some("Close this worktree’s terminals and open another project before removing it.".into());
+                                    cx.notify();
+                                    return;
+                                }
+                                if let Some(host) = &view.host {
+                                    let result = host.remove_worktree(path, true);
+                                    view.result(result, cx);
+                                }
+                            });
                         }
                     }).detach();
                 }))));

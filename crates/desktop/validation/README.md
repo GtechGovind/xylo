@@ -4,10 +4,10 @@ Run these commands from the repository root. The checked-in Cargo configuration 
 
 ```sh
 # Fast compile feedback without linking the app.
-cargo check -p xylo --locked
+cargo check -p xylo --locked --no-default-features
 
 # Build the desktop, worker, helper, and CLI; no evaluation binary.
-cargo app
+cargo build --locked
 
 # Run only the native checks relevant to the change.
 cargo native-test --test composer-interactions
@@ -40,7 +40,9 @@ Screenshots default to `crates/desktop/validation/target/native-preview` even wi
 
 Lockfiles remain separate. Consolidating them or the harness executables is a later structural change; do not casually add all native capture targets to ordinary `cargo test --workspace`.
 
-Build a local macOS bundle with `python3 scripts/bundle-macos.py` from the repository root
+Build a local macOS bundle with `cargo bundle-macos` from the repository root
 (`--profile debug` is available for development). The bundle contains copies of the desktop,
-worker, helper and CLI programs from the same profile, so clearing `target` cannot break it.
-Plain `cargo build` and `cargo build --release` now build all four required programs.
+worker, helper, CLI and Obscura programs from the same profile, so clearing `target` cannot break it.
+Plain `cargo build` and `cargo build --release` build the four application programs and the
+bundled browser through the desktop crate's default `bundled-browser` feature. Build tooling
+and protocol test fixtures are Rust; Python is not a prerequisite.

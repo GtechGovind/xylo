@@ -48,6 +48,7 @@ pub(super) struct HistorySearchUi {
     chat_hits: Vec<(Uuid, String)>,
     chat_error: Option<String>,
     open: bool,
+    return_focus: Option<FocusHandle>,
     items: Vec<HistoryMatch>,
     before: Option<ConversationCursor>,
     has_more: bool,
@@ -79,6 +80,7 @@ impl HistorySearchUi {
             chat_hits: vec![],
             chat_error: None,
             open: false,
+            return_focus: None,
             items: Vec::new(),
             before: None,
             has_more: false,
@@ -125,6 +127,11 @@ impl HistorySearchUi {
     pub(super) fn validation_request(&self) -> Option<Uuid> {
         self.request.as_ref().map(|request| request.id)
     }
+
+    #[cfg(test)]
+    pub(super) fn validation_notice(&self) -> &str {
+        &self.notice
+    }
 }
 
 /// Indices of the chats whose shown title contains `query`, ignoring case,
@@ -165,7 +172,7 @@ pub(super) fn age_label(timestamp: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64);
-    let elapsed = (now - seconds).max(0);
+    let elapsed = now.saturating_sub(seconds).max(0);
     match elapsed {
         0..60 => "now".into(),
         60..3600 => format!("{}m", elapsed / 60),
@@ -234,6 +241,8 @@ impl Xylo {
                     self.history_search.chat_error = Some("Saved history is unavailable.".into())
                 }
             }
+        } else {
+            self.history_search.chat_error = Some("Saved history is unavailable.".into());
         }
         cx.notify();
     }
@@ -285,8 +294,11 @@ impl Xylo {
         cx: &mut Context<Self>,
     ) {
         if self.history_search.open && query.is_none() {
-            self.close_history_search(cx);
+            self.close_history_search(window, cx);
             return;
+        }
+        if !self.history_search.open {
+            self.history_search.return_focus = window.focused(cx);
         }
         self.history_search.reset();
         self.history_search.open = true;
@@ -298,9 +310,12 @@ impl Xylo {
             .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
-    pub(super) fn close_history_search(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_history_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.history_search.reset();
         self.history_search.open = false;
+        if let Some(focus) = self.history_search.return_focus.take() {
+            focus.focus(window, cx);
+        }
         cx.notify();
     }
     pub(super) fn history_search_changed(&mut self, cx: &mut Context<Self>) {
@@ -359,6 +374,7 @@ impl Xylo {
         if result.is_err() {
             // Scrolling must not retry a page that could not be requested.
             self.history_search.has_more = false;
+            self.history_search.notice = "Saved message search is unavailable. Try again.".into();
         }
         if result.is_ok() {
             self.history_search.request = Some(PendingSearch {
@@ -463,14 +479,14 @@ impl Xylo {
                     return;
                 };
                 let (id, workspace) = (chat.id, chat.workspace.clone());
-                self.close_history_search(cx);
+                self.close_history_search(window, cx);
                 self.open_conversation(id, workspace, window, cx);
             }
             PaletteRow::Message(index) => {
                 let Some(hit) = self.history_search.items.get(index).cloned() else {
                     return;
                 };
-                self.close_history_search(cx);
+                self.close_history_search(window, cx);
                 match hit.message_id {
                     Some(anchor) => self.open_history_message(hit.conversation, anchor, window, cx),
                     None => self.open_conversation(
@@ -597,18 +613,18 @@ impl Xylo {
             .pt(px(88.))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, _, _, cx| view.close_history_search(cx)),
+                cx.listener(|view, _, window, cx| view.close_history_search(window, cx)),
             )
-            .capture_key_down(cx.listener(|view, event: &KeyDownEvent, _, cx| {
+            .capture_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
-                    "escape" => view.close_history_search(cx),
+                    "escape" => view.close_history_search(window, cx),
                     "down" => view.palette_move(1, cx),
                     "up" => view.palette_move(-1, cx),
                     _ => return,
                 }
                 cx.stop_propagation();
             }))
-            .child(crate::motion::scale_fade_in("history-palette-enter", card))
+            .child(card)
             .into_any_element()
     }
     fn palette_row(

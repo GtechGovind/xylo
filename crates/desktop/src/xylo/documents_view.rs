@@ -30,9 +30,16 @@ impl Xylo {
                         return;
                     };
                     view.documents.source_conflict = false;
+                    view.documents.source = Some(snapshot.source.clone());
                     view.documents.edits.clear();
                     view.documents.pending_copy = None;
+                    view.documents.selected_sheet = None;
+                    view.documents.selected = None;
+                    view.documents.paragraph = None;
+                    view.documents.grid = None;
+                    view.documents.grid_subscription = None;
                     view.documents.recovery_applied = true;
+                    view.documents.notice = "Opening document…".into();
                     view.document_snapshot(snapshot, ReadKind::Initial, window, cx);
                     view.document_draft_changed(cx);
                     view.document_persist_active(cx);
@@ -118,14 +125,13 @@ impl Xylo {
                             .flex()
                             .gap_2()
                             .items_center()
-                            .child(
-                                div()
-                                    .w(px(90.))
-                                    .child(Input::new(&self.documents.coordinate)),
-                            )
+                            .child(div().w(px(90.)).child(
+                                Input::new(&self.documents.coordinate).aria_label("Cell address"),
+                            ))
                             .child(
                                 div().flex_1().min_w_0().child(
                                     Input::new(&self.documents.value)
+                                        .aria_label("Cell value or formula")
                                         .readonly(!self.document_selected_editable(cx)),
                                 ),
                             ),
@@ -293,7 +299,7 @@ impl Xylo {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(Input::new(&self.documents.name)),
+                        .child(Input::new(&self.documents.name).aria_label("Saved copy name")),
                 )
                 .child(
                     primary("document-save-copy", "Save a copy")
@@ -352,5 +358,68 @@ impl Xylo {
             );
         }
         panel.into_any_element()
+    }
+}
+
+#[cfg(all(test, not(feature = "validation")))]
+mod tests {
+    use super::{
+        DocumentContent, DocumentEdit, DocumentKind, DocumentSnapshot, DocumentSource, PathBuf,
+        PermissionMode, Xylo,
+    };
+    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+
+    #[gpui_kit::test]
+    fn discarding_recovery_opens_the_current_source_revision(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+            })
+            .unwrap()
+        });
+        let current = DocumentSource {
+            path: PathBuf::from("/project/notes.txt"),
+            revision: "current".into(),
+            bytes: 12,
+            kind: DocumentKind::Text,
+        };
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.settings.permissions = PermissionMode::FullAccess;
+                view.documents.source = Some(DocumentSource {
+                    revision: "recovered".into(),
+                    ..current.clone()
+                });
+                view.documents.snapshot = Some(DocumentSnapshot {
+                    source: current.clone(),
+                    content: DocumentContent::Text {
+                        text: "Current text".into(),
+                    },
+                });
+                view.documents.recovery_applied = true;
+                view.documents.source_conflict = true;
+                view.documents.selected_sheet = Some("Removed worksheet".into());
+                view.documents.selected = Some((900, 200));
+                view.documents.edits = vec![DocumentEdit::Text {
+                    text: "Recovered edit".into(),
+                }];
+                view.document_discard_recovery(window, cx);
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.documents.source.as_ref(), Some(&current));
+            assert!(!view.documents.source_conflict);
+            assert!(view.documents.edits.is_empty());
+            assert!(view.documents.selected_sheet.is_none());
+            assert!(view.documents.selected.is_none());
+            assert_eq!(
+                view.documents.text.read(cx).value().as_str(),
+                "Current text"
+            );
+        });
     }
 }

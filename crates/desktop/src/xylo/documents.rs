@@ -352,7 +352,7 @@ impl Xylo {
             row: key.row / self.documents.page_rows * self.documents.page_rows,
             column: key.column / self.documents.page_columns * self.documents.page_columns,
         };
-        if grid.read(cx).delegate().failed.contains(&key)
+        if grid.read(cx).delegate().failed.contains_key(&key)
             || self
                 .documents
                 .reads
@@ -469,12 +469,19 @@ impl Xylo {
                 }
                 if let Some(Read {
                     kind: ReadKind::Grid(key),
+                    args,
                     ..
                 }) = read.as_ref()
                     && let Some(grid) = &self.documents.grid
                 {
                     grid.update(cx, |grid, cx| {
-                        grid.delegate_mut().failed.insert(key.clone());
+                        grid.delegate_mut().failed.insert(
+                            key.clone(),
+                            (
+                                args["row_count"].as_u64().unwrap_or(ROWS as u64) as u32,
+                                args["column_count"].as_u64().unwrap_or(COLUMNS as u64) as u32,
+                            ),
+                        );
                         cx.notify();
                     });
                 }

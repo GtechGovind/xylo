@@ -8,21 +8,20 @@ use crate::tools::{
 use std::sync::Arc;
 use xylo_core::{EngineEvent, PermissionMode};
 
+mod protocol_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../runtime/test_support.rs"
+    ));
+}
+
 fn configure(dir: &Path, extra: &[&str]) -> std::path::PathBuf {
     let marker = dir.join("server-started");
-    let mut args = vec![
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../runtime/src/lsp/agent/test_server.py"
-        )
-        .to_owned(),
-        "--marker".into(),
-        marker.to_string_lossy().into_owned(),
-    ];
+    let mut args = vec!["--marker".into(), marker.to_string_lossy().into_owned()];
     args.extend(extra.iter().map(|arg| (*arg).to_owned()));
     std::fs::write(
         dir.join("profile/language-servers.json"),
-        json!({"servers":[{"languages":["python"],"executable":"/usr/bin/python3","args":args}]})
+        json!({"servers":[{"languages":["python"],"executable":protocol_fixture::executable("lsp"),"args":args}]})
             .to_string(),
     )
     .unwrap();

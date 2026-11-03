@@ -149,3 +149,20 @@ fn harness_notes_alone_are_not_work_to_fold() {
         "A plain answer gets no 'Worked for' header for a note"
     );
 }
+
+#[test]
+fn one_reasoning_passage_reuses_its_markdown_snapshot() {
+    let first: gpui_kit::SharedString = "Consider the alternatives".to_owned().into();
+    let mut turn = TurnState::default();
+    turn.segments
+        .push(crate::state::Segment::Thinking(first.clone()));
+    assert_eq!(super::thinking_text(&turn).as_ptr(), first.as_ptr());
+    turn.segments
+        .push(crate::state::Segment::Text("Answer".into()));
+    turn.segments
+        .push(crate::state::Segment::Thinking("Another thought".into()));
+    assert_eq!(
+        super::thinking_text(&turn).as_ref(),
+        "Consider the alternatives\n\nAnother thought"
+    );
+}

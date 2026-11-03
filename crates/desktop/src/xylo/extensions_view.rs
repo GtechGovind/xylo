@@ -341,11 +341,23 @@ impl Xylo {
             .unwrap_or_default();
         let total = directory.page.as_ref().map_or(0, |page| page.total);
         let loading = entries.is_empty()
-            && (directory.page.is_none()
+            && ((directory.page.is_none() && (directory.search.is_some() || refreshing))
                 || (refreshing && shown.iter().all(|status| status.fetched_at.is_none())));
         body.child(if loading {
             settings_ui::loading_list(4, directory.since.or(directory.refresh_since))
                 .into_any_element()
+        } else if directory.page.is_none() && directory.error.is_some() {
+            settings_ui::empty_state(
+                AppIcon::Plugins,
+                "Plugins could not be loaded",
+                "Try again to search the available plugins.",
+                Some(
+                    settings_ui::secondary_button("extensions-retry-search", "Try again")
+                        .on_click(cx.listener(|view, _, _, cx| view.extension_directory_search(cx)))
+                        .into_any_element(),
+                ),
+            )
+            .into_any_element()
         } else if entries.is_empty() {
             let searching = !self.extensions.query.read(cx).value().trim().is_empty()
                 || self.extensions.source_filter.is_some()

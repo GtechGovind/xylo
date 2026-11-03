@@ -12,7 +12,7 @@
 //! (macOS: `NSWorkspace.accessibilityDisplayShouldReduceMotion`) into
 //! [`App::reduce_motion`], and GPUI's animation elements, value transitions
 //! and spinners all honour that flag: a one-shot animation renders its end
-//! state on the first frame, a looping one (spinner, shimmer, pulse) renders
+//! state on the first frame, a looping one (spinner, shimmer) renders
 //! its resting state and asks for no frames. Read the flag directly
 //! (`cx.reduce_motion()`) in the rare place that must choose different
 //! content; [`refresh_motion_preference`] re-reads it, because macOS posts no
@@ -23,7 +23,7 @@
 //! An animation asks GPUI to redraw the view that rendered it on the next
 //! frame, and Xylo's workspace is one view, so every running animation
 //! re-renders the workspace. Entrances are therefore one-shot and short, and
-//! the looping decorations (shimmer, pulse, the slow-hint timer) are throttled
+//! loading indicators (shimmer and the slow-hint timer) are throttled
 //! with [`Animation::with_max_fps`] or a single timer. Animate the small thing
 //! that changed (a row, a popover, a chevron), never a whole list.
 //!
@@ -58,12 +58,8 @@ pub const SLOW_HINT: &str = "Taking longer than usual…";
 const SURFACE_RISE: f32 = 4.;
 /// Looping decorations never need more than this many redraws a second.
 const AMBIENT_FPS: f32 = 30.;
-/// One breath of [`pulse`].
-const PULSE_PERIOD: Duration = Duration::from_millis(1600);
 /// One sweep of the skeleton shimmer.
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1400);
-/// The dimmest a pulsing element gets.
-const PULSE_FLOOR: f32 = 0.35;
 /// The dimmest a shimmering skeleton gets.
 const SHIMMER_FLOOR: f32 = 0.55;
 
@@ -144,20 +140,6 @@ where
         id,
         Animation::new(BASE).with_easing(enter),
         move |this, t| this.relative().top(px(from_px * (1. - t))).opacity(t),
-    )
-}
-
-/// Fades `element` in while sliding it horizontally `from_px` pixels into
-/// place (positive starts to the right). Used for toasts and side panels.
-/// Like [`fade_slide_in`], only for in-flow elements.
-pub fn slide_in_x<E>(id: impl Into<ElementId>, element: E, from_px: f32) -> AnimationElement<E>
-where
-    E: IntoElement + Styled + 'static,
-{
-    element.with_animation(
-        id,
-        Animation::new(SLOW).with_easing(enter),
-        move |this, t| this.relative().left(px(from_px * (1. - t))).opacity(t),
     )
 }
 
@@ -252,22 +234,6 @@ fn key_hash(key: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish()
-}
-
-/// A gentle, endless breath for small "this is live" indicators such as a
-/// running dot. Throttled, and fully lit when motion is reduced.
-pub fn pulse<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
-where
-    E: IntoElement + Styled + 'static,
-{
-    element.with_animation(
-        id,
-        Animation::new(PULSE_PERIOD)
-            .repeat_synced()
-            .with_max_fps(AMBIENT_FPS)
-            .with_easing(breathe(PULSE_FLOOR)),
-        |this, t| this.opacity(t),
-    )
 }
 
 /// The same emphasis an element gets when it needs attention as it appears

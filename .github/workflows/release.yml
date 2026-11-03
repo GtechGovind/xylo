@@ -14,14 +14,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Only actual native hosts: V8 startup snapshots cannot be cross-built.
+          # Windows ARM64 is deliberately unsupported (no qualified upstream build).
           - os: macos-15
+            target: aarch64-apple-darwin
             formats: app,dmg
           - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
             formats: deb,appimage
           - os: windows-2022
+            target: x86_64-pc-windows-msvc
             formats: nsis
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_INCREMENTAL: "0"
@@ -33,11 +38,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.12"
       - name: Release packaging tests
-        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+        run: cargo test --locked --manifest-path crates/release-tool/Cargo.toml
+      - name: Obscura offline build-planning tests
+        run: cargo test --locked -p xylo-build
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
@@ -53,8 +57,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'crates/release-tool/Cargo.lock', 'rust-toolchain.toml', 'crates/build*.rs', 'crates/build*/**') }}
           restore-keys: release-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build pinned native Obscura from source (build-time network)
+        # The Rust planner fails before fetching for unsupported/cross targets.
+        run: cargo run --locked -p xylo-build -- browser --profile release --target ${{ matrix.target }}
+      - name: Qualify bundled browser with local fixtures
+        shell: bash
+        run: |
+          suffix=''
+          if [ "$RUNNER_OS" = Windows ]; then suffix='.exe'; fi
+          mkdir -p target/release/deps
+          cp "target/release/xylo-obscura$suffix" "target/release/deps/xylo-obscura$suffix"
+          cargo test --release --locked -p xylo-capabilities --lib browser::tests::bundled_ -- --ignored --test-threads=1
       - name: Build application binaries
         run: cargo build --release --locked -p xylo -p xylo-worker -p xylo-helper -p xylo-cli -p xylo-distribution --bins
       - name: Install pinned packager
@@ -71,7 +86,10 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-        run: python3 .github/scripts/package_release.py
+        run: cargo run --locked --manifest-path crates/release-tool/Cargo.toml -- package
+      - name: Verify installed Obscura payload and nested macOS signature
+        shell: bash
+        run: cargo run --locked --manifest-path crates/release-tool/Cargo.toml -- verify-payload
       - name: Upload reviewable release artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -106,4 +124,4 @@ jobs:
       - name: Publish verified release candidate
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/publish_release.py
+        run: cargo run --locked --manifest-path crates/release-tool/Cargo.toml -- publish

@@ -413,7 +413,7 @@ impl Xylo {
                 directory.sources = sources.unwrap_or_else(|| page.sources.clone());
                 if kind == 1 {
                     directory.installed = page.entries;
-                } else {
+                } else if kind == 0 {
                     directory.since = None;
                     directory.page = Some(page);
                 }
@@ -421,7 +421,9 @@ impl Xylo {
             Err(error) => directory.error = Some(product_error(&error.to_string())),
         }
         if kind == 2 {
-            // The cache changed: the installed entries may have updates now.
+            // The refresh was sent with an older query. Search the updated
+            // cache with the current filters instead of replacing their page.
+            self.extension_directory_search(cx);
             self.extension_directory_installed(cx);
         }
         cx.notify();

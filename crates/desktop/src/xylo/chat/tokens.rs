@@ -7,7 +7,7 @@ pub(in crate::xylo) const PRIMARY_CONTROL_SIZE: f32 = 36.;
 pub(in crate::xylo) const COLUMN_WIDTH: f32 = 800.;
 pub(in crate::xylo) const RESPONSE_LINE_HEIGHT: f32 = 1.75;
 pub(in crate::xylo) const CHAT_INSET: f32 = 30.;
-pub(in crate::xylo) const COMPOSER_RADIUS: f32 = 23.;
+pub(in crate::xylo) const COMPOSER_RADIUS: f32 = 18.;
 pub(in crate::xylo) const COMPOSER_INPUT_MIN_HEIGHT: f32 = 53.;
 
 /// Markdown rhythm from the approved chat draft, scoped to conversation text.

@@ -225,6 +225,25 @@ impl Xylo {
         }
         cx.notify();
     }
+    fn add_permission_rule(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
+        if self.permissions.loading {
+            return;
+        }
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        let pattern = self.permission_pattern.read(cx).value().trim().to_owned();
+        let project = self.settings.permission_rules_project;
+        let result = self
+            .host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Application service unavailable"))
+            .and_then(|host| host.save_permission_rule(workspace, pattern, decision, project));
+        self.permissions.loading = result.is_ok();
+        self.permissions.loading_since = result.is_ok().then(|| self.arm_slow_hint(cx));
+        self.permissions.error = result.err().map(|error| error.to_string());
+        cx.notify();
+    }
     /// Applies a project's rules unless the page has moved to another project.
     pub(super) fn approval_rules_received(
         &mut self,
@@ -650,7 +669,7 @@ impl Xylo {
                 None,
                 settings_ui::rows([settings_ui::setting_row(
                     "Theme",
-                    Some("System follows your Mac's light or dark appearance.".into()),
+                    Some("System follows your device's light or dark appearance.".into()),
                     Some(theme.into_any_element()),
                 )
                 .into_any_element()]),
@@ -807,7 +826,8 @@ impl Xylo {
         section = section.child(destination).child(subtitle(
             "New rules and Always allow use this destination. Local settings are git-ignored.",
         ));
-        section = section.child(Input::new(&self.permission_pattern));
+        section = section
+            .child(Input::new(&self.permission_pattern).aria_label("Permission rule pattern"));
         let mut actions = div().flex().gap_2();
         for decision in [
             PermissionDecision::Allow,
@@ -821,16 +841,7 @@ impl Xylo {
                 )
                 .disabled(self.workspace.is_none() || self.permissions.loading)
                 .on_click(cx.listener(move |view, _, _, cx| {
-                    let Some(workspace) = view.workspace.clone() else {
-                        return;
-                    };
-                    let pattern = view.permission_pattern.read(cx).value().trim().to_owned();
-                    let project = view.settings.permission_rules_project;
-                    view.host_call(cx, |host| {
-                        host.save_permission_rule(workspace, pattern, decision, project)
-                    });
-                    view.permissions.loading = true;
-                    cx.notify();
+                    view.add_permission_rule(decision, cx);
                 })),
             );
         }

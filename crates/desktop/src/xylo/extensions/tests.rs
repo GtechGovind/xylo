@@ -119,3 +119,46 @@ fn a_local_install_reviews_the_new_or_changed_package() {
     );
     assert!(installed_package(&before, &before).is_none());
 }
+
+#[gpui_kit::test]
+fn a_delayed_refresh_cannot_replace_the_current_search(cx: &mut gpui_kit::TestAppContext) {
+    use crate::xylo::Xylo;
+    use gpui_kit::{AppContext, WindowOptions};
+    cx.update(gpui_kit::init);
+    let (window, view) = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            let refresh = uuid::Uuid::new_v4();
+            let search = uuid::Uuid::new_v4();
+            view.extensions.directory.refresh = Some(refresh);
+            view.extensions.directory.search = Some(search);
+            view.extensions.query.update(cx, |input, cx| {
+                input.set_value("current query", window, cx);
+            });
+            // Input notifications may dispatch a search; pin the accepted
+            // request after changing the query for this delayed-response fixture.
+            view.extensions.directory.search = Some(search);
+            let page = |total| {
+                json!({"directory": {
+                    "entries": [], "total": total, "offset": 0,
+                    "categories": [], "sources": []
+                }})
+            };
+            assert!(view.extension_directory_result(search, &Ok(page(2)), cx));
+            assert_eq!(view.extensions.directory.page.as_ref().unwrap().total, 2);
+            assert!(view.extension_directory_result(refresh, &Ok(page(100)), cx));
+            assert_eq!(
+                view.extensions.directory.page.as_ref().unwrap().total,
+                2,
+                "The old refresh query must not overwrite the current filter's page"
+            );
+            assert!(view.extensions.directory.refresh.is_none());
+        });
+    })
+    .unwrap();
+}

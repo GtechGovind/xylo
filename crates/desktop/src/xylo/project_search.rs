@@ -20,6 +20,71 @@ pub(super) struct ProjectSearchUi {
     pub external_conflict: bool,
     _subscription: Subscription,
 }
+
+#[cfg(all(test, not(feature = "validation")))]
+mod tests {
+    use super::{FileRequest, SearchCursor, Uuid, Xylo};
+    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+
+    #[gpui_kit::test]
+    fn stopping_a_continuation_removes_automatic_pagination(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| {
+                view.project_search.request = Some((Uuid::new_v4(), true));
+                view.project_search.next = Some(SearchCursor {
+                    revision: 1,
+                    path: "file.rs".into(),
+                    line: 100,
+                    byte_offset: 200,
+                });
+                view.cancel_project_search(cx);
+                assert!(view.project_search.request.is_none());
+                assert!(view.project_search.next.is_none());
+                assert_eq!(view.project_search.notice, "Search stopped.");
+            })
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn an_empty_search_preserves_editor_conflicts_and_pending_file_reads(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Isolated fixture")), window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| {
+                let id = Uuid::new_v4();
+                view.workspace = Some("/project".into());
+                view.project_search.external_conflict = true;
+                view.project_search.opening = Some(FileRequest {
+                    id,
+                    path: "/project/file.rs".into(),
+                    jump: None,
+                    refresh: true,
+                });
+                view.run_project_search(false, cx);
+                assert!(view.project_search.external_conflict);
+                assert_eq!(
+                    view.project_search.opening.as_ref().map(|read| read.id),
+                    Some(id)
+                );
+                assert!(view.project_search.hits.is_empty());
+            })
+        })
+        .unwrap();
+    }
+}
 struct FileRequest {
     id: Uuid,
     path: PathBuf,
@@ -51,14 +116,17 @@ impl ProjectSearchUi {
         }
     }
     pub(super) fn reset(&mut self) {
+        self.reset_results();
+        self.revision = 0;
+        self.opening = None;
+        self.external_conflict = false;
+    }
+    fn reset_results(&mut self) {
         self.hits.clear();
         self.submitted = None;
         self.next = None;
         self.request = None;
         self.notice.clear();
-        self.revision = 0;
-        self.opening = None;
-        self.external_conflict = false;
     }
 }
 impl Xylo {
@@ -97,6 +165,10 @@ impl Xylo {
             .update(cx, |input, cx| input.focus(window, cx));
     }
     pub(super) fn cancel_project_search(&mut self, cx: &mut Context<Self>) {
+        self.project_search.next = None;
+        self.cancel_project_search_request(cx);
+    }
+    fn cancel_project_search_request(&mut self, cx: &mut Context<Self>) {
         if let Some((id, _)) = self.project_search.request.take() {
             if let Some(host) = &self.host {
                 let _ = host.cancel_project_search(id);
@@ -114,7 +186,7 @@ impl Xylo {
         cx.notify();
     }
     fn run_project_search(&mut self, more: bool, cx: &mut Context<Self>) {
-        self.cancel_project_search(cx);
+        self.cancel_project_search_request(cx);
         let Some(root) = self.workspace.clone() else {
             self.project_search.notice = "Open a project folder to search its files.".into();
             cx.notify();
@@ -128,7 +200,7 @@ impl Xylo {
             .trim()
             .to_string();
         if query.is_empty() {
-            self.project_search.reset();
+            self.project_search.reset_results();
             cx.notify();
             return;
         }

@@ -193,7 +193,7 @@ pub struct TurnState {
     /// harness's [`NoteKind::Truncated`] note when the answer still hit the
     /// output limit. The archived reply then has [`MessageStatus::Truncated`].
     pub answer_note: Option<SharedString>,
-    /// The text of the segment being streamed, grown in place. The segment's
+    /// The text or reasoning segment being streamed, grown in place. Its
     /// shared string is rebuilt from it at most once per frame
     /// ([`Self::flush_text`]), so streaming stays linear in its length.
     stream: String,
@@ -263,7 +263,7 @@ impl TurnState {
             return;
         }
         self.stream_pending = false;
-        if let Some(Segment::Text(text)) = self.segments.last_mut() {
+        if let Some(Segment::Text(text) | Segment::Thinking(text)) = self.segments.last_mut() {
             *text = SharedString::from(self.stream.clone());
         }
     }
@@ -357,7 +357,10 @@ impl TurnState {
         }
     }
     pub fn apply(&mut self, event: EngineEvent) {
-        if !matches!(event, EngineEvent::Delta { .. }) {
+        if !matches!(
+            event,
+            EngineEvent::Delta { .. } | EngineEvent::ThinkingDelta { .. }
+        ) {
             // Every other event reads or reorders segments: show the stream first.
             self.flush_text();
         }
@@ -417,13 +420,9 @@ impl TurnState {
                 self.phase = Some(phase);
                 self.phase_since = now_ms();
             }
-            EngineEvent::Delta { text } => self.push_text(&text),
+            EngineEvent::Delta { text } => self.push_stream(&text, false),
             EngineEvent::ThinkingDelta { text } => {
-                if let Some(Segment::Thinking(previous)) = self.segments.last_mut() {
-                    *previous = format!("{previous}{text}").into();
-                } else {
-                    self.segments.push(Segment::Thinking(text.into()));
-                }
+                self.push_stream(&text, true);
                 // The chat presents reasoning as one disclosure at its first
                 // non-empty segment; later deltas must remeasure that row.
                 let first = self
@@ -589,23 +588,30 @@ impl TurnState {
         self.phase = Some(TurnPhase::Preparing);
         self.phase_since = now;
     }
-    /// Appends streamed text to the open text segment in place; the segment
-    /// shows it at the next [`Self::flush_text`].
-    fn push_text(&mut self, delta: &str) {
+    /// Appends text or reasoning in place; snapshots update once per frame.
+    /// Switching stream kinds first settles the preceding segment.
+    fn push_stream(&mut self, delta: &str, thinking: bool) {
         if delta.is_empty() {
             return;
         }
-        match self.segments.last() {
-            Some(Segment::Text(_)) if self.stream_open => {}
-            Some(Segment::Text(text)) => {
+        let same_kind = matches!(
+            (self.segments.last(), thinking),
+            (Some(Segment::Text(_)), false) | (Some(Segment::Thinking(_)), true)
+        );
+        if !same_kind {
+            self.flush_text();
+            self.stream.clear();
+            self.stream_open = true;
+            self.segments.push(if thinking {
+                Segment::Thinking(SharedString::default())
+            } else {
+                Segment::Text(SharedString::default())
+            });
+        } else if !self.stream_open {
+            if let Some(Segment::Text(text) | Segment::Thinking(text)) = self.segments.last() {
                 self.stream = text.to_string();
-                self.stream_open = true;
             }
-            _ => {
-                self.stream.clear();
-                self.stream_open = true;
-                self.segments.push(Segment::Text(SharedString::default()));
-            }
+            self.stream_open = true;
         }
         self.stream.push_str(delta);
         self.stream_pending = true;

@@ -29,6 +29,7 @@ pub(super) struct MemoryUi {
     pub(super) editing: Option<Uuid>,
     pub(super) export: Option<(Uuid, String)>,
     pub(super) notice: String,
+    read_error: Option<String>,
     scroll: UniformListScrollHandle,
     /// When the pending memory read was sent, for the slow-wait caption.
     loading_since: Option<std::time::Instant>,
@@ -51,6 +52,7 @@ impl MemoryUi {
         self.editing = None;
         self.retry = None;
         self.notice.clear();
+        self.read_error = None;
     }
 }
 impl Xylo {
@@ -86,6 +88,9 @@ impl Xylo {
             self.facts.query = Some(Query { id, scope, text });
             self.facts.loading_since = Some(self.arm_slow_hint(cx));
             self.facts.notice = "Loading memories…".into();
+            self.facts.read_error = None;
+        } else {
+            self.facts.read_error = Some("Memories could not be loaded. Try again.".into());
         }
         self.result(result, cx);
     }
@@ -128,6 +133,7 @@ impl Xylo {
             Err(error) => {
                 tracing::warn!(%error,"Load project memories");
                 self.facts.notice="Memories could not be loaded. Try again, or check Downloads if search needs setup.".into();
+                self.facts.read_error = Some(self.facts.notice.clone());
             }
         }
         cx.notify();
@@ -439,8 +445,29 @@ impl Xylo {
         } else if self.memory_form_has_status() {
             page = page.child(self.memory_form_status(cx));
         }
+        if let Some(error) = &self.facts.read_error {
+            page = page.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(settings_ui::inline_error(error)),
+                    )
+                    .child(
+                        settings_ui::secondary_button("memory-retry-load", "Try again")
+                            .on_click(cx.listener(|view, _, _, cx| view.search_memory(cx))),
+                    ),
+            );
+        }
         if nothing_saved {
-            if !show_form {
+            if self.facts.read_error.is_none() && !self.facts.status_message().is_empty() {
+                page = page.child(settings_ui::caption(self.facts.status_message().to_owned()));
+            }
+            if !show_form && self.facts.read_error.is_none() {
                 page = page.child(settings_ui::empty_state(
                     AppIcon::Memory,
                     "No memories yet",
@@ -448,7 +475,10 @@ impl Xylo {
                     Some(self.memory_new_button(busy, cx).into_any_element()),
                 ));
             }
-            return page.into_any_element();
+            // No current facts does not imply that no previous versions remain.
+            return page
+                .child(self.memory_archive_controls(cx))
+                .into_any_element();
         }
         let search = div()
             .w_full()
@@ -464,7 +494,7 @@ impl Xylo {
             .when(loading, |row| row.child(motion::spinner_inline()));
         let mut saved = div().w_full().flex().flex_col().gap(px(12.)).child(search);
         let status = self.facts.status_message();
-        if empty && !loading {
+        if empty && !loading && self.facts.read_error.is_none() {
             saved = saved.child(settings_ui::empty_state(
                 AppIcon::Memory,
                 "No matching memories",
@@ -472,12 +502,12 @@ impl Xylo {
                 None,
             ));
         } else {
-            if !status.is_empty() && !loading {
+            if !status.is_empty() && !loading && self.facts.read_error.is_none() {
                 saved = saved.child(settings_ui::caption(status.to_owned()));
             }
-            if empty {
+            if empty && loading {
                 saved = saved.child(settings_ui::loading_list(3, self.facts.loading_since));
-            } else {
+            } else if !empty {
                 saved = saved.child(self.memory_list(cx));
             }
         }

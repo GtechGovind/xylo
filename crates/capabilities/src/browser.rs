@@ -1,57 +1,211 @@
-//! A dedicated, explicitly provisioned Chromium profile controlled through CDP.
+//! Xylo's bundled Obscura browser. CDP is a private implementation detail.
+mod cdp;
 
 use crate::{
-    CapabilityConfig, definition, observation, output_path, process::validate_executable,
+    CapabilityConfig, definition, observation, output_path,
+    process::{ManagedProcess, ProcessSpec, validate_executable},
     required_str,
 };
 use anyhow::{Context, Result, ensure};
-use chromiumoxide::{
-    Browser, BrowserConfig, Page,
-    cdp::browser_protocol::{
-        accessibility::GetFullAxTreeParams,
-        browser::{
-            CancelDownloadParams, DownloadProgressState, EventDownloadProgress,
-            EventDownloadWillBegin, SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
-        },
-        page::{CaptureScreenshotFormat, NavigateParams},
-    },
-    page::ScreenshotParams,
-};
-use futures_util::StreamExt;
+use base64::Engine as _;
+use cdp::Cdp;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    future::Future,
+    collections::BTreeMap,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 use xylo_core::{ToolDefinition, ToolObservation};
 
-/// Download budget used when `browser_download` is called without `max_bytes`.
-const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 50 * 1024 * 1024;
-/// Hard ceiling for any single browser download; matches the tool schema's
-/// `max_bytes.maximum` so a caller cannot raise the budget past it.
-const DOWNLOAD_MAX_BYTES_CEILING: u64 = 100 * 1024 * 1024;
+const DOWNLOAD_UNSUPPORTED: &str = "browser_download is unavailable with Obscura v0.2.6: its CDP download controls do not enforce byte limits or cancellation. Use a bounded HTTP download tool instead; no browser download was started.";
+const MAX_SCREENSHOT_BYTES: usize = 8 * 1024 * 1024;
+
+fn sibling_runtime(current_executable: &Path) -> Result<PathBuf> {
+    let directory = current_executable
+        .parent()
+        .context("Xylo executable has no parent directory")?;
+    Ok(directory.join(if cfg!(windows) {
+        "xylo-obscura.exe"
+    } else {
+        "xylo-obscura"
+    }))
+}
+
+/// Resolve only the native component shipped beside the running Xylo binary.
+/// There is deliberately no environment, PATH, import, or remote fallback.
+pub fn runtime_executable() -> Result<PathBuf> {
+    let current = std::env::current_exe().context("Cannot locate the running Xylo executable")?;
+    validate_executable(&sibling_runtime(&current)?)
+        .context("Bundled xylo-obscura runtime is missing or invalid; repair the Xylo installation")
+}
+
+// Keep storage alive until after the process tree has been stopped. Drop kills
+// synchronously even when an operation future is aborted during launch or CDP.
+struct Sidecar {
+    child: Option<ManagedProcess>,
+    profile: Option<tempfile::TempDir>,
+}
+
+impl Sidecar {
+    fn is_running(&mut self) -> Result<bool> {
+        self.child.as_mut().context("Obscura stopped")?.is_running()
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(ManagedProcess::pid)
+    }
+
+    fn profile(&self) -> &Path {
+        self.profile.as_ref().expect("live sidecar profile").path()
+    }
+
+    async fn stop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.stop().await;
+        }
+        self.child.take();
+        self.profile.take();
+    }
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            child.finish_tree();
+            let profile = self.profile.take();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = child.stop().await;
+                    drop(child);
+                    drop(profile);
+                });
+            } else {
+                // ManagedProcess also kills on drop. Without a running Tokio
+                // runtime, asynchronous reaping cannot be promised.
+                drop(child);
+                drop(profile);
+            }
+        }
+    }
+}
 
 struct Session {
-    browser: Browser,
-    page: Page,
-    handler: JoinHandle<()>,
-    profile: PathBuf,
-    downloads: PathBuf,
+    process: Sidecar,
+    cdp: Cdp,
     used: Instant,
 }
 
 impl Session {
     async fn close(mut self) {
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.browser.close()).await;
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.browser.wait()).await;
-        self.handler.abort();
-        drop(self.browser); // chromiumoxide kills/reaps a launched browser on drop.
-        let _ = tokio::fs::remove_dir_all(self.profile).await;
+        // Browser.close acknowledges without stopping Obscura v0.2.6.
+        self.process.stop().await;
     }
+}
+
+#[derive(Deserialize)]
+struct ReadyRecord {
+    pid: u32,
+    host: String,
+    port: u16,
+    websocket_path: String,
+}
+
+impl ReadyRecord {
+    fn endpoint(&self, pid: Option<u32>) -> Result<String> {
+        ensure!(
+            Some(self.pid) == pid && self.pid != 0,
+            "Obscura ready file PID mismatch"
+        );
+        ensure!(
+            self.host == "127.0.0.1"
+                && self.port != 0
+                && self.websocket_path == "/devtools/browser",
+            "Obscura ready file is not the expected loopback endpoint"
+        );
+        Ok(format!(
+            "ws://127.0.0.1:{}{}",
+            self.port, self.websocket_path
+        ))
+    }
+}
+
+fn launch_spec(
+    executable: PathBuf,
+    profile: &Path,
+    token: String,
+    timeout: Duration,
+    allow_private_network: bool,
+) -> ProcessSpec {
+    // Verified against v0.2.6 crates/obscura-cli/src/main.rs Serve options.
+    let mut args = vec![
+        "serve".into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        "0".into(),
+        "--workers".into(),
+        "1".into(),
+        "--max-connections".into(),
+        "1".into(),
+        "--ready-file".into(),
+        profile.join("ready.json").to_string_lossy().into_owned(),
+        "--storage-dir".into(),
+        profile.join("storage").to_string_lossy().into_owned(),
+    ];
+    if allow_private_network {
+        args.push("--allow-private-network".into());
+    }
+    ProcessSpec {
+        executable,
+        args,
+        cwd: profile.to_owned(),
+        env: BTreeMap::from([("OBSCURA_CDP_TOKEN".into(), token)]),
+        timeout,
+        output_limit: 64 * 1024,
+    }
+}
+
+fn screenshot_bytes(response: &Value) -> Result<Vec<u8>> {
+    let encoded = response["data"]
+        .as_str()
+        .context("Obscura omitted screenshot data")?;
+    ensure!(
+        encoded.len() <= MAX_SCREENSHOT_BYTES,
+        "Screenshot exceeds encoded byte limit"
+    );
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    ensure!(
+        bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR",
+        "Obscura did not return a PNG screenshot"
+    );
+    ensure!(
+        u32::from_be_bytes(bytes[16..20].try_into()?) == 1280
+            && u32::from_be_bytes(bytes[20..24].try_into()?) == 900,
+        "Obscura returned unexpected screenshot dimensions"
+    );
+    // Header checks constrain dimensions before decoding; do not publish a
+    // truncated payload merely because its signature resembles a PNG.
+    image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        .context("Obscura returned an invalid PNG screenshot")?;
+    Ok(bytes)
+}
+
+fn save_screenshot(path: &Path, bytes: &[u8]) -> Result<()> {
+    // Write privately first, then publish without replacing an
+    // existing artifact (including symlinks). A failed write leaves no partial
+    // artifact at the published path.
+    let directory = path.parent().context("Screenshot path has no parent")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(bytes)?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
+    Ok(())
 }
 
 pub struct BrowserService {
@@ -68,55 +222,58 @@ impl BrowserService {
     }
 
     async fn launch(&self) -> Result<Session> {
-        let chromium=self.config.chromium.clone().or_else(detect_browser).context("Browser automation requires Google Chrome, Chromium, or Microsoft Edge installed on this computer")?;
-        let executable = validate_executable(&chromium)?;
-        let profile = self
-            .config
-            .artifacts
-            .join(format!(".browser-{}", uuid::Uuid::new_v4()));
-        let downloads = profile.join("downloads");
-        tokio::fs::create_dir_all(&downloads).await?;
-        let cfg = BrowserConfig::builder()
-            .chrome_executable(executable)
-            .user_data_dir(&profile)
-            .window_size(1280, 900)
-            .request_timeout(Duration::from_secs(self.config.operation_timeout_seconds))
-            .build()
-            .map_err(anyhow::Error::msg)?;
-        let (browser, mut handler) = Browser::launch(cfg).await?;
-        let handler = tokio::spawn(async move {
-            while let Some(result) = handler.next().await {
-                if result.is_err() {
-                    break;
+        let executable = runtime_executable()?;
+        let profile = tempfile::Builder::new().prefix("xylo-obscura-").tempdir()?;
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let spec = launch_spec(
+            executable,
+            profile.path(),
+            token.clone(),
+            Duration::from_secs(self.config.operation_timeout_seconds),
+            self.config.browser_allow_private_network,
+        );
+        let child = ManagedProcess::spawn(&spec)?;
+        let mut process = Sidecar {
+            child: Some(child),
+            profile: Some(profile),
+        };
+        let endpoint = loop {
+            ensure!(
+                process.is_running()?,
+                "Bundled Obscura exited before publishing readiness"
+            );
+            match tokio::fs::File::open(process.profile().join("ready.json")).await {
+                Ok(file) => {
+                    let mut bytes = Vec::new();
+                    file.take(4097).read_to_end(&mut bytes).await?;
+                    ensure!(bytes.len() <= 4096, "Obscura ready file exceeds limit");
+                    let record: ReadyRecord =
+                        serde_json::from_slice(&bytes).context("Invalid Obscura ready file")?;
+                    break record.endpoint(process.pid())?;
                 }
-            }
-        });
-        // Downloads are denied browser-wide from the start so that navigation,
-        // clicks, or page script cannot write files; only browser_download
-        // opens a short, budgeted window and closes it again.
-        let ready = async {
-            browser.execute(deny_downloads()).await?;
-            Ok::<_, anyhow::Error>(browser.new_page("about:blank").await?)
-        }
-        .await;
-        let page = match ready {
-            Ok(page) => page,
-            Err(error) => {
-                handler.abort();
-                let _ = tokio::fs::remove_dir_all(&profile).await;
-                return Err(error);
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error.into()),
             }
         };
+        let mut cdp = Cdp::connect(&endpoint, &token).await?;
+        cdp.initialize().await?;
         let weak = Arc::downgrade(&self.state);
         let idle = Duration::from_secs(self.config.helper_idle_seconds.clamp(5, 3600));
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(idle.min(Duration::from_secs(10))).await;
-                let Some(state) = weak.upgrade() else {
-                    break;
-                };
+                let Some(state) = weak.upgrade() else { break };
                 let mut guard = state.lock().await;
-                if guard.as_ref().is_some_and(|s| s.used.elapsed() >= idle) {
+                if guard
+                    .as_ref()
+                    .is_some_and(|session| session.used.elapsed() >= idle)
+                {
                     if let Some(session) = guard.take() {
                         session.close().await;
                     }
@@ -128,20 +285,25 @@ impl BrowserService {
             }
         });
         Ok(Session {
-            browser,
-            page,
-            handler,
-            profile,
-            downloads,
+            process,
+            cdp,
             used: Instant::now(),
         })
     }
 
     pub async fn status(&self) -> Value {
-        let Ok(state) = self.state.try_lock() else {
-            return json!({"state":"busy","protocol":"CDP"});
+        let Ok(mut state) = self.state.try_lock() else {
+            return json!({"state":"busy","backend":"obscura","download":"unavailable"});
         };
-        json!({"state":if state.is_some() {"running"} else {crate::asset_status(self.config.chromium.clone().or_else(detect_browser).as_deref())}, "protocol":"CDP","profile":"isolated"})
+        let running = state
+            .as_mut()
+            .is_some_and(|session| session.process.is_running().unwrap_or(false));
+        json!({
+            "state": if running { "running" } else if runtime_executable().is_ok() { "ready" } else { "missing" },
+            "backend":"obscura",
+            "profile":"isolated",
+            "download":"unavailable"
+        })
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -157,17 +319,20 @@ impl BrowserService {
         args: &Value,
         cancel: CancellationToken,
     ) -> Result<ToolObservation> {
-        let result = tokio::select! {
-            result = self.inner(name, args) => result,
+        // Legacy compatibility only: not advertised, and rejected before any
+        // lock, launch, validation or destruction of a healthy session.
+        ensure!(name != "browser_download", "{DOWNLOAD_UNSUPPORTED}");
+        // In-flight operations own their session and drop its process on failure.
+        // A cancelled request still waiting for the mutex must not tear down a
+        // different request's healthy session or wait for that request to finish.
+        tokio::select! {
+            biased;
             _ = cancel.cancelled() => Err(anyhow::anyhow!("Browser operation cancelled")),
-            _ = tokio::time::sleep(Duration::from_secs(self.config.operation_timeout_seconds)) => Err(anyhow::anyhow!("Browser operation timed out")),
-        };
-        // A timed-out click or download can have effects. Close the isolated
-        // browser rather than replaying the action on an uncertain page.
-        if result.is_err() {
-            self.shutdown().await?;
+            _ = tokio::time::sleep(Duration::from_secs(self.config.operation_timeout_seconds)) => {
+                Err(anyhow::anyhow!("Browser operation timed out"))
+            }
+            result = self.inner(name, args) => result,
         }
-        result
     }
 
     async fn inner(&self, name: &str, args: &Value) -> Result<ToolObservation> {
@@ -175,276 +340,136 @@ impl BrowserService {
             self.shutdown().await?;
             return Ok(observation(json!({"closed":true}), vec![]));
         }
+        ensure!(
+            [
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_wait",
+                "browser_screenshot"
+            ]
+            .contains(&name),
+            "Unknown browser tool: {name}"
+        );
         let mut state = self.state.lock().await;
         if state.is_none() {
             *state = Some(self.launch().await?);
         }
-        let session = state.as_mut().context("Browser failed to initialize")?;
-        session.used = Instant::now();
-        let page = &session.page;
-        match name {
+        // Own the session while holding the serialization lock. Aborting this
+        // future also drops (and kills) the sidecar, not a half-used connection.
+        let mut session = state.take().context("Browser failed to initialize")?;
+        ensure!(
+            session.process.is_running()?,
+            "Bundled Obscura process has exited"
+        );
+        let cdp = &mut session.cdp;
+        let value = match name {
             "browser_navigate" => {
                 let url = validate_url(required_str(args, "url")?)?;
-                page.goto(url.as_str()).await?;
-                Ok(observation(
-                    json!({"url":page.url().await?,"title":page.get_title().await?}),
-                    vec![],
-                ))
+                let response = cdp
+                    .call(
+                        "Page.navigate",
+                        json!({"url":url.as_str(),"waitUntil":"load"}),
+                    )
+                    .await?;
+                ensure!(
+                    response.get("errorText").is_none(),
+                    "Browser navigation failed: {}",
+                    response["errorText"]
+                );
+                cdp.evaluate("({url:location.href,title:document.title})".into())
+                    .await?
             }
             "browser_snapshot" => {
-                let response = page.execute(GetFullAxTreeParams::default()).await?;
-                let mut value = serde_json::to_value(response.result)?;
+                let mut response = cdp.call("Accessibility.getFullAXTree", json!({})).await?;
                 let limit = args
                     .get("max_nodes")
                     .and_then(Value::as_u64)
                     .unwrap_or(300)
                     .clamp(1, 2000) as usize;
-                if let Some(nodes) = value.get_mut("nodes").and_then(Value::as_array_mut) {
-                    let total = nodes.len();
-                    nodes.truncate(limit);
-                    value["total_nodes"] = json!(total);
-                    value["truncated"] = json!(total > limit);
+                let nodes = response["nodes"]
+                    .as_array_mut()
+                    .context("Obscura omitted accessibility nodes")?;
+                let total = nodes.len();
+                nodes.truncate(limit);
+                response["total_nodes"] = json!(total);
+                response["truncated"] = json!(total > limit);
+                response
+            }
+            "browser_click" | "browser_type" => {
+                let selector = serde_json::to_string(required_str(args, "selector")?)?;
+                let action = if name == "browser_click" {
+                    "if(e.matches(':disabled'))return false;e.click()"
+                } else {
+                    "if(!e.matches('input,textarea')||e.matches(':disabled')||e.readOnly)return false;e.focus();if(document.activeElement!==e)return false"
+                };
+                let found = cdp.evaluate(format!(
+                    "(()=>{{const e=document.querySelector({selector});if(!e)return false;{action};return true;}})()"
+                )).await?;
+                ensure!(
+                    found == json!(true),
+                    "Browser selector was not found or is not actionable"
+                );
+                if name == "browser_type" {
+                    let text = required_str(args, "text")?;
+                    ensure!(text.len() <= 100_000, "Input text exceeds limit");
+                    cdp.call("Input.insertText", json!({"text":text})).await?;
+                    json!({"input_dispatched":true})
+                } else {
+                    json!({"click_dispatched":true})
                 }
-                Ok(observation(value, vec![]))
             }
-            "browser_click" => {
-                page.find_element(required_str(args, "selector")?)
-                    .await?
-                    .click()
-                    .await?;
-                Ok(observation(json!({"clicked":true}), vec![]))
-            }
-            "browser_type" => {
-                let text = required_str(args, "text")?;
-                ensure!(text.len() <= 100_000, "Input text exceeds limit");
-                page.find_element(required_str(args, "selector")?)
-                    .await?
-                    .focus()
-                    .await?
-                    .type_str(text)
-                    .await?;
-                Ok(observation(json!({"typed":true}), vec![]))
+            "browser_wait" => {
+                let selector = required_str(args, "selector")?;
+                let literal = serde_json::to_string(selector)?;
+                loop {
+                    if cdp
+                        .evaluate(format!("document.querySelector({literal}) !== null"))
+                        .await?
+                        == json!(true)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                json!({"found":selector})
             }
             "browser_screenshot" => {
+                let response = cdp
+                    .call(
+                        "Page.captureScreenshot",
+                        json!({
+                            "format":"png", "captureBeyondViewport":false
+                        }),
+                    )
+                    .await?;
+                let bytes = screenshot_bytes(&response)?;
                 let path = output_path(
                     &self.config,
                     &format!("browser-{}", uuid::Uuid::new_v4()),
                     "png",
                 )?;
-                page.save_screenshot(
-                    ScreenshotParams::builder()
-                        .format(CaptureScreenshotFormat::Png)
-                        .full_page(false)
-                        .build(),
-                    &path,
-                )
-                .await?;
-                Ok(observation(
-                    json!({"path":path,"viewport_only":true}),
+                save_screenshot(&path, &bytes)?;
+                session.used = Instant::now();
+                *state = Some(session);
+                return Ok(observation(
+                    json!({"path":path,"width":1280,"height":900,"viewport_only":true}),
                     vec![path],
-                ))
+                ));
             }
-            "browser_wait" => {
-                let selector = required_str(args, "selector")?;
-                loop {
-                    if page.find_element(selector).await.is_ok() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Ok(observation(json!({"found":selector}), vec![]))
-            }
-            "browser_download" => {
-                let url = validate_url(required_str(args, "url")?)?;
-                let max = download_budget(args);
-                // A download navigation never finishes loading, and
-                // chromiumoxide runs one navigation per page at a time: on the
-                // session page it would hold every later browser_navigate
-                // until the request timeout. It runs in a page of its own,
-                // closed afterwards, which drops that pending navigation.
-                let download_page = session.browser.new_page("about:blank").await?;
-                let closing = download_page.clone();
-                // The restore runs whether the download succeeds or fails, so a
-                // failed attempt cannot leave later pages able to download.
-                // Cancellation and timeouts drop this future instead; execute()
-                // then closes the whole browser, which is stricter still.
-                let (file, begin) = run_then_restore(
-                    download_to_staging(session, &download_page, &url, max),
-                    async {
-                        let denied = session.browser.execute(deny_downloads()).await;
-                        let closed = closing.close().await;
-                        denied?;
-                        closed.context("Failed to close the download page")?;
-                        Ok(())
-                    },
-                )
-                .await?;
-                let extension = Path::new(&begin.suggested_filename)
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .filter(|s| s.len() <= 12 && s.chars().all(|c| c.is_ascii_alphanumeric()))
-                    .unwrap_or("bin");
-                let output = output_path(
-                    &self.config,
-                    &format!("download-{}", uuid::Uuid::new_v4()),
-                    extension,
-                )?;
-                tokio::fs::rename(file, &output).await?;
-                Ok(observation(
-                    json!({"path":output,"suggested_filename":begin.suggested_filename,"source_url":begin.url}),
-                    vec![output],
-                ))
-            }
-            _ => anyhow::bail!("Unknown browser tool: {name}"),
-        }
-    }
-}
-
-/// Allows downloads into the session's private staging directory, navigates to
-/// `url`, and waits for the resulting download to finish within `max` bytes.
-///
-/// Returns the staged file and its begin event. The caller must re-deny
-/// downloads afterwards regardless of the outcome (see [`run_then_restore`]).
-async fn download_to_staging(
-    session: &Session,
-    page: &Page,
-    url: &url::Url,
-    max: u64,
-) -> Result<(PathBuf, Arc<EventDownloadWillBegin>)> {
-    session
-        .browser
-        .execute(
-            SetDownloadBehaviorParams::builder()
-                .behavior(SetDownloadBehaviorBehavior::AllowAndName)
-                .download_path(session.downloads.to_string_lossy().to_string())
-                .events_enabled(true)
-                .build()
-                .map_err(anyhow::Error::msg)?,
-        )
-        .await?;
-    let mut starts = session
-        .browser
-        .event_listener::<EventDownloadWillBegin>()
-        .await?;
-    let mut progress = session
-        .browser
-        .event_listener::<EventDownloadProgress>()
-        .await?;
-    // chromiumoxide recognizes Page.navigate and waits for normal
-    // navigation completion even through execute(). Attachments do
-    // not finish a page load: consume the download event while the
-    // single navigation request remains in flight.
-    let begin = {
-        let navigation = page.execute(NavigateParams::new(url.as_str()));
-        tokio::pin!(navigation);
-        tokio::select! {
-            event = starts.next() => event.context("Browser closed before download began")?,
-            result = &mut navigation => {
-                let _ = result?;
-                starts.next().await.context("Browser closed before download began")?
-            }
-        }
-    };
-    loop {
-        // A closed event stream means completion was never observed; the
-        // staged file may be partial, so treat it as a failure.
-        let event = progress
-            .next()
-            .await
-            .context("Browser closed before download completed")?;
-        if event.guid != begin.guid {
-            continue;
-        }
-        if download_exceeds_budget(event.received_bytes, event.total_bytes, max) {
-            // Stop the transfer early; the size check below and the session
-            // teardown on error still apply if the cancel itself fails.
-            if let Err(error) = session
-                .browser
-                .execute(CancelDownloadParams::new(begin.guid.clone()))
-                .await
-            {
-                anyhow::bail!("Download exceeded byte budget; cancelling it failed: {error}");
-            }
-            anyhow::bail!("Download exceeded byte budget");
-        }
-        match event.state {
-            DownloadProgressState::Canceled => anyhow::bail!("Download canceled"),
-            DownloadProgressState::Completed => break,
-            _ => (),
-        }
-    }
-    let file = session.downloads.join(&begin.guid);
-    // Progress events are reported by the page's server and Chromium; the
-    // bytes on disk are the authoritative measure.
-    enforce_file_budget(&file, max).await?;
-    Ok((file, begin))
-}
-
-/// Browser-wide parameters that forbid all downloads.
-fn deny_downloads() -> SetDownloadBehaviorParams {
-    SetDownloadBehaviorParams::new(SetDownloadBehaviorBehavior::Deny)
-}
-
-/// The caller's `max_bytes`, defaulted and clamped to the download ceiling.
-fn download_budget(args: &Value) -> u64 {
-    args.get("max_bytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_DOWNLOAD_MAX_BYTES)
-        .clamp(1, DOWNLOAD_MAX_BYTES_CEILING)
-}
-
-/// Whether a progress event shows a download past `max` bytes.
-///
-/// CDP reports byte counts as floats and `total_bytes` is 0 when unknown.
-/// Written as a negated "within budget" test so NaN fails closed.
-fn download_exceeds_budget(received: f64, total: f64, max: u64) -> bool {
-    let max = max as f64;
-    !(received <= max && total <= max)
-}
-
-/// Verifies the staged download is a regular file of at most `max` bytes,
-/// deleting it when it is not so an oversized payload never lingers.
-async fn enforce_file_budget(file: &Path, max: u64) -> Result<u64> {
-    // symlink_metadata: a link planted in place of the download must not be
-    // followed to some other file's size.
-    let metadata = tokio::fs::symlink_metadata(file)
-        .await
-        .context("Downloaded file is missing")?;
-    if metadata.is_file() && metadata.len() <= max {
-        return Ok(metadata.len());
-    }
-    let _ = tokio::fs::remove_file(file).await;
-    if metadata.is_file() {
-        anyhow::bail!("Download exceeded byte budget");
-    }
-    anyhow::bail!("Download did not produce a regular file")
-}
-
-/// Awaits `body`, then always awaits `restore`, returning the body's value
-/// only when both succeed.
-///
-/// A restore failure after a successful body is reported as the error; when
-/// both fail the body's error is kept with the restore failure attached.
-async fn run_then_restore<T>(
-    body: impl Future<Output = Result<T>>,
-    restore: impl Future<Output = Result<()>>,
-) -> Result<T> {
-    let result = body.await;
-    let restored = restore.await;
-    match (result, restored) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context("Failed to disable browser downloads again")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(restore)) => Err(error.context(format!(
-            "Also failed to disable browser downloads again: {restore:#}"
-        ))),
+            _ => unreachable!(),
+        };
+        session.used = Instant::now();
+        *state = Some(session);
+        Ok(observation(value, vec![]))
     }
 }
 
 fn validate_url(raw: &str) -> Result<url::Url> {
     let url = url::Url::parse(raw)?;
     ensure!(
-        (url.scheme() == "http" || url.scheme() == "https") && url.host_str().is_some(),
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
         "Browser accepts HTTP(S) URLs only"
     );
     ensure!(
@@ -458,110 +483,54 @@ pub fn definitions() -> Vec<ToolDefinition> {
     vec![
         definition(
             "browser_navigate",
-            "Navigate an isolated managed Chromium tab to an HTTP(S) URL.",
+            "Navigate an isolated bundled Obscura tab to an HTTP(S) URL.",
             json!({"url":{"type":"string"}}),
             &["url"],
             true,
         ),
         definition(
             "browser_snapshot",
-            "Read the isolated managed browser's Chromium accessibility tree, including backend DOM identifiers.",
+            "Read Obscura's accessibility tree (not Chromium-equivalent). max_nodes limits returned nodes, not upstream tree construction.",
             json!({"max_nodes":{"type":"integer","minimum":1,"maximum":2000}}),
             &[],
             false,
         ),
         definition(
             "browser_click",
-            "Click a CSS selector in the managed browser.",
+            "Dispatch a DOM click to a CSS-selected element in Obscura (not a physical pointer click).",
             json!({"selector":{"type":"string"}}),
             &["selector"],
             true,
         ),
         definition(
             "browser_type",
-            "Type text into a CSS-selected element in the isolated managed browser.",
+            "Insert text into a focused, editable CSS-selected input or textarea in Obscura.",
             json!({"selector":{"type":"string"},"text":{"type":"string"}}),
             &["selector", "text"],
             true,
         ),
         definition(
             "browser_wait",
-            "Wait for a CSS selector in the isolated managed browser, bounded by the operation timeout.",
+            "Wait for a CSS selector in Obscura, subject to the operation timeout.",
             json!({"selector":{"type":"string"}}),
             &["selector"],
             false,
         ),
         definition(
             "browser_screenshot",
-            "Save the isolated managed browser's current viewport as a PNG artifact.",
+            "Save the current 1280x900 Obscura viewport as a new PNG artifact without overwriting existing files.",
             json!({}),
             &[],
             false,
         ),
         definition(
-            "browser_download",
-            "Download an HTTP(S) URL through the isolated managed browser's authenticated profile; report source URL and artifact.",
-            json!({"url":{"type":"string"},"max_bytes":{"type":"integer","minimum":1,"maximum":104857600}}),
-            &["url"],
-            true,
-        ),
-        definition(
             "browser_close",
-            "Close and reap the managed browser and delete its temporary profile.",
+            "Stop the bundled Obscura sidecar and remove its temporary profile.",
             json!({}),
             &[],
             true,
         ),
     ]
-}
-
-/// Detect existing browsers without opening a personal profile or downloading.
-fn detect_browser() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    #[cfg(target_os = "macos")]
-    {
-        for root in [
-            Some(PathBuf::from("/Applications")),
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Applications")),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            for path in [
-                "Google Chrome.app/Contents/MacOS/Google Chrome",
-                "Chromium.app/Contents/MacOS/Chromium",
-                "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            ] {
-                candidates.push(root.join(path));
-            }
-        }
-    }
-    #[cfg(windows)]
-    for key in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"] {
-        if let Some(root) = std::env::var_os(key) {
-            for path in [
-                "Google/Chrome/Application/chrome.exe",
-                "Microsoft/Edge/Application/msedge.exe",
-                "Chromium/Application/chrome.exe",
-            ] {
-                candidates.push(PathBuf::from(&root).join(path));
-            }
-        }
-    }
-    for root in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
-        for executable in [
-            "chromium",
-            "chromium-browser",
-            "google-chrome",
-            "google-chrome-stable",
-            "microsoft-edge",
-        ] {
-            candidates.push(root.join(executable));
-        }
-    }
-    candidates
-        .into_iter()
-        .find_map(|path| validate_executable(&path).ok())
 }
 
 #[cfg(test)]

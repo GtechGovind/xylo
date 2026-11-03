@@ -214,6 +214,60 @@ async fn nested_project_scopes_paths_diffs_and_renames() {
     assert!(patch.contains("-outgoing baseline"), "{patch}");
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_native_reads_preserve_neutral_config_and_repository_metadata() {
+    use std::io::Write;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    git(root, &["init", "--quiet"]);
+    std::fs::write(root.join("tracked.txt"), "staged baseline\n").unwrap();
+    git(root, &["add", "tracked.txt"]);
+    std::fs::write(root.join("tracked.txt"), "working change\n").unwrap();
+    // If repository config/includes were loaded this malformed include would
+    // make every Git command fail. Keep executable config out of the overlay.
+    std::fs::write(root.join(".git/forbidden-config"), "[invalid\n").unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(root.join(".git/config"))
+        .unwrap()
+        .write_all(b"\n[include]\npath = forbidden-config\n[core]\nfsmonitor = forbidden-hook\n")
+        .unwrap();
+    let index = std::fs::read(root.join(".git/index")).unwrap();
+    let config = std::fs::read(root.join(".git/config")).unwrap();
+    let head = std::fs::read(root.join(".git/HEAD")).unwrap();
+
+    // This is the same entry point as the engine's git_status/git_diff tools.
+    for args in [
+        vec!["status".into(), "--short".into(), "--branch".into()],
+        vec![
+            "diff".into(),
+            "--no-ext-diff".into(),
+            "--no-textconv".into(),
+        ],
+    ] {
+        let result = run_read(root, &args, Duration::from_secs(30), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(result.code, Some(0), "{}", result.stderr);
+        assert!(result.stdout.contains("tracked.txt"), "{}", result.stdout);
+    }
+    // Also exercise the native UI's shared status path.
+    let state = status(root).await.unwrap();
+    assert!(
+        state
+            .changes
+            .iter()
+            .any(|change| change.path == Path::new("tracked.txt"))
+    );
+    assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+    assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), config);
+    assert_eq!(std::fs::read(root.join(".git/HEAD")).unwrap(), head);
+    assert!(root.join(".git/objects").is_dir());
+    assert!(root.join(".git/refs").is_dir());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn untracked_symlink_diff_cannot_read_outside_project_or_git_metadata() {

@@ -6,8 +6,8 @@
 //! Messages: the person's turns sit right-aligned on a neutral raised surface
 //! that hugs its text; answers are full-width text on the page with an action
 //! row (copy, retry, read aloud, time) that is always shown for the latest
-//! answer and appears on hover for earlier ones. Hover actions are overlaid,
-//! never reserving layout space.
+//! answer and appears on hover for earlier ones. User controls sit beside the
+//! bubble; answer controls occupy a compact gap below their text.
 use super::*;
 use crate::icons::{self, AppIcon};
 use gpui_kit::base::Disableable;
@@ -42,9 +42,9 @@ const BOTTOM_INSET: f32 = 12.;
 /// Height of the fade between the transcript and the composer.
 const FADE_HEIGHT: f32 = 0.;
 const _: () = assert!(BOTTOM_INSET >= FADE_HEIGHT);
-/// Space under an answer, holding its overlaid action row (one 28 px icon
+/// Space under an answer, holding its overlaid action row (one 30 px icon
 /// button high) clear of the answer's last line.
-const ANSWER_GAP: f32 = 54.;
+const ANSWER_GAP: f32 = 36.;
 
 /// Placeholder messages while a conversation's first page loads: a request
 /// and a reply, twice, so the layout the reader is about to see is already
@@ -621,7 +621,7 @@ impl Xylo {
                     32.
                 }))
             })
-            .when(is_message && user, |row| row.pb(px(28.)))
+            .when(is_message && user, |row| row.pb(px(24.)))
             .child(div().w_full().max_w(px(COLUMN_WIDTH)).child(content))
             .into_any_element()
     }
@@ -707,7 +707,7 @@ impl Xylo {
                 div()
                     .absolute()
                     .left_0()
-                    .bottom(px(12.))
+                    .bottom_0()
                     .child(self.answer_actions(
                         index,
                         Answer {
@@ -745,7 +745,7 @@ impl Xylo {
             .flex_col()
             .gap_2()
             .px(px(19.))
-            .py(px(13.))
+            .py(px(8.))
             .rounded(px(22.))
             .bg(rgb(well()))
             .text_size(px(15.))
@@ -766,6 +766,7 @@ impl Xylo {
         let actions = div()
             .id(("message-actions", index))
             .flex_shrink_0()
+            .mt(px(5.))
             .flex()
             .items_center()
             .child(
@@ -794,11 +795,11 @@ impl Xylo {
         div()
             .w_full()
             .flex()
-            .flex_col()
-            .items_end()
+            .items_start()
+            .justify_end()
             .gap(px(4.))
-            .child(bubble)
             .child(actions)
+            .child(bubble)
             .into_any_element()
     }
     /// An answer from history: text on the page.
@@ -962,22 +963,42 @@ impl Xylo {
             }
             return;
         }
+        let Some(card) = self
+            .turns
+            .get(&self.session)
+            .and_then(|turn| turn.tools.iter().find(|t| t.id == id && t.approval))
+        else {
+            return;
+        };
+        // The engine shortens very large change previews; a change nobody
+        // could inspect in full is never approved by pointer or keyboard.
+        if allow
+            && card
+                .input
+                .get("diff_truncated")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        {
+            return;
+        }
+        // Keep the decision available if the bounded host queue cannot accept
+        // it. Optimistic feedback starts only once local dispatch succeeds.
+        if let Err(error) = self.try_engine_command(
+            WorkerCommand::Approve {
+                action_id: id,
+                allow,
+                remember,
+            },
+            cx,
+        ) {
+            self.result(Err(error), cx);
+            return;
+        }
         if let Some(card) = self
             .turns
             .get_mut(&self.session)
             .and_then(|turn| turn.tools.iter_mut().find(|t| t.id == id))
         {
-            // The engine shortens very large change previews; a change nobody
-            // could inspect in full is never approved by pointer or keyboard.
-            if allow
-                && card
-                    .input
-                    .get("diff_truncated")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-            {
-                return;
-            }
             card.approval = false;
             if !allow {
                 card.success = Some(false);
@@ -985,14 +1006,6 @@ impl Xylo {
                 card.refresh_presentation();
             }
         }
-        self.engine_command(
-            WorkerCommand::Approve {
-                action_id: id,
-                allow,
-                remember,
-            },
-            cx,
-        );
         self.invalidate_live_history();
         self.sync_history_list(cx);
         cx.notify();
@@ -1006,6 +1019,10 @@ impl Xylo {
             && !self.model_picker.open
             && !self.history_search.is_open()
             && self.has_live_transcript()
+            && self
+                .histories
+                .get(&self.session)
+                .is_some_and(|history| history.at_latest())
             && (self
                 .composer
                 .read(cx)
@@ -1090,7 +1107,7 @@ impl Xylo {
                 .to_string_lossy()
                 .into_owned()
         });
-        // Context line under the composer: where we are. The model picker in
+        // Context line under the heading: where we are. The model picker in
         // the composer already names the model, so only a missing one is noted.
         let mut context = div()
             .flex()
@@ -1137,21 +1154,106 @@ impl Xylo {
                 })),
             );
         }
-        div().size_full().min_h_0().flex().flex_col()
-            .child(div().flex_1().min_h_0().w_full().flex().flex_col().items_center().justify_center().px(px(if self.chat_width.get() < 750. { 18. } else { CHAT_INSET })).pb(px(30.))
-                .child(brand_glyph(34.).mb(px(12.)).text_color(rgb(muted())))
-                .child(div().text_size(px(28.)).text_center().font_weight(FontWeight::MEDIUM).mb(px(8.)).child("What would you like to work on?"))
-                .child(div().mb(px(24.)).child(context))
-                .when(self.can_populate_chat_starter(cx), |body| body.child(div().flex().flex_wrap().justify_center().gap(px(8.)).children([
-                    (AppIcon::Skills, "Explain this project", "Explain this project using read-only inspection. Summarize its architecture, key entry points, and how to run its tests. Do not edit files."),
-                    (AppIcon::Changes, "Review my changes", "Review the current project changes using read-only inspection. Look for bugs, regressions, and missing tests. Do not edit files."),
-                    (AppIcon::Plan, "Plan a change", "Inspect this project and help me plan a change before making any edits. Ask what I want to change, then propose a plan and wait for my approval before editing files."),
-                ].into_iter().enumerate().map(|(index, (glyph, label, prompt))| {
-                    chip_with(("chat-home-starter", index), Some(icons::small(glyph)), label)
-                        .min_h(px(34.)).rounded(px(8.)).bg(rgb(panel())).border_1().border_color(rgb(border_strong())).text_size(px(13.))
-                        .on_click(cx.listener(move |view, _, window, cx| view.populate_chat_starter(prompt, window, cx)))
-                })))))
-            .child(div().w_full().flex().justify_center().px(px(if self.chat_width.get() < 750. { 16. } else { CHAT_INSET })).pb(px(if self.chat_width.get() < 750. {8.} else {13.})).flex_shrink_0().child(self.prompt_box(cx)))
+        let compact = self.chat_width.get() < 620.;
+        let intro = div()
+            .w_full()
+            .flex_shrink_0()
+            .my_auto()
+            .flex()
+            .flex_col()
+            .items_center()
+            .px(px(if compact { 18. } else { CHAT_INSET }))
+            .py(px(24.))
+            .child(brand_mark(if compact { 32. } else { 44. }).mb(px(if compact { 12. } else { 20. })))
+            .child(
+                div()
+                    .text_size(px(if compact { 24. } else { 30. }))
+                    .line_height(relative(1.2))
+                    .text_center()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .mb(px(10.))
+                    .child("What would you like to work on?"),
+            )
+            .child(div().mb(px(24.)).child(context))
+            .when(self.can_populate_chat_starter(cx), |body| {
+                body.child(
+                    div()
+                        .w_full()
+                        .max_w(px(COLUMN_WIDTH))
+                        .flex()
+                        .when(compact, |row| row.flex_col())
+                        .gap(px(if compact { 6. } else { 10. }))
+                        .children([
+                            (AppIcon::Skills, "Explain this project", "Find your way around the code.", "Explain this project using read-only inspection. Summarize its architecture, key entry points, and how to run its tests. Do not edit files."),
+                            (AppIcon::Changes, "Review my changes", "Get a fresh look before you ship.", "Review the current project changes using read-only inspection. Look for bugs, regressions, and missing tests. Do not edit files."),
+                            (AppIcon::Plan, "Plan a change", "Turn an idea into a clear next step.", "Inspect this project and help me plan a change before making any edits. Ask what I want to change, then propose a plan and wait for my approval before editing files."),
+                        ].into_iter().enumerate().map(|(index, (glyph, label, description, prompt))| {
+                            focus_ring(gpui_kit::base::Button::new(("chat-home-starter", index)))
+                                .accessibility_label(label)
+                                .flex_1()
+                                .min_w_0()
+                                .min_h(px(if compact { 44. } else { 92. }))
+                                .px(px(16.))
+                                .py(px(if compact { 6. } else { 14. }))
+                                .rounded(px(12.))
+                                .bg(rgb(panel()))
+                                .border_color(rgb(border()))
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .justify_center()
+                                .gap(px(8.))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(hover_panel())).border_color(rgb(border_strong())))
+                                .active(|style| style.bg(rgb(pressed())))
+                                .focus_visible(|style| style.border_color(rgb(brand())))
+                                .child(
+                                    div().flex().items_center().gap(px(8.))
+                                        .child(icons::small(glyph).text_color(rgb(accent_text())))
+                                        .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(rgb(text())).child(label)),
+                                )
+                                .when(!compact, |button| button.child(
+                                    div().text_size(px(12.)).line_height(relative(1.45)).text_color(rgb(muted())).child(description),
+                                ))
+                                .on_click(cx.listener(move |view, _, window, cx| view.populate_chat_starter(prompt, window, cx)))
+                        })),
+                )
+            });
+        div()
+            .size_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("chat-home-content")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .child(intro),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .px(px(if self.chat_width.get() < 750. {
+                        16.
+                    } else {
+                        CHAT_INSET
+                    }))
+                    .pb(px(if self.chat_width.get() < 750. {
+                        8.
+                    } else {
+                        13.
+                    }))
+                    .flex_shrink_0()
+                    .child(self.prompt_box(cx)),
+            )
             .into_any_element()
     }
 
@@ -1567,7 +1669,7 @@ impl Xylo {
             .when(self.draft_needs_attention(), |surface| surface.child(div().px(px(8.)).py(px(6.)).child(self.draft_status_footer(cx))))
             .child(div().id("image-drop-target").test_support().relative().w_full().rounded(px(COMPOSER_RADIUS))
                 .track_focus(&self.composer_surface_focus).tab_stop(false).in_focus(|style| style.border_color(rgb(brand())))
-                .bg(rgb(panel())).border_1().border_color(rgb(border_strong())).shadow(vec![BoxShadow::new(px(0.),px(1.),hsla(0.,0.,0.,1./15.)).blur_radius(px(2.))])
+                .bg(rgb(panel())).border_1().border_color(rgb(border_strong())).shadow(vec![BoxShadow::new(px(0.),px(3.),hsla(0.,0.,0.,0.04)).blur_radius(px(12.))])
                 .flex().flex_col().px(px(12.)).pt(px(15.)).pb(px(10.))
                 .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| view.attach_image_paths(paths.paths().to_vec(), AttachmentSource::Drop, cx)))
                 .children(self.speech_strip(cx))

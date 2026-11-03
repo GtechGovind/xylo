@@ -408,7 +408,7 @@ mod xylo {
                     match change {
                         "query" => {
                             view.update(cx, |view, cx| view.open_project_search(window, cx));
-                            window.press("cmd-a", cx);
+                            window.press(if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" }, cx);
                             window.input("TARGET", cx);
                         }
                         "case" => window.click("project-search-case", cx),

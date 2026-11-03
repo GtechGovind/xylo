@@ -496,6 +496,142 @@ fn the_allow_shortcut_needs_the_card_in_front_of_the_person(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
+fn a_full_dispatch_queue_keeps_approval_and_denial_retryable(cx: &mut TestAppContext) {
+    with_view(cx, |view, _, cx| {
+        for allow in [true, false] {
+            let action = approval(view);
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            sender.send((view.session, WorkerCommand::Cancel)).unwrap();
+            view.validation_worker_commands = Some(sender);
+            view.decide_action(action, allow, false, cx);
+            let card = view.turns[&view.session].tool(action).unwrap();
+            assert!(card.approval, "An undelivered decision must stay available");
+            assert_eq!(card.success, None);
+            assert!(card.result.is_none());
+            assert!(view.error.is_some());
+            receiver.try_recv().unwrap();
+            view.decide_action(action, allow, false, cx);
+            assert!(matches!(receiver.try_recv().unwrap().1,
+                WorkerCommand::Approve { action_id, allow: sent, .. }
+                    if action_id == action && sent == allow));
+            assert!(!view.turns[&view.session].tool(action).unwrap().approval);
+            view.decide_action(action, allow, false, cx);
+            assert!(
+                receiver.try_recv().is_err(),
+                "A submitted decision cannot dispatch twice"
+            );
+        }
+    });
+}
+
+#[gpui_kit::test]
+fn decision_shortcuts_wait_until_the_reader_returns_to_latest(cx: &mut TestAppContext) {
+    with_view(cx, |view, window, cx| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        view.validation_worker_commands = Some(sender);
+        let action = approval(view);
+        view.sync_history_list(cx);
+        view.composer
+            .update(cx, |input, cx| input.focus(window, cx));
+        view.histories.get_mut(&view.session).unwrap().loading = true;
+        view.allow_pending(window, cx);
+        assert!(
+            receiver.try_recv().is_err(),
+            "Loading history is not a reviewed decision"
+        );
+        view.histories.get_mut(&view.session).unwrap().loading = false;
+        view.histories[&view.session].list.pause_following_tail();
+        view.allow_pending(window, cx);
+        view.deny_or_stop_shortcut(window, cx);
+        assert!(
+            receiver.try_recv().is_err(),
+            "An unseen decision stays pending"
+        );
+        assert!(view.turns[&view.session].tool(action).unwrap().approval);
+        view.jump_to_latest(cx);
+        view.allow_pending(window, cx);
+        assert!(matches!(receiver.try_recv().unwrap().1,
+            WorkerCommand::Approve { action_id, allow: true, .. } if action_id == action));
+
+        // Centered search history may still have tail-follow enabled while its
+        // page loads. Its pending decision must also wait for Return to latest.
+        let action = approval(view);
+        view.workspace = Some("/fixture".into());
+        view.messages = (0..300)
+            .map(|index| {
+                crate::state::message(view.session, "user", format!("Earlier message {index}"))
+            })
+            .collect();
+        view.sync_history_list(cx);
+        view.histories.get_mut(&view.session).unwrap().has_more = true;
+        view.load_older(cx);
+        assert!(view.histories[&view.session].list.is_following_tail());
+        view.allow_pending(window, cx);
+        view.deny_or_stop_shortcut(window, cx);
+        assert!(
+            receiver.try_recv().is_err(),
+            "A centered history window cannot approve live work"
+        );
+        assert!(view.turns[&view.session].tool(action).unwrap().approval);
+    });
+}
+
+#[gpui_kit::test]
+fn escape_keeps_unseen_decisions_pending_but_still_stops_turns(cx: &mut TestAppContext) {
+    with_view(cx, |view, window, cx| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        view.validation_worker_commands = Some(sender);
+        let action = approval(view);
+        view.sync_history_list(cx);
+        view.composer
+            .update(cx, |input, cx| input.focus(window, cx));
+
+        view.histories.get_mut(&view.session).unwrap().loading = true;
+        view.escape_pressed(window, cx);
+        assert!(
+            receiver.try_recv().is_err(),
+            "Escape cannot deny while history loads"
+        );
+        view.histories.get_mut(&view.session).unwrap().loading = false;
+        view.histories[&view.session].list.pause_following_tail();
+        view.escape_pressed(window, cx);
+        assert!(
+            receiver.try_recv().is_err(),
+            "Escape cannot deny an off-tail decision"
+        );
+
+        view.jump_to_latest(cx);
+        view.workspace = Some("/fixture".into());
+        view.messages = (0..300)
+            .map(|index| {
+                crate::state::message(view.session, "user", format!("Earlier message {index}"))
+            })
+            .collect();
+        view.sync_history_list(cx);
+        view.histories.get_mut(&view.session).unwrap().has_more = true;
+        view.load_older(cx);
+        assert!(view.histories[&view.session].list.is_following_tail());
+        view.escape_pressed(window, cx);
+        assert!(
+            receiver.try_recv().is_err(),
+            "Escape cannot deny from centered history"
+        );
+        assert!(view.turns[&view.session].tool(action).unwrap().approval);
+
+        view.return_to_latest(cx);
+        view.escape_pressed(window, cx);
+        assert!(matches!(receiver.try_recv().unwrap().1,
+            WorkerCommand::Approve { action_id, allow: false, .. } if action_id == action));
+        view.histories[&view.session].list.pause_following_tail();
+        view.escape_pressed(window, cx);
+        assert!(
+            matches!(receiver.try_recv().unwrap().1, WorkerCommand::Cancel),
+            "With no decision pending, Escape still stops an off-tail task"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn the_composer_prompt_follows_the_page(cx: &mut TestAppContext) {
     let (window, view) = open_chat(cx);
     let placeholder = |cx: &mut TestAppContext| {
@@ -738,6 +874,88 @@ fn interaction_oversize_text_remains_editable_without_dispatch(cx: &mut TestAppC
             );
         }
     });
+}
+
+#[gpui_kit::test]
+fn question_choices_expose_their_label_and_description(cx: &mut TestAppContext) {
+    use gpui_kit::test::{TestQueryExt, TestWindowExt};
+    let (window, view) = open_chat(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.error = None;
+            let session = Some(view.session);
+            engine(view, session, EngineEvent::Started, window, cx);
+            engine(
+                view,
+                session,
+                EngineEvent::QuestionRequired {
+                    action_id: Uuid::new_v4(),
+                    questions: vec![xylo_core::UserQuestion {
+                        header: "Scope".into(),
+                        question: "Which scope?".into(),
+                        options: vec![xylo_core::QuestionOption {
+                            label: "Small".into(),
+                            description: "One file".into(),
+                        }],
+                        multi_select: false,
+                    }],
+                },
+                window,
+                cx,
+            );
+            view.sync_history_list(cx);
+        });
+        window.render_frame(cx);
+        assert!(window.find_by_label("Small. One file").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn completed_answers_keep_reasoning_available_without_tool_activity(cx: &mut TestAppContext) {
+    use gpui_kit::test::{TestQueryExt, TestWindowExt};
+    let (window, view) = open_chat(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.error = None;
+            let session = Some(view.session);
+            engine(view, session, EngineEvent::Started, window, cx);
+            engine(
+                view,
+                session,
+                EngineEvent::ThinkingDelta {
+                    text: "Consider the alternatives.".into(),
+                },
+                window,
+                cx,
+            );
+            engine(
+                view,
+                session,
+                EngineEvent::Completed {
+                    text: "Answer".into(),
+                    usage: Usage::default(),
+                },
+                window,
+                cx,
+            );
+            view.sync_history_list(cx);
+        });
+        window.render_frame(cx);
+        assert!(window.find_by_label("Approach. Show details").visible());
+        let current = view.read(cx);
+        let started = current.turns[&current.session]
+            .started_at
+            .unwrap_or_default();
+        let key = Uuid::new_v5(&current.session, format!("thinking-{started}-0").as_bytes());
+        window.click(
+            gpui_kit::ElementId::Name(format!("thinking-toggle-{key}").into()),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(window.find_by_label("Approach. Hide details").visible());
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

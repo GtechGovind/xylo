@@ -126,6 +126,8 @@ impl TerminalView {
         self.assist_open = !self.assist_open;
         if self.assist_open {
             self.assist.update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            self.focus_terminal(window, cx);
         }
         cx.notify();
     }

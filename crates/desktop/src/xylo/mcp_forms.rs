@@ -62,7 +62,7 @@ impl Xylo {
                     let property = &form.request.schema["properties"][name];
                     let title = property["title"].as_str().unwrap_or(name);
                     let help = property["description"].as_str().map(|text| text.to_owned().into());
-                    card = card.child(settings_ui::field(title.to_owned(), Input::new(input), help));
+                    card = card.child(settings_ui::field(title.to_owned(), Input::new(input).aria_label(title.to_owned()), help));
                 }
                 if let Some(error) = &form.error {
                     card = card.child(settings_ui::inline_error(error));

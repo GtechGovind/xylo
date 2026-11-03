@@ -947,7 +947,7 @@ fn render() {
         initial_sources,
         "Native remove must persist source cleanup"
     );
-    std::fs::write(output.join("lifecycle.json"),serde_json::to_vec_pretty(&serde_json::json!({"platform":"macOS native offscreen GPU","local_install":true,"package_id":package_id,"enable":true,"disable":true,"remove":true,"discovery_network_requested":true,"physical_desktop_verified":false})).unwrap()).unwrap();
+    std::fs::write(output.join("lifecycle.json"),serde_json::to_vec_pretty(&serde_json::json!({"platform":std::env::consts::OS,"local_install":true,"package_id":package_id,"enable":true,"disable":true,"remove":true,"discovery_network_requested":true,"physical_desktop_verified":false})).unwrap()).unwrap();
     client.shutdown().unwrap();
     println!(
         "Portable extension lifecycle and captures passed: {}",

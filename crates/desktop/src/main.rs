@@ -16,7 +16,7 @@ mod xylo;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{prelude::*, *};
 use xylo_runtime::host::HostClient;
-actions!(xylo, [ShowXylo, QuitXylo]);
+actions!(xylo, [ShowXylo]);
 struct ShellState {
     window: AnyWindowHandle,
     view: Entity<xylo::Xylo>,
@@ -40,6 +40,17 @@ fn quit(cx: &mut App) {
     } else {
         cx.quit();
     }
+}
+fn configure_shell_actions(cx: &mut App) {
+    cx.on_action(|_: &ShowXylo, cx| show(cx));
+    cx.on_action(|_: &xylo::QuitApplication, cx| quit(cx));
+    // Sharing the root's action preserves the native menu accelerator. A
+    // different action bound to that chord would shadow the focused route.
+    cx.set_menus([Menu::new("Xylo").items([
+        MenuItem::action("Open Xylo", ShowXylo),
+        MenuItem::Separator,
+        MenuItem::action("Quit Xylo", xylo::QuitApplication),
+    ])]);
 }
 fn main() -> anyhow::Result<()> {
     let (data, debug) = match startup::Command::parse(std::env::args_os().skip(1))? {
@@ -135,22 +146,7 @@ fn main() -> anyhow::Result<()> {
             view,
             _tray: tray,
         });
-        cx.on_action(|_: &ShowXylo, cx| show(cx));
-        cx.on_action(|_: &QuitXylo, cx| quit(cx));
-        cx.bind_keys([KeyBinding::new(
-            if cfg!(target_os = "macos") {
-                "cmd-q"
-            } else {
-                "ctrl-q"
-            },
-            QuitXylo,
-            None,
-        )]);
-        cx.set_menus([Menu::new("Xylo").items([
-            MenuItem::action("Open Xylo", ShowXylo),
-            MenuItem::Separator,
-            MenuItem::action("Quit Xylo", QuitXylo),
-        ])]);
+        configure_shell_actions(cx);
         if let Some(events) = events {
             cx.spawn(async move |cx| {
                 while let Ok(event) = events.recv().await {

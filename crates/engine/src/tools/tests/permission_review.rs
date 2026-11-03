@@ -36,6 +36,7 @@ fn rule(name: &str, arguments: Value, workspace: &std::path::Path) -> (String, S
     permissions::approval_rule(name, &arguments, &Reach::Project, workspace).unwrap()
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approve_for_me_asks_before_writing_through_a_symlink_out_of_the_project() {
     let (directory, broker, mut events) = fixture(PermissionMode::ApproveForMe);

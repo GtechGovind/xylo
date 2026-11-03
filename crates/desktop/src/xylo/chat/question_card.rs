@@ -218,6 +218,7 @@ impl Xylo {
                         ElementId::Name(format!("question-{i}-{index}-{choice}").into()),
                         "",
                     )
+                    .accessibility_label(format!("{}. {}", option.label, option.description))
                     .justify_start()
                     .w_full()
                     .px(px(12.))

@@ -10,7 +10,6 @@ use crate::icons::{self, AppIcon};
 use crate::motion::{self, Disclosure};
 use gpui_kit::TestSupportExt;
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
-use std::time::Instant;
 
 /// Words that make a first prompt a greeting rather than a topic.
 const GREETINGS: &[&str] = &[
@@ -131,26 +130,11 @@ fn project_rows(
     rows
 }
 
-/// A sidebar change that animates for a moment after it happens.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Change {
-    /// A project was expanded; its chats fade in under it.
-    Expanded(PathBuf),
-    /// A chat appeared after the first list (a new chat); it slides in.
-    Arrived(Uuid),
-    /// A chat's title changed; it cross-fades.
-    Retitled(Uuid),
-}
-
 pub(super) struct SidebarUi {
     rows: std::sync::Arc<Vec<SidebarRow>>,
     pub dirty: bool,
     pub collapsed: BTreeSet<PathBuf>,
     renaming: Option<Rename>,
-    /// When each recent change happened. Rows animate only while their change
-    /// is fresh: the list is virtual, so a row scrolled back into view mounts
-    /// again and would otherwise replay its entrance.
-    changes: BTreeMap<Change, Instant>,
     /// Chats archived here that no host page has confirmed yet. A page that
     /// was already on its way still lists them; it must not bring them back.
     archiving: BTreeSet<Uuid>,
@@ -162,28 +146,11 @@ impl Default for SidebarUi {
             dirty: true,
             collapsed: Default::default(),
             renaming: None,
-            changes: BTreeMap::new(),
             archiving: BTreeSet::new(),
         }
     }
 }
 impl SidebarUi {
-    /// A new, unsaved chat's row slides in at the top of its project.
-    pub(super) fn note_new_chat(&mut self, session: Uuid) {
-        self.note(Change::Arrived(session));
-    }
-    fn note(&mut self, change: Change) {
-        self.changes.insert(change, Instant::now());
-    }
-    /// Whether `change` happened recently enough to still be animating.
-    fn fresh(&self, change: &Change) -> bool {
-        self.changes
-            .get(change)
-            .is_some_and(|at| at.elapsed() < motion::SLOW)
-    }
-    fn forget_settled(&mut self) {
-        self.changes.retain(|_, at| at.elapsed() < motion::SLOW);
-    }
     /// Whether `id` was archived here and no host page has confirmed it.
     pub(super) fn archiving(&self, id: Uuid) -> bool {
         self.archiving.contains(&id)
@@ -211,6 +178,25 @@ impl SidebarUi {
     }
 }
 impl Xylo {
+    fn dispatch_chat_change(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&HostClient) -> anyhow::Result<()>,
+    ) -> bool {
+        let result = self
+            .host
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "The application service is unavailable. Restart Xylo to reconnect."
+                )
+            })
+            .and_then(change);
+        let sent = result.is_ok();
+        self.result(result, cx);
+        sent
+    }
+
     pub(super) fn sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.settings_open {
             return self.settings_navigation(cx);
@@ -345,7 +331,6 @@ impl Xylo {
                 self.conversations_has_more || self.conversations_loading_more,
             ));
         }
-        self.sidebar_state.forget_settled();
         let rows = self.sidebar_state.rows.clone();
         let weak = cx.entity().downgrade();
         let content = uniform_list(
@@ -430,10 +415,7 @@ impl Xylo {
                                                     path.display()
                                                 ))
                                                 .on_click(cx.listener(move |view, _, _, cx| {
-                                                    if view.sidebar_state.collapsed.remove(&path) {
-                                                        view.sidebar_state
-                                                            .note(Change::Expanded(path.clone()));
-                                                    } else {
+                                                    if !view.sidebar_state.collapsed.remove(&path) {
                                                         view.sidebar_state
                                                             .collapsed
                                                             .insert(path.clone());
@@ -503,20 +485,7 @@ impl Xylo {
                                         },
                                     )),
                                 );
-                                Some(
-                                    if view.sidebar_state.fresh(&Change::Arrived(view.session)) {
-                                        motion::fade_slide_in(
-                                            ElementId::Name(
-                                                format!("chat-enter-{}", view.session).into(),
-                                            ),
-                                            row,
-                                            -10.,
-                                        )
-                                        .into_any_element()
-                                    } else {
-                                        row.into_any_element()
-                                    },
-                                )
+                                Some(row.into_any_element())
                             }
                             SidebarRow::Conversation(index) => {
                                 let conversation = view.conversations.get(*index)?;
@@ -548,17 +517,6 @@ impl Xylo {
                                 let busy = view.chat_busy(id);
                                 let weak = cx.entity().downgrade();
                                 let title = display_title(conversation);
-                                let state = &view.sidebar_state;
-                                // A new chat drops in from above; chats revealed by
-                                // expanding their project settle a shorter way.
-                                let entrance = if state.fresh(&Change::Arrived(id)) {
-                                    Some(-10.)
-                                } else if state.fresh(&Change::Expanded(path.clone())) {
-                                    Some(-4.)
-                                } else {
-                                    None
-                                };
-                                let retitled = state.fresh(&Change::Retitled(id));
                                 let button = sidebar_chat_button(
                                     ("conversation", i),
                                     title.clone(),
@@ -575,16 +533,6 @@ impl Xylo {
                                         }
                                     },
                                 ));
-                                let button = if retitled {
-                                    motion::fade_on_change(
-                                        format!("chat-title-{id}"),
-                                        &title,
-                                        button,
-                                    )
-                                    .into_any_element()
-                                } else {
-                                    button.into_any_element()
-                                };
                                 let hover_weak = weak.clone();
                                 // The hover "…" opens the same menu as a right-click.
                                 let more =
@@ -618,15 +566,7 @@ impl Xylo {
                                     .context_menu(move |menu, _, _| {
                                         chat_menu(menu, weak.clone(), id, pinned, busy)
                                     });
-                                Some(match entrance {
-                                    Some(from) => motion::fade_slide_in(
-                                        ElementId::Name(format!("chat-enter-{id}").into()),
-                                        row,
-                                        from,
-                                    )
-                                    .into_any_element(),
-                                    None => row.into_any_element(),
-                                })
+                                Some(row.into_any_element())
                             }
                             SidebarRow::More => {
                                 // Reaching the end of the list loads the next
@@ -765,11 +705,14 @@ impl Xylo {
     /// Pins or unpins a chat. The row moves at once; the host's fresh page
     /// confirms it.
     pub(super) fn set_chat_pinned(&mut self, id: Uuid, pinned: bool, cx: &mut Context<Self>) {
+        if !self.dispatch_chat_change(cx, |host| host.set_conversation_pinned(id, pinned)) {
+            return;
+        }
         if let Some(chat) = self.conversations.iter_mut().find(|chat| chat.id == id) {
             chat.pinned = pinned;
             self.sidebar_state.dirty = true;
         }
-        self.host_call(cx, |host| host.set_conversation_pinned(id, pinned));
+        cx.notify();
     }
     /// Archives a chat: it leaves the list and search but keeps its history.
     /// Archiving needs no confirmation; a toast offers Undo. Archiving the
@@ -780,11 +723,14 @@ impl Xylo {
         }
         // Leave the open chat first; when leaving is blocked (unsaved draft,
         // interrupted action) nothing is archived.
+        if self.session == id && !self.draft_before_switch(cx) {
+            return;
+        }
+        if !self.dispatch_chat_change(cx, |host| host.set_conversation_archived(id, true)) {
+            return;
+        }
         if self.session == id {
-            self.new_chat(cx);
-            if self.session == id {
-                return;
-            }
+            self.new_chat_after_draft_check(cx);
         }
         let Some(index) = self.conversations.iter().position(|chat| chat.id == id) else {
             return;
@@ -795,7 +741,7 @@ impl Xylo {
         self.sidebar_state.dirty = true;
         self.status =
             StatusLine::with_undo("Chat archived", app_status::ToastUndo::Unarchive(chat));
-        self.host_call(cx, |host| host.set_conversation_archived(id, true));
+        cx.notify();
     }
     /// A chat with a running turn, an approval waiting or turns queued keeps
     /// working; archiving it would hide that work, so Archive is off.
@@ -813,6 +759,13 @@ impl Xylo {
     /// even when it is older than the first page the host sends back.
     pub(super) fn unarchive_chat(&mut self, mut chat: Conversation, cx: &mut Context<Self>) {
         let id = chat.id;
+        if !self.dispatch_chat_change(cx, |host| host.set_conversation_archived(id, false)) {
+            self.status = StatusLine::with_undo(
+                "Chat couldn't be restored. Try again.",
+                app_status::ToastUndo::Unarchive(chat),
+            );
+            return;
+        }
         chat.archived = false;
         self.sidebar_state.archiving.remove(&id);
         if !self.conversations.iter().any(|existing| existing.id == id) {
@@ -825,7 +778,7 @@ impl Xylo {
             });
             self.sidebar_state.dirty = true;
         }
-        self.host_call(cx, |host| host.set_conversation_archived(id, false));
+        cx.notify();
     }
     /// Renames the open chat in the toolbar title.
     pub(super) fn start_header_rename(
@@ -885,25 +838,19 @@ impl Xylo {
             return;
         };
         if !title.is_empty() && title != display_title(conversation) {
+            if !self.dispatch_chat_change(cx, |host| host.rename_conversation(id, title.clone())) {
+                self.sidebar_state.renaming = Some(rename);
+                return;
+            }
+            let Some(conversation) = self.conversations.iter_mut().find(|chat| chat.id == id)
+            else {
+                return;
+            };
             conversation.title = title.clone();
             conversation.title_source = TitleSource::User;
-            self.sidebar_state.note(Change::Retitled(id));
             self.sidebar_state.dirty = true;
-            self.host_call(cx, |host| host.rename_conversation(id, title));
         }
         cx.notify();
-    }
-    /// Notes which chats are new or renamed since `before`, so their rows
-    /// animate once.
-    pub(super) fn note_conversation_changes(&mut self, before: &[Conversation]) {
-        for change in conversation_changes(
-            before,
-            &self.conversations,
-            self.conversations_loaded,
-            self.session,
-        ) {
-            self.sidebar_state.note(change);
-        }
     }
     /// Applies a stored title to the sidebar and to open search results.
     pub(super) fn conversation_renamed(&mut self, conversation: Conversation) {
@@ -914,9 +861,6 @@ impl Xylo {
             .find(|chat| chat.id == conversation.id)
         {
             Some(existing) => {
-                if display_title(existing) != display_title(&conversation) {
-                    self.sidebar_state.note(Change::Retitled(conversation.id));
-                }
                 *existing = conversation;
             }
             None => {
@@ -931,33 +875,6 @@ impl Xylo {
         }
         self.sidebar_state.dirty = true;
     }
-}
-/// The sidebar changes between two conversation lists: chats that arrived and
-/// chats whose shown title changed. The first list (`loaded` false) is not
-/// news, and the open chat never "arrives": its row already entered as the
-/// unsaved draft.
-fn conversation_changes(
-    before: &[Conversation],
-    after: &[Conversation],
-    loaded: bool,
-    session: Uuid,
-) -> Vec<Change> {
-    if !loaded {
-        return Vec::new();
-    }
-    let previous: BTreeMap<Uuid, String> = before
-        .iter()
-        .map(|chat| (chat.id, display_title(chat)))
-        .collect();
-    after
-        .iter()
-        .filter_map(|chat| match previous.get(&chat.id) {
-            None if chat.id == session => None,
-            None => Some(Change::Arrived(chat.id)),
-            Some(title) if *title != display_title(chat) => Some(Change::Retitled(chat.id)),
-            Some(_) => None,
-        })
-        .collect()
 }
 /// The person's name as the operating system knows it, for the account row.
 pub(super) fn person_name() -> String {
@@ -1053,14 +970,14 @@ fn sidebar_chat_button(
             )
         })
         .when(running, |button| {
-            button.child(motion::pulse(
-                "chat-running-dot",
+            button.child(
                 div()
+                    .id("chat-running-dot")
                     .size(px(6.))
                     .flex_shrink_0()
                     .rounded_full()
                     .bg(rgb(brand())),
-            ))
+            )
         })
 }
 

@@ -33,6 +33,18 @@ The native interface references AionUi's workflow and default theme:
 https://github.com/iOfficeAI/AionUi
 Xylo uses its own name and does not include AionUi brand artwork.
 
+Xylo bundles Obscura v0.2.6, built from source at immutable revision
+8534b401898ed17b62f69bdc3d5eb186bffb0d60:
+https://github.com/h4ckf0r0day/obscura
+Obscura is licensed under Apache License 2.0. Xylo builds the standard
+render-enabled CLI (no stealth feature) as xylo-obscura, its sole native
+managed-browser runtime. The bundled licenses/obscura resource contains the
+upstream license, available upstream/vendor and Cargo dependency notices,
+and BUILD.json recording the pinned source and dependency attribution.
+Source and build dependencies are fetched only during the build; installed
+Xylo does not download a browser runtime. Obscura's independent web engine
+is not Chromium and does not promise full browser/web-platform compatibility.
+
 Other third-party dependencies retain their respective copyright and license
 notices. Cargo.lock identifies the Rust dependency versions used by this build.
 The managed OS sandbox helper uses @anthropic-ai/sandbox-runtime 0.0.81;

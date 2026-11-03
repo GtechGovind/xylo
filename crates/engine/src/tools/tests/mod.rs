@@ -1997,6 +1997,7 @@ async fn small_windows_keep_a_smaller_resident_tool_set() {
         assert!(small_names.iter().any(|tool| tool == name), "{name}");
     }
     assert!(!small_names.iter().any(|tool| tool == "git_status"));
+    assert!(!small_names.iter().any(|tool| tool.starts_with("browser_")));
     assert!(large_names.iter().any(|tool| tool == "git_status"));
     // A served window below the configured one counts as small too.
     let (_served_directory, served, _served_events) =
@@ -2005,6 +2006,54 @@ async fn small_windows_keep_a_smaller_resident_tool_set() {
             request.provider.served_context_tokens = Some(8192);
         });
     assert_eq!(names(&served), small_names);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bundled_browser_is_offered_without_configuration_only_in_normal_windows() {
+    let (_directory, large, _events) = window_fixture(200_000);
+    assert!(!large.capability_config.browser_allow_private_network);
+    let mut browser_names = large
+        .initial_definitions()
+        .into_iter()
+        .filter(|tool| tool.name.starts_with("browser_"))
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    browser_names.sort();
+    assert_eq!(
+        browser_names,
+        vec![
+            "browser_click",
+            "browser_close",
+            "browser_navigate",
+            "browser_screenshot",
+            "browser_snapshot",
+            "browser_type",
+            "browser_wait",
+        ]
+    );
+    assert!(
+        !large
+            .definitions
+            .iter()
+            .any(|tool| tool.name == "browser_download")
+    );
+    for context in [8192, 4096] {
+        let (_directory, compact, _events) = window_fixture(context);
+        assert!(
+            !compact
+                .initial_definitions()
+                .iter()
+                .any(|tool| tool.name.starts_with("browser_"))
+        );
+        assert_eq!(
+            compact
+                .definitions
+                .iter()
+                .filter(|tool| tool.name.starts_with("browser_"))
+                .count(),
+            7
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

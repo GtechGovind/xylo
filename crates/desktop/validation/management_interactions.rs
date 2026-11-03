@@ -14,6 +14,14 @@ mod terminal_view;
 mod terminal_workspace;
 #[path = "../src/ui.rs"]
 mod ui;
+#[cfg(unix)]
+mod protocol_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../runtime/test_support.rs"
+    ));
+}
+
 mod xylo {
     include!("../src/xylo.rs");
     mod management_tests {
@@ -133,11 +141,13 @@ mod xylo {
                 assert!(Instant::now() < deadline, "Host fixture did not shut down");
                 std::thread::sleep(Duration::from_millis(10));
             }
+            #[cfg(unix)]
             assert_no_ssh_masters(&fixture.base);
         }
         /// Every SSH master the fixture client started (it logs its PID and
         /// control socket path) must end with the host and helper, not
         /// outlive them as an orphan.
+        #[cfg(unix)]
         fn assert_no_ssh_masters(base: &Path) {
             let Ok(masters) = std::fs::read_to_string(base.join("ssh-masters")) else {
                 return;
@@ -161,32 +171,9 @@ mod xylo {
         fn approved_context_mcp_registers_discovers_and_persists_real_stdio_tools(
             cx: &mut TestAppContext,
         ) {
-            use std::os::unix::fs::PermissionsExt;
             let fixture = open(cx);
             let server = fixture.workspace.join("mcp-fixture");
-            std::fs::write(&server, r#"#!/usr/bin/env python3
-import json,sys,time,pathlib,os
-pathlib.Path(__file__+".pid").write_text(str(os.getpid()))
-assert sys.argv[1:] == ["first argument", "--readonly"], sys.argv
-for line in sys.stdin:
-    request=json.loads(line)
-    if 'id' not in request: continue
-    method=request['method']
-    if method=='initialize':
-        result={'protocolVersion':request['params']['protocolVersion'],'capabilities':{'tools':{}},'serverInfo':{'name':'native-ui-fixture','version':'1'}}
-    elif method=='tools/list':
-        mode_path=pathlib.Path(__file__+'.mode')
-        mode=mode_path.read_text() if mode_path.exists() else 'normal'
-        if mode=='slow': time.sleep(0.15)
-        if mode=='error':
-            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32603,'message':'Fixture catalogue failed'}}),flush=True)
-            continue
-        result={'tools':[{'name':'fixture_echo','description':'Local fixture echo','inputSchema':{'type':'object','properties':{'value':{'type':'string'}}},'annotations':{'readOnlyHint':True}}]}
-        if mode=='empty': result={'tools':[]}
-    else: result={}
-    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
-"#).unwrap();
-            std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::protocol_fixture::install("ui", &server);
             cx.update_window(fixture.window, |_, window, cx| {
                 window.render_frame(cx);
                 window.click("settings", cx);
@@ -1390,7 +1377,7 @@ printf 'isolated remote command completed'
                     view.validation_environment_focus_name(window, cx)
                 });
                 window.render_frame(cx);
-                window.press("cmd-a", cx);
+                window.press(if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" }, cx);
                 window.input("Newer form name", cx);
             })
             .unwrap();

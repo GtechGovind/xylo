@@ -44,14 +44,24 @@ fn explicit_profiles_require_one_absolute_path_without_creating_it() {
 
 #[test]
 fn debug_can_be_combined_with_an_explicit_profile_in_either_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("xylo-debug");
     for arguments in [
-        vec!["--debug", "--data-dir", "/tmp/xylo-debug"],
-        vec!["--data-dir", "/tmp/xylo-debug", "--debug"],
+        vec![
+            "--debug".into(),
+            "--data-dir".into(),
+            data.clone().into_os_string(),
+        ],
+        vec![
+            "--data-dir".into(),
+            data.clone().into_os_string(),
+            "--debug".into(),
+        ],
     ] {
         assert_eq!(
-            Command::parse(arguments.into_iter().map(OsString::from)).unwrap(),
+            Command::parse(arguments).unwrap(),
             Command::Launch {
-                data: Some("/tmp/xylo-debug".into()),
+                data: Some(data.clone()),
                 debug: true
             }
         );

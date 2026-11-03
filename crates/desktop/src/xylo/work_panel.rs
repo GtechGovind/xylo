@@ -719,8 +719,7 @@ impl Xylo {
                     .when(!stacked, |pane| pane.h_full())
                     .child(chat),
             )
-            .child(crate::motion::slide_in_x(
-                "native-work-pane-enter",
+            .child(
                 div()
                     .id("native-work-pane")
                     .test_support()
@@ -740,10 +739,7 @@ impl Xylo {
                     .border_color(rgb(border()))
                     .child(tabs)
                     .child(div().flex_1().min_h_0().bg(rgb(panel())).child(content)),
-                // The pane opens from the edge it lives on: the right, or the
-                // bottom when the window is narrow and the panes stack.
-                if stacked { 0. } else { 24. },
-            ))
+            )
             .into_any_element()
     }
     fn changed_file_rows(&self, limit: Option<usize>, cx: &Context<Self>) -> Vec<AnyElement> {

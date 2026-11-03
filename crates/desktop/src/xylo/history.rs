@@ -64,6 +64,10 @@ impl ChatHistory {
     pub(super) fn reader_scrolled_away(&self) -> bool {
         !self.windowed && !self.list.is_following_tail()
     }
+    /// Keyboard decisions apply only after the reader reaches the live tail.
+    pub(super) fn at_latest(&self) -> bool {
+        !self.windowed && !self.loading && self.list.is_following_tail()
+    }
 }
 impl Xylo {
     pub(super) fn jump_to_latest(&mut self, cx: &mut Context<Self>) {

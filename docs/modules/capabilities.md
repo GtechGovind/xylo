@@ -2,11 +2,11 @@
 
 ## Purpose and boundaries
 
-`xylo-capabilities` hosts the native services the agent can call as tools: a managed Chromium browser, desktop capture and input, DOCX/XLSX/PDF documents, SSH and container environments, Wasmtime plugins, local inference and speech, reviewed asset downloads, and the scheduler tools. Its crate docs say: "Native capability services, isolated from the agent implementation."
+`xylo-capabilities` hosts the native services the agent can call as tools: the bundled Obscura browser, desktop capture and input, DOCX/XLSX/PDF documents, SSH and container environments, Wasmtime plugins, local inference and speech, reviewed asset downloads, and the scheduler tools. Its crate docs say: "Native capability services, isolated from the agent implementation."
 
-**Constructing a service is cheap.** Browsers, model servers and native libraries start only when an operation is requested. Optional assets (Chromium, pdfium, llama, whisper, sherpa) are local paths supplied by the asset manager or an explicit import; construction never downloads or loads them.
+**Constructing a service is cheap.** Browsers, model servers and native libraries start only when an operation is requested. The render-enabled Obscura v0.2.6 component is source-built and packaged as the sibling `xylo-obscura` executable (`.exe` on Windows). It is not an optional downloaded asset. Optional assets (pdfium, llama, whisper, sherpa) are local paths supplied by the asset manager or an explicit import; construction never downloads or loads them.
 
-Dependencies (`Cargo.toml`): `xylo-core`, `xylo-resources`, `xylo-scheduler`, plus `chromiumoxide`, `pdfium-render`, `calamine`, `rust_xlsxwriter`, `zip`, `quick-xml`, `xcap`, `enigo`, `wasmtime` 50, `cpal`/`rodio`/`hound`/`rubato`, `reqwest` (rustls), `sysinfo`.
+Dependencies (`Cargo.toml`): `xylo-core`, `xylo-resources`, `xylo-scheduler`, plus `pdfium-render`, `calamine`, `rust_xlsxwriter`, `zip`, `quick-xml`, `xcap`, `enigo`, `wasmtime` 50, `cpal`/`rodio`/`hound`/`rubato`, `reqwest` (rustls), `sysinfo`.
 
 **The crate does not decide permissions.** `CapabilityService::execute` "must be called after the application's tool permission decision". Approval lives in the engine and runtime: see [engine-tools](engine-tools.md) and [runtime](runtime.md).
 
@@ -15,7 +15,7 @@ Dependencies (`Cargo.toml`): `xylo-core`, `xylo-resources`, `xylo-scheduler`, pl
 | Path under `crates/capabilities/src` | Purpose |
 | --- | --- |
 | `lib.rs` | `CapabilityConfig`, `CapabilityService`, dispatch, output budget, shared helpers |
-| `browser.rs` | Isolated Chromium over CDP (8 tools) |
+| `browser.rs` | Bundled Obscura over private local IPC (7 tools) |
 | `desktop.rs` | `xcap` screenshots and `enigo` input (4 tools) |
 | `documents.rs`, `documents/` | DOCX, XLSX, XLS, PDF open/edit/export with transactional saves |
 | `environments.rs`, `environments/` | SSH and container execution, capture, archives, devcontainers, storage |
@@ -35,7 +35,7 @@ Dependencies (`Cargo.toml`): `xylo-core`, `xylo-resources`, `xylo-scheduler`, pl
 
 ### `CapabilityConfig`
 
-Fields: `workspace`, `artifacts`, `management_root`, `chromium`, `pdfium_library`, `llama`, `whisper`, `sherpa`, `helper_idle_seconds` (default 60), `operation_timeout_seconds` (default 120), `max_output_bytes` (default 1 MiB). `management_root` holds application-owned catalogs and lifecycle receipts; the process host replaces it and imported settings cannot redirect it.
+Fields: `workspace`, `artifacts`, `management_root`, `browser_allow_private_network` (default `false`), `pdfium_library`, `llama`, `whisper`, `sherpa`, `helper_idle_seconds` (default 60), `operation_timeout_seconds` (default 120), `max_output_bytes` (default 1 MiB). `management_root` holds application-owned catalogs and lifecycle receipts; the process host replaces it and imported settings cannot redirect it.
 
 `CapabilityService::new` **fails** unless:
 
@@ -63,22 +63,23 @@ Other entry points: `approval_presentation` (only `plugin_run_installed` returns
 
 ## Browser (`browser.rs`)
 
-One lazily launched, **isolated** Chromium session (browser, one page, CDP handler) shared behind a `Mutex`. The executable is `config.chromium` or detected Chrome, Chromium or Edge (`/Applications`, `~/Applications`, Windows program dirs, `PATH`), validated by `validate_executable`. Each launch uses a fresh profile `<artifacts>/.browser-<uuid>` (window 1280x900, request timeout = operation timeout) that is deleted on close. A personal profile is never opened.
+One lazily launched, **isolated** Obscura session shared behind a `Mutex`. Xylo owns the source-built, render-enabled v0.2.6 component, packaged as `xylo-obscura` beside the host executable (`xylo-obscura.exe` on Windows). Communication uses private local IPC (authenticated, dynamically allocated loopback CDP), not a user-configured browser URL, cloud service, MCP connection or public CDP listener. There is no configurable browser path, PATH discovery, installed Chrome/Chromium/Edge fallback or attachment to a personal profile. Missing packaged runtime is an installation/build error, not a request to configure another browser.
+
+`browser_allow_private_network` defaults to `false`: loopback and private-network destinations are blocked. Setting it to `true` explicitly permits broad private-network access, including local development sites; it is not a per-host allowlist or a sandbox grant. Ordinary tool permissions still apply.
 
 | Tool | `writes` | Notes |
 | --- | --- | --- |
 | `browser_navigate` | yes | `url`; HTTP(S) with a host only, **no URL credentials** |
 | `browser_snapshot` | no | Accessibility tree; `max_nodes` default 300, clamped 1..=2000; reports `total_nodes`, `truncated` |
-| `browser_click` | yes | CSS `selector` |
-| `browser_type` | yes | `selector`, `text` up to 100,000 bytes |
+| `browser_click` | yes | CSS `selector`; DOM click dispatch, not a physical pointer click |
+| `browser_type` | yes | Focused editable input/textarea `selector`, `text` up to 100,000 bytes |
 | `browser_wait` | no | Polls the selector every 100 ms until the operation timeout |
 | `browser_screenshot` | no | Viewport-only PNG artifact `browser-<uuid>.png` |
-| `browser_download` | yes | `max_bytes` default 50 MiB, ceiling 100 MiB |
 | `browser_close` | yes | Closes the session and deletes the profile |
 
-**Downloads are denied browser-wide** at launch. `browser_download` opens a window in a separate page, stages into the session `downloads` directory, cancels the transfer once received or total bytes exceed the budget (NaN fails closed), re-checks the file on disk (`symlink_metadata`, regular file, size) and then always re-denies downloads and closes the page. The result is renamed to `download-<uuid>.<ext>` (extension at most 12 alphanumerics, else `bin`).
+Exactly seven browser tools are advertised. Downloads are unsupported: legacy `browser_download` calls fail before launching the runtime. There is no substitute unauthenticated download transport.
 
-**Failure behavior.** Each call races cancellation and `operation_timeout_seconds` (`Browser operation cancelled` or `timed out`). **Any error closes the whole browser** instead of replaying an action on an uncertain page. An idle session closes after `helper_idle_seconds` clamped to 5..=3600 s (checked every at most 10 s). `status()` reports `busy` when the lock is held, `running`, or the asset status.
+**Failure behavior.** Each call races cancellation and `operation_timeout_seconds` (`Browser operation cancelled` or `timed out`). **An interrupted or failed in-flight operation drops its owned browser session** instead of replaying an action on an uncertain page. Cancellation/timeout while waiting for the session lock returns without destroying another request's healthy session; legacy-download rejection also leaves a healthy session intact. An idle session closes after `helper_idle_seconds` clamped to 5..=3600 s (checked every at most 10 s). Status distinguishes a running session from a missing bundled runtime; browser readiness never depends on a user-configured executable.
 
 ## Desktop (`desktop.rs`)
 
@@ -229,8 +230,8 @@ A running server registers `http://127.0.0.1:<port>/v1` with its PID in `managed
 
 | Location | Content |
 | --- | --- |
-| `<artifacts>/` | Tool outputs (`browser-*.png`, `display-*.png`, `download-*`, `pdf-*`, `speech-*`, exports, plugin `.txt` writes), `schedules.json` |
-| `<artifacts>/.browser-<uuid>/` | Throwaway Chromium profile, deleted on close |
+| `<artifacts>/` | Tool outputs (`browser-*.png`, `display-*.png`, `pdf-*`, `speech-*`, exports, plugin `.txt` writes), `schedules.json` |
+| OS temporary directory `xylo-obscura-*` | Private throwaway browser session state and readiness record, deleted on close |
 | `<artifacts>/.document-operations/`, `.document-admission.lock` | Save receipts, leases, admission lock |
 | `<artifacts>/..` (parent) | `local-inference.lock`, `local-inference-activity.lock`, `managed-endpoints.json` and its lock |
 | `<management_root>/admission` | Shared resource admission leases |
@@ -250,7 +251,7 @@ Outputs never overwrite: `output_path` refuses an existing name, and document pu
 - **No permission logic here;** the caller approves first. `definition(..., writes)` marks write tools. Agents cannot reach `helper_*` management controls, asset installs or audio capture.
 - Native helpers never inherit the app environment (provider keys); executables must be absolute, existing and executable.
 - Inputs open race-free beneath the workspace or artifacts root; management storage is refused and must be disjoint from artifacts.
-- Browser: isolated profile, HTTP(S) only, no URL credentials, downloads denied except inside a budgeted window.
+- Browser: isolated bundled component, private local IPC, HTTP(S) only, no URL credentials, private networks blocked by default, no download tool. Process isolation is not a claim of Chromium-equivalent sandboxing or web compatibility.
 - Plugins: reviewed and pinned by SHA-256; grants only from the catalog; three host imports; HTTPS-only without redirects.
 - Environments: explicit argv, strict SSH host keys, revision-bound approval, owner-only private keys.
 - Assets: pinned catalog URL, size and digest; unverified bytes are never installed.
@@ -258,7 +259,7 @@ Outputs never overwrite: `output_path` refuses an existing name, and document pu
 
 ## Configuration
 
-`CapabilityConfig` (above) is the only configuration surface. Optional paths (`chromium`, `pdfium_library`, `llama`, `whisper`, `sherpa`) default to `None`; the matching tools then fail with a configuration message, or the browser falls back to detecting an installed Chrome, Chromium or Edge. The host replaces `management_root`.
+`CapabilityConfig` (above) is the only configuration surface. Optional paths (`pdfium_library`, `llama`, `whisper`, `sherpa`) default to `None`; the matching optional tools fail with a configuration message. The browser has no runtime path or URL setting; its sole network-policy flag is `browser_allow_private_network` (default `false`). Legacy persisted `chromium` fields are ignored and disappear on the next save, while unrelated settings are preserved. Helper configure/patch APIs reject `chromium`, `obscura` and `browser_url` explicitly. The host replaces `management_root`.
 
 ## Testing
 

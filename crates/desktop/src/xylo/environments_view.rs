@@ -14,7 +14,7 @@ impl Xylo {
         let busy = self.environments.busy();
         let empty = self.environments.loaded && self.environments.records.is_empty();
         let mut page = settings_ui::settings_page("environments-page", "Environments").description(
-            "Let the agent run commands on a remote machine or in a container instead of this Mac.",
+            "Let the agent run commands on a remote machine or in a container instead of this computer.",
         );
         if !empty {
             page = page.action(
@@ -28,11 +28,9 @@ impl Xylo {
         page = page.children(self.environment_status_notices(cx));
         if let Some(offer) = &self.environments.devcontainer {
             let offer = offer.clone();
-            let client = self
-                .environments
-                .clients
-                .iter()
-                .find(|client| matches!(client.runtime.as_str(), "docker" | "podman"));
+            let client = self.environments.clients.iter().find(|client| {
+                client.available && matches!(client.runtime.as_str(), "docker" | "podman")
+            });
             let mut card = div()
                 .flex()
                 .flex_col()
@@ -64,10 +62,23 @@ impl Xylo {
             page = page.child(settings_ui::section("Project setup", None, card));
         }
         if !self.environments.loaded {
-            page = page.child(settings_ui::loading_list(
-                3,
-                self.environments.waiting_since,
-            ));
+            page = if busy {
+                page.child(settings_ui::loading_list(
+                    3,
+                    self.environments.waiting_since,
+                ))
+            } else {
+                page.child(settings_ui::empty_state(
+                    AppIcon::Environment,
+                    "Environments could not be loaded",
+                    "Try again to load saved environments and available programs.",
+                    Some(
+                        settings_ui::secondary_button("environment-retry-load", "Try again")
+                            .on_click(cx.listener(|view, _, _, cx| view.refresh_environments(cx)))
+                            .into_any_element(),
+                    ),
+                ))
+            };
         } else if empty {
             page = page
                 .child(settings_ui::empty_state(
@@ -444,7 +455,7 @@ impl Xylo {
             busy || form.dirty || form.conflict || self.environments.unresolved(record.profile.id);
         settings_ui::section(
             "Run a command",
-            Some("Runs in this environment, not on this Mac, once it is connected.".into()),
+            Some("Runs in this environment once it is connected.".into()),
             settings_ui::form_column([
                 settings_ui::field(
                     "Command",

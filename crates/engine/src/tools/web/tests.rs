@@ -190,7 +190,7 @@ async fn cached_page_keeps_private_approval_and_untrusted_memory_provenance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn body_caps_and_unregistered_fixture_paths_are_not_bypassed() {
+async fn output_budget_truncates_text_without_poisoning_cache_or_bypassing_fixture_paths() {
     let (_directory, broker, mut events) = crate::tools::tests::fixture(PermissionMode::FullAccess);
     let (url,server)=fixture_server("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\n01234567890123456789").await;
     broker.session.register_web_fixture(&url).unwrap();
@@ -201,7 +201,7 @@ async fn body_caps_and_unregistered_fixture_paths_are_not_bypassed() {
         "https"
     );
     let (result, _) = run_approved(
-        broker,
+        broker.clone(),
         &mut events,
         "cap",
         "web_fetch",
@@ -210,13 +210,93 @@ async fn body_caps_and_unregistered_fixture_paths_are_not_bypassed() {
         false,
     )
     .await;
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("exceeds max_bytes")
+    let result = result.unwrap();
+    assert!(result.contains("\"content\":\"0123456789\""), "{result}");
+    assert!(result.contains("\"truncated\":true"), "{result}");
+    let (result, approvals) = run_approved(
+        broker,
+        &mut events,
+        "full-page",
+        "web_fetch",
+        json!({"url":url,"max_bytes":20}),
+        true,
+        false,
+    )
+    .await;
+    let result = result.unwrap();
+    assert!(result.contains("01234567890123456789"), "{result}");
+    assert!(result.contains("\"truncated\":false"), "{result}");
+    assert!(result.contains("\"cached\":true"), "{result}");
+    assert_eq!(
+        approvals.len(),
+        1,
+        "cached reads still need private-network approval"
     );
     assert_eq!(server.await.unwrap(), 1);
+}
+
+#[test]
+fn page_text_budget_preserves_utf8_and_exact_boundaries() {
+    assert_eq!(bounded_page_text("aé日", 2), ("a", true));
+    assert_eq!(bounded_page_text("aé日", 3), ("aé", true));
+    assert_eq!(bounded_page_text("aé日", 6), ("aé日", false));
+    assert_eq!(bounded_page_text("é", 1), ("", true));
+    assert_eq!(bounded_page_text("", 1), ("", false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn html_scaffolding_does_not_consume_the_readable_text_budget() {
+    let (_directory, broker, mut events) = crate::tools::tests::fixture(PermissionMode::FullAccess);
+    let html = format!("<script>{}</script><p>Hello</p>", "x".repeat(4096));
+    let (url, server) = fixture_server(format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+        html.len()
+    ))
+    .await;
+    broker.session.register_web_fixture(&url).unwrap();
+    let (result, _) = run_approved(
+        broker,
+        &mut events,
+        "large-html",
+        "web_fetch",
+        json!({"url":url,"max_bytes":100}),
+        true,
+        false,
+    )
+    .await;
+    let result = result.unwrap();
+    assert!(result.contains("Hello"), "{result}");
+    assert!(result.contains("\"truncated\":false"), "{result}");
+    assert!(!result.contains("xxxxx"), "{result}");
+    assert_eq!(server.await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn network_body_limit_still_rejects_declared_and_chunked_oversize() {
+    for response in [
+        "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n01234567890123456789",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n14\r\n01234567890123456789\r\n0\r\n\r\n",
+    ] {
+        let (url, server) = fixture_server(response).await;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
+        let error = read_body(
+            response,
+            10,
+            tokio::time::Instant::now() + TIMEOUT,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("hard response byte limit"));
+        assert_eq!(server.await.unwrap(), 1);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -257,7 +337,7 @@ async fn page_prompt_uses_the_turn_provider_with_lowest_effort_and_source_url() 
         &mut events,
         "prompt",
         "web_fetch",
-        json!({"url":url,"prompt":"What is this page?"}),
+        json!({"url":url,"prompt":"What is this page?","max_bytes":3}),
         true,
         false,
     )
@@ -271,6 +351,12 @@ async fn page_prompt_uses_the_turn_provider_with_lowest_effort_and_source_url() 
         assert!(requests[0].tools.is_empty());
         assert!(requests[0].messages[1].content.contains("<untrusted_page>"));
         assert!(requests[0].messages[1].content.contains(&url));
+        assert!(
+            requests[0].messages[1]
+                .content
+                .contains("Page text truncated: true")
+        );
+        assert!(!requests[0].messages[1].content.contains("# Doc"));
     }
     assert_eq!(server.await.unwrap(), 1);
 }

@@ -1,4 +1,47 @@
 use super::*;
+
+#[test]
+fn legacy_browser_path_is_ignored_without_resetting_other_settings() {
+    let config: CapabilityConfig = serde_json::from_value(json!({
+        "chromium": "/obsolete/custom/chrome",
+        "pdfium_library": "/assets/pdfium",
+        "helper_idle_seconds": 73,
+        "operation_timeout_seconds": 241,
+        "max_output_bytes": 8192
+    }))
+    .unwrap();
+    assert!(!config.browser_allow_private_network);
+    assert_eq!(config.pdfium_library, Some(PathBuf::from("/assets/pdfium")));
+    assert_eq!(config.helper_idle_seconds, 73);
+    assert_eq!(config.operation_timeout_seconds, 241);
+    assert_eq!(config.max_output_bytes, 8192);
+    let serialized = serde_json::to_value(&config).unwrap();
+    assert!(serialized.get("chromium").is_none());
+    assert!(serialized.get("obscura").is_none());
+    assert!(serialized.get("browser_url").is_none());
+    assert_eq!(serialized["browser_allow_private_network"], false);
+    assert_eq!(serialized["helper_idle_seconds"], 73);
+    assert_eq!(serialized["pdfium_library"], "/assets/pdfium");
+}
+
+#[test]
+fn browser_private_network_requires_an_explicit_boolean_opt_in() {
+    assert!(!CapabilityConfig::default().browser_allow_private_network);
+    let config: CapabilityConfig =
+        serde_json::from_value(json!({"browser_allow_private_network": true})).unwrap();
+    assert!(config.browser_allow_private_network);
+    assert_eq!(
+        serde_json::to_value(config).unwrap()["browser_allow_private_network"],
+        true
+    );
+    assert!(
+        serde_json::from_value::<CapabilityConfig>(json!({
+            "browser_allow_private_network": "true"
+        }))
+        .is_err()
+    );
+}
+
 #[test]
 fn output_names_cannot_escape_artifacts() {
     let cfg = CapabilityConfig::default();

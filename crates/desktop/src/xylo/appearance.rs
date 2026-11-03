@@ -16,6 +16,24 @@ impl Render for ResizePanel {
     }
 }
 impl Xylo {
+    /// The file tree's splitter uses the same work-pane geometry as rendering.
+    /// In a stacked workspace the work pane starts at the sidebar, not at
+    /// the side-by-side panel's trailing edge.
+    pub(super) fn files_width_at_pointer(&self, total: f32, pointer: f32) -> f32 {
+        let sidebar = if self.settings.ui.sidebar_visible || self.settings_open {
+            self.settings.ui.sidebar_width
+        } else {
+            0.
+        };
+        let available = (total - sidebar).max(0.);
+        let work_width = if available < 720. {
+            available
+        } else {
+            self.effective_work_panel_width(total)
+        };
+        (pointer - (total - work_width)).clamp(130., (work_width * 0.45).clamp(130., 480.))
+    }
+
     pub(super) fn resize_edge(&self, panel: Panel) -> AnyElement {
         let (id, axis) = match panel {
             Panel::Sidebar => ("sidebar-resize", Axis::Horizontal),
@@ -54,11 +72,11 @@ impl Xylo {
         self.host_call(cx, |host| host.save_settings(settings));
     }
     /// Applies the theme preference: "light", "dark", or "system", which
-    /// follows the macOS appearance and keeps following it while chosen.
+    /// follows the system appearance and keeps following it while chosen.
     pub(super) fn apply_theme(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.theme == "system" {
             // Hand the window back to the system appearance, so what it
-            // reports (now and on every later change) is the Mac's choice.
+            // reports (now and on every later change) is the system's choice.
             cx.set_window_appearance(None);
             follow_system_appearance(window, cx);
             self.paint_theme(system_is_dark(window), window, cx);
@@ -97,7 +115,7 @@ fn system_is_dark(window: &Window) -> bool {
     )
 }
 
-/// Repaints whenever the Mac's appearance changes while "System" is chosen.
+/// Repaints whenever the system appearance changes while "System" is chosen.
 /// Registered once for the main window; a later Light or Dark choice makes
 /// the observer a no-op rather than unregistering it.
 fn follow_system_appearance(window: &mut Window, cx: &mut Context<Xylo>) {

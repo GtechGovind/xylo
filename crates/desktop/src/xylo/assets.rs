@@ -447,7 +447,11 @@ impl Xylo {
                             ("install-asset", i),
                             if installed { "Use" } else { "Install" },
                         )
+                        .disabled(self.assets.pending_action.is_some())
                         .on_click(cx.listener(move |view, _, _, cx| {
+                            if view.assets.pending_action.is_some() {
+                                return;
+                            }
                             view.assets.pending_action = Some(id.clone());
                             view.capability(
                                 if installed {

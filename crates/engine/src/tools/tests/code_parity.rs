@@ -1,4 +1,13 @@
 use super::*;
+
+#[cfg(unix)]
+mod protocol_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../runtime/test_support.rs"
+    ));
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edits_require_a_conversation_read_and_report_type_errors() {
@@ -33,7 +42,10 @@ async fn edits_require_a_conversation_read_and_report_type_errors() {
     run(&broker, "reread", "file_read", json!({"path":"a.py"}))
         .await
         .unwrap();
-    std::fs::write(dir.path().join("profile/language-servers.json"),json!({"servers":[{"languages":["python"],"executable":"/usr/bin/python3","args":[concat!(env!("CARGO_MANIFEST_DIR"),"/../runtime/src/lsp/agent/test_server.py")]}]}).to_string()).unwrap();
+    std::fs::write(
+        dir.path().join("profile/language-servers.json"),
+        json!({"servers":[{"languages":["python"],"executable":protocol_fixture::executable("lsp"),"args":[]}]}).to_string(),
+    ).unwrap();
     broker.session.permissions().set(PermissionMode::FullAccess);
     let result = run(&broker, "edit", "file_edit", edit).await.unwrap();
     let value: Value = serde_json::from_str(&result).unwrap();

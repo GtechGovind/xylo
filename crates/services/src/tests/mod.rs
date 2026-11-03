@@ -4,6 +4,14 @@ use std::sync::Arc;
 use uuid::Uuid;
 use xylo_core::{ChatMessage, ConnectorConfig, Conversation, MemoryRecord, now_ms};
 
+#[cfg(unix)]
+mod protocol_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../runtime/test_support.rs"
+    ));
+}
+
 fn database() -> (tempfile::TempDir, Store, Uuid) {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path().join("xylo.db")).unwrap();
@@ -1152,26 +1160,13 @@ async fn authenticated_http_mcp_uses_isolated_vault_and_rejects_missing_token() 
 #[cfg(unix)]
 #[tokio::test]
 async fn scoped_mcp_reuses_only_matching_workspace_and_environment() {
-    use std::os::unix::fs::PermissionsExt;
     let (directory, store, _) = database();
     let first = directory.path().join("first");
     let second = directory.path().join("second");
     std::fs::create_dir_all(&first).unwrap();
     std::fs::create_dir_all(&second).unwrap();
     let script = directory.path().join("scoped-mcp");
-    std::fs::write(&script,r#"#!/usr/bin/python3
-import json,sys,pathlib,os
-marker=pathlib.Path('launches.txt')
-marker.write_text(str(int(marker.read_text())+1 if marker.exists() else 1))
-for line in sys.stdin:
-    request=json.loads(line)
-    if 'id' not in request: continue
-    if request['method']=='initialize': result={'protocolVersion':request['params']['protocolVersion'],'capabilities':{'tools':{}},'serverInfo':{'name':'scoped-fixture','version':'1'}}
-    elif request['method']=='tools/list': result={'tools':[{'name':pathlib.Path.cwd().name+'_'+os.environ['FIXTURE_SCOPE'],'inputSchema':{'type':'object'}}]}
-    else: result={}
-    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
-"#).unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    protocol_fixture::install("scoped", &script);
     let broker = ConnectorBroker::new(store.clone(), vault());
     let config = ConnectorConfig {
         id: Uuid::new_v4(),

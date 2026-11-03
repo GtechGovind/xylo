@@ -13,10 +13,17 @@ pub(super) struct TurnQueueUi {
     undo: BTreeMap<Uuid, Uuid>,
     removals: BTreeSet<Uuid>,
     restores: BTreeSet<Uuid>,
+    pauses: BTreeMap<Uuid, Uuid>,
     recovered: BTreeMap<Uuid, QueuedTurn>,
     guidance: BTreeMap<Uuid, QueuedTurn>,
 }
 impl TurnQueueUi {
+    fn operation_pending(&self, session: Uuid, item: Uuid) -> bool {
+        self.operations
+            .values()
+            .any(|owned| *owned == (session, item))
+    }
+
     /// Only retire a transfer's recovery link once the composer payload is durable.
     pub(super) fn draft_saved(&mut self, draft: &xylo_runtime::drafts::DraftSnapshot) {
         self.recovered.retain(|_, item| {
@@ -56,13 +63,17 @@ impl Xylo {
         cx: &mut Context<Self>,
     ) {
         let expected = self.turn_queue.requests.remove(&id) == Some(session);
+        let pause = self.turn_queue.pauses.get(&session) == Some(&id);
+        if pause {
+            self.turn_queue.pauses.remove(&session);
+        }
         let removed = self.turn_queue.operations.get(&id).copied();
         let operation = self
             .turn_queue
             .operations
             .remove(&id)
             .is_some_and(|(owned, _)| owned == session);
-        if !id.is_nil() && !expected && !operation {
+        if !id.is_nil() && !expected && !operation && !pause {
             return;
         }
         let edit = self.turn_queue.edits.remove(&id);
@@ -200,31 +211,31 @@ impl Xylo {
         cx.notify();
     }
     fn manage_queued_turn(&mut self, item: Uuid, send: bool, cx: &mut Context<Self>) {
+        let _ = self.dispatch_queued_turn(item, send, cx);
+    }
+
+    fn dispatch_queued_turn(
+        &mut self,
+        item: Uuid,
+        send: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
         if send {
             self.cancel_setup_close_intents(cx);
         }
         let session = self.session;
-        if send && self.running() {
-            return;
+        if (send && self.running()) || self.turn_queue.operation_pending(session, item) {
+            return None;
         }
-        if self
-            .turn_queue
-            .operations
-            .values()
-            .any(|entry| *entry == (session, item))
-        {
-            return;
-        }
-        let Some(host) = &self.host else {
-            return;
-        };
+        let host = self.host.as_ref()?;
         let id = Uuid::new_v4();
         let result = if send {
             host.run_queued_turn(id, session, item)
         } else {
             host.remove_queued_turn(id, session, item)
         };
-        if result.is_ok() {
+        let accepted = result.is_ok();
+        if accepted {
             self.turn_queue
                 .requests
                 .retain(|_, owned| *owned != session);
@@ -238,19 +249,20 @@ impl Xylo {
                 .insert(session, "The queue is busy. Try again.".into());
         }
         cx.notify();
+        accepted.then_some(id)
     }
     fn edit_queued_turn(&mut self, item: QueuedTurn, cx: &mut Context<Self>) {
-        self.manage_queued_turn(item.id, false, cx);
-        if let Some((&request, _)) = self
-            .turn_queue
-            .operations
-            .iter()
-            .find(|(_, owned)| **owned == (self.session, item.id))
-        {
+        // Never attach an edit to a Send/Remove already in flight.
+        if let Some(request) = self.dispatch_queued_turn(item.id, false, cx) {
             self.turn_queue.edits.insert(request, item);
         }
     }
     fn undo_queued_turn(&mut self, item: Uuid, cx: &mut Context<Self>) {
+        if self.turn_queue.undo.get(&self.session) != Some(&item)
+            || self.turn_queue.operation_pending(self.session, item)
+        {
+            return;
+        }
         let Some(host) = &self.host else {
             return;
         };
@@ -258,6 +270,11 @@ impl Xylo {
         if host.restore_queued_turn(id, self.session, item).is_ok() {
             self.turn_queue.operations.insert(id, (self.session, item));
             self.turn_queue.restores.insert(id);
+        } else {
+            self.turn_queue.notice.insert(
+                self.session,
+                "The message could not be restored. Use Undo to retry.".into(),
+            );
         }
         cx.notify();
     }
@@ -314,6 +331,9 @@ impl Xylo {
         true
     }
     fn steer_queued_turn(&mut self, item: Uuid, cx: &mut Context<Self>) {
+        if self.turn_queue.operation_pending(self.session, item) {
+            return;
+        }
         let Some(host) = &self.host else {
             return;
         };
@@ -331,10 +351,24 @@ impl Xylo {
             self.turn_queue
                 .operations
                 .insert(request, (self.session, item));
+        } else {
+            self.turn_queue.notice.insert(
+                self.session,
+                "The task could not be updated. Your message remains in the queue.".into(),
+            );
         }
         cx.notify();
     }
     fn set_queue_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
+        if self.turn_queue.pauses.contains_key(&self.session)
+            || self
+                .turn_queue
+                .items
+                .get(&self.session)
+                .is_none_or(Vec::is_empty)
+        {
+            return;
+        }
         let Some(host) = &self.host else {
             return;
         };
@@ -343,7 +377,12 @@ impl Xylo {
             .set_turn_queue_paused(request, self.session, paused)
             .is_ok()
         {
-            self.turn_queue.requests.insert(request, self.session);
+            self.turn_queue.pauses.insert(self.session, request);
+        } else {
+            self.turn_queue.notice.insert(
+                self.session,
+                "The queue could not be paused or resumed. Try again.".into(),
+            );
         }
         cx.notify();
     }
@@ -364,6 +403,7 @@ impl Xylo {
                     preview.attachments = item.turn.attachments.clone();
                     let edit = item.clone();
                     let id = item.id;
+                    let pending = view.turn_queue.operation_pending(item.turn.session_id, id);
                     div()
                         .id("queued-message-dialog")
                         .test_support()
@@ -382,12 +422,14 @@ impl Xylo {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(primary("edit-queued-dialog", "Edit message").on_click(
-                                    cx.listener(move |view, _, window, cx| {
-                                        window.close_dialog(cx);
-                                        view.edit_queued_turn(edit.clone(), cx);
-                                    }),
-                                ))
+                                .child(
+                                    primary("edit-queued-dialog", "Edit message")
+                                        .disabled(pending)
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            window.close_dialog(cx);
+                                            view.edit_queued_turn(edit.clone(), cx);
+                                        })),
+                                )
                                 .child(
                                     secondary(
                                         "send-queued-dialog",
@@ -398,10 +440,11 @@ impl Xylo {
                                         },
                                     )
                                     .disabled(
-                                        view.running()
-                                            && (!item.turn.attachments.is_empty()
-                                                || item.turn.prompt.len()
-                                                    > xylo_core::MAX_STEERING_BYTES),
+                                        pending
+                                            || (view.running()
+                                                && (!item.turn.attachments.is_empty()
+                                                    || item.turn.prompt.len()
+                                                        > xylo_core::MAX_STEERING_BYTES)),
                                     )
                                     .on_click(cx.listener(
                                         move |view, _, window, cx| {
@@ -414,12 +457,14 @@ impl Xylo {
                                         },
                                     )),
                                 )
-                                .child(button("remove-queued-dialog", "Remove").on_click(
-                                    cx.listener(move |view, _, window, cx| {
-                                        window.close_dialog(cx);
-                                        view.manage_queued_turn(id, false, cx);
-                                    }),
-                                )),
+                                .child(
+                                    button("remove-queued-dialog", "Remove")
+                                        .disabled(pending)
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            window.close_dialog(cx);
+                                            view.manage_queued_turn(id, false, cx);
+                                        })),
+                                ),
                         )
                         .into_any_element()
                 })
@@ -437,13 +482,15 @@ impl Xylo {
         let items = self.turn_queue.items.get(&self.session);
         let guidance = self.pending_guidance_text();
         let notice = self.turn_queue.notice.get(&self.session);
-        if items.is_none_or(|items| items.is_empty())
-            && guidance.is_none()
-            && !self
+        let has_items = items.is_some_and(|items| !items.is_empty());
+        let has_rows = has_items
+            || guidance.is_some()
+            || self
                 .turn_queue
                 .guidance
                 .values()
-                .any(|item| item.turn.session_id == self.session)
+                .any(|item| item.turn.session_id == self.session);
+        if !has_rows
             && notice.is_none()
             && !self.turn_queue.undo.contains_key(&self.session)
             && !self
@@ -606,77 +653,85 @@ impl Xylo {
             );
         }
         let mut outer = div()
+            .id("pending-messages-panel")
+            .test_support()
             .mx(px(if self.chat_width.get() < 520. {
                 3.
             } else {
                 10.
             }))
             .flex_shrink_0()
-            .mb(px(-13.))
+            .mb(px(8.))
             .pt(px(9.))
             .px(px(12.))
-            .pb(px(20.))
-            .rounded_t(px(16.))
+            .pb(px(9.))
+            .rounded(px(16.))
             .bg(rgb(well()))
             .border_1()
             .border_color(rgb(border_strong()))
             .flex()
             .flex_col()
             .gap(px(4.))
-            .child(
-                div()
-                    .id("next-messages-header")
-                    .flex()
-                    .items_center()
-                    .gap(px(7.))
-                    .child(
-                        subtitle(format!("Next messages · {}", items.map_or(0, Vec::len)))
-                            .text_size(px(12.))
-                            .flex_1(),
-                    )
-                    .child(
-                        button(
-                            "pause-queue",
-                            if items.into_iter().flatten().any(|item| item.paused) {
-                                "Resume"
-                            } else {
-                                "Pause"
-                            },
+            .when(has_items, |panel| {
+                panel.child(
+                    div()
+                        .id("next-messages-header")
+                        .test_support()
+                        .flex()
+                        .items_center()
+                        .gap(px(7.))
+                        .child(
+                            subtitle(format!("Next messages · {}", items.map_or(0, Vec::len)))
+                                .text_size(px(12.))
+                                .flex_1(),
                         )
-                        .min_h(px(28.))
-                        .text_size(px(12.))
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            let paused = view
-                                .turn_queue
-                                .items
-                                .get(&view.session)
-                                .is_some_and(|items| items.iter().any(|item| item.paused));
-                            view.set_queue_paused(!paused, cx);
-                        })),
-                    )
-                    .when(items.is_some_and(|x| x.len() > 1), |row| {
-                        row.child(
+                        .child(
                             button(
-                                "show-all-queued",
-                                if self.turn_queue.show_all.contains(&self.session) {
-                                    "Show less".to_string()
+                                "pause-queue",
+                                if items.into_iter().flatten().any(|item| item.paused) {
+                                    "Resume"
                                 } else {
-                                    "Show all".to_string()
+                                    "Pause"
                                 },
                             )
                             .min_h(px(28.))
-                            .px(px(7.))
                             .text_size(px(12.))
+                            .disabled(self.turn_queue.pauses.contains_key(&self.session))
                             .on_click(cx.listener(|view, _, _, cx| {
-                                if !view.turn_queue.show_all.remove(&view.session) {
-                                    view.turn_queue.show_all.insert(view.session);
-                                }
-                                cx.notify();
+                                let paused = view
+                                    .turn_queue
+                                    .items
+                                    .get(&view.session)
+                                    .is_some_and(|items| items.iter().any(|item| item.paused));
+                                view.set_queue_paused(!paused, cx);
                             })),
                         )
-                    }),
-            )
-            .child(rows);
+                        .when(items.is_some_and(|x| x.len() > 1), |row| {
+                            row.child(
+                                button(
+                                    "show-all-queued",
+                                    if self.turn_queue.show_all.contains(&self.session) {
+                                        "Show less".to_string()
+                                    } else {
+                                        "Show all".to_string()
+                                    },
+                                )
+                                .min_h(px(28.))
+                                .px(px(7.))
+                                .text_size(px(12.))
+                                .on_click(cx.listener(
+                                    |view, _, _, cx| {
+                                        if !view.turn_queue.show_all.remove(&view.session) {
+                                            view.turn_queue.show_all.insert(view.session);
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        }),
+                )
+            })
+            .when(has_rows, |panel| panel.child(rows));
         // The host pauses the queue when a task stops or fails; say why and let
         // the user resume it from the first message.
         let paused = items
@@ -789,8 +844,11 @@ impl Xylo {
             outer = outer.child(recovery_rows);
         }
         if let Some(&item) = self.turn_queue.undo.get(&self.session) {
+            let pending = self.turn_queue.operation_pending(self.session, item);
             outer = outer.child(
                 div()
+                    .id("queue-removal-feedback")
+                    .test_support()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -798,9 +856,27 @@ impl Xylo {
                     .child(
                         button("undo-remove-queued", "Undo")
                             .min_h(px(32.))
+                            .disabled(pending)
                             .on_click(
                                 cx.listener(move |view, _, _, cx| view.undo_queued_turn(item, cx)),
                             ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        icons::icon_button(
+                            "dismiss-queue-removal",
+                            AppIcon::Close,
+                            "Dismiss removed message",
+                        )
+                        .disabled(pending)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            if view.turn_queue.undo.get(&view.session) == Some(&item)
+                                && !view.turn_queue.operation_pending(view.session, item)
+                            {
+                                view.turn_queue.undo.remove(&view.session);
+                                cx.notify();
+                            }
+                        })),
                     ),
             );
         }
@@ -810,6 +886,30 @@ impl Xylo {
 
 #[cfg(all(test, feature = "validation"))]
 impl Xylo {
+    pub(super) fn validation_edit_queued_turn_while_pending(
+        &mut self,
+        item: QueuedTurn,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let request = Uuid::new_v4();
+        self.turn_queue
+            .operations
+            .insert(request, (item.turn.session_id, item.id));
+        self.edit_queued_turn(item, cx);
+        self.turn_queue.edits.contains_key(&request)
+    }
+    pub(super) fn validation_queue_restore_pending(&mut self, session: Uuid, item: Uuid) -> Uuid {
+        let request = Uuid::new_v4();
+        self.turn_queue.undo.insert(session, item);
+        self.turn_queue.operations.insert(request, (session, item));
+        self.turn_queue.restores.insert(request);
+        request
+    }
+    pub(super) fn validation_queue_pause_pending(&mut self, session: Uuid) -> Uuid {
+        let request = Uuid::new_v4();
+        self.turn_queue.pauses.insert(session, request);
+        request
+    }
     pub(super) fn validation_recovered_queue_ids(&self) -> Vec<Uuid> {
         self.turn_queue.recovered.keys().copied().collect()
     }

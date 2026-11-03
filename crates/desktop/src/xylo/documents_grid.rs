@@ -35,7 +35,7 @@ pub(super) struct DocumentGrid {
     pub columns: u32,
     pages: BTreeMap<PageKey, Page>,
     order: VecDeque<PageKey>,
-    pub failed: BTreeSet<PageKey>,
+    pub failed: BTreeMap<PageKey, (u32, u32)>,
     pub edits: BTreeMap<(String, String), DocumentCellValue>,
 }
 impl DocumentGrid {
@@ -54,7 +54,7 @@ impl DocumentGrid {
             columns,
             pages: BTreeMap::new(),
             order: VecDeque::new(),
-            failed: BTreeSet::new(),
+            failed: BTreeMap::new(),
             edits: BTreeMap::new(),
         }
     }
@@ -186,7 +186,7 @@ impl TableDelegate for DocumentGrid {
                 preview(&cell.value)
             }
         } else {
-            if !self.failed.contains(&key) {
+            if !page_failed(&self.failed, &key) {
                 let owner = self.owner.clone();
                 let epoch = self.epoch;
                 cx.defer(move |cx| {
@@ -209,6 +209,15 @@ impl TableDelegate for DocumentGrid {
             .child(value)
             .into_any_element()
     }
+}
+fn page_failed(failed: &BTreeMap<PageKey, (u32, u32)>, cell: &PageKey) -> bool {
+    failed.iter().any(|(page, (rows, columns))| {
+        page.sheet == cell.sheet
+            && cell.row >= page.row
+            && cell.row < page.row.saturating_add(*rows)
+            && cell.column >= page.column
+            && cell.column < page.column.saturating_add(*columns)
+    })
 }
 pub(super) fn column_name(mut column: u32) -> String {
     let mut name = String::new();
@@ -252,6 +261,45 @@ pub(super) fn display(value: &DocumentCellValue) -> String {
         DocumentCellValue::Boolean { value } => if *value { "TRUE" } else { "FALSE" }.into(),
         DocumentCellValue::Formula { expression, .. } => expression.clone(),
         DocumentCellValue::Error { code } => code.clone(),
+    }
+}
+
+#[cfg(all(test, not(feature = "validation")))]
+mod tests {
+    use super::{PageKey, page_failed};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_failed_page_marks_every_cell_in_its_actual_response_range() {
+        let failed = BTreeMap::from([
+            (
+                PageKey {
+                    sheet: "Data".into(),
+                    row: 64,
+                    column: 16,
+                },
+                (64, 16),
+            ),
+            (
+                PageKey {
+                    sheet: "Data".into(),
+                    row: 4,
+                    column: 4,
+                },
+                (4, 4),
+            ),
+        ]);
+        let at = |sheet: &str, row, column| PageKey {
+            sheet: sheet.into(),
+            row,
+            column,
+        };
+        assert!(page_failed(&failed, &at("Data", 100, 20)));
+        assert!(page_failed(&failed, &at("Data", 7, 7)));
+        assert!(!page_failed(&failed, &at("Data", 8, 7)));
+        assert!(!page_failed(&failed, &at("Data", 128, 20)));
+        assert!(!page_failed(&failed, &at("Other", 100, 20)));
+        assert!(!page_failed(&failed, &at("Data", 100, 32)));
     }
 }
 

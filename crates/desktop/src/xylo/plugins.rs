@@ -38,6 +38,7 @@ pub(super) struct PluginUi {
     pub input: Entity<TextareaState>,
     output: Entity<TextareaState>,
     artifacts: Vec<PathBuf>,
+    output_owner: Option<(String, u64)>,
     pending: BTreeMap<Uuid, Request>,
     retired: BTreeSet<Uuid>,
     epoch: u64,
@@ -66,6 +67,7 @@ impl PluginUi {
             }),
             output: cx.new(|cx| TextareaState::new(window, cx).rows(6)),
             artifacts: Vec::new(),
+            output_owner: None,
             pending: BTreeMap::new(),
             retired: BTreeSet::new(),
             epoch: 0,
@@ -108,6 +110,15 @@ impl PluginUi {
                         && plugin.package_sha256 == selected.package_sha256
                 })
             })
+        })
+    }
+    fn has_selected_output(&self) -> bool {
+        self.output_owner.as_ref().is_some_and(|(id, epoch)| {
+            *epoch == self.epoch
+                && self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|plugin| plugin.manifest.id == *id)
         })
     }
 }
@@ -491,6 +502,8 @@ impl Xylo {
             return;
         }
         let args = json!({"id":plugin.manifest.id,"package_sha256":plugin.package_sha256,"input":self.plugins.input.read(cx).value().to_string()});
+        self.plugins.output_owner = None;
+        self.plugins.artifacts.clear();
         self.plugins.notice = "Running plugin…".into();
         self.plugin_request("plugin_run_installed", args, RequestKind::Run, cx);
     }
@@ -562,6 +575,13 @@ impl Xylo {
         };
         if request.epoch != self.plugins.epoch {
             return;
+        }
+        if matches!(request.kind, RequestKind::Run) {
+            self.plugins.output_owner = self
+                .plugins
+                .selected
+                .as_ref()
+                .map(|plugin| (plugin.manifest.id.clone(), self.plugins.epoch));
         }
         let value = match result {
             Ok(value) => value,
@@ -754,3 +774,7 @@ impl Xylo {
         self.plugins.artifacts.clone()
     }
 }
+
+#[cfg(all(test, not(feature = "validation")))]
+#[path = "plugins/tests.rs"]
+mod tests;

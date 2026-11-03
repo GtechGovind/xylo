@@ -10135,7 +10135,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xylo-core"
-version = "0.1.1-rc.3"
+version = "0.1.1-rc.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10148,7 +10148,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-distribution"
-version = "0.1.1-rc.3"
+version = "0.1.1-rc.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -10172,7 +10172,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-helper-client"
-version = "0.1.1-rc.3"
+version = "0.1.1-rc.5"
 dependencies = [
  "anyhow",
  "serde",
@@ -10214,7 +10214,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-notifications"
-version = "0.1.1-rc.3"
+version = "0.1.1-rc.5"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -10240,7 +10240,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-resources"
-version = "0.1.1-rc.3"
+version = "0.1.1-rc.5"
 dependencies = [
  "anyhow",
  "fs2",
@@ -10256,7 +10256,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-runtime"
-version = "0.1.1-rc.3"
+version = "0.1.1-rc.5"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -10297,7 +10297,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-scheduler"
-version = "0.1.1-rc.3"
+version = "0.1.1-rc.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -10312,7 +10312,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-services"
-version = "0.1.1-rc.3"
+version = "0.1.1-rc.5"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",

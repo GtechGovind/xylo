@@ -51,3 +51,9 @@ fn messages_follow_chats_under_one_caption_and_status_comes_last() {
     );
     assert_eq!(palette_rows(&[1], 0, ""), vec![PaletteRow::Chat(1)]);
 }
+
+#[test]
+fn extreme_saved_timestamps_do_not_overflow_age_labels() {
+    assert!(super::age_label(i64::MIN).ends_with('w'));
+    assert_eq!(super::age_label(i64::MAX), "now");
+}

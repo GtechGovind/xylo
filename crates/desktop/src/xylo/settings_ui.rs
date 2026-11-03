@@ -258,11 +258,6 @@ impl ParentElement for SettingsPage {
 }
 impl RenderOnce for SettingsPage {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        // Each page (and each sub-page, which differs by title) plays its own
-        // entrance: top-level pages rise into place, sub-pages slide in from
-        // the breadcrumb side.
-        let entrance_id: SharedString = format!("{:?}-{}-in", self.id, self.title).into();
-        let sub_page = self.breadcrumb.is_some();
         let mut heading = div().flex().items_start().gap(px(16.)).child(
             div()
                 .flex_1()
@@ -316,11 +311,6 @@ impl RenderOnce for SettingsPage {
             .gap(px(SECTION_GAP))
             .child(header)
             .children(self.children);
-        let entrance = if sub_page {
-            motion::slide_in_x(entrance_id, column, 16.).into_any_element()
-        } else {
-            motion::fade_slide_in(entrance_id, column, 6.).into_any_element()
-        };
         div()
             .id(self.id)
             .test_support()
@@ -329,7 +319,7 @@ impl RenderOnce for SettingsPage {
             .px(px(CONTENT_GUTTER))
             .pt(px(CONTENT_TOP))
             .pb(px(64.))
-            .child(entrance)
+            .child(column)
     }
 }
 
@@ -843,8 +833,7 @@ impl RenderOnce for ListItem {
                 .into_any_element(),
             None => main.into_any_element(),
         };
-        let entrance_id: SharedString = format!("{group}-in").into();
-        let row = div()
+        div()
             .group(group)
             .w_full()
             .h(px(LIST_ITEM_HEIGHT))
@@ -877,8 +866,7 @@ impl RenderOnce for ListItem {
                         .flex_shrink_0()
                         .text_color(rgb(icons::rest_color())),
                 )
-            });
-        motion::fade_in(entrance_id, row)
+            })
     }
 }
 

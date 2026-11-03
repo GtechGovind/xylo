@@ -1,0 +1,314 @@
+{
+  "date": "2026-11-03",
+  "scope": "Production native desktop UI source, with relevant inline and integration tests",
+  "reviewers": [
+    "root",
+    "review_native_design",
+    "review_settings_ui",
+    "review_workspace_ui"
+  ],
+  "reviewed_production_file_count": 82,
+  "reviewed_production_files": [
+    "crates/desktop/src/app_icon.rs",
+    "crates/desktop/src/assets.rs",
+    "crates/desktop/src/icons.rs",
+    "crates/desktop/src/main.rs",
+    "crates/desktop/src/motion.rs",
+    "crates/desktop/src/startup.rs",
+    "crates/desktop/src/state.rs",
+    "crates/desktop/src/terminal_view.rs",
+    "crates/desktop/src/terminal_workspace.rs",
+    "crates/desktop/src/tool_presentation.rs",
+    "crates/desktop/src/tool_presentation/rich_reads.rs",
+    "crates/desktop/src/tray.rs",
+    "crates/desktop/src/ui.rs",
+    "crates/desktop/src/xylo.rs",
+    "crates/desktop/src/xylo/accounts.rs",
+    "crates/desktop/src/xylo/app_status.rs",
+    "crates/desktop/src/xylo/appearance.rs",
+    "crates/desktop/src/xylo/assets.rs",
+    "crates/desktop/src/xylo/attachments.rs",
+    "crates/desktop/src/xylo/chat.rs",
+    "crates/desktop/src/xylo/chat/diff_preview.rs",
+    "crates/desktop/src/xylo/chat/plan_card.rs",
+    "crates/desktop/src/xylo/chat/question_card.rs",
+    "crates/desktop/src/xylo/chat/thinking.rs",
+    "crates/desktop/src/xylo/chat/tokens.rs",
+    "crates/desktop/src/xylo/chat/tools.rs",
+    "crates/desktop/src/xylo/context_panel.rs",
+    "crates/desktop/src/xylo/documents_copy.rs",
+    "crates/desktop/src/xylo/documents_drafts.rs",
+    "crates/desktop/src/xylo/documents_grid.rs",
+    "crates/desktop/src/xylo/documents_missing.rs",
+    "crates/desktop/src/xylo/documents_view.rs",
+    "crates/desktop/src/xylo/documents.rs",
+    "crates/desktop/src/xylo/drafts.rs",
+    "crates/desktop/src/xylo/drafts/saved.rs",
+    "crates/desktop/src/xylo/editor_assist.rs",
+    "crates/desktop/src/xylo/environments_view.rs",
+    "crates/desktop/src/xylo/environments.rs",
+    "crates/desktop/src/xylo/extension_setup.rs",
+    "crates/desktop/src/xylo/extensions_view.rs",
+    "crates/desktop/src/xylo/extensions.rs",
+    "crates/desktop/src/xylo/file_browser.rs",
+    "crates/desktop/src/xylo/file_tree.rs",
+    "crates/desktop/src/xylo/git_review.rs",
+    "crates/desktop/src/xylo/history_search.rs",
+    "crates/desktop/src/xylo/history.rs",
+    "crates/desktop/src/xylo/image_generation.rs",
+    "crates/desktop/src/xylo/learning.rs",
+    "crates/desktop/src/xylo/management.rs",
+    "crates/desktop/src/xylo/mcp_forms.rs",
+    "crates/desktop/src/xylo/memory_form.rs",
+    "crates/desktop/src/xylo/memory_versions.rs",
+    "crates/desktop/src/xylo/memory.rs",
+    "crates/desktop/src/xylo/model_picker.rs",
+    "crates/desktop/src/xylo/native_tools.rs",
+    "crates/desktop/src/xylo/notifications.rs",
+    "crates/desktop/src/xylo/output_view.rs",
+    "crates/desktop/src/xylo/permission_control.rs",
+    "crates/desktop/src/xylo/plugins_view.rs",
+    "crates/desktop/src/xylo/plugins.rs",
+    "crates/desktop/src/xylo/project_search.rs",
+    "crates/desktop/src/xylo/providers.rs",
+    "crates/desktop/src/xylo/quit.rs",
+    "crates/desktop/src/xylo/settings_ui.rs",
+    "crates/desktop/src/xylo/settings.rs",
+    "crates/desktop/src/xylo/shell_jobs.rs",
+    "crates/desktop/src/xylo/shortcuts.rs",
+    "crates/desktop/src/xylo/sidebar.rs",
+    "crates/desktop/src/xylo/speech.rs",
+    "crates/desktop/src/xylo/ssh_config.rs",
+    "crates/desktop/src/xylo/tasks.rs",
+    "crates/desktop/src/xylo/tool_result_view.rs",
+    "crates/desktop/src/xylo/transcript.rs",
+    "crates/desktop/src/xylo/turn_activity.rs",
+    "crates/desktop/src/xylo/turn_queue.rs",
+    "crates/desktop/src/xylo/updates.rs",
+    "crates/desktop/src/xylo/usage.rs",
+    "crates/desktop/src/xylo/usage/forms.rs",
+    "crates/desktop/src/xylo/usage/status.rs",
+    "crates/desktop/src/xylo/work_panel.rs",
+    "crates/desktop/src/xylo/workspace_pages.rs",
+    "crates/desktop/src/xylo/worktrees.rs"
+  ],
+  "application_language": "Rust",
+  "new_dependencies": [],
+  "python_added_or_run_in_this_review": false,
+  "fixes": [
+    {
+      "area": "Action dispatch",
+      "before": "Loop submission, sidebar changes and permission rules could mutate local state after dispatch failed.",
+      "after": "Drafts and forms remain retryable; archive, undo, pin and rename update after accepted dispatch.",
+      "why": "Avoids losing user input and showing changes that were never sent."
+    },
+    {
+      "area": "Approval decisions",
+      "before": "Failed dispatch could hide an approval and keyboard shortcuts could decide unseen approvals in older history.",
+      "after": "Failed decisions remain retryable; allow, deny and Escape require the latest history for pending approvals.",
+      "why": "Preserves informed decisions without changing ordinary task stopping."
+    },
+    {
+      "area": "Streaming and reasoning",
+      "before": "Thinking deltas repeatedly rebuilt strings and completed answers without tools lost their reasoning disclosure.",
+      "after": "Reasoning uses the stream buffer, reuses snapshots and remains available after completion.",
+      "why": "Reduces repeated work and preserves readable context."
+    },
+    {
+      "area": "Delayed results",
+      "before": "Old extension refreshes and plugin runs could replace newer query or project state.",
+      "after": "Search uses current filters and plugin output is bound to its module and workspace epoch.",
+      "why": "Keeps results attached to the request that produced them."
+    },
+    {
+      "area": "Management recovery",
+      "before": "Initial load failures could leave skeletons running; empty memory views hid failures; asset receipts could overlap.",
+      "after": "Failures expose retry controls, archive access remains available and asset actions are single-flight.",
+      "why": "Makes failed operations understandable and recoverable."
+    },
+    {
+      "area": "Document recovery and grids",
+      "before": "Discarded recovery reopened stale source state and failed page ranges left cells indefinitely loading.",
+      "after": "Discard adopts the current source and failed ranges mark all affected cells.",
+      "why": "Prevents obsolete conflict state and false loading indicators."
+    },
+    {
+      "area": "Search and editor state",
+      "before": "Clearing project search could clear file conflicts and pending reads; stopping could retain pagination.",
+      "after": "Result resets preserve editor state and explicit Stop clears continuation.",
+      "why": "Protects overwrite warnings and respects cancellation."
+    },
+    {
+      "area": "Keyboard and focus",
+      "before": "Search dismissal and terminal question dismissal lost focus; root quit did not reliably reach the unsaved-file guard.",
+      "after": "Focus returns to its originating control; root, shell and native menu share one guarded quit action with its platform accelerator. The duplicate startup binding is removed.",
+      "why": "Keeps keyboard workflows predictable and protects unsaved work."
+    },
+    {
+      "area": "Workspace identity and layout",
+      "before": "Canonical workspace paths could duplicate projects or lose saved panels; stacked file splitters used side-by-side geometry.",
+      "after": "Aliases reconcile to one project with saved preferences and splitters use the rendered pane origin.",
+      "why": "Preserves workspace state and makes dragging track the pointer."
+    },
+    {
+      "area": "Worktree removal",
+      "before": "Removal eligibility could become stale while confirmation was open.",
+      "after": "Active checkout and terminal use are rechecked immediately before removal.",
+      "why": "Avoids removing worktrees that became active during confirmation."
+    },
+    {
+      "area": "Accessibility and long output",
+      "before": "Several controls lacked explicit labels and long command titles could consume the output dialog.",
+      "after": "Question choices, permission patterns, MCP and document fields have explicit labels; output titles have a bounded height.",
+      "why": "Improves assistive navigation and keeps output controls visible."
+    },
+    {
+      "area": "Cross-platform branding",
+      "before": "Runtime icons used a separate procedural drawing from packaged artwork.",
+      "after": "Packaged, Dock, X11 and tray icons derive from the canonical PNG; macOS extracts its alpha template before resizing.",
+      "why": "Keeps mark geometry and padding consistent across icon sizes."
+    },
+    {
+      "area": "Platform text and engine choice",
+      "before": "Environment setup referred to this Mac on every platform and could select an unavailable container engine.",
+      "after": "Copy refers to this computer and uses an available Docker or Podman engine.",
+      "why": "Matches the actual platform and available tools."
+    },
+    {
+      "area": "Compact message actions",
+      "before": "Invisible user-message actions reserved a separate row, making a short user message 84 pixels tall; answer action gaps were 54 pixels.",
+      "after": "User controls share the bubble row, giving a 40 pixel short message; answer controls use a 36 pixel gap.",
+      "why": "Removes unused vertical space while retaining contained controls, pointer hover transfer and keyboard focus at wide and narrow split widths."
+    }
+  ],
+  "validation": {
+    "status": "verified_on_windows",
+    "log_directory": "target/ui-review",
+    "native_runtime_platform": "Windows x86_64",
+    "unavailable_native_runtime_platforms": [
+      "macOS",
+      "Linux"
+    ],
+    "desktop": {
+      "failed": 0,
+      "log": "target/ui-review/desktop-tests.log",
+      "passed": 234,
+      "command": "cargo test -p xylo --locked --no-default-features -j 2 --quiet"
+    },
+    "interactions": [
+      {
+        "ignored": 1,
+        "target": "native-interactions",
+        "passed": 35,
+        "log": "target/ui-review/native-layout-tests.log"
+      },
+      {
+        "target": "workspace-interactions",
+        "passed": 16
+      },
+      {
+        "target": "updater-interactions",
+        "passed": 10
+      },
+      {
+        "target": "draft-interactions",
+        "passed": 23
+      },
+      {
+        "target": "vision-interactions",
+        "passed": 7
+      },
+      {
+        "target": "notification-interactions",
+        "passed": 9
+      },
+      {
+        "target": "memory-interactions",
+        "passed": 12,
+        "log": "target/ui-review/memory-tests.log"
+      },
+      {
+        "target": "image-generation-interactions",
+        "passed": 6
+      },
+      {
+        "target": "document-interactions",
+        "passed": 8
+      },
+      {
+        "target": "management-interactions",
+        "passed": 9
+      },
+      {
+        "target": "recovery-interactions",
+        "passed": 14
+      },
+      {
+        "target": "document-recovery-interactions",
+        "passed": 9
+      },
+      {
+        "target": "terminal-workspace-interactions",
+        "passed": 3
+      },
+      {
+        "target": "file-tree-interactions",
+        "passed": 7
+      },
+      {
+        "target": "account-interactions",
+        "passed": 11
+      },
+      {
+        "target": "composer-interactions",
+        "passed": 46
+      }
+    ],
+    "interaction_test_executions_passed": 225,
+    "shared_fixture_note": "Native harness counts include the three shared terminal fixture tests in each executable.",
+    "ignored_test": "native_editor_completion_uses_real_host_and_clangd requires native clangd for OS qualification; clangd is not available on PATH on this host.",
+    "packaged_icon_tests": {
+      "failed": 0,
+      "passed": 2,
+      "command": "cargo test -p xylo-build --locked --lib build_icons::tests --quiet"
+    },
+    "source_format": "cargo fmt -p xylo -- --check passed",
+    "whitespace": "git diff --check passed",
+    "fixture_corrections": [
+      "Platform Select All bindings",
+      "Stable work-pane lifecycle assertions",
+      "Memory fixture startup readiness and exact destination checks before SQLite contention"
+    ],
+    "application_build": {
+      "status": "passed",
+      "log": "target/ui-review/desktop-build.log",
+      "command": "cargo build -p xylo -p xylo-worker -p xylo-helper -p xylo-cli --locked --no-default-features -j 2",
+      "kind": "Development build without the optional bundled browser download"
+    },
+    "final_desktop_build": {
+      "status": "passed",
+      "log": "target/ui-review/desktop-final-build.log",
+      "command": "cargo build -p xylo --locked --no-default-features -j 2"
+    },
+    "manual_windows_checks": [
+      "Light and dark appearance and header alignment",
+      "Window logo and in-app mark alignment",
+      "Ctrl+K opens search with keyboard focus",
+      "Escape closes search and restores composer focus",
+      "Ctrl+Q with the composer focused closes the final rebuilt app",
+      "Relaunch succeeds with the isolated preview profile"
+    ],
+    "preview": {
+      "profile": "F:/AI/xylo/target/design-preview/profile",
+      "screenshot": "target/ui-review/windows-light.jpg",
+      "installed_copy_replaced": false,
+      "executable": "F:/AI/xylo/target/debug/xylo.exe"
+    }
+  },
+  "validation_portability": [
+    "Native input tests use the platform Select All chord.",
+    "Work-pane lifecycle tests inspect the pane and selected tab.",
+    "Rendering reports identify the actual OS.",
+    "The memory fixture waits for initial setup and scoped drafts before database contention and verifies the exact project after each switch."
+  ]
+}

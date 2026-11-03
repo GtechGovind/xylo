@@ -373,7 +373,7 @@ impl Xylo {
             .as_ref()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned());
-        let run_blocked = busy
+        let run_blocked = settings_blocked
             || !plugin.enabled
             || changed
             || self.plugins.grants_dirty()
@@ -404,7 +404,7 @@ impl Xylo {
             .into_any_element()])
             .into_any_element(),
         ]);
-        if !self.plugins.output.read(cx).value().is_empty() {
+        if self.plugins.has_selected_output() && !self.plugins.output.read(cx).value().is_empty() {
             run = run.child(settings_ui::field(
                 "Output",
                 Textarea::new(&self.plugins.output)
@@ -413,7 +413,7 @@ impl Xylo {
                 None,
             ));
         }
-        if !self.plugins.artifacts.is_empty() {
+        if self.plugins.has_selected_output() && !self.plugins.artifacts.is_empty() {
             run = run.child(settings_ui::list_container(
                 self.plugins
                     .artifacts
@@ -445,7 +445,8 @@ impl Xylo {
             ),
             Some(
                 settings_ui::busy(
-                    settings_ui::destructive_button("plugin-remove", "Remove").disabled(busy),
+                    settings_ui::destructive_button("plugin-remove", "Remove")
+                        .disabled(settings_blocked),
                     self.plugins.pending_tool("helper_plugin_remove"),
                 )
                 .on_click(cx.listener(|view, _, window, cx| view.plugin_confirm(true, window, cx)))

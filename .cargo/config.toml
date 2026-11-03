@@ -5,6 +5,7 @@ target-dir = "target"
 
 [alias]
 # Run aliases from the repository root. Evaluation tooling is opt-in.
-app = "build --locked -p xylo -p xylo-worker -p xylo-helper -p xylo-cli --bins"
-app-release = "build --locked --release -p xylo -p xylo-worker -p xylo-helper -p xylo-cli --bins"
+app = "run --locked -p xylo-build --"
+app-release = "run --locked -p xylo-build -- --release"
+bundle-macos = "run --locked -p xylo-build -- bundle-macos"
 native-test = "test --locked --manifest-path crates/desktop/validation/Cargo.toml"
