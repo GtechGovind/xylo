@@ -16,6 +16,12 @@ mod xylo;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{prelude::*, *};
 use xylo_runtime::host::HostClient;
+// Development executables must not inherit the installed release shortcut's
+// icon and relaunch target. Release builds retain the stable application ID.
+#[cfg(all(target_os = "windows", debug_assertions))]
+const SHELL_APPLICATION_ID: &str = "com.qurkos.xylo.dev";
+#[cfg(not(all(target_os = "windows", debug_assertions)))]
+const SHELL_APPLICATION_ID: &str = xylo_core::APPLICATION_ID;
 actions!(xylo, [ShowXylo]);
 struct ShellState {
     window: AnyWindowHandle,
@@ -43,7 +49,8 @@ fn quit(cx: &mut App) {
 }
 fn configure_shell_actions(cx: &mut App) {
     cx.on_action(|_: &ShowXylo, cx| show(cx));
-    cx.on_action(|_: &xylo::QuitApplication, cx| quit(cx));
+    // Global key dispatch borrows the window; wait for GPUI to restore it.
+    cx.on_action(|_: &xylo::QuitApplication, cx| cx.defer(quit));
     // Sharing the root's action preserves the native menu accelerator. A
     // different action bound to that chord would shadow the focused route.
     cx.set_menus([Menu::new("Xylo").items([
@@ -51,6 +58,23 @@ fn configure_shell_actions(cx: &mut App) {
         MenuItem::Separator,
         MenuItem::action("Quit Xylo", xylo::QuitApplication),
     ])]);
+}
+fn configure_window_close(has_tray: bool, window: &mut Window, cx: &App) {
+    window.on_window_should_close(cx, move |window, cx| {
+        if has_tray && cfg!(target_os = "macos") {
+            cx.hide();
+        } else {
+            let view = cx
+                .try_global::<ShellState>()
+                .map(|state| state.view.clone());
+            if let Some(view) = view {
+                view.update(cx, |view, cx| view.request_quit(window, cx));
+            } else {
+                cx.quit();
+            }
+        }
+        false
+    });
 }
 fn main() -> anyhow::Result<()> {
     let (data, debug) = match startup::Command::parse(std::env::args_os().skip(1))? {
@@ -82,7 +106,7 @@ fn main() -> anyhow::Result<()> {
         .with_quit_mode(QuitMode::Explicit);
     application.on_reopen(show);
     application.run(move |cx| {
-        cx.set_app_identity(xylo_core::APPLICATION_ID, xylo_core::APPLICATION_NAME);
+        cx.set_app_identity(SHELL_APPLICATION_ID, xylo_core::APPLICATION_NAME);
         #[cfg(target_os = "macos")]
         if let Err(error) = app_icon::install() {
             tracing::warn!(%error, "The macOS Dock icon could not be installed");
@@ -92,7 +116,7 @@ fn main() -> anyhow::Result<()> {
         cx.set_window_appearance(Some(WindowAppearance::Light));
         let tray = tray::create();
         if let Err(error) = &tray {
-            tracing::warn!(%error,"Tray unavailable; close minimizes the window");
+            tracing::warn!(%error,"Tray unavailable; closing the window quits Xylo");
         }
         let (tray, events) = match tray {
             Ok((tray, events)) => (Some(tray), Some(events)),
@@ -122,14 +146,7 @@ fn main() -> anyhow::Result<()> {
             },
             cx,
             move |window, cx| {
-                window.on_window_should_close(cx, move |window, cx| {
-                    if has_tray && cfg!(target_os = "macos") {
-                        cx.hide();
-                    } else {
-                        window.minimize_window();
-                    }
-                    false
-                });
+                configure_window_close(has_tray, window, cx);
                 cx.new(|cx| xylo::Xylo::new(host, window, cx))
             },
         );

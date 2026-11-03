@@ -436,6 +436,47 @@ fn sha256_is_standard_and_streamed() {
     );
 }
 
+#[test]
+fn release_checksums_fit_a_small_windows_stack() {
+    const CHILD: &str = "XYLO_TEST_SMALL_HASH_STACK";
+    if std::env::var_os(CHILD).is_some() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("fixture");
+        // Span multiple chunks, so the same regression also exercises streaming.
+        let bytes = vec![b'a'; 2 * 1024 * 1024 + 17];
+        fs::write(&path, &bytes).unwrap();
+        let expected = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        let actual = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || sha256(&path).unwrap())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(actual, expected);
+        return;
+    }
+    // Stack overflow aborts the process rather than unwinding. Isolate that
+    // failure so it reports as one failed test instead of aborting the suite.
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::release_checksums_fit_a_small_windows_stack",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "Checksum subprocess failed ({}): {}",
+        child.status,
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn linker_signatures_do_not_seal_bundles_and_tampered_resources_fail() {

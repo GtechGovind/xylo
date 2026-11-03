@@ -42,6 +42,14 @@ mod tests {
     const SOURCE: &[u8] = include_bytes!("assets/xylo-icon.png");
 
     #[test]
+    fn checked_in_installer_icon_matches_the_canonical_windows_icon() {
+        assert!(
+            include_bytes!("assets/xylo-icon.ico").as_slice() == windows_ico(SOURCE).unwrap(),
+            "Regenerate assets/xylo-icon.ico with windows_ico when the canonical PNG changes"
+        );
+    }
+
+    #[test]
     fn windows_icon_contains_all_shell_and_taskbar_sizes_with_valid_offsets() {
         let ico = windows_ico(SOURCE).unwrap();
         assert_eq!(&ico[..6], &[0, 0, 1, 0, 7, 0]);

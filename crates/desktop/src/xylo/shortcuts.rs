@@ -41,7 +41,7 @@ pub(super) fn bind(cx: &mut App) {
         ),
         KeyBinding::new(chord!("s"), SaveCurrentFile, Some("Xylo")),
         KeyBinding::new(chord!("n"), NewConversation, Some("Xylo")),
-        KeyBinding::new(chord!("q"), QuitApplication, Some("Xylo")),
+        KeyBinding::new(chord!("q"), QuitApplication, None),
         KeyBinding::new(chord!("k"), FindConversation, Some("Xylo")),
         KeyBinding::new(chord!("shift-f"), FindProject, Some("Xylo")),
         KeyBinding::new(chord!("j"), ToggleProjectTerminal, Some("Xylo")),

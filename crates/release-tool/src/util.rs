@@ -41,7 +41,9 @@ pub fn checked(command: &mut Command, label: &str) -> Result<()> {
 pub fn sha256(path: &Path) -> Result<String> {
     let mut digest = Sha256::new();
     let mut file = fs::File::open(path)?;
-    let mut buffer = [0; 1024 * 1024];
+    // The Windows release-tool main thread has a 1 MiB stack. Keep the
+    // streaming chunk on the heap so package checksums fit that stack too.
+    let mut buffer = vec![0; 1024 * 1024];
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {

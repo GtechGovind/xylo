@@ -12327,7 +12327,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xylo"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -12359,7 +12359,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-build"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "fs2",
@@ -12373,7 +12373,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-capabilities"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "async-tungstenite",
@@ -12419,7 +12419,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-cli"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "serde",
@@ -12439,7 +12439,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-core"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12452,7 +12452,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-distribution"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -12477,7 +12477,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-engine"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -12519,7 +12519,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-evals"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -12541,7 +12541,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-helper"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "fs2",
@@ -12557,7 +12557,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-helper-client"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "serde",
@@ -12570,7 +12570,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-notifications"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -12597,7 +12597,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-resources"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "fs2",
@@ -12614,7 +12614,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-runtime"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -12657,7 +12657,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-scheduler"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -12673,7 +12673,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-sdk"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "serde",
@@ -12686,7 +12686,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-services"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -12730,7 +12730,7 @@ dependencies = [
 
 [[package]]
 name = "xylo-worker"
-version = "0.1.1-rc.5"
+version = "0.1.1-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",

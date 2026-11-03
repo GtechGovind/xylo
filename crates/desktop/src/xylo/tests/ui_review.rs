@@ -117,6 +117,47 @@ fn search_dismissal_restores_keyboard_focus(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn window_close_reaches_the_unsaved_editor_guard_with_or_without_a_tray(cx: &mut TestAppContext) {
+    let (window, view) = open(cx);
+    cx.update(|cx| {
+        cx.set_global(crate::ShellState {
+            window,
+            view: view.clone(),
+            _tray: None,
+        });
+    });
+    for has_tray in [false, true] {
+        // macOS keeps its normal close-to-background behavior when a tray exists.
+        if cfg!(target_os = "macos") && has_tray {
+            continue;
+        }
+        cx.update_window(window, |_, window, cx| {
+            crate::configure_window_close(has_tray, window, cx);
+            view.update(cx, |view, _| {
+                view.editor_dirty = true;
+                view.editor_path = Some("/fixture/unsaved.rs".into());
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut visual = gpui_kit::VisualTestContext::from_window(window, cx);
+        assert!(!visual.simulate_close(), "Saving must precede native close");
+        assert!(
+            cx.has_pending_prompt(),
+            "The close button must offer to save unsaved work (tray={has_tray})"
+        );
+        assert!(cx.update(|cx| view.read(cx).quit_prompt_open));
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(view.read(cx).editor_dirty);
+            assert!(!view.read(cx).quitting);
+            assert!(!view.read(cx).quit_prompt_open);
+        });
+    }
+}
+
+#[gpui_kit::test]
 fn quit_shortcut_reaches_the_unsaved_editor_guard(cx: &mut TestAppContext) {
     let (window, view) = open(cx);
     cx.update(|cx| {
@@ -170,6 +211,52 @@ fn quit_shortcut_reaches_the_unsaved_editor_guard(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn quit_shortcut_works_on_settings_without_a_focused_control(cx: &mut TestAppContext) {
+    let (window, view) = open(cx);
+    cx.update(|cx| {
+        cx.set_global(crate::ShellState {
+            window,
+            view: view.clone(),
+            _tray: None,
+        });
+        crate::configure_shell_actions(cx);
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.page = super::super::Page::Providers;
+            view.settings_open = true;
+            view.editor_dirty = true;
+            view.editor_path = Some("/fixture/unsaved.rs".into());
+        });
+        window.render_frame(cx);
+        window.blur(cx);
+        assert!(window.focused(cx).is_none());
+        window.press(
+            if cfg!(target_os = "macos") {
+                "cmd-q"
+            } else {
+                "ctrl-q"
+            },
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        cx.has_pending_prompt(),
+        "Quit must reach the save guard when no control supplies a focused Xylo key context"
+    );
+    assert!(cx.update(|cx| view.read(cx).quit_prompt_open));
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(view.read(cx).editor_dirty);
+        assert!(!view.read(cx).quitting);
+        assert!(!view.read(cx).quit_prompt_open);
+    });
 }
 
 #[gpui_kit::test]

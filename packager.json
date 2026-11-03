@@ -1,9 +1,12 @@
 {
   "name": "xylo",
   "productName": "Xylo",
-  "version": "0.1.1-rc.5",
+  "version": "0.1.1-rc.6",
   "identifier": "com.qurkos.xylo",
   "icons": ["crates/desktop/assets/xylo-icon.png"],
+  "nsis": {
+    "installerIcon": "crates/desktop/assets/xylo-icon.ico"
+  },
   "description": "Workspace for AI conversations, coding and tools",
   "authors": [
     "Govind Yadav <gtech.govind2000@gmail.com>"

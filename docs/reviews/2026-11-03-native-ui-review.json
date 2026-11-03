@@ -305,6 +305,25 @@
       "executable": "F:/AI/xylo/target/debug/xylo.exe"
     }
   },
+  "rc6_followup": {
+    "native_close": "Windows and Linux close now reaches the existing guarded quit flow; macOS with a tray preserves hide behavior.",
+    "unfocused_quit": "Quit binds globally and defers the shell action until GPUI restores its borrowed window. Real unfocused Providers/save/Cancel regression failed before the fix and passes afterward.",
+    "windows_taskbar": "Sequential captures of the same executable showed a generic icon with the old installed release identity and the purple logo with an isolated identity. Windows debug builds now use com.qurkos.xylo.dev; release keeps com.qurkos.xylo.",
+    "preview_taskbar_verified": true,
+    "private_preview_evidence": "target/close-fix/windows-rc6-preview-taskbar.png",
+    "installed_copy_replaced": false,
+    "temporary_native_overrides_removed": true,
+    "installer_icon": "Canonical PNG-derived ICO supplied to NSIS; exact-byte drift regression passes.",
+    "release_pipeline_repairs": [
+      "Move the runtime wire test module after other items for strict Clippy.",
+      "Allocate the streaming checksum buffer on the heap; subprocess regression passes with a 128 KiB stack."
+    ],
+    "desktop_tests_passed": 236,
+    "build_tool_tests_passed": 18,
+    "release_tool_tests_passed": 32,
+    "strict_desktop_clippy": "Passed with --no-default-features --no-deps; existing Windows dependency warnings remain outside this check.",
+    "strict_release_tool_clippy": "Passed."
+  },
   "validation_portability": [
     "Native input tests use the platform Select All chord.",
     "Work-pane lifecycle tests inspect the pane and selected tab.",
