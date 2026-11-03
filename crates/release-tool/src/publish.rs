@@ -265,7 +265,7 @@ fn notes(commit: &str, receipts: &[Value], partial: bool) -> Result<String> {
 
 {availability}
 
-This release includes Rust build and release tooling, the bundled Obscura browser, cleaner light and dark surfaces, safer draft and document recovery, retryable approvals, and reliable search and quit shortcuts. Closing the Windows or Linux window now follows the guarded quit flow, including when no control has keyboard focus. Windows development previews use a separate taskbar identity so installed shortcuts cannot override their logo, and the installer uses the Xylo logo. Windows package checksum generation no longer overflows its thread stack.
+This release includes Rust build and release tooling, the bundled Obscura browser, OpenAPI-configured providers, bounded rotating diagnostics, cleaner light and dark surfaces, safer draft and document recovery, retryable approvals, and reliable search and quit shortcuts. Closing the Windows or Linux window now follows the guarded quit flow, including when no control has keyboard focus. Windows development previews use a separate taskbar identity so installed shortcuts cannot override their logo, and the installer uses the Xylo logo. Windows package checksum generation no longer overflows its thread stack.
 
 Every download has a SHA-256 checksum and a project-key signature (`.sig`). The verification public key is included as `Xylo-release-signing.pub`. These are cargo-packager/Minisign signatures; **they do not provide Apple notarization or Windows publisher trust**. This preview may display operating-system security warnings.
 

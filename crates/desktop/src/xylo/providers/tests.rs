@@ -273,3 +273,54 @@ fn editing_custom_connection_updates_active_model_without_duplicate_connection()
         serde_json::to_value(&unrelated).unwrap()
     );
 }
+
+#[gpui_kit::test]
+fn switching_provider_after_openapi_import_clears_its_notice(cx: &mut gpui_kit::TestAppContext) {
+    use super::Xylo;
+    use gpui_kit::{AppContext, WindowOptions};
+
+    cx.update(gpui_kit::init);
+    let (window, view) = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Xylo::new(Err(anyhow::anyhow!("Offline fixture")), window, cx))
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.choose_provider_kind("Custom", window, cx);
+            view.provider_openapi.update(cx, |input, cx| {
+                input.set_value(
+                    serde_json::json!({
+                        "openapi": "3.0.3",
+                        "servers": [{"url": "https://fixture.example.invalid/api"}],
+                        "paths": {
+                            "/responses": {"post": {}},
+                            "/models": {"get": {}}
+                        }
+                    })
+                    .to_string(),
+                    window,
+                    cx,
+                );
+            });
+            view.import_provider_openapi(window, cx);
+            assert!(
+                view.provider_discovery
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.starts_with("API configuration imported.")),
+                "The source editor must first show the successful import"
+            );
+
+            view.close_provider_editor(window, cx);
+            view.choose_provider_kind("OpenAI", window, cx);
+            assert_eq!(view.provider_editor_kind, "OpenAI");
+            assert!(
+                view.provider_discovery.notice.is_none(),
+                "An unrelated provider must not claim the previous API configuration was imported"
+            );
+        });
+    })
+    .unwrap();
+}

@@ -1096,6 +1096,7 @@ impl Xylo {
     }
     pub(super) fn reset_provider_discovery(&mut self, cx: &mut Context<Self>) {
         self.cancel_provider_discovery(cx);
+        self.provider_discovery.notice = None;
         self.provider_discovery.status = DiscoveryStatus::Idle;
     }
     /// The slow-wait caption for the running discovery or save. The first

@@ -306,6 +306,7 @@
     }
   },
   "rc6_followup": {
+    "merged_default_branch_commit": "bd50235",
     "native_close": "Windows and Linux close now reaches the existing guarded quit flow; macOS with a tray preserves hide behavior.",
     "unfocused_quit": "Quit binds globally and defers the shell action until GPUI restores its borrowed window. Real unfocused Providers/save/Cancel regression failed before the fix and passes afterward.",
     "windows_taskbar": "Sequential captures of the same executable showed a generic icon with the old installed release identity and the purple logo with an isolated identity. Windows debug builds now use com.qurkos.xylo.dev; release keeps com.qurkos.xylo.",
@@ -313,12 +314,14 @@
     "private_preview_evidence": "target/close-fix/windows-rc6-preview-taskbar.png",
     "installed_copy_replaced": false,
     "temporary_native_overrides_removed": true,
+    "provider_editor_notice": "A real OpenAPI import followed by switching to OpenAI reproduced a stale success notice. Resetting provider discovery now clears that notice.",
     "installer_icon": "Canonical PNG-derived ICO supplied to NSIS; exact-byte drift regression passes.",
     "release_pipeline_repairs": [
       "Move the runtime wire test module after other items for strict Clippy.",
       "Allocate the streaming checksum buffer on the heap; subprocess regression passes with a 128 KiB stack."
     ],
-    "desktop_tests_passed": 236,
+    "desktop_tests_passed": 239,
+    "core_tests_passed": 23,
     "build_tool_tests_passed": 18,
     "release_tool_tests_passed": 32,
     "strict_desktop_clippy": "Passed with --no-default-features --no-deps; existing Windows dependency warnings remain outside this check.",
