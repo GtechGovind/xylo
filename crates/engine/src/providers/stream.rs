@@ -240,6 +240,11 @@ impl EventState {
 
     pub fn event(&mut self, event: Event) -> Result<Vec<StreamEvent>, ModelError> {
         if event.data == "[DONE]" {
+            // Some compatible gateways append the transport sentinel after the
+            // protocol's own terminal event (e.g. response.completed).
+            if self.terminal {
+                return Ok(Vec::new());
+            }
             if self.protocol != ProviderProtocol::ChatCompletions || !self.choice_finished {
                 return Err(ModelError::transient(
                     "Provider ended a stream without a terminal completion",

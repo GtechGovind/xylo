@@ -17,17 +17,49 @@ use std::cell::Cell;
 use std::time::Instant;
 
 pub(super) fn same_connection(a: &ProviderConfig, b: &ProviderConfig) -> bool {
-    a.family == b.family
+    a.custom == b.custom
+        && a.family == b.family
         && a.endpoint == b.endpoint
         && a.credential_ref == b.credential_ref
         && a.headers == b.headers
         && a.discovery_url == b.discovery_url
 }
+/// Migrate the edited connection while preserving the active model and its controls.
+pub(super) fn replace_edited_connection(
+    settings: &mut AppSettings,
+    original: &ProviderConfig,
+    replacement: &ProviderConfig,
+) {
+    let update = |saved: &mut ProviderConfig| {
+        if !same_connection(saved, original) {
+            return;
+        }
+        saved.name = replacement.name.clone();
+        saved.family = replacement.family.clone();
+        saved.endpoint = replacement.endpoint.clone();
+        saved.credential_ref = replacement.credential_ref.clone();
+        saved.headers = replacement.headers.clone();
+        saved.discovery_url = replacement.discovery_url.clone();
+        saved.custom = replacement.custom.clone();
+        saved.managed_local = replacement.managed_local;
+        if original.endpoint != replacement.endpoint {
+            saved.model_capabilities = None;
+            saved.served_context_tokens = None;
+            saved.reasoning_options = None;
+            saved.default_reasoning_effort = None;
+        }
+    };
+    for saved in &mut settings.providers {
+        update(saved);
+    }
+    update(&mut settings.provider);
+}
 pub(super) fn provider_kind(provider: &ProviderConfig) -> &'static str {
     if provider.credential_ref.as_deref() == Some(CHATGPT_REF) {
         return "ChatGPT";
     }
-    if !provider.headers.is_empty() || provider.discovery_url.is_some() {
+    if provider.custom.is_some() || !provider.headers.is_empty() || provider.discovery_url.is_some()
+    {
         return "Custom";
     }
     match (&provider.family, provider.endpoint.trim_end_matches('/')) {
@@ -144,6 +176,7 @@ fn catalog_entries(
     context_limits: &BTreeMap<String, u32>,
     reasoning_options: &BTreeMap<String, Vec<String>>,
     default_reasoning_efforts: &BTreeMap<String, String>,
+    model_capabilities: &BTreeMap<String, ModelCapabilities>,
 ) -> Vec<ProviderConfig> {
     let previous: BTreeMap<&str, &ProviderConfig> = saved
         .iter()
@@ -156,6 +189,7 @@ fn catalog_entries(
             let saved = previous.get(model.as_str()).copied();
             let mut provider = source.clone();
             provider.model = (*model).clone();
+            provider.model_capabilities = model_capabilities.get(*model).cloned();
             provider.fallback_model = saved
                 .and_then(|saved| saved.fallback_model.clone())
                 .or_else(|| source.fallback_model.clone());
@@ -275,6 +309,7 @@ impl Xylo {
             } else {
                 None
             },
+            custom: (kind == "Custom").then(CustomProviderConfig::default),
             ..Default::default()
         };
         self.provider_form(&provider, window, cx);
@@ -372,6 +407,48 @@ impl Xylo {
             });
         settings_ui::list_container(presets).into_any_element()
     }
+    fn import_provider_openapi(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let imported = xylo_runtime::import_openapi(
+            self.provider_openapi.read(cx).value().as_ref(),
+            self.endpoint.read(cx).value().as_ref(),
+        );
+        match imported {
+            Ok(imported) => {
+                self.reset_provider_discovery(cx);
+                // Import changes only the editor. Saving is the explicit network/storage action.
+                Self::set_input(&self.endpoint, imported.endpoint, window, cx);
+                Self::set_input(&self.provider_discovery_url, "", window, cx);
+                if let Some(source) = self.provider_editor_source.as_mut() {
+                    source.family = imported.family;
+                    source.model_capabilities = None;
+                }
+                self.provider_custom.update(cx, |input, cx| {
+                    input.set_value(
+                        serde_json::to_string_pretty(&imported.custom).unwrap_or_default(),
+                        window,
+                        cx,
+                    )
+                });
+                self.provider_openapi
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.provider_discovery.page_error = None;
+                self.provider_discovery.status = DiscoveryStatus::Idle;
+                self.provider_discovery.notice = Some(if imported.warnings.is_empty() {
+                    "API configuration imported. Review the endpoint, enter your credential and save to load models.".into()
+                } else {
+                    format!(
+                        "API configuration imported. {}",
+                        imported.warnings.join(" ")
+                    )
+                });
+            }
+            Err(error) => {
+                self.provider_discovery.page_error =
+                    Some(format!("Could not import API configuration: {error}"))
+            }
+        }
+        cx.notify();
+    }
     /// The connection form of an API-key, local or custom provider.
     fn provider_connection_form(&self, kind: &str, cx: &mut Context<Self>) -> AnyElement {
         let custom = kind == "Custom";
@@ -388,7 +465,7 @@ impl Xylo {
         if custom || local {
             fields.push(self.provider_input("Base URL", &self.endpoint));
         }
-        if custom {
+        if custom && self.provider_advanced {
             let current = self
                 .provider_editor_source
                 .as_ref()
@@ -425,8 +502,8 @@ impl Xylo {
             .collect();
             fields.push(
                 settings_ui::field(
-                    "API protocol",
-                    settings_ui::select("provider-protocol", "API protocol", options),
+                    "Fallback API protocol",
+                    settings_ui::select("provider-protocol", "Fallback API protocol", options),
                     None,
                 )
                 .into_any_element(),
@@ -444,7 +521,7 @@ impl Xylo {
                 &self.secret,
             ));
         }
-        if custom {
+        if custom && self.provider_advanced {
             fields.push(
                 settings_ui::field(
                     "Extra headers (JSON object)",
@@ -466,7 +543,50 @@ impl Xylo {
                 .into_any_element(),
             );
         }
-        fields.push(self.provider_input("Model ID (optional)", &self.model));
+        if custom && self.provider_advanced {
+            fields.push(settings_ui::field(
+                "Custom API configuration (JSON)",
+                Textarea::new(&self.provider_custom).disabled(busy).aria_label("Custom API configuration (JSON)"),
+                Some("Configure automatic routing, relative API paths, authentication header/prefix, request defaults and model overrides. Leave blank to keep the selected protocol's standard behavior. Secrets belong in the API key field; a credential-header JSON record supports multiple tokens.".into()),
+            ).into_any_element());
+        }
+        if custom {
+            fields.push(settings_ui::field(
+                "OpenAPI JSON",
+                Textarea::new(&self.provider_openapi).disabled(busy).aria_label("OpenAPI JSON"),
+                Some("Paste the API specification to fill in this connection. Enter credentials separately, then save to load models.".into()),
+            ).into_any_element());
+            fields.push(
+                settings_ui::secondary_button(
+                    "provider-import-openapi",
+                    "Import API configuration",
+                )
+                .disabled(busy || self.provider_openapi.read(cx).value().trim().is_empty())
+                .on_click(
+                    cx.listener(|view, _, window, cx| view.import_provider_openapi(window, cx)),
+                )
+                .into_any_element(),
+            );
+            fields.push(
+                settings_ui::secondary_button(
+                    "provider-advanced",
+                    if self.provider_advanced {
+                        "Hide advanced settings"
+                    } else {
+                        "Advanced settings"
+                    },
+                )
+                .disabled(busy)
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.provider_advanced = !view.provider_advanced;
+                    cx.notify();
+                }))
+                .into_any_element(),
+            );
+        }
+        if !custom || self.provider_advanced {
+            fields.push(self.provider_input("Model ID (optional)", &self.model));
+        }
         let key_typed = !self.secret.read(cx).value().trim().is_empty();
         let saved = self.edited_connection().is_some();
         // Which discovery (not a save) is running, to mark its button busy.
@@ -893,6 +1013,7 @@ impl Xylo {
         }
         // The host runs discovery only after it stored the secret and settings.
         if let Some(saved) = self.provider_discovery.saving.take() {
+            self.provider_editor_original = Some(saved.clone());
             self.provider_editor_source = Some(saved);
         }
         self.provider_discovery.since = None;
@@ -929,6 +1050,7 @@ impl Xylo {
                     same_connection(stored, &saved) && stored.model == saved.model
                 }) =>
             {
+                self.provider_editor_original = Some(saved.clone());
                 self.provider_editor_source = Some(saved);
                 DiscoveryStatus::Failed(message.into())
             }
@@ -998,7 +1120,10 @@ impl Xylo {
     pub(super) fn provider_discovery_feedback(&self, cx: &mut Context<Self>) -> AnyElement {
         let chatgpt = self.provider_editor_kind == "ChatGPT";
         let (message, tone, retry, cancel) = match &self.provider_discovery.status {
-            DiscoveryStatus::Idle => return div().into_any_element(),
+            DiscoveryStatus::Idle => match &self.provider_discovery.notice {
+                Some(notice) => (notice.clone(), BadgeTone::Neutral, false, false),
+                None => return div().into_any_element(),
+            },
             DiscoveryStatus::Ready => {
                 if self.provider_discovery.purpose == DiscoveryPurpose::Test {
                     (
@@ -1231,6 +1356,7 @@ impl Xylo {
         context_limits: &BTreeMap<String, u32>,
         reasoning_options: &BTreeMap<String, Vec<String>>,
         default_reasoning_efforts: &BTreeMap<String, String>,
+        model_capabilities: &BTreeMap<String, ModelCapabilities>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
@@ -1251,6 +1377,7 @@ impl Xylo {
             context_limits,
             reasoning_options,
             default_reasoning_efforts,
+            model_capabilities,
         );
         if self.provider_discovery.purpose == DiscoveryPurpose::Test {
             self.provider_discovery.tested = registered;
@@ -1287,6 +1414,7 @@ impl Xylo {
             registered[0].clone()
         };
         self.settings = settings;
+        self.provider_editor_original = Some(shown.clone());
         self.provider_editor_source = Some(shown.clone());
         Self::set_input(&self.model, shown.model.clone(), window, cx);
         Self::set_input(&self.context, shown.context_tokens.to_string(), window, cx);

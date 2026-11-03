@@ -1,12 +1,6 @@
 // Shared by test modules with include!; never linked into the application.
 // Also type-check the standalone source and run its JSON wire-value tests as
 // part of the normal Cargo test harness, not just when rustc builds a fixture.
-#[cfg(test)]
-#[allow(dead_code)]
-mod wire {
-    include!("test_protocol_server.rs");
-}
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -52,4 +46,10 @@ pub fn executable(kind: &str) -> PathBuf {
 #[allow(dead_code)]
 pub fn install(kind: &str, destination: &Path) {
     std::fs::copy(executable(kind), destination).unwrap();
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+mod wire {
+    include!("test_protocol_server.rs");
 }

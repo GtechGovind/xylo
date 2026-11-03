@@ -1,8 +1,11 @@
 //! Application-owned provider protocols and configuration. Capability flags describe
 //! the wire protocol; actual model/account permissions still come from the service.
 mod aws_signing;
+mod custom;
 mod discovery;
+mod openapi;
 pub use discovery::*;
+pub use openapi::{OpenApiImport, import_openapi};
 mod served_context;
 pub use served_context::{ServedContextCache, served_context_limits, served_context_tokens};
 mod chatgpt;
@@ -131,6 +134,9 @@ fn provider_url(endpoint: &str) -> Result<Url> {
 pub fn normalize_provider(config: &ProviderConfig) -> Result<NormalizedProvider> {
     // Validate metadata before persisting a connection or updating its secret.
     ProviderCredential::None.headers(&config.family, &config.headers)?;
+    if config.custom.is_some() {
+        return custom::normalize(config);
+    }
     let mut base = provider_url(&config.endpoint)?;
     let loopback = matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     let path = base.path().trim_end_matches('/').to_owned();
@@ -284,6 +290,7 @@ pub enum ProviderCredential {
     None,
     ApiKey(String),
     Bearer(String),
+    Headers(BTreeMap<String, String>),
     Aws {
         access_key_id: String,
         secret_access_key: String,
@@ -315,6 +322,12 @@ impl ProviderCredential {
                 expiry > now_ms() + 30_000,
                 "Provider credential has expired; reconnect or refresh it"
             );
+        }
+        if let Some(headers) = value.get("headers") {
+            let headers = serde_json::from_value(headers.clone())
+                .context("Credential headers must be a JSON object with string values")?;
+            custom::secret_headers(&mut HeaderMap::new(), &headers)?;
+            return Ok(Self::Headers(headers));
         }
         let string = |name: &str| {
             value
@@ -400,6 +413,7 @@ impl ProviderCredential {
                 );
             }
             Self::None | Self::Aws { .. } => {}
+            Self::Headers(values) => custom::secret_headers(&mut headers, values)?,
         }
         validate_custom_headers(extra)?;
         for (name, value) in extra {

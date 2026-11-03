@@ -59,3 +59,12 @@ fn thinking_replay_diagnostics_keep_public_fields_but_hide_reflected_content() {
         );
     }
 }
+
+#[test]
+fn gateway_top_level_error_explains_rejected_generation_fields_without_credentials() {
+    let payload = serde_json::json!({"status":"failed","message":"Unsupported parameter 'max_completion_tokens'; reasoning_effort must be none. Bearer fixture-token","errorCode":400});
+    let reason = reason(&payload, &["fixture-token".into()]).unwrap();
+    assert!(reason.contains("max_completion_tokens"));
+    assert!(reason.contains("reasoning_effort"));
+    assert!(!reason.contains("fixture-token"));
+}

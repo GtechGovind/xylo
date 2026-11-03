@@ -3,6 +3,7 @@
 pub mod drafts;
 pub mod extensions;
 pub use xylo_services::action_review::*;
+pub use xylo_services::providers::{OpenApiImport, import_openapi};
 pub mod conversation_export;
 pub mod headless;
 pub mod history;

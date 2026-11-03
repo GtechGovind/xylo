@@ -269,6 +269,10 @@ pub struct Xylo {
     terminal_starting: bool,
     provider_name: Entity<InputState>,
     provider_headers: Entity<TextareaState>,
+    provider_custom: Entity<TextareaState>,
+    provider_openapi: Entity<TextareaState>,
+    provider_advanced: bool,
+    provider_editor_original: Option<ProviderConfig>,
     provider_discovery_url: Entity<InputState>,
     provider_editor_source: Option<ProviderConfig>,
     provider_discovery: providers::ProviderDiscoveryUi,
@@ -572,8 +576,20 @@ impl Xylo {
                     .placeholder(r#"{"X-Header":"value"}"#)
                     .rows(3)
             }),
+            provider_custom: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("Optional custom API configuration")
+                    .rows(8)
+            }),
             provider_discovery_url: input("Optional absolute model discovery URL", window, cx),
             provider_editor_source: None,
+            provider_editor_original: None,
+            provider_advanced: false,
+            provider_openapi: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("Paste OpenAPI JSON here")
+                    .rows(5)
+            }),
             provider_discovery: Default::default(),
             permissions: Default::default(),
             provider_editor_kind: String::new(),
@@ -793,6 +809,10 @@ impl Xylo {
         self.models.clear();
         self.model_context_limits.clear();
         self.provider_editor_source = Some(p.clone());
+        self.provider_editor_original = Some(p.clone());
+        self.provider_advanced = false;
+        self.provider_openapi
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.provider_editor_kind = providers::provider_kind(p).into();
         Self::set_input(&self.secret, "", window, cx);
         Self::set_input(&self.provider_name, p.name.clone(), window, cx);
@@ -806,6 +826,16 @@ impl Xylo {
             window,
             cx,
         );
+        self.provider_custom.update(cx, |input, cx| {
+            input.set_value(
+                p.custom
+                    .as_ref()
+                    .map(|custom| serde_json::to_string_pretty(custom).unwrap_or_default())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
         self.provider_headers.update(cx, |input, cx| {
             input.set_value(
                 serde_json::to_string_pretty(&p.headers).unwrap_or_else(|_| "{}".into()),
@@ -845,6 +875,19 @@ impl Xylo {
                 anyhow::anyhow!("Extra headers must be a JSON object with text values")
             })?
         };
+        let custom = self.provider_custom.read(cx).value();
+        provider.custom = if custom.trim().is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str::<CustomProviderConfig>(custom.as_ref()).map_err(|error| {
+                    anyhow::anyhow!("Invalid custom API configuration: {error}")
+                })?,
+            )
+        };
+        if let Some(custom) = &provider.custom {
+            custom.validate()?;
+        }
         let discovery = self.provider_discovery_url.read(cx).value();
         provider.discovery_url =
             (!discovery.trim().is_empty()).then(|| discovery.trim().to_owned());
@@ -1268,6 +1311,7 @@ impl Xylo {
                 context_limits,
                 reasoning_options,
                 default_reasoning_efforts,
+                model_capabilities,
             } => {
                 if self
                     .host
@@ -1292,6 +1336,7 @@ impl Xylo {
                     &context_limits,
                     &reasoning_options,
                     &default_reasoning_efforts,
+                    &model_capabilities,
                     window,
                     cx,
                 ) {
@@ -1923,6 +1968,9 @@ impl Xylo {
             provider.credential_ref = Some(format!("provider:{}", Uuid::new_v4()));
         }
         let mut settings = self.settings.clone();
+        if let Some(original) = &self.provider_editor_original {
+            providers::replace_edited_connection(&mut settings, original, &provider);
+        }
         if let Some(existing) = settings.providers.iter_mut().find(|saved| {
             providers::same_connection(saved, &provider) && saved.model == provider.model
         }) {

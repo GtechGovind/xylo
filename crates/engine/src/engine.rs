@@ -159,11 +159,25 @@ impl AgentEngine {
         else {
             return Ok(primary);
         };
+        // Resolve metadata only within the already authorized connection. A
+        // fallback model may require a different wire protocol or output cap.
+        let settings = self.store.settings()?;
+        let catalog = settings.providers.iter().find(|saved| {
+            saved.model == model
+                && saved.family == config.family
+                && saved.endpoint == config.endpoint
+                && saved.credential_ref == config.credential_ref
+                && saved.headers == config.headers
+                && saved.discovery_url == config.discovery_url
+                && saved.custom == config.custom
+        });
         let mut alternative = config.clone();
         alternative.model = model.to_owned();
+        alternative.model_capabilities = catalog.and_then(|saved| saved.model_capabilities.clone());
         alternative.fallback_model = None;
-        alternative.reasoning_options = None;
-        alternative.default_reasoning_effort = None;
+        alternative.reasoning_options = catalog.and_then(|saved| saved.reasoning_options.clone());
+        alternative.default_reasoning_effort =
+            catalog.and_then(|saved| saved.default_reasoning_effort.clone());
         alternative.reasoning_effort = None;
         alternative.served_context_tokens = None;
         Ok(Arc::new(crate::providers::fallback::WithFallback {

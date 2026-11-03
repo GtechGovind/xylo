@@ -112,6 +112,7 @@ fn catalog_entries_keep_saved_choices_and_apply_advertised_limits() {
         &limits,
         &options,
         &BTreeMap::new(),
+        &BTreeMap::new(),
     );
     assert_eq!(entries[0].context_tokens, 50_000);
     assert_eq!(entries[0].reasoning_effort.as_deref(), Some("high"));
@@ -192,4 +193,83 @@ fn a_chatgpt_connection_with_models_is_connected_before_its_account_status_is_re
 fn a_fresh_profile_lists_no_provider() {
     // The page shows its empty state, not a phantom "Local model" row.
     assert!(saved_connections(&AppSettings::default()).is_empty());
+}
+
+#[test]
+fn generic_catalog_refresh_persists_native_protocol_capabilities_and_custom_routes() {
+    let mut source = connection("");
+    source.family = ApiFamily::OpenAiChat;
+    source.endpoint = "https://gateway.example/api".into();
+    source.custom = Some(Default::default());
+    let ids = ["future-native".to_string(), "future-reasoner".to_string()];
+    let models = ids.iter().collect::<Vec<_>>();
+    let capabilities = BTreeMap::from([
+        (
+            ids[0].clone(),
+            xylo_core::ModelCapabilities {
+                supported_apis: Some(vec![ApiFamily::Anthropic]),
+                native_family: Some(ApiFamily::Anthropic),
+                ..Default::default()
+            },
+        ),
+        (
+            ids[1].clone(),
+            xylo_core::ModelCapabilities {
+                supported_apis: Some(vec![ApiFamily::OpenAiResponses]),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let entries = catalog_entries(
+        &source,
+        &[],
+        &models,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &capabilities,
+    );
+    let mut settings = AppSettings::default();
+    apply_catalog(&mut settings, &source, entries);
+    let restored: AppSettings =
+        serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+    assert_eq!(restored.provider.effective_family(), ApiFamily::Anthropic);
+    assert_eq!(
+        restored.providers[1].effective_family(),
+        ApiFamily::OpenAiResponses
+    );
+    assert!(same_connection(
+        &restored.providers[0],
+        &restored.providers[1]
+    ));
+    assert_eq!(restored.provider.custom, source.custom);
+}
+
+#[test]
+fn editing_custom_connection_updates_active_model_without_duplicate_connection() {
+    let source = connection("first");
+    let second = connection("second");
+    let unrelated = local("local");
+    let mut settings = AppSettings {
+        provider: second.clone(),
+        providers: vec![source.clone(), second, unrelated.clone()],
+        ..Default::default()
+    };
+    let mut replacement = source.clone();
+    replacement.custom = Some(Default::default());
+    super::replace_edited_connection(&mut settings, &source, &replacement);
+    assert_eq!(settings.provider.model, "second");
+    assert!(same_connection(&settings.provider, &replacement));
+    assert_eq!(
+        settings
+            .providers
+            .iter()
+            .filter(|p| same_connection(p, &replacement))
+            .count(),
+        2
+    );
+    assert_eq!(
+        serde_json::to_value(&settings.providers[2]).unwrap(),
+        serde_json::to_value(&unrelated).unwrap()
+    );
 }

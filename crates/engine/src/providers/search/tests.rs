@@ -203,3 +203,43 @@ fn citation_ranges_handle_unicode_and_invalid_indices_without_broad_fallbacks() 
         assert_eq!(cited_range(text, &boundaries, &annotation), "");
     }
 }
+
+#[tokio::test]
+async fn custom_gemini_search_uses_documented_generate_route_and_query() {
+    let (endpoint, server) = fixture(
+        serde_json::to_vec(&json!({"candidates":[{"content":{"parts":[{"text":"Answer"}]}}]}))
+            .unwrap(),
+        200,
+        "application/json",
+    )
+    .await;
+    let addresses = url::Url::parse(&endpoint)
+        .unwrap()
+        .socket_addrs(|| None)
+        .unwrap();
+    let mut cfg = xylo_core::ProviderConfig {
+        family: ApiFamily::Gemini,
+        endpoint,
+        model: "fixture-model".into(),
+        ..Default::default()
+    };
+    let mut custom = xylo_core::CustomProviderConfig::default();
+    custom.paths.generate_content = "text/generate?version=2".into();
+    custom.paths.stream_generate_content = "text/stream?version=2".into();
+    cfg.custom = Some(custom);
+    let adapter = NativeProvider::new(
+        cfg,
+        xylo_services::providers::ProviderCredential::ApiKey("fixture-key".into()),
+    )
+    .unwrap();
+    adapter
+        .search(json!({"query":"docs"}), addresses, CancellationToken::new())
+        .await
+        .unwrap();
+    let sent = server.await.unwrap();
+    assert!(
+        sent.line.starts_with("POST /text/generate?version=2 "),
+        "{}",
+        sent.line
+    );
+}

@@ -446,6 +446,7 @@ mod xylo {
                         context_limits: Default::default(),
                         reasoning_options: Default::default(),
                         default_reasoning_efforts: Default::default(),
+                        model_capabilities: Default::default(),
                     },
                     window,
                     cx,
