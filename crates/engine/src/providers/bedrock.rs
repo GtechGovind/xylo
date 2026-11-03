@@ -74,6 +74,9 @@ impl BedrockProvider {
             ProviderCredential::None => {
                 anyhow::bail!("Save a Bedrock API key or AWS access key before connecting")
             }
+            ProviderCredential::Headers(_) => anyhow::bail!(
+                "Custom credential headers are not supported by signed Bedrock connections"
+            ),
             ProviderCredential::ChatGpt { .. } => {
                 anyhow::bail!("ChatGPT credentials can only be used with the public Responses API")
             }

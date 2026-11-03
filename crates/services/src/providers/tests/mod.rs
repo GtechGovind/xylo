@@ -751,3 +751,167 @@ async fn actual_catalog_discovery_retains_future_model_reasoning_capabilities() 
     assert_eq!(models[2].reasoning_options, None);
     server.await.unwrap();
 }
+
+#[test]
+fn custom_gateway_routes_follow_model_capabilities_without_vendor_names() {
+    let mut value = serde_json::to_value(config(
+        ApiFamily::OpenAiChat,
+        "https://gateway.example/api/llm",
+    ))
+    .unwrap();
+    value["custom"] = json!({"automatic_protocol":true});
+    value["model_capabilities"] = json!({"supported_apis":["open_ai_chat","open_ai_responses"],"chat_tools_with_reasoning":false});
+    let provider: ProviderConfig = serde_json::from_value(value.clone()).unwrap();
+    let routes = normalize_provider(&provider).unwrap();
+    assert_eq!(
+        routes.inference_url.as_str(),
+        "https://gateway.example/api/llm/responses"
+    );
+    value["model_capabilities"] =
+        json!({"supported_apis":["open_ai_chat","anthropic"],"native_family":"anthropic"});
+    let provider: ProviderConfig = serde_json::from_value(value).unwrap();
+    let routes = normalize_provider(&provider).unwrap();
+    assert_eq!(
+        routes.inference_url.as_str(),
+        "https://gateway.example/api/llm/v1/messages"
+    );
+    assert_eq!(
+        routes.models_url.unwrap().as_str(),
+        "https://gateway.example/api/llm/models"
+    );
+}
+
+#[test]
+fn custom_gateway_routes_are_overridable_but_cannot_change_origin() {
+    let mut value = serde_json::to_value(config(
+        ApiFamily::OpenAiChat,
+        "https://gateway.example/tenant/api",
+    ))
+    .unwrap();
+    value["custom"] = json!({"automatic_protocol":false,"paths":{"chat_completions":"text/generate?version=2","models":"catalog"}});
+    let provider: ProviderConfig = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        normalize_provider(&provider)
+            .unwrap()
+            .inference_url
+            .as_str(),
+        "https://gateway.example/tenant/api/text/generate?version=2"
+    );
+    value["custom"]["paths"]["chat_completions"] = json!("https://other.example/collect");
+    assert!(normalize_provider(&serde_json::from_value(value).unwrap()).is_err());
+}
+
+#[test]
+fn custom_authentication_stays_bearer_for_native_messages_and_supports_vault_header_records() {
+    let mut value =
+        serde_json::to_value(config(ApiFamily::Anthropic, "https://gateway.example/api")).unwrap();
+    value["custom"] = json!({});
+    let config: ProviderConfig = serde_json::from_value(value).unwrap();
+    let headers = ProviderCredential::ApiKey("fixture-token".into())
+        .headers_for(&config)
+        .unwrap();
+    assert_eq!(headers["authorization"], "Bearer fixture-token");
+    assert!(!headers.contains_key("x-api-key"));
+    assert_eq!(headers["anthropic-version"], "2023-06-01");
+    let credential = ProviderCredential::parse(Some(json!({"headers":{"Authorization":"Bearer user-token","X-App-Authorization":"Bearer app-token"}}).to_string())).unwrap();
+    let headers = credential.headers_for(&config).unwrap();
+    assert_eq!(headers["x-app-authorization"], "Bearer app-token");
+    assert!(headers["authorization"].is_sensitive());
+    assert!(
+        ProviderCredential::parse(Some(
+            json!({"headers":{"Host":"other.example"}}).to_string()
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn nested_gateway_reasoning_metadata_is_preserved_for_unknown_models() {
+    let row = json!({"id":"future-model","metadata":{"capabilities":{"reasoning":{"effort_levels":["none","low","medium","high"],"default_effort":"medium"}}}});
+    let (options, default) = super::discovery::catalog_reasoning(&row);
+    assert_eq!(
+        options,
+        Some(vec![
+            "none".into(),
+            "low".into(),
+            "medium".into(),
+            "high".into()
+        ])
+    );
+    assert_eq!(default.as_deref(), Some("medium"));
+}
+
+#[tokio::test]
+async fn automatic_custom_catalog_keeps_native_and_responses_models_and_constraints() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut request = String::new();
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            request.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        assert!(request.starts_with("GET /api/models HTTP/1.1"));
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer fixture-token")
+        );
+        let body=json!({"data":[
+            {"id":"future-reasoner","supported_apis":["responses"],"metadata":{"max_output_tokens":4096,"capabilities":{"reasoning":{"effort_levels":["low","high"],"default_effort":"high"},"api":{"tools_with_reasoning_on_chat_completions":false,"output_limit_param_chat_completions":"max_completion_tokens"}}}},
+            {"id":"future-native","supported_apis":["messages"],"metadata":{"family":"anthropic","is_access_restricted":true}},
+            {"id":"embedding","model_type":"embedding","supported_apis":["embeddings"]}
+        ]}).to_string();
+        socket
+            .get_mut()
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let mut cfg = config(ApiFamily::OpenAiChat, &format!("http://{address}/api"));
+    cfg.custom = Some(Default::default());
+    let models = super::discovery::discover_with_credential(
+        &cfg,
+        &ProviderCredential::ApiKey("fixture-token".into()),
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["future-reasoner", "future-native"]
+    );
+    assert_eq!(
+        models[0].capabilities.as_ref().unwrap().max_output_tokens,
+        Some(4096)
+    );
+    assert_eq!(
+        models[0]
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .chat_tools_with_reasoning,
+        Some(false)
+    );
+    assert_eq!(
+        models[0].reasoning_options,
+        Some(vec!["low".into(), "high".into()])
+    );
+    assert_eq!(
+        models[1].capabilities.as_ref().unwrap().access_restricted,
+        Some(true)
+    );
+}

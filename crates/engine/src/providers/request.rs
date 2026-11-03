@@ -158,6 +158,28 @@ pub(super) fn body(
         return Err(invalid("Provider request requires conversation messages"));
     }
     let model = provider.config.model.as_str();
+    let capabilities = provider.config.capabilities();
+    if capabilities
+        .and_then(|c| c.supported_apis.as_ref())
+        .is_some_and(|apis| !apis.contains(&provider.config.family))
+    {
+        return Err(invalid(
+            "The model does not advertise the selected API protocol. Refresh models or enable automatic protocol routing.",
+        ));
+    }
+    let max_tokens = capabilities
+        .and_then(|c| c.max_output_tokens)
+        .filter(|limit| *limit > 0)
+        .map_or(max_tokens, |limit| max_tokens.min(limit));
+    if provider.endpoint.protocol == ProviderProtocol::ChatCompletions
+        && !tools.is_empty()
+        && capabilities.and_then(|c| c.chat_tools_with_reasoning) == Some(false)
+        && reasoning_effort(&provider.config, reasoning) != Some("none")
+    {
+        return Err(invalid(
+            "This model does not support tools with reasoning on Chat Completions. Enable automatic protocol routing, select Responses, or explicitly choose reasoning None.",
+        ));
+    }
     let mut body = match provider.endpoint.protocol {
         ProviderProtocol::ChatCompletions => chat_body(model, messages, tools, max_tokens)?,
         ProviderProtocol::Responses => responses_body(provider, messages, tools, max_tokens)?,
@@ -167,6 +189,35 @@ pub(super) fn body(
             return Err(invalid("Use the native Bedrock provider"));
         }
     };
+    if provider.endpoint.protocol == ProviderProtocol::ChatCompletions
+        && let Some(parameter) = capabilities.and_then(|c| c.chat_output_limit)
+    {
+        body.as_object_mut().unwrap().remove("max_tokens");
+        body.as_object_mut()
+            .unwrap()
+            .remove("max_completion_tokens");
+        body[parameter.field()] = json!(max_tokens);
+    }
+    if let Some(custom) = &provider.config.custom {
+        custom
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
+        for (key, value) in &custom.request_defaults {
+            merge_defaults(&mut body[key], value);
+        }
+        let api = match provider.endpoint.protocol {
+            ProviderProtocol::ChatCompletions => "open_ai_chat",
+            ProviderProtocol::Responses => "open_ai_responses",
+            ProviderProtocol::AnthropicMessages => "anthropic",
+            ProviderProtocol::GeminiGenerateContent => "gemini",
+            ProviderProtocol::BedrockConverse => "bedrock",
+        };
+        if let Some(defaults) = custom.request_defaults_by_api.get(api) {
+            for (key, value) in defaults {
+                merge_defaults(&mut body[key], value);
+            }
+        }
+    }
     if routes_prompt_cache(provider) {
         body["prompt_cache_key"] = json!(prompt_cache_key(model, messages));
     }
@@ -181,6 +232,16 @@ pub(super) fn body(
     super::thinking::apply(&provider.config, reasoning, max_tokens, &mut body);
     super::thinking::allow_replay_prefix_changes(&provider.config, &mut body);
     Ok(body)
+}
+
+fn merge_defaults(target: &mut Value, source: &Value) {
+    if let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) {
+        for (key, value) in source {
+            merge_defaults(target.entry(key.clone()).or_insert(Value::Null), value);
+        }
+    } else {
+        *target = source.clone();
+    }
 }
 
 /// The effort to send: the user's capability-checked choice, or the lowest

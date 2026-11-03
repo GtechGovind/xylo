@@ -44,6 +44,40 @@ mod xylo {
             (window, view)
         }
         #[gpui_kit::test]
+        fn custom_openapi_import_configures_editor_and_keeps_advanced_optional(
+            cx: &mut TestAppContext,
+        ) {
+            let (window, view) = open(cx);
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.settings_open = true;
+                    view.page = Page::Providers;
+                    view.provider_form_open = true;
+                    view.error = None;
+                    view.choose_provider_kind("Custom", window, cx);
+                    view.provider_openapi.update(cx, |input, cx| input.set_value(serde_json::json!({
+                        "openapi":"3.0.3", "servers":[{"url":"https://fixture.example.invalid/api"}],
+                        "paths":{"/responses":{"post":{}},"/models":{"get":{}}},
+                        "security":[{"key":[]}],"components":{"securitySchemes":{"key":{"type":"apiKey","in":"header","name":"x-access-key"}}}
+                    }).to_string(), window, cx));
+                });
+                window.render_frame(cx);
+                assert!(window.try_find("provider-protocol").is_none());
+                window.click("provider-import-openapi", cx);
+                view.update(cx, |view, cx| {
+                    let config = view.provider_from_form(cx).unwrap();
+                    assert_eq!(config.endpoint, "https://fixture.example.invalid/api");
+                    assert_eq!(config.family, ApiFamily::OpenAiResponses);
+                    assert_eq!(config.custom.unwrap().auth_header, "x-access-key");
+                    assert!(view.provider_discovery.test_requests.is_empty());
+                    assert!(view.provider_openapi.read(cx).value().is_empty());
+                });
+                window.render_frame(cx);
+                window.click("provider-advanced", cx);
+                assert!(window.try_find("provider-protocol").is_some());
+            }).unwrap();
+        }
+        #[gpui_kit::test]
         fn use_account_does_not_replace_an_active_model_before_selection(cx: &mut TestAppContext) {
             let (window, view) = open(cx);
             cx.update_window(window,|_,window,cx| {
@@ -106,6 +140,7 @@ mod xylo {
                     context_limits: Default::default(),
                     reasoning_options: reasoning,
                     default_reasoning_efforts: Default::default(),
+                    model_capabilities: Default::default(),
                 },
                 window,
                 cx,
@@ -257,7 +292,7 @@ mod xylo {
                 view.update(cx,|view,cx|view.event(xylo_runtime::host::HostEvent::Models {
                     generation,provider,models:vec!["future-model-v99".into(),"future-other-v99".into()],context_limits:Default::default(),
                     reasoning_options:std::collections::BTreeMap::from([("future-model-v99".into(),vec!["low".into(),"high".into(),"xhigh".into()]),("future-other-v99".into(),Vec::new())]),
-                    default_reasoning_efforts:std::collections::BTreeMap::from([("future-model-v99".into(),"high".into())]),
+                    default_reasoning_efforts:std::collections::BTreeMap::from([("future-model-v99".into(),"high".into())]), model_capabilities: Default::default(),
                 },window,cx));
                 assert_eq!(view.read(cx).settings.provider.model,"future-model-v99","With no usable model active, the first discovered model is activated");
                 assert!(view.read(cx).settings.providers.iter().any(|provider|provider.model=="future-other-v99"));
@@ -270,12 +305,12 @@ mod xylo {
                 let (generation,provider)=view.read(cx).provider_discovery.test_requests.last().unwrap().clone();
                 view.update(cx,|view,cx|view.event(xylo_runtime::host::HostEvent::Models {
                     generation,provider,models:vec!["future-other-v99".into(),"future-model-v99".into()],context_limits:Default::default(),
-                    reasoning_options:std::collections::BTreeMap::from([("future-model-v99".into(),vec!["low".into(),"high".into(),"xhigh".into()])]),default_reasoning_efforts:Default::default(),
+                    reasoning_options:std::collections::BTreeMap::from([("future-model-v99".into(),vec!["low".into(),"high".into(),"xhigh".into()])]),default_reasoning_efforts:Default::default(), model_capabilities: Default::default(),
                 },window,cx));
                 assert_eq!(view.read(cx).settings.provider.model,"future-model-v99","Refresh preserves the active model while it is supported, even when server order changes");
                 assert_eq!(view.read(cx).settings.provider.reasoning_effort.as_deref(),Some("high"));
                 view.update(cx,|view,cx|view.use_chatgpt(window,cx));let (generation,provider)=view.read(cx).provider_discovery.test_requests.last().unwrap().clone();
-                view.update(cx,|view,cx|view.event(xylo_runtime::host::HostEvent::Models {generation,provider,models:vec!["gpt-5.2".into()],context_limits:Default::default(),reasoning_options:std::collections::BTreeMap::from([("gpt-5.2".into(),Vec::new())]),default_reasoning_efforts:Default::default()},window,cx));
+                view.update(cx,|view,cx|view.event(xylo_runtime::host::HostEvent::Models {generation,provider,models:vec!["gpt-5.2".into()],context_limits:Default::default(),reasoning_options:std::collections::BTreeMap::from([("gpt-5.2".into(),Vec::new())]),default_reasoning_efforts:Default::default(), model_capabilities: Default::default(),},window,cx));
                 view.update(cx,|view,cx|{view.settings_open=false;view.page=Page::Chat;cx.notify();});window.render_frame(cx);
                 assert!(view.read(cx).settings.provider.supported_reasoning_efforts().is_empty(),"Explicit catalog metadata overrides a known-name fallback");
                 window.click("composer-model",cx);

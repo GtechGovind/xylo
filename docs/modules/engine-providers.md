@@ -4,7 +4,7 @@
 
 `crates/engine/src/providers/` holds the native HTTP adapters that implement `ModelProvider` (`model.rs`) for the model families Xylo supports. This page covers the adapters, the guard that wraps them (`provider_guard.rs`), the error vocabulary (`ModelError` in `model.rs`), fallback and renewal, and how a provider is configured. The loop that calls providers is in [engine](engine.md); tool execution is in [engine-tools](engine-tools.md); helper agents (which share the same provider) are in [engine-agents-and-skills](engine-agents-and-skills.md). Settings types live in [core](core.md), endpoint normalization, credential parsing and discovery in [services](services.md).
 
-The module doc (`providers/mod.rs`) states the contract: **no provider selection starts a subprocess, reads another application's auth cache, or silently changes to another API family.**
+The module doc (`providers/mod.rs`) states the contract: **no provider selection starts a subprocess, reads another application's auth cache, or silently changes to another API family unless the user enables capability-based custom routing.**
 
 ## Module map
 
@@ -130,7 +130,7 @@ Provider errors are untrusted text that may echo input or auth. Only bounded dia
 
 - `redactions(headers)` collects every default header value, plus the secret part of `Bearer`/`Basic` values, longest first; these are replaced by `[redacted]` in messages and cause identifiers containing them to be dropped.
 - `identifier`: at most 120 bytes of `[A-Za-z0-9_.\-\[\]]`, not starting with `sk-` or `eyJ`, not containing a redaction value. Used for error codes, request IDs (`x-request-id` or body `request_id`) and `type`/`status`.
-- `readable` (the provider's reason text from `/error/message`, `/detail` or `/detail/message`): replaces secrets; **replaces every quoted value** (`'`, `"`, backtick) with `[redacted]` unless it is an exact public protocol field (`input`, `messages`, `system`, `thinking`, `tools`, `reasoning`, `instructions`, `model`, `stream`, `store`, `max_output_tokens`, `temperature` and indexed/dotted paths) or one of `signature`, `redacted_thinking`, `drop_block`, `anthropic-beta`, `thinking-binding-controls-2026-08-01`; strips control and bidi characters; replaces words that contain `://`, `@`, a `?…=` query, start with `www.`, `sk-` or `eyj`, exceed 120 bytes, look like `token=`/`password:` assignments, or follow `bearer`, `authorization`, `api_key`, `secret` and similar keys. **The result is bounded to 480 characters** (truncated with `…`).
+- `readable` (the provider's reason text from `/error/message`, `/message`, `/detail` or `/detail/message`): replaces secrets; **replaces every quoted value** (`'`, `"`, backtick) with `[redacted]` unless it is an exact public protocol field (`input`, `messages`, `system`, `thinking`, `tools`, `reasoning`, `instructions`, `model`, `stream`, `store`, `max_output_tokens`, `temperature` and indexed/dotted paths) or one of `signature`, `redacted_thinking`, `drop_block`, `anthropic-beta`, `thinking-binding-controls-2026-08-01`; strips control and bidi characters; replaces words that contain `://`, `@`, a `?…=` query, start with `www.`, `sk-` or `eyj`, exceed 120 bytes, look like `token=`/`password:` assignments, or follow `bearer`, `authorization`, `api_key`, `secret` and similar keys. **The result is bounded to 480 characters** (truncated with `…`).
 - `stream_error` builds "Provider stream error (code=…, type=…, field=…, request=…)" from safe identifiers plus the readable message, bounded to 1000 characters.
 
 ## Retries and fallback
@@ -221,3 +221,39 @@ For `ApiFamily::Gemini` only (not Vertex), before each send `cached_body` tries 
 - **A stream that ends without its terminal event is retryable, never a silent success.**
 - **Renewal replays a request at most once and only before any output.**
 - **Fallback stays on the same connection and family, is persisted before use, and is triggered only by `Unavailable`.**
+
+## Custom gateways and OpenAPI import
+
+Choose **Custom**, then paste an OpenAPI JSON document and click **Import API configuration**. Import fills the endpoint, recognized inference/catalog routes and authentication header; it does not contact servers, fetch remote references, save credentials or send prompts. Review the endpoint and any import notices, enter the credential separately, then **Save provider** to discover models. Supported wire formats are Chat Completions, Responses, Anthropic Messages and Gemini GenerateContent. An OpenAPI document describing an unrelated proprietary body format cannot create a new protocol adapter automatically.
+
+The normal form shows name, endpoint, credential and import. **Advanced settings** contains the fallback protocol, metadata headers, optional discovery URL, optional model ID and custom configuration JSON. Existing connections keep their previous behavior until custom configuration is enabled; use `{}` to enable the default custom routes and automatic routing, then save/refresh the catalog. No gateway identity or hostname is built into this behavior.
+
+Custom configuration example (paths are relative to the base URL):
+
+```json
+{
+  "automatic_protocol": true,
+  "paths": {
+    "chat_completions": "chat/completions",
+    "responses": "responses",
+    "messages": "v1/messages",
+    "generate_content": "v1beta/models/{model}:generateContent",
+    "stream_generate_content": "v1beta/models/{model}:streamGenerateContent?alt=sse",
+    "models": "models"
+  },
+  "auth_header": "Authorization",
+  "auth_prefix": "Bearer ",
+  "request_defaults_by_api": {
+    "open_ai_chat": {"temperature": 0.2},
+    "gemini": {"generationConfig": {"temperature": 0.2}}
+  }
+}
+```
+
+Blank routes disable those APIs. URLs must remain under the configured base URL; only the `{model}` path placeholder is supported. `request_defaults` applies across protocols; `request_defaults_by_api` applies to one of `open_ai_chat`, `open_ai_responses`, `anthropic`, `gemini`. Defaults cannot replace managed conversation, tool, streaming, reasoning or output-limit fields, or carry authentication. Prefer per-API defaults when field names differ.
+
+Catalog `supported_apis` and native-family metadata select native Messages/GenerateContent where advertised; otherwise Responses is preferred, with the selected protocol as the fallback for unknown catalogs. The catalog's output limit, token parameter, reasoning choices and tool/reasoning compatibility are retained with each model. Explicit unsupported combinations fail before sending. A fixed Chat Completions connection whose model disallows tools with reasoning requires reasoning `none` or a supported Responses route. The UI reports server permission failures; discovery does not grant access to restricted models.
+
+For incomplete catalogs, `model_overrides` maps a model ID to a complete capability override (it replaces that model's discovered capability object). Supported fields include `supported_apis`, `native_family`, `chat_tools_with_reasoning`, `chat_output_limit` (`max_tokens` or `max_completion_tokens`), `max_output_tokens`, `adaptive_thinking`, and `access_restricted`.
+
+A normal credential is formatted with `auth_header`/`auth_prefix`, independently of the selected wire protocol. For multiple secret headers, enter a credential record in the credential field, for example `{"headers":{"Authorization":"Bearer <token>","X-App-Authorization":"<second token>"}}`. This record stays in the credential vault. Extra headers are for nonsecret metadata only.

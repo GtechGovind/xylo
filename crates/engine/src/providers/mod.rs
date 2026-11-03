@@ -19,7 +19,10 @@ use crate::model::{EventStream, ModelError, ModelProvider, ModelRequest, ModelUs
 use anyhow::{Context, Result, ensure};
 use futures_util::StreamExt;
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio_util::sync::CancellationToken;
 use xylo_core::{ApiFamily, ProviderConfig};
 use xylo_services::providers::{
@@ -45,8 +48,7 @@ fn redactions(headers: &reqwest::header::HeaderMap) -> Arc<Vec<String>> {
         if !value.is_empty() {
             redactions.push(value.to_owned());
         }
-        if let Some((scheme, secret)) = value.split_once(' ')
-            && (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic"))
+        if let Some((_, secret)) = value.split_once(' ')
             && !secret.is_empty()
         {
             redactions.push(secret.to_owned());
@@ -80,7 +82,8 @@ struct NativeProvider {
 }
 
 impl NativeProvider {
-    fn new(config: ProviderConfig, credential: ProviderCredential) -> Result<Self> {
+    fn new(mut config: ProviderConfig, credential: ProviderCredential) -> Result<Self> {
+        config.family = config.effective_family();
         let endpoint = normalize_provider(&config)?;
         let chatgpt_plan = matches!(credential, ProviderCredential::ChatGpt { .. });
         if chatgpt_plan {
@@ -103,7 +106,7 @@ impl NativeProvider {
             !matches!(credential, ProviderCredential::Aws { .. }),
             "AWS credentials require the Bedrock API family"
         );
-        let mut headers = credential.headers(&config.family, &config.headers)?;
+        let mut headers = credential.headers_for(&config)?;
         if config.family == ApiFamily::Anthropic
             && !config.supported_reasoning_efforts().is_empty()
             && !config.adaptive_thinking()
@@ -125,7 +128,15 @@ impl NativeProvider {
                 );
             }
         }
-        let error_redactions = redactions(&headers);
+        let mut error_redactions = redactions(&headers);
+        if let ProviderCredential::ApiKey(secret) | ProviderCredential::Bearer(secret) = &credential
+            && !secret.is_empty()
+        {
+            let values = Arc::make_mut(&mut error_redactions);
+            values.push(secret.clone());
+            values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+            values.dedup();
+        }
         Ok(Self {
             client: http_client(headers.clone())?,
             search_headers: headers,
@@ -138,6 +149,9 @@ impl NativeProvider {
     }
 
     async fn send(&self, body: &Value) -> Result<reqwest::Response, ModelError> {
+        let started = Instant::now();
+        let model = diagnostics::identifier(&self.config.model, &self.error_redactions)
+            .unwrap_or_else(|| "configured-model".into());
         let mut request = self
             .client
             .post(self.endpoint.stream_url.clone())
@@ -165,16 +179,23 @@ impl NativeProvider {
                 request = request.header("anthropic-beta", beta);
             }
         }
-        let response = request.send().await.map_err(|error| ModelError::Provider {
+        let response = request.send().await.map_err(|error| {
+            tracing::warn!(model, protocol = ?self.endpoint.protocol, elapsed_ms = started.elapsed().as_millis() as u64, timeout = error.is_timeout(), connect = error.is_connect(), "Provider transport failed");
+            ModelError::Provider {
             // Once request transmission may have started, replay is unsafe.
             retryable: error.is_connect(),
             retry_after: None,
             message: format!("Provider transport failed: {}", error.without_url()),
-        })?;
+        }})?;
         if response.status().is_success() {
             return Ok(response);
         }
         let status = response.status().as_u16();
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| diagnostics::identifier(value, &self.error_redactions));
         let retry_after = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
@@ -189,6 +210,12 @@ impl NativeProvider {
             .and_then(|code| diagnostics::identifier(code, &self.error_redactions))
             .unwrap_or_else(|| "request_failed".into());
         let reason = diagnostics::reason(&payload, &self.error_redactions);
+        // Raw error text can reflect prompts or secrets. Persist bounded metadata only.
+        tracing::warn!(model, protocol = ?self.endpoint.protocol, status, error_code = code,
+            request_id = request_id.as_deref().unwrap_or("unavailable"),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            tool_count = body.get("tools").and_then(|value| value.as_array()).map_or(0, Vec::len),
+            "Provider request rejected");
         Err(self.http_error(status, &code, reason.as_deref(), retry_after, body))
     }
 
@@ -239,7 +266,11 @@ impl NativeProvider {
         };
         if self.chatgpt_plan && status == 401 && code == "token_expired" {
             ModelError::Authentication(renewal::TOKEN_EXPIRED.into())
-        } else if matches!(status, 401 | 403) || code == "invalid_api_key" {
+        } else if status == 403 {
+            ModelError::Authentication(format!(
+                "{message}. Check this credential's model permissions and required client/workspace headers; listing a model does not grant access."
+            ))
+        } else if status == 401 || code == "invalid_api_key" {
             ModelError::Authentication(message)
         } else if status == 429 {
             ModelError::RateLimited {

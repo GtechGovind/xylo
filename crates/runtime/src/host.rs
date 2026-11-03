@@ -287,6 +287,7 @@ pub enum HostEvent {
         context_limits: std::collections::BTreeMap<String, u32>,
         reasoning_options: std::collections::BTreeMap<String, Vec<String>>,
         default_reasoning_efforts: std::collections::BTreeMap<String, String>,
+        model_capabilities: std::collections::BTreeMap<String, xylo_core::ModelCapabilities>,
     },
     ModelsFailed {
         generation: u64,
@@ -1133,7 +1134,8 @@ enum Admission {
 /// Saved models belong to one connection when everything but the model
 /// choice matches.
 fn same_connection(a: &ProviderConfig, b: &ProviderConfig) -> bool {
-    a.family == b.family
+    a.custom == b.custom
+        && a.family == b.family
         && a.endpoint == b.endpoint
         && a.credential_ref == b.credential_ref
         && a.discovery_url == b.discovery_url
@@ -1996,6 +1998,7 @@ impl HostState {
                             context_limits: Default::default(),
                             reasoning_options: Default::default(),
                             default_reasoning_efforts: Default::default(),
+                            model_capabilities: Default::default(),
                         })
                         .await?;
                 }
@@ -3610,10 +3613,18 @@ impl HostState {
                     .map(|effort| (m.id.clone(), effort))
             })
             .collect();
+        let model_capabilities = catalog
+            .iter()
+            .filter_map(|m| {
+                m.capabilities
+                    .clone()
+                    .map(|capabilities| (m.id.clone(), capabilities))
+            })
+            .collect();
         let models = catalog.into_iter().map(|m| m.id).collect();
         tokio::select! {
             _ = cancel.cancelled() => {},
-            result = self.events.send(HostEvent::Models { generation, provider: config, models, context_limits, reasoning_options, default_reasoning_efforts }) => { result?; },
+            result = self.events.send(HostEvent::Models { generation, provider: config, models, context_limits, reasoning_options, default_reasoning_efforts, model_capabilities }) => { result?; },
         }
         Ok(())
     }

@@ -171,6 +171,7 @@ async fn discovery_lowers_catalog_context_to_the_served_context() {
             context_tokens: Some(131_072),
             reasoning_options: None,
             default_reasoning_effort: None,
+            capabilities: None,
         },
         super::super::ProviderModel {
             id: "unknown".into(),
@@ -178,6 +179,7 @@ async fn discovery_lowers_catalog_context_to_the_served_context() {
             context_tokens: None,
             reasoning_options: None,
             default_reasoning_effort: None,
+            capabilities: None,
         },
     ];
     super::super::discovery::apply_served_context(

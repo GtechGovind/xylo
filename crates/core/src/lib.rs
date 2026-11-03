@@ -14,7 +14,9 @@ mod attachments;
 pub use attachments::*;
 mod image_generation;
 pub use image_generation::*;
+mod custom_provider;
 mod provider_controls;
+pub use custom_provider::*;
 mod steering;
 pub use steering::*;
 
@@ -94,6 +96,10 @@ pub struct ProviderConfig {
     /// An alternative model on this same authorized connection.
     #[serde(default)]
     pub fallback_model: Option<String>,
+    #[serde(default)]
+    pub custom: Option<CustomProviderConfig>,
+    #[serde(default)]
+    pub model_capabilities: Option<ModelCapabilities>,
 }
 
 impl Default for ProviderConfig {
@@ -115,6 +121,8 @@ impl Default for ProviderConfig {
             managed_local: false,
             headers: Default::default(),
             fallback_model: None,
+            custom: None,
+            model_capabilities: None,
         }
     }
 }
@@ -138,6 +146,7 @@ impl ProviderConfig {
             self.family,
             ApiFamily::OpenAiChat | ApiFamily::OpenAiResponses | ApiFamily::Azure
         ) && self.native_reasoning_efforts().is_empty()
+            && self.custom.is_none()
         {
             return Vec::new();
         }
@@ -219,6 +228,9 @@ impl ProviderConfig {
 
     /// Validate provider setup before a model has been discovered or selected.
     pub fn validate_connection(&self) -> Result<()> {
+        if let Some(custom) = &self.custom {
+            custom.validate()?;
+        }
         ensure!(
             self.context_tokens >= 1024 && self.output_tokens < self.context_tokens,
             "Output tokens must fit inside the context budget (minimum context: 1024)"
@@ -431,6 +443,7 @@ impl AppSettings {
                 && p.credential_ref == provider.credential_ref
                 && p.headers == provider.headers
                 && p.discovery_url == provider.discovery_url
+                && p.custom == provider.custom
         }) {
             *existing = provider;
         } else {

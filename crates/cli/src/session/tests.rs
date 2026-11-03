@@ -34,3 +34,32 @@ fn headless_explicit_provider_fallback_wins_even_with_primary_override() {
         Some("provider-fallback")
     );
 }
+
+#[test]
+fn model_override_resolves_catalog_metadata_only_on_the_selected_connection() {
+    let mut settings = xylo_core::AppSettings::default();
+    settings.provider.custom = Some(Default::default());
+    settings.provider.model = "primary".into();
+    settings.provider.reasoning_options = Some(vec!["high".into()]);
+    settings.provider.reasoning_effort = Some("high".into());
+    let mut catalog = settings.provider.clone();
+    catalog.model = "secondary".into();
+    catalog.model_capabilities = Some(xylo_core::ModelCapabilities {
+        supported_apis: Some(vec![xylo_core::ApiFamily::Anthropic]),
+        native_family: Some(xylo_core::ApiFamily::Anthropic),
+        ..Default::default()
+    });
+    catalog.reasoning_options = Some(vec!["low".into()]);
+    catalog.default_reasoning_effort = Some("low".into());
+    settings.providers = vec![catalog];
+    let provider = turn_provider(&settings, Some("secondary"));
+    assert_eq!(provider.effective_family(), xylo_core::ApiFamily::Anthropic);
+    assert_eq!(provider.reasoning_options, Some(vec!["low".into()]));
+    assert_eq!(provider.default_reasoning_effort.as_deref(), Some("low"));
+    assert!(provider.reasoning_effort.is_none());
+    settings.providers[0].credential_ref = Some("other-account".into());
+    let provider = turn_provider(&settings, Some("secondary"));
+    assert!(provider.model_capabilities.is_none());
+    assert!(provider.reasoning_options.is_none());
+    assert!(provider.reasoning_effort.is_none());
+}

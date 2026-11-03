@@ -370,8 +370,8 @@ pub(super) async fn handshake<R: AsyncBufRead + Unpin>(output: &mut R, hello: Uu
     }
 }
 
-/// Removes bearer tokens, `sk-` keys and `api_key=` values before a worker
-/// diagnostic line is logged.
+/// Removes common credential forms before a worker diagnostic is logged.
+/// Provider diagnostics must still omit request/response bodies at their source.
 pub(super) fn redact_secrets(line: &str) -> String {
     let mut output = String::with_capacity(line.len());
     let mut rest = line;
@@ -380,10 +380,28 @@ pub(super) fn redact_secrets(line: &str) -> String {
         if boundary && let Some(length) = secret_prefix(rest) {
             output.push_str(&rest[..length]);
             output.push_str("[REDACTED]");
+            let quote = rest[..length]
+                .chars()
+                .last()
+                .filter(|c| matches!(c, '"' | '\''));
             rest = &rest[length..];
-            let end = rest
-                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '&' | ',' | ';'))
-                .unwrap_or(rest.len());
+            let end = if let Some(quote) = quote {
+                let mut escaped = false;
+                rest.char_indices().find_map(|(index, character)| {
+                    if escaped {
+                        escaped = false;
+                        None
+                    } else if character == '\\' {
+                        escaped = true;
+                        None
+                    } else {
+                        (character == quote).then_some(index)
+                    }
+                })
+            } else {
+                rest.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '&' | ',' | ';'))
+            }
+            .unwrap_or(rest.len());
             rest = &rest[end..];
         } else {
             let mut chars = rest.chars();
@@ -404,9 +422,11 @@ fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
 
 /// Length of a secret-introducing prefix at the start of `text`, if any.
 fn secret_prefix(text: &str) -> Option<usize> {
-    if starts_with_ignore_case(text, "bearer ") {
-        let value = text["bearer ".len()..].trim_start_matches(' ');
-        return (!value.is_empty()).then_some(text.len() - value.len());
+    for prefix in ["bearer ", "basic "] {
+        if starts_with_ignore_case(text, prefix) {
+            let value = text[prefix.len()..].trim_start_matches(' ');
+            return (!value.is_empty()).then_some(text.len() - value.len());
+        }
     }
     if text.starts_with("sk-")
         && text
@@ -416,7 +436,16 @@ fn secret_prefix(text: &str) -> Option<usize> {
     {
         return Some(3);
     }
-    for key in ["api_key", "api-key", "apikey"] {
+    for key in [
+        "api_key",
+        "api-key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "password",
+        "token",
+    ] {
         if starts_with_ignore_case(text, key) {
             let after = &text[key.len()..];
             let value = after.trim_start_matches([' ', '=', ':', '"', '\'']);
@@ -685,19 +714,64 @@ async fn write_commands(
 }
 
 async fn log_diagnostics(errors: tokio::process::ChildStderr, session: Uuid) {
+    const MAX_LINE: u64 = 16 * 1024;
     let mut errors = BufReader::new(errors);
     let mut line = Vec::new();
+    let mut discarding = false;
     loop {
         line.clear();
         match (&mut errors)
-            .take(16 * 1024)
+            .take(MAX_LINE)
             .read_until(b'\n', &mut line)
             .await
         {
             Ok(0) | Err(_) => break,
             _ => {
+                let complete = line.ends_with(b"\n");
+                if discarding {
+                    discarding = !complete;
+                    continue;
+                }
+                if !complete && line.len() == MAX_LINE as usize {
+                    // Never log fragments: a credential could straddle the
+                    // bounded reads and lose the prefix used for redaction.
+                    discarding = true;
+                    tracing::warn!(worker = %session, "Oversized worker diagnostic discarded");
+                    continue;
+                }
                 let message = redact_secrets(&String::from_utf8_lossy(&line));
-                tracing::debug!(worker = %session, %message, "native worker");
+                let message = message.trim_end();
+                // fmt emits LEVEL first, or after the timestamp. Do not infer
+                // severity from arbitrary words inside the diagnostic body.
+                let level = message
+                    .split_whitespace()
+                    .take(2)
+                    .find_map(|word| match word {
+                        "ERROR" => Some(tracing::Level::ERROR),
+                        "WARN" => Some(tracing::Level::WARN),
+                        "INFO" => Some(tracing::Level::INFO),
+                        "DEBUG" => Some(tracing::Level::DEBUG),
+                        "TRACE" => Some(tracing::Level::TRACE),
+                        _ => None,
+                    })
+                    .unwrap_or(tracing::Level::WARN);
+                match level {
+                    tracing::Level::ERROR => {
+                        tracing::error!(worker = %session, %message, "native worker")
+                    }
+                    tracing::Level::WARN => {
+                        tracing::warn!(worker = %session, %message, "native worker")
+                    }
+                    tracing::Level::INFO => {
+                        tracing::info!(worker = %session, %message, "native worker")
+                    }
+                    tracing::Level::DEBUG => {
+                        tracing::debug!(worker = %session, %message, "native worker")
+                    }
+                    tracing::Level::TRACE => {
+                        tracing::trace!(worker = %session, %message, "native worker")
+                    }
+                }
             }
         }
     }

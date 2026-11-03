@@ -227,6 +227,8 @@ async fn queued_timeout_does_not_wait_for_another_operations_lock() {
     assert!(guard.is_none());
 }
 
+// The WebSocket handshake callback fixes its error type in the upstream API.
+#[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn cdp_auth_session_viewport_events_and_script_errors() {
     use async_tungstenite::tungstenite::{

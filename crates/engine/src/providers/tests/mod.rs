@@ -1678,3 +1678,224 @@ mod thinking;
 mod thinking_binding;
 mod tool_images;
 mod usage_headers;
+
+#[test]
+fn custom_native_messages_use_connection_auth_and_native_request_shape() {
+    let mut cfg = config(ApiFamily::OpenAiChat, "https://gateway.example/api".into());
+    cfg.custom = Some(Default::default());
+    cfg.model_capabilities = Some(xylo_core::ModelCapabilities {
+        supported_apis: Some(vec![ApiFamily::OpenAiChat, ApiFamily::Anthropic]),
+        native_family: Some(ApiFamily::Anthropic),
+        ..Default::default()
+    });
+    let provider =
+        NativeProvider::new(cfg, ProviderCredential::ApiKey("fixture-key".into())).unwrap();
+    assert_eq!(provider.config.family, ApiFamily::Anthropic);
+    assert_eq!(
+        provider.search_headers["authorization"],
+        "Bearer fixture-key"
+    );
+    assert!(!provider.search_headers.contains_key("x-api-key"));
+    let body = request::body(
+        &provider,
+        &[Message::user("hello")],
+        &[],
+        100,
+        crate::model::Reasoning::Configured,
+    )
+    .unwrap();
+    assert_eq!(body["max_tokens"], 100);
+    assert!(body.get("stream_options").is_none());
+}
+
+#[test]
+fn fixed_custom_chat_rejects_tools_with_implicit_reasoning_and_honors_catalog_token_field() {
+    let mut cfg = config(ApiFamily::OpenAiChat, "https://gateway.example/api".into());
+    cfg.custom = Some(xylo_core::CustomProviderConfig {
+        automatic_protocol: false,
+        ..Default::default()
+    });
+    cfg.reasoning_options = Some(vec!["none".into(), "medium".into()]);
+    cfg.model_capabilities = Some(xylo_core::ModelCapabilities {
+        chat_tools_with_reasoning: Some(false),
+        chat_output_limit: Some(xylo_core::ChatOutputLimit::MaxCompletionTokens),
+        max_output_tokens: Some(64),
+        ..Default::default()
+    });
+    let messages = [Message::user("hello")];
+    let provider = NativeProvider::new(
+        cfg.clone(),
+        ProviderCredential::ApiKey("fixture-key".into()),
+    )
+    .unwrap();
+    let error = request::body(
+        &provider,
+        &messages,
+        &[tool_schema()],
+        100,
+        crate::model::Reasoning::Configured,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("Responses"));
+    cfg.reasoning_effort = Some("none".into());
+    cfg.custom
+        .as_mut()
+        .unwrap()
+        .request_defaults
+        .insert("temperature".into(), json!(0.3));
+    let provider =
+        NativeProvider::new(cfg, ProviderCredential::ApiKey("fixture-key".into())).unwrap();
+    let body = request::body(
+        &provider,
+        &messages,
+        &[tool_schema()],
+        100,
+        crate::model::Reasoning::Configured,
+    )
+    .unwrap();
+    assert_eq!(body["max_completion_tokens"], 64);
+    assert!(body.get("max_tokens").is_none());
+    assert_eq!(body["temperature"], 0.3);
+    assert_eq!(body["reasoning_effort"], "none");
+}
+
+#[tokio::test]
+async fn provider_failure_diagnostics_record_status_and_request_id_without_payloads() {
+    // tracing's callsite interest cache is process-global; isolate capture from parallel tests.
+    const CHILD: &str = "XYLO_PROVIDER_LOG_CAPTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "providers::tests::provider_failure_diagnostics_record_status_and_request_id_without_payloads", "--nocapture"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use std::io::Write;
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let capture = Capture(Arc::default());
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    use tracing::instrument::WithSubscriber;
+    let (endpoint, server) = fixture(
+        json!({"status":"failed","message":"private-provider-body fixture-key","errorCode":403})
+            .to_string()
+            .into_bytes(),
+        403,
+        "application/json",
+    )
+    .await;
+    let provider = provider(ApiFamily::OpenAiChat, endpoint);
+    let result = provider.send(&json!({"model":"fixture-model","messages":[{"role":"user","content":"private-prompt"}]})).with_subscriber(subscriber).await;
+    assert!(result.is_err());
+    server.await.unwrap();
+    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("status=403"), "{log}");
+    assert!(log.contains("req_transport_fixture"), "{log}");
+    assert!(
+        log.contains("fixture-model") && log.contains("ChatCompletions"),
+        "{log}"
+    );
+    for secret in [
+        "fixture-key",
+        "private-prompt",
+        "private-provider-body",
+        "authorization",
+    ] {
+        assert!(!log.contains(secret), "{log}");
+    }
+}
+
+#[tokio::test]
+async fn responses_gateway_accepts_trailing_done_only_after_terminal_response() {
+    for completed in [true, false] {
+        let mut payload = if completed {
+            sse(&[
+                json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":3,"output_tokens":1}}}),
+            ])
+        } else {
+            Vec::new()
+        };
+        payload.extend_from_slice(b"data: [DONE]\n\n");
+        let (endpoint, server) = fixture(payload, 200, "text/event-stream").await;
+        let result = collect(
+            &provider(ApiFamily::OpenAiResponses, endpoint),
+            &[Message::user("hello")],
+        )
+        .await;
+        server.await.unwrap();
+        if completed {
+            assert_eq!(result.unwrap().message.content, "OK");
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}
+
+#[test]
+fn custom_auth_prefix_redacts_unprefixed_secret_in_identifiers() {
+    let mut cfg = config(ApiFamily::OpenAiChat, "https://gateway.example/api".into());
+    cfg.custom = Some(xylo_core::CustomProviderConfig {
+        auth_prefix: "Token ".into(),
+        ..Default::default()
+    });
+    let provider = NativeProvider::new(
+        cfg,
+        ProviderCredential::ApiKey("fixture-private-secret".into()),
+    )
+    .unwrap();
+    assert!(
+        diagnostics::identifier("fixture-private-secret", &provider.error_redactions).is_none()
+    );
+}
+
+#[test]
+fn custom_protocol_defaults_preserve_managed_gemini_output_limit() {
+    let mut cfg = config(ApiFamily::Gemini, "https://gateway.example/api".into());
+    let mut custom = xylo_core::CustomProviderConfig::default();
+    custom.request_defaults_by_api.insert(
+        "gemini".into(),
+        std::collections::BTreeMap::from([("generationConfig".into(), json!({"temperature":0.2}))]),
+    );
+    cfg.custom = Some(custom);
+    let provider = NativeProvider::new(
+        cfg.clone(),
+        ProviderCredential::ApiKey("fixture-key".into()),
+    )
+    .unwrap();
+    let body = request::body(
+        &provider,
+        &[Message::user("hello")],
+        &[],
+        100,
+        crate::model::Reasoning::Configured,
+    )
+    .unwrap();
+    assert_eq!(body["generationConfig"]["maxOutputTokens"], 100);
+    assert_eq!(body["generationConfig"]["temperature"], 0.2);
+    cfg.custom
+        .as_mut()
+        .unwrap()
+        .request_defaults
+        .insert("generationConfig".into(), Value::Null);
+    assert!(NativeProvider::new(cfg, ProviderCredential::ApiKey("fixture-key".into())).is_err());
+}

@@ -962,3 +962,105 @@ async fn interaction_late_plan_receipt_cannot_replace_newer_permissions_or_turn(
         assert_eq!(*worker.mode.lock(), newer);
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_diagnostics_keep_warning_and_error_severity_at_info_and_redact_credentials() {
+    use tracing::instrument::WithSubscriber;
+    let root = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(root.path().join("capture")).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(file)
+        .finish();
+    let mut child = tokio::process::Command::new("sh").arg("-c").arg("printf '%s\\n' '2026-11-03T00:00:00Z WARN xylo_engine: provider status=403 Bearer fake-secret' 'ERROR xylo_worker: failed api_key=fake-key' 'INFO xylo_worker: ready' 'DEBUG xylo_engine: detail' >&2").stderr(Stdio::piped()).spawn().unwrap();
+    log_diagnostics(child.stderr.take().unwrap(), Uuid::nil())
+        .with_subscriber(subscriber)
+        .await;
+    child.wait().await.unwrap();
+    let output = std::fs::read_to_string(root.path().join("capture")).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line.contains(" WARN ") && line.contains("provider status=403")),
+        "{output}"
+    );
+    assert!(
+        output
+            .lines()
+            .any(|line| line.contains(" ERROR ") && line.contains("failed")),
+        "{output}"
+    );
+    assert!(output.contains("ready"), "{output}");
+    assert!(
+        !output.contains("detail")
+            && !output.contains("fake-secret")
+            && !output.contains("fake-key"),
+        "{output}"
+    );
+}
+
+#[test]
+fn diagnostics_redact_auth_headers_and_token_fields() {
+    let output = redact_secrets(
+        "Authorization: Basic dXNlcjpwYXNz access_token=access-secret refresh_token=refresh-secret client_secret=client-secret x-api-key: header-secret password=pass-secret",
+    );
+    for secret in [
+        "dXNlcjpwYXNz",
+        "access-secret",
+        "refresh-secret",
+        "client-secret",
+        "header-secret",
+        "pass-secret",
+    ] {
+        assert!(!output.contains(secret), "{output}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn oversized_diagnostics_are_discarded_without_leaking_split_credentials() {
+    use tracing::instrument::WithSubscriber;
+    let root = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(root.path().join("capture")).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(file)
+        .finish();
+    let message = format!(
+        "WARN {}Bearer {}\\nWARN retained-warning\\n",
+        "x".repeat(16 * 1024 - 12),
+        "secret-suffix".repeat(300)
+    );
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("printf '%b' \"$1\" >&2")
+        .arg("fixture")
+        .arg(message)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    log_diagnostics(child.stderr.take().unwrap(), Uuid::nil())
+        .with_subscriber(subscriber)
+        .await;
+    child.wait().await.unwrap();
+    let output = std::fs::read_to_string(root.path().join("capture")).unwrap();
+    assert!(!output.contains("secret-suffix"), "{output}");
+    assert!(output.contains("retained-warning"), "{output}");
+    assert!(
+        output.len() < 1024,
+        "oversized diagnostics must not be retained"
+    );
+}
+
+#[test]
+fn diagnostics_redact_entire_quoted_credentials_including_whitespace() {
+    let output = redact_secrets(r#"api_key="secret with spaces" token='more secret' status=401"#);
+    assert!(
+        !output.contains("secret") && !output.contains("spaces"),
+        "{output}"
+    );
+    assert!(output.contains("status=401"), "{output}");
+}

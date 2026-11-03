@@ -4,6 +4,9 @@ use crate::{ApiFamily, AppSettings, ProviderConfig};
 impl ProviderConfig {
     /// Whether the Claude model accepts adaptive thinking and effort.
     pub fn adaptive_thinking(&self) -> bool {
+        if let Some(adaptive) = self.capabilities().and_then(|c| c.adaptive_thinking) {
+            return self.family == ApiFamily::Anthropic && adaptive;
+        }
         self.default_adaptive_thinking()
             || self.anthropic_model(&[
                 "claude-opus-4-6",

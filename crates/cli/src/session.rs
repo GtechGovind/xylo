@@ -365,8 +365,23 @@ async fn read_commands(sender: mpsc::Sender<Result<Command>>) {
 /// Headless requests use the same saved defaults as desktop and wakeups.
 fn turn_provider(settings: &xylo_core::AppSettings, model: Option<&str>) -> ProviderConfig {
     let mut provider = settings.turn_provider();
-    if let Some(model) = model {
+    if let Some(model) = model.filter(|model| *model != provider.model) {
+        let catalog = settings.providers.iter().find(|saved| {
+            saved.model == model
+                && saved.family == provider.family
+                && saved.endpoint == provider.endpoint
+                && saved.credential_ref == provider.credential_ref
+                && saved.headers == provider.headers
+                && saved.discovery_url == provider.discovery_url
+                && saved.custom == provider.custom
+        });
         provider.model = model.to_owned();
+        provider.model_capabilities = catalog.and_then(|saved| saved.model_capabilities.clone());
+        provider.reasoning_options = catalog.and_then(|saved| saved.reasoning_options.clone());
+        provider.default_reasoning_effort =
+            catalog.and_then(|saved| saved.default_reasoning_effort.clone());
+        provider.reasoning_effort = None;
+        provider.served_context_tokens = None;
     }
     provider
 }

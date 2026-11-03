@@ -28,6 +28,9 @@ fn field(value: &str) -> bool {
         "stream",
         "store",
         "max_output_tokens",
+        "max_tokens",
+        "max_completion_tokens",
+        "reasoning_effort",
         "temperature",
     ]
     .iter()
@@ -146,6 +149,7 @@ pub(super) fn reason(value: &Value, redactions: &[String]) -> Option<String> {
         .pointer("/error/message")
         .and_then(Value::as_str)
         .or_else(|| value.get("detail").and_then(Value::as_str))
+        .or_else(|| value.get("message").and_then(Value::as_str))
         .or_else(|| value.pointer("/detail/message").and_then(Value::as_str))?;
     Some(readable(text, redactions)).filter(|reason| !reason.is_empty())
 }

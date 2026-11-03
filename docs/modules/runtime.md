@@ -34,7 +34,7 @@ Two small crates under `crates/runtime/validation/` (`terminal`, `windows-worksp
 | `lsp/` | Language-server sessions for the editor (`mod.rs`, `service.rs`, `client.rs`, `transport.rs`) and for agent tools (`agent.rs`) |
 | `workspace/` | Project catalogue (`index.rs`, `monitor.rs`, `rules.rs`, `paths.rs`), confined reads (`reader*.rs`), search, read-only Git (`git.rs`, `git/hunks.rs`), owned worktrees, output styles |
 | `updates.rs` | Check, download and install lifecycle over `xylo_distribution::Updater` |
-| `observability.rs` | Daily private logs and opt-in OTLP export |
+| `observability.rs` | Daily/size rolling private logs and opt-in OTLP export |
 | `status_line.rs` | Sandboxed user-configured status command |
 | `drafts.rs`, `steering.rs`, `turn_queue.rs`, `history.rs`, `learning.rs`, `extensions.rs`, `conversation_export.rs` | Off-UI wrappers and re-exports over `xylo_services` stores |
 | `tests/`, `*/tests.rs`, `*_tests.rs` | Unit and integration-style tests |
@@ -141,3 +141,9 @@ Application-owned sessions: servers start on first editor use, share a bounded n
 - `lsp/service.rs` orders editor synchronization (monotonic document versions handle out-of-order host scheduling) and runs read requests cancellably and concurrently. `LspEvent` is `Diagnostics` or `Response`.
 - `lsp/agent.rs` (`AgentService`) gives agent tools awaitable language intelligence over the same native transport.
 - The host rejects LSP requests with "Open a project to use code intelligence" when no project is open.
+
+## Rolling diagnostic logs
+
+Logs live under the application data directory's `logs/` folder (macOS: `~/Library/Application Support/com.qurkos.xylo/logs`). Files are `xylo-<UTC epoch day>.log`, followed by numbered segments. They rotate at the UTC day boundary or 10 MiB, retain seven UTC calendar days, and prune oldest segments to keep total owned log bytes within 100 MiB. Rotation resumes the latest segment after restart. Unrelated files and symlinks are not removed; log files are private (`0600` on Unix).
+
+Provider HTTP failures record protocol, safe model identifier, HTTP status, bounded error code/request ID, elapsed time and tool count. They do not record request/response bodies, prompts, headers or raw provider error text. Turn failures record session/turn ID, failure kind and retryability even when telemetry export is disabled. Worker stderr retains warning/error severity, redacts credential patterns, and discards overlong lines. OTLP remains opt-in.

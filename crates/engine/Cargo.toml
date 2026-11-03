@@ -46,6 +46,7 @@ hmac = "0.13"
 jsonschema = { version = "=0.58.6", default-features = false }
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 xylo-services = { workspace = true, features = ["test-support"] }
 keyring-core = "1.0.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }

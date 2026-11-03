@@ -1,6 +1,7 @@
-//! Private daily logs and opt-in OTLP HTTP/JSON telemetry. Exported spans carry
+//! Private size/day rolling logs and opt-in OTLP HTTP/JSON telemetry. Exported spans carry
 //! operation names and timing only; prompts, arguments, results and secrets are
-//! never attached. Logs are retained for seven UTC calendar days.
+//! never attached. Logs roll at 10 MiB and are retained for seven UTC calendar
+//! days, with a 100 MiB total cap.
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -22,51 +23,194 @@ use xylo_core::EngineEvent;
 
 const DAY: u64 = 86_400;
 const RETENTION_DAYS: u64 = 7;
+const LOG_BYTES: u64 = 10 * 1024 * 1024;
+const TOTAL_LOG_BYTES: u64 = 100 * 1024 * 1024;
 
 struct LogFile {
     directory: PathBuf,
     day: u64,
+    segment: u64,
+    size: u64,
     file: File,
 }
 
 impl LogFile {
     fn open(directory: PathBuf) -> Result<Self> {
+        Self::open_at(directory, unix_seconds() / DAY)
+    }
+
+    fn open_at(directory: PathBuf, day: u64) -> Result<Self> {
         std::fs::create_dir_all(&directory)?;
-        let day = unix_seconds() / DAY;
-        clean_logs(&directory, day)?;
-        let file = open_log(&directory, day)?;
-        Ok(Self {
+        let segment = owned_logs(&directory)?
+            .into_iter()
+            .filter(|entry| entry.day == day)
+            .map(|entry| entry.segment)
+            .max()
+            .unwrap_or(0);
+        let file = open_log(&directory, day, segment)?;
+        let size = file.metadata()?.len();
+        let mut log = Self {
             directory,
             day,
+            segment,
+            size,
             file,
-        })
+        };
+        if log.size >= LOG_BYTES {
+            log.roll()?;
+        }
+        clean_logs_except(&log.directory, day, TOTAL_LOG_BYTES, Some(&log.path()))?;
+        Ok(log)
+    }
+
+    fn path(&self) -> PathBuf {
+        log_path(&self.directory, self.day, self.segment)
+    }
+
+    fn roll(&mut self) -> Result<()> {
+        let segment = self
+            .segment
+            .checked_add(1)
+            .context("Log segment overflow")?;
+        let file = open_log(&self.directory, self.day, segment)?;
+        self.size = file.metadata()?.len();
+        self.file = file;
+        self.segment = segment;
+        Ok(())
+    }
+
+    fn write_at(&mut self, bytes: &[u8], day: u64) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if day != self.day {
+            *self = Self::open_at(self.directory.clone(), day).map_err(std::io::Error::other)?;
+        }
+        while self.size >= LOG_BYTES
+            || (self.size > 0
+                && bytes.len() as u64 <= LOG_BYTES
+                && bytes.len() as u64 > LOG_BYTES - self.size)
+        {
+            self.roll().map_err(std::io::Error::other)?;
+        }
+        // Keep ordinary diagnostics intact when they fit in a fresh segment.
+        // Write returns a partial count for an oversized chunk. write_all then
+        // continues in a new segment, so even one huge event cannot exceed it.
+        let count = bytes.len().min((LOG_BYTES - self.size) as usize);
+        clean_logs_except(
+            &self.directory,
+            day,
+            TOTAL_LOG_BYTES - count as u64,
+            Some(&self.path()),
+        )
+        .map_err(std::io::Error::other)?;
+        let written = self.file.write(&bytes[..count])?;
+        self.size += written as u64;
+        Ok(written)
     }
 }
 
-fn open_log(directory: &Path, day: u64) -> Result<File> {
+fn log_path(directory: &Path, day: u64, segment: u64) -> PathBuf {
+    directory.join(if segment == 0 {
+        format!("xylo-{day}.log")
+    } else {
+        format!("xylo-{day}-{segment}.log")
+    })
+}
+
+fn open_log(directory: &Path, day: u64, segment: u64) -> Result<File> {
+    let path = log_path(directory, day, segment);
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        ensure!(
+            metadata.file_type().is_file(),
+            "Log path is not a regular file"
+        );
+    }
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    Ok(options.open(directory.join(format!("xylo-{day}.log")))?)
+    let file = options.open(path)?;
+    ensure!(file.metadata()?.is_file(), "Log path is not a regular file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        ensure!(
+            file.metadata()?.nlink() == 1,
+            "Log path has multiple hard links"
+        );
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
-fn clean_logs(directory: &Path, today: u64) -> Result<()> {
+struct OwnedLog {
+    path: PathBuf,
+    day: u64,
+    segment: u64,
+    size: u64,
+}
+
+fn owned_logs(directory: &Path) -> Result<Vec<OwnedLog>> {
+    let mut logs = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name();
-        if let Some(day) = name
+        let Some(stem) = name
             .to_str()
             .and_then(|name| name.strip_prefix("xylo-"))
             .and_then(|name| name.strip_suffix(".log"))
-            .and_then(|day| day.parse::<u64>().ok())
-            && day.saturating_add(RETENTION_DAYS) <= today
-            && entry.file_type()?.is_file()
-        {
-            std::fs::remove_file(entry.path())?;
+        else {
+            continue;
+        };
+        let (day, segment) = stem.split_once('-').unwrap_or((stem, "0"));
+        let canonical_number = |value: &str| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|number| number.to_string() == value)
+        };
+        let (Some(day), Some(segment)) = (canonical_number(day), canonical_number(segment)) else {
+            continue;
+        };
+        // symlink_metadata never follows a link into another file or directory.
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() {
+            continue;
+        }
+        logs.push(OwnedLog {
+            path: entry.path(),
+            day,
+            segment,
+            size: metadata.len(),
+        });
+    }
+    logs.sort_by(|a, b| (a.day, a.segment, &a.path).cmp(&(b.day, b.segment, &b.path)));
+    Ok(logs)
+}
+
+fn clean_logs_except(
+    directory: &Path,
+    today: u64,
+    budget: u64,
+    active: Option<&Path>,
+) -> Result<()> {
+    let logs = owned_logs(directory)?;
+    let mut total = logs
+        .iter()
+        .fold(0_u64, |sum, log| sum.saturating_add(log.size));
+    for log in logs {
+        if active == Some(log.path.as_path()) {
+            continue;
+        }
+        if log.day.saturating_add(RETENTION_DAYS) <= today || total > budget {
+            std::fs::remove_file(log.path)?;
+            total = total.saturating_sub(log.size);
         }
     }
     Ok(())
@@ -76,17 +220,10 @@ fn clean_logs(directory: &Path, today: u64) -> Result<()> {
 struct LogWriter(Arc<Mutex<LogFile>>);
 impl Write for LogWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let mut log = self
-            .0
+        self.0
             .lock()
-            .map_err(|_| std::io::Error::other("Log lock poisoned"))?;
-        let day = unix_seconds() / DAY;
-        if day != log.day {
-            clean_logs(&log.directory, day).map_err(std::io::Error::other)?;
-            log.file = open_log(&log.directory, day).map_err(std::io::Error::other)?;
-            log.day = day;
-        }
-        log.file.write(bytes)
+            .map_err(|_| std::io::Error::other("Log lock poisoned"))?
+            .write_at(bytes, unix_seconds() / DAY)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.0
@@ -235,6 +372,12 @@ impl Observability {
 
 impl MetricState {
     fn event(&self, session: Uuid, turn: Uuid, event: &EngineEvent) {
+        if let EngineEvent::Error {
+            kind, retryable, ..
+        } = event
+        {
+            tracing::error!(%session, %turn, ?kind, retryable, "Turn failed");
+        }
         let Some(exporter) = &self.exporter else {
             return;
         };

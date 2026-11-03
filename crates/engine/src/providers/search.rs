@@ -98,15 +98,11 @@ pub(super) async fn execute(
     let args = SearchArguments::parse(&arguments)
         .map_err(|_| request::invalid("Invalid search query or domain lists"))?;
     let body = search_request(provider, &args)?;
-    let mut endpoint = provider.endpoint.stream_url.clone();
-    if provider.endpoint.protocol == ProviderProtocol::GeminiGenerateContent {
-        endpoint.set_path(
-            &endpoint
-                .path()
-                .replace(":streamGenerateContent", ":generateContent"),
-        );
-        endpoint.set_query(None);
-    }
+    let endpoint = if provider.endpoint.protocol == ProviderProtocol::GeminiGenerateContent {
+        provider.endpoint.inference_url.clone()
+    } else {
+        provider.endpoint.stream_url.clone()
+    };
     let host = endpoint
         .host_str()
         .ok_or_else(|| request::invalid("Search endpoint has no host"))?

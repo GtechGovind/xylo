@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use xylo_core::{ApiFamily, ProviderConfig};
+use xylo_core::{ApiFamily, ChatOutputLimit, ModelCapabilities, ProviderConfig};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderModel {
@@ -16,6 +16,8 @@ pub struct ProviderModel {
     pub reasoning_options: Option<Vec<String>>,
     #[serde(default)]
     pub default_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<ModelCapabilities>,
 }
 
 /// Account-specific catalog, bounded to eight pages / 2,000 models. Discovery is
@@ -136,7 +138,7 @@ pub(crate) async fn discover_with_credential(
         !matches!(credential, ProviderCredential::Aws { .. }),
         "AWS credentials require the Bedrock API family"
     );
-    let headers = credential.headers(&config.family, &config.headers)?;
+    let headers = credential.headers_for(config)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -156,6 +158,20 @@ pub(crate) async fn discover_with_credential(
             .and_then(Value::as_array)
             .context("Provider returned no model catalog")?;
         for row in rows {
+            let capabilities = catalog_capabilities(row);
+            let automatic = config.custom.as_ref().is_some_and(|c| c.automatic_protocol);
+            if automatic
+                && (capabilities
+                    .supported_apis
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+                    || row
+                        .get("model_type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| !matches!(kind, "chat" | "completion")))
+            {
+                continue;
+            }
             // Gateways may advertise multiple protocols and non-chat models.
             // Respect explicit catalog metadata; plain OpenAI catalogs omit it.
             let api = match config.family {
@@ -163,11 +179,13 @@ pub(crate) async fn discover_with_credential(
                 ApiFamily::OpenAiResponses => Some("responses"),
                 _ => None,
             };
-            if api.is_some_and(|api| {
-                row.get("supported_apis")
-                    .and_then(Value::as_array)
-                    .is_some_and(|apis| !apis.iter().any(|value| value.as_str() == Some(api)))
-            }) {
+            if !automatic
+                && api.is_some_and(|api| {
+                    row.get("supported_apis")
+                        .and_then(Value::as_array)
+                        .is_some_and(|apis| !apis.iter().any(|value| value.as_str() == Some(api)))
+                })
+            {
                 continue;
             }
             if matches!(config.family, ApiFamily::Gemini)
@@ -232,6 +250,7 @@ pub(crate) async fn discover_with_credential(
                 .filter(|n| *n >= 1024);
                 let (reasoning_options, default_reasoning_effort) = catalog_reasoning(row);
                 output.push(ProviderModel {
+                    capabilities: Some(capabilities),
                     reasoning_options,
                     default_reasoning_effort,
                     id,
@@ -339,6 +358,7 @@ async fn bedrock_catalog(
                 };
                 if seen.insert(id.to_owned()) {
                     output.push(ProviderModel {
+                        capabilities: None,
                         context_tokens: None,
                         reasoning_options: None,
                         default_reasoning_effort: None,
@@ -391,13 +411,14 @@ pub(super) fn model_identifier(row: &Value, chatgpt_plan: bool) -> Option<&str> 
 pub(super) fn catalog_reasoning(row: &Value) -> (Option<Vec<String>>, Option<String>) {
     let options = row
         .get("supported_reasoning_levels")
+        .or_else(|| row.pointer("/metadata/capabilities/reasoning/effort_levels"))
         .and_then(Value::as_array)
         .map(|levels| {
             let mut options = Vec::new();
             for level in levels.iter().take(16) {
                 if let Some(effort) = level
-                    .get("effort")
-                    .and_then(Value::as_str)
+                    .as_str()
+                    .or_else(|| level.get("effort").and_then(Value::as_str))
                     .filter(|v| xylo_core::valid_reasoning_option(v))
                     && !options.iter().any(|v| v == effort)
                 {
@@ -408,6 +429,7 @@ pub(super) fn catalog_reasoning(row: &Value) -> (Option<Vec<String>>, Option<Str
         });
     let default = row
         .get("default_reasoning_level")
+        .or_else(|| row.pointer("/metadata/capabilities/reasoning/default_effort"))
         .and_then(Value::as_str)
         .filter(|effort| {
             options
@@ -416,4 +438,54 @@ pub(super) fn catalog_reasoning(row: &Value) -> (Option<Vec<String>>, Option<Str
         })
         .map(str::to_owned);
     (options, default)
+}
+
+fn catalog_capabilities(row: &Value) -> ModelCapabilities {
+    let api = |name: &str| match name {
+        "chatCompletions" | "chat_completions" | "chat.completions" => Some(ApiFamily::OpenAiChat),
+        "responses" => Some(ApiFamily::OpenAiResponses),
+        "messages" | "anthropic" => Some(ApiFamily::Anthropic),
+        "generateContent" | "generate_content" => Some(ApiFamily::Gemini),
+        _ => None,
+    };
+    let supported_apis = row
+        .get("supported_apis")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str().and_then(api))
+                .collect()
+        });
+    ModelCapabilities {
+        supported_apis,
+        native_family: match row.pointer("/metadata/family").and_then(Value::as_str) {
+            Some("anthropic" | "claude") => Some(ApiFamily::Anthropic),
+            Some("google" | "gemini") => Some(ApiFamily::Gemini),
+            _ => None,
+        },
+        chat_tools_with_reasoning: row
+            .pointer("/metadata/capabilities/api/tools_with_reasoning_on_chat_completions")
+            .and_then(Value::as_bool),
+        chat_output_limit: match row
+            .pointer("/metadata/capabilities/api/output_limit_param_chat_completions")
+            .and_then(Value::as_str)
+        {
+            Some("max_tokens") => Some(ChatOutputLimit::MaxTokens),
+            Some("max_completion_tokens") => Some(ChatOutputLimit::MaxCompletionTokens),
+            _ => None,
+        },
+        max_output_tokens: row
+            .pointer("/metadata/max_output_tokens")
+            .or_else(|| row.get("max_tokens"))
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0),
+        access_restricted: row
+            .pointer("/metadata/is_access_restricted")
+            .and_then(Value::as_bool),
+        adaptive_thinking: row
+            .pointer("/metadata/capabilities/reasoning/adaptive_thinking")
+            .and_then(Value::as_bool),
+    }
 }

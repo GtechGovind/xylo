@@ -112,3 +112,44 @@ fn the_served_context_lowers_but_never_raises_the_window() {
     config.served_context_tokens = Some(0);
     assert_eq!(config.context_window(), 32_768);
 }
+
+#[test]
+fn custom_catalog_supports_unknown_native_model_reasoning_and_preserves_old_settings() {
+    let mut config = ProviderConfig {
+        family: ApiFamily::Anthropic,
+        model: "future-native".into(),
+        custom: Some(Default::default()),
+        reasoning_options: Some(vec!["low".into(), "high".into()]),
+        ..Default::default()
+    };
+    assert_eq!(config.supported_reasoning_efforts(), vec!["low", "high"]);
+    config.custom = None;
+    assert!(config.supported_reasoning_efforts().is_empty());
+    let mut value = serde_json::to_value(&config).unwrap();
+    value.as_object_mut().unwrap().remove("custom");
+    value.as_object_mut().unwrap().remove("model_capabilities");
+    let restored: ProviderConfig = serde_json::from_value(value).unwrap();
+    assert!(restored.custom.is_none() && restored.model_capabilities.is_none());
+    assert_eq!(restored.effective_family(), ApiFamily::Anthropic);
+}
+
+#[test]
+fn automatic_custom_routing_uses_only_configured_documented_routes() {
+    let mut config = ProviderConfig {
+        custom: Some(Default::default()),
+        model_capabilities: Some(crate::ModelCapabilities {
+            supported_apis: Some(vec![
+                ApiFamily::OpenAiChat,
+                ApiFamily::OpenAiResponses,
+                ApiFamily::Anthropic,
+            ]),
+            native_family: Some(ApiFamily::Anthropic),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let custom = config.custom.as_mut().unwrap();
+    custom.paths.messages.clear();
+    custom.paths.responses.clear();
+    assert_eq!(config.effective_family(), ApiFamily::OpenAiChat);
+}
