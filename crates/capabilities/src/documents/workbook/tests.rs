@@ -32,6 +32,41 @@ fn read_file(file: &tempfile::NamedTempFile, extension: &str, limit: usize) -> R
 }
 
 #[test]
+fn malformed_cfb_prefix_in_a_zip_is_rejected_by_spreadsheet_readers() {
+    // RUSTSEC-2026-0436's upstream cfb_difat_oom.xls header, followed by an
+    // empty ZIP. ZIP preflight accepts this polyglot, but spreadsheet readers
+    // must reject it before calamine's separate CFB encryption probe.
+    let mut bytes = vec![0u8; 512];
+    bytes[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+    bytes[0x0A] = 1;
+    for (offset, value) in [
+        (0x18, 0x003Eu16),
+        (0x1A, 3),
+        (0x1C, 0xFFFE),
+        (0x1E, 9),
+        (0x20, 6),
+    ] {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[0x2C] = 1;
+    bytes.extend_from_slice(b"PK\x05\x06");
+    bytes.extend_from_slice(&[0; 18]);
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(&bytes).unwrap();
+    let preflight = preflight_archive(file.as_file());
+    assert!(
+        preflight.is_ok(),
+        "The fixture must pass ZIP preflight: {preflight:?}"
+    );
+    for extension in ["xlsx", "xlsm", "xlsb"] {
+        assert!(
+            read_file(&file, extension, 10).is_err(),
+            "Malformed CFB/ZIP must be rejected as {extension}"
+        );
+    }
+}
+
+#[test]
 fn opposite_corners_stream_without_allocating_the_bounding_box() {
     let file = xlsx(|sheet| {
         sheet.write_string(0, 0, "first").unwrap();

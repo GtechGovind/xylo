@@ -22,7 +22,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "image_025", "thread_safe"] }
 # Enables PNG encoding for PDF previews and screenshots saved through pdfium and xcap.
 image = { version = "0.25", default-features = false, features = ["png"] }
-calamine = "0.37"
+calamine = "0.38"
 rust_xlsxwriter = "0.102"
 xcap = "0.9.8"
 enigo = "0.6.1"

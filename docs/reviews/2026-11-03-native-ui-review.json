@@ -327,6 +327,17 @@
     "strict_desktop_clippy": "Passed with --no-default-features --no-deps; existing Windows dependency warnings remain outside this check.",
     "strict_release_tool_clippy": "Passed."
   },
+  "rc7_followup": {
+    "supersedes_unpublished_candidate": "v0.1.1-rc.6",
+    "release_run_cancelled": 41631704133,
+    "reason": "CI functional checks passed on macOS, but dependency audit rejected calamine 0.37.0 under RUSTSEC-2026-0436.",
+    "parser_version": "calamine 0.38.0",
+    "additional_guard": "A CFB-prefix/ZIP polyglot passed archive preflight and caused a calamine 0.38.0 panic. XLSX/XLSM/XLSB readers now reject that compound-file wrapper before the encryption probe. Legacy XLS and ODS paths are unchanged.",
+    "document_tests_passed": 38,
+    "regression": "malformed_cfb_prefix_in_a_zip_is_rejected_by_spreadsheet_readers",
+    "regression_red_log": "target/close-fix/rc7-documents-tests.log",
+    "regression_green_log": "target/close-fix/rc7-documents-green.log"
+  },
   "validation_portability": [
     "Native input tests use the platform Select All chord.",
     "Work-pane lifecycle tests inspect the pane and selected tab.",

@@ -66,14 +66,14 @@ pub(super) fn read(
         "xlsx" | "xlsm" => {
             preflight_archive(file)?;
             check_shared_strings(file, cancel)?;
-            let mut workbook = Xlsx::new(reader(file)?)?;
+            let mut workbook = Xlsx::new(openxml_reader(file)?)?;
             let (sheet, sheets) = choose(workbook.sheet_names().iter().map(String::as_str), sheet)?;
             let window = stream(&mut workbook, &sheet, limit, cancel)?;
             Ok(window.json(&sheet, &sheets))
         }
         "xlsb" => {
             preflight_archive(file)?;
-            let mut workbook = Xlsb::new(reader(file)?)?;
+            let mut workbook = Xlsb::new(openxml_reader(file)?)?;
             let (sheet, sheets) = choose(workbook.sheet_names().iter().map(String::as_str), sheet)?;
             let window = stream(&mut workbook, &sheet, limit, cancel)?;
             Ok(window.json(&sheet, &sheets))
@@ -123,6 +123,20 @@ fn reader(file: &File) -> Result<BufReader<File>> {
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(0))?;
     Ok(BufReader::new(file))
+}
+
+/// A ZIP polyglot can also have a Compound File header. Reject that wrapper
+/// before calamine probes it for encryption using its separate CFB parser.
+fn openxml_reader(file: &File) -> Result<BufReader<File>> {
+    let mut reader = reader(file)?;
+    let mut header = [0; 8];
+    reader.read_exact(&mut header)?;
+    ensure!(
+        header != [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1],
+        "Encrypted or malformed Office spreadsheets are not supported; save an unencrypted workbook"
+    );
+    reader.rewind()?;
+    Ok(reader)
 }
 
 /// The sheet names a result lists; the rest are only counted.
