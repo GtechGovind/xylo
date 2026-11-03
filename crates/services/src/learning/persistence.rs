@@ -105,7 +105,12 @@ fn promote(conn: &Connection, skill: &mut LearnedSkill) -> Result<()> {
     skill.state = "promoted".into();
     Ok(())
 }
-fn completed_case(conn: &Connection, session: Uuid, turn: Uuid) -> Result<Option<ObservedCase>> {
+fn completed_case(
+    conn: &Connection,
+    live: &[ActiveAction],
+    session: Uuid,
+    turn: Uuid,
+) -> Result<Option<ObservedCase>> {
     let conversation: String = conn.query_row(
         "SELECT json FROM conversations WHERE id=?1",
         [session.to_string()],
@@ -131,37 +136,27 @@ fn completed_case(conn: &Connection, session: Uuid, turn: Uuid) -> Result<Option
     let user = user
         .map(|json| serde_json::from_str::<ChatMessage>(&json))
         .transpose()?;
-    let (count,max_size):(i64,i64)=conn.query_row("SELECT count(*),COALESCE(MAX(length(intent)),0) FROM actions WHERE session_id=?1 AND turn_id=?2",params![session.to_string(),turn.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;
+    let mut actions: Vec<_> = live
+        .iter()
+        .filter(|a| a.intent.session_id == session && a.intent.turn_id == turn)
+        .cloned()
+        .collect();
     ensure!(
-        count <= 64 && max_size <= 65536,
+        actions.len() <= 64
+            && actions
+                .iter()
+                .all(|a| serde_json::to_vec(&a.intent).is_ok_and(|v| v.len() <= 65536)),
         "Turn evidence exceeds the automatic learning budget"
     );
-    let mut statement=conn.prepare("SELECT intent,state,CASE WHEN length(result)<=262144 THEN result ELSE NULL END,error,updated_at FROM actions WHERE session_id=?1 AND turn_id=?2 AND length(intent)<=65536 ORDER BY rowid LIMIT 65")?;
-    let rows = statement.query_map(params![session.to_string(), turn.to_string()], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, i64>(4)?,
-        ))
-    })?;
-    let mut actions = Vec::new();
-    for row in rows {
-        let (intent, state, result, error, updated_at) = row?;
-        let intent: ActionIntent = serde_json::from_str(&intent)?;
-        if sanitize::ignored_tool(&intent.name) {
-            continue;
-        }
-        actions.push(JournalAction {
-            intent,
-            state,
-            result: result.map(|json| serde_json::from_str(&json)).transpose()?,
-            error,
-            updated_at,
-        });
-        if actions.len() > MAX_STEPS {
-            break;
+    actions.retain(|a| !sanitize::ignored_tool(&a.intent.name));
+    actions.truncate(MAX_STEPS + 1);
+    for action in &mut actions {
+        if action
+            .result
+            .as_ref()
+            .is_some_and(|r| serde_json::to_vec(r).map_or(true, |v| v.len() > 262144))
+        {
+            action.result = None;
         }
     }
     if actions.is_empty() {
@@ -219,7 +214,7 @@ fn completed_case(conn: &Connection, session: Uuid, turn: Uuid) -> Result<Option
         reason: reason.into(),
     }))
 }
-fn case_is_current(conn: &Connection, case: &ObservedCase) -> Result<bool> {
+fn case_is_current(conn: &Connection, live: &[ActiveAction], case: &ObservedCase) -> Result<bool> {
     if !case.eligible {
         return Ok(false);
     }
@@ -234,11 +229,24 @@ fn case_is_current(conn: &Connection, case: &ObservedCase) -> Result<bool> {
     if !receipt {
         return Ok(false);
     }
-    let ids = serde_json::to_string(&case.evidence.action_ids)?;
-    let valid=conn.query_row("SELECT count(*) FROM actions WHERE id IN (SELECT value FROM json_each(?1)) AND state='succeeded' AND result IS NOT NULL",[ids],|row|crate::store::row_usize(row,0))?;
-    Ok(valid == case.evidence.action_ids.len())
+    Ok(!case.evidence.action_ids.is_empty()
+        && case.evidence.action_ids.len() == case.evidence.result_digests.len()
+        && case
+            .evidence
+            .action_ids
+            .iter()
+            .zip(&case.evidence.result_digests)
+            .all(|(id, expected)| {
+                live.iter().any(|a| {
+                    a.intent.id == *id
+                        && a.intent.session_id == case.evidence.session_id
+                        && a.intent.turn_id == case.evidence.turn_id
+                        && sanitize::result_verified(a)
+                        && digest(&a.result).is_ok_and(|d| d == *expected)
+                })
+            }))
 }
-fn evaluate(conn: &Connection, skill: &mut LearnedSkill) -> Result<()> {
+fn evaluate(conn: &Connection, live: &[ActiveAction], skill: &mut LearnedSkill) -> Result<()> {
     let Some(key) = &skill.workflow_key else {
         return Ok(());
     };
@@ -261,7 +269,7 @@ fn evaluate(conn: &Connection, skill: &mut LearnedSkill) -> Result<()> {
         if skill.correction_message_id.is_some() && case.eligible && !later {
             continue;
         }
-        let passed = case_is_current(conn, &case)?;
+        let passed = case_is_current(conn, live, &case)?;
         if passed {
             distinct.insert((case.evidence.session_id, case.evidence.turn_id));
             held_out |= later;
@@ -283,7 +291,7 @@ fn evaluate(conn: &Connection, skill: &mut LearnedSkill) -> Result<()> {
         || skill.review.is_some();
     let passed = distinct.len() >= 2 && held_out && !negative && guidance_verified;
     skill.provenance = proofs;
-    let evaluation=LearningEvaluation{evaluator:"historical-outcome-template/v1".into(),passed,score:if passed{1.0}else{0.0},checks:vec![format!("{} distinct successful completed turns; require at least 2",distinct.len()),format!("Independent later evidence: {held_out}"),format!("Failed/unknown/external-write counterexamples: {negative}"),format!("Correction semantics checked or explicitly reviewed: {guidance_verified}"),"Exact workspace, typed procedure and current durable action states verified; no tool is executed by evaluation".into()],cases,evaluated_at:now_ms(),limitation:"Checks historical outcome/template consistency. It does not prove task-quality improvement, causal reuse, command sandbox safety, or benchmark/model training results.".into()};
+    let evaluation=LearningEvaluation{evaluator:"historical-outcome-template/v1".into(),passed,score:if passed{1.0}else{0.0},checks:vec![format!("{} distinct successful completed turns; require at least 2",distinct.len()),format!("Independent later evidence: {held_out}"),format!("Failed/unknown/external-write counterexamples: {negative}"),format!("Correction semantics checked or explicitly reviewed: {guidance_verified}"),"Exact workspace, typed procedure and available live action evidence verified; no tool is executed by evaluation".into()],cases,evaluated_at:now_ms(),limitation:"Checks historical outcome/template consistency. It does not prove task-quality improvement, causal reuse, command sandbox safety, or benchmark/model training results.".into()};
     skill.evaluation = Some(evaluation);
     Ok(())
 }
@@ -391,12 +399,17 @@ impl LearningService {
         session: String,
         turn: String,
     ) -> Result<LearningBatch> {
+        let evidence_store = self.store.clone();
         self.store.call(move|conn|{
             let tx=crate::store::write_transaction(conn)?;
+            // Read readiness inside the same serialized operation as job completion.
+            // A host finalization/requeue is then either before this snapshot or after
+            // the job commits, so it cannot lose the last transport update.
+            let live = evidence_store.learning_actions()?;
             let owned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM learning_jobs WHERE id=?1 AND owner=?2 AND state='processing')",params![id,owner],|row|row.get(0))?;
             ensure!(owned,"Learning job lease changed");
             let mut batch=LearningBatch::default();
-            if let Some(case)=completed_case(&tx,Uuid::parse_str(&session)?,Uuid::parse_str(&turn)?)?{
+            if let Some(case)=completed_case(&tx,&live,Uuid::parse_str(&session)?,Uuid::parse_str(&turn)?)?{
                 tx.execute("INSERT INTO learning_cases(session_id,turn_id,scope,workflow_key,json) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(session_id,turn_id) DO UPDATE SET scope=excluded.scope,workflow_key=excluded.workflow_key,json=excluded.json",params![session,turn,case.scope,case.workflow_key,serde_json::to_string(&case)?])?;
                 let case_id:i64=tx.query_row("SELECT id FROM learning_cases WHERE session_id=?1 AND turn_id=?2",params![session,turn],|row|row.get(0))?;
                 // The bounded evaluation batch must never leave an older promoted
@@ -422,7 +435,7 @@ impl LearningService {
                         if command_matches && ((skill.expected_tools.is_empty() && terms_match)||(!skill.expected_tools.is_empty() && skill.expected_tools==tools)){skill.workflow_key=Some(case.workflow_key.clone());skill.steps=case.steps.clone();skill.skill.content=render(&skill);}
                     }
                     if skill.workflow_key.as_deref()!=Some(case.workflow_key.as_str()){continue;}
-                    evaluate(&tx,&mut skill)?;
+                    evaluate(&tx,&live,&mut skill)?;
                     if skill.evaluation.as_ref().is_some_and(|evaluation|evaluation.passed) {
                         if skill.state=="candidate" {promote(&tx,&mut skill)?;batch.promoted+=1;}
                     }else if skill.state=="promoted" {skill.state="suspended".into();batch.suspended+=1;}
@@ -538,6 +551,7 @@ impl LearningService {
         let scope = scope.to_owned();
         let name = name.to_owned();
         let evidence = evidence.to_owned();
+        let live = self.store.learning_actions()?;
         self.store.call(move |conn| {
             let tx = crate::store::write_transaction(conn)?;
             let mut skill = load_skill(&tx, &name, version)?;
@@ -546,7 +560,7 @@ impl LearningService {
                 evidence,
                 reviewed_at: now_ms(),
             });
-            evaluate(&tx, &mut skill)?;
+            evaluate(&tx, &live, &mut skill)?;
             promote(&tx, &mut skill)?;
             save(&tx, &skill)?;
             tx.commit()?;
@@ -561,11 +575,12 @@ impl LearningService {
     ) -> Result<LearnedSkill> {
         let scope = scope.to_owned();
         let name = name.to_owned();
+        let live = self.store.learning_actions()?;
         self.store.call(move |conn| {
             let tx = crate::store::write_transaction(conn)?;
             let mut skill = load_skill(&tx, &name, version)?;
             ensure!(skill.scope == scope, "Rollback cannot cross workspaces");
-            evaluate(&tx, &mut skill)?;
+            evaluate(&tx, &live, &mut skill)?;
             promote(&tx, &mut skill)?;
             save(&tx, &skill)?;
             tx.commit()?;

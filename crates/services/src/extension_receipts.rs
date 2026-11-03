@@ -1,63 +1,133 @@
-//! Settings-triggered executions have durable receipts without creating fake chats.
+//! Settings-triggered execution tracking lives only for the current Store.
 use crate::Store;
-use anyhow::{Result, bail, ensure};
-use rusqlite::{OptionalExtension, params};
+use anyhow::{Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
 use uuid::Uuid;
 impl Store {
     pub fn record_extension_action_binding(&self, id: Uuid, binding: &Value) -> Result<()> {
-        let binding = serde_json::to_string(binding)?;
-        self.call(move |conn| {
-            let old: Option<String> = conn
-                .query_row(
-                    "SELECT binding FROM extension_action_bindings WHERE action_id=?1",
-                    [id.to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(old) = old {
-                ensure!(old == binding, "Extension action binding cannot change");
-                return Ok(());
-            }
-            conn.execute(
-                "INSERT INTO extension_action_bindings(action_id,binding) VALUES(?1,?2)",
-                params![id.to_string(), binding],
-            )?;
-            Ok(())
-        })
+        let action = self
+            .action(id)?
+            .ok_or_else(|| anyhow!("Binding has no live action"))?;
+        ensure!(
+            !action.imported,
+            "Imported activity cannot bind an execution"
+        );
+        if crate::live_actions::serialized_size(binding)? > 16 * 1024 {
+            self.mark_live_action_incomplete(action.intent.session_id, action.intent.turn_id)?;
+            return Ok(());
+        }
+        let mut bindings = self
+            .extension_bindings
+            .lock()
+            .map_err(|_| anyhow!("Extension tracking unavailable"))?;
+        if let Some(old) = bindings.get(&id) {
+            ensure!(old == binding, "Extension action binding cannot change");
+        }
+        ensure!(
+            bindings.len() < 1000 || bindings.contains_key(&id),
+            "Too many live extension bindings"
+        );
+        bindings.insert(id, binding.clone());
+        let _ = self
+            .live_action_updates
+            .send(crate::LiveActionUpdate::Binding {
+                session_id: action.intent.session_id,
+                turn_id: action.intent.turn_id,
+                id,
+                binding: binding.clone(),
+            });
+        Ok(())
     }
     pub fn extension_action_binding(&self, id: Uuid) -> Result<Option<Value>> {
-        self.call(move |conn| {
-            let value: Option<String> = conn
-                .query_row(
-                    "SELECT binding FROM extension_action_bindings WHERE action_id=?1",
-                    [id.to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            value
-                .map(|value| serde_json::from_str(&value).map_err(Into::into))
-                .transpose()
-        })
+        Ok(self
+            .extension_bindings
+            .lock()
+            .map_err(|_| anyhow!("Extension tracking unavailable"))?
+            .get(&id)
+            .cloned())
     }
     pub fn begin_extension_execution(&self, id: Uuid, intent: &Value) -> Result<Option<Value>> {
-        let intent = serde_json::to_string(intent)?;
-        self.call(move|conn|{let tx=crate::store::write_transaction(conn)?;let old:Option<(String,String,Option<String>)>=tx.query_row("SELECT intent,state,result FROM extension_execution_receipts WHERE id=?1",[id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
-            if let Some((old,state,result))=old{ensure!(old==intent,"Extension attempt ID reused with different input");match state.as_str(){"succeeded"=>return Ok(Some(serde_json::from_str(&result.unwrap_or_else(||"null".into()))?)),"running"=>bail!("Extension attempt is already running"),"outcome_unknown"=>bail!("Extension attempt outcome is unknown; inspect its receipt before a new explicit attempt"),_=>bail!("Extension attempt already failed; use a new explicit attempt")}}
-            tx.execute("INSERT INTO extension_execution_receipts(id,intent,state,updated_at) VALUES(?1,?2,'running',?3)",params![id.to_string(),intent,xylo_core::now_ms()])?;tx.commit()?;Ok(None)})
+        let oversized = crate::live_actions::serialized_size(intent)? > 16 * 1024;
+        let intent_fingerprint = oversized
+            .then(|| crate::live_actions::fingerprint(intent))
+            .transpose()?;
+        let mut executions = self
+            .extension_executions
+            .lock()
+            .map_err(|_| anyhow!("Extension tracking unavailable"))?;
+        if let Some(old) = executions.iter().find(|r| r["id"] == id.to_string()) {
+            ensure!(
+                old.get("intent_fingerprint")
+                    .and_then(Value::as_str)
+                    .map_or_else(
+                        || &old["intent"] == intent,
+                        |expected| crate::live_actions::fingerprint(intent)
+                            .is_ok_and(|digest| digest == expected)
+                    ),
+                "Extension attempt ID reused with different input"
+            );
+            ensure!(
+                old["evidence_complete"] != false,
+                "Extension result exceeded the live budget and cannot be reused"
+            );
+            return match old["state"].as_str() {
+                Some("succeeded") => Ok(Some(old["result"].clone())),
+                Some("running") => bail!("Extension attempt is already running"),
+                _ => bail!(
+                    "Extension attempt did not finish successfully; use a new explicit attempt"
+                ),
+            };
+        }
+        ensure!(executions.len() < 1000, "Too many live extension attempts");
+        executions.push(json!({"id":id,"intent":if oversized { &Value::Null } else { intent },"intent_fingerprint":intent_fingerprint,"state":"running","result":null,"error":null,"updated_at":xylo_core::now_ms()}));
+        Ok(None)
     }
     pub fn finish_extension_execution(&self, id: Uuid, result: &Value) -> Result<()> {
-        let result = serde_json::to_string(result)?;
-        self.call(move|conn|{let changed=conn.execute("UPDATE extension_execution_receipts SET state='succeeded',result=?1,error=NULL,updated_at=?2 WHERE id=?3 AND state='running'",params![result,xylo_core::now_ms(),id.to_string()])?;ensure!(changed==1,"Extension receipt is no longer running");Ok(())})
+        let mut executions = self
+            .extension_executions
+            .lock()
+            .map_err(|_| anyhow!("Extension tracking unavailable"))?;
+        let execution = executions
+            .iter_mut()
+            .find(|r| r["id"] == id.to_string() && r["state"] == "running")
+            .ok_or_else(|| anyhow!("Extension attempt is no longer running"))?;
+        execution["state"] = json!("succeeded");
+        let complete = serde_json::to_vec(result)?.len() <= 16 * 1024;
+        execution["result"] = if complete {
+            result.clone()
+        } else {
+            Value::Null
+        };
+        execution["evidence_complete"] = json!(complete);
+        execution["updated_at"] = json!(xylo_core::now_ms());
+        Ok(())
     }
     pub fn mark_extension_execution_unknown(&self, id: Uuid, message: &str) -> Result<()> {
-        let message = message.chars().take(2048).collect::<String>();
-        self.call(move|conn|{conn.execute("UPDATE extension_execution_receipts SET state='outcome_unknown',error=?1,updated_at=?2 WHERE id=?3 AND state='running'",params![message,xylo_core::now_ms(),id.to_string()])?;Ok(())})
+        let mut executions = self
+            .extension_executions
+            .lock()
+            .map_err(|_| anyhow!("Extension tracking unavailable"))?;
+        if let Some(execution) = executions
+            .iter_mut()
+            .find(|r| r["id"] == id.to_string() && r["state"] == "running")
+        {
+            execution["state"] = json!("outcome_unknown");
+            execution["error"] = json!(message.chars().take(2048).collect::<String>());
+            execution["updated_at"] = json!(xylo_core::now_ms());
+        }
+        Ok(())
     }
     pub fn extension_execution_receipts(&self, limit: usize) -> Result<Vec<Value>> {
-        self.call(move|conn|{let mut statement=conn.prepare("SELECT id,intent,state,result,error,updated_at FROM extension_execution_receipts ORDER BY updated_at DESC,id DESC LIMIT ?1")?;let rows=statement.query_map([limit.min(200) as i64],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,i64>(5)?)))?;rows.map(|row|{let(id,intent,state,result,error,updated_at)=row?;Ok(json!({"id":id,"intent":serde_json::from_str::<Value>(&intent)?,"state":state,"result":result.map(|value|serde_json::from_str::<Value>(&value)).transpose()?,"error":error,"updated_at":updated_at}))}).collect()})
+        Ok(self
+            .extension_executions
+            .lock()
+            .map_err(|_| anyhow!("Extension tracking unavailable"))?
+            .iter()
+            .rev()
+            .take(limit.min(200))
+            .cloned()
+            .collect())
     }
 }
-
 #[cfg(test)]
 mod tests;

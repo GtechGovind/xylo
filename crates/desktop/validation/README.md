@@ -1,6 +1,6 @@
 # Native validation
 
-Run these commands from the repository root. The checked-in Cargo configuration uses the root `target` directory for the app and this standalone validation workspace. Different dependency versions, features, or profiles can still require separate artifacts; sharing a directory does not guarantee identical compilation.
+Run these commands from the repository root. The commands below explicitly use the root `target` directory for this standalone validation workspace, matching the app’s default build directory. Different dependency versions, features, or profiles can still require separate artifacts; sharing a directory does not guarantee identical compilation.
 
 ```sh
 # Fast compile feedback without linking the app.
@@ -10,11 +10,11 @@ cargo check -p xylo --locked --no-default-features
 cargo build --locked
 
 # Run only the native checks relevant to the change.
-cargo native-test --test composer-interactions
-cargo native-test --test draft-interactions
+cargo test --locked --manifest-path crates/desktop/validation/Cargo.toml --target-dir target --test composer-interactions
+cargo test --locked --manifest-path crates/desktop/validation/Cargo.toml --target-dir target --test draft-interactions
 
 # Capture only the relevant UI fixture.
-cargo native-test --test composer-rendering
+cargo test --locked --manifest-path crates/desktop/validation/Cargo.toml --target-dir target --test composer-rendering
 
 # Ordinary desktop unit tests run once here.
 cargo test -p xylo --locked
@@ -31,16 +31,16 @@ Test source is small. Large test executables, object files, dependency variants,
 After all Cargo/rustc processes have stopped, remove only this package's generated executables with:
 
 ```sh
-cargo clean --manifest-path crates/desktop/validation/Cargo.toml -p xylo-native-validation
+cargo clean --manifest-path crates/desktop/validation/Cargo.toml --target-dir target -p xylo-native-validation
 ```
 
-This keeps shared dependency artifacts. A full `cargo clean` is appropriate when deliberately resetting the build cache, but makes the next build cold. Existing pre-configuration `crates/desktop/validation/target` build artifacts are obsolete once the root target is used and may be removed when not in use.
+This keeps shared dependency artifacts. A full `cargo clean` is appropriate when deliberately resetting the build cache, but makes the next build cold. Artifacts from earlier commands without an explicit target directory may remain under `crates/desktop/validation/target` and may be removed when not in use.
 
 Screenshots default to `crates/desktop/validation/target/native-preview` even with a shared compiler target. Each capture harness replaces its previous images, so this small preview folder can reappear. Set `XYLO_RENDER_DIR` to a chosen evidence directory when preserving a reviewed capture. Do not treat those images as proof of real provider/account execution.
 
 Lockfiles remain separate. Consolidating them or the harness executables is a later structural change; do not casually add all native capture targets to ordinary `cargo test --workspace`.
 
-Build a local macOS bundle with `cargo bundle-macos` from the repository root
+Build a local macOS bundle with `cargo run --locked -p xylo-build -- bundle-macos` from the repository root
 (`--profile debug` is available for development). The bundle contains copies of the desktop,
 worker, helper, CLI and Obscura programs from the same profile, so clearing `target` cannot break it.
 Plain `cargo build` and `cargo build --release` build the four application programs and the

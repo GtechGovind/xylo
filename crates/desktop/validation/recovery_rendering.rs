@@ -1,4 +1,4 @@
-//! Normal chat capture with an interrupted write retained in the real Host/Store.
+//! Normal chat capture after an interrupted write with no durable action record.
 //! This renders offscreen and never inspects a locked desktop or uses a model.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
@@ -151,7 +151,7 @@ fn render() {
     .into_iter()
     .map(|(name, bytes)| (name, hex::encode(Sha256::digest(bytes))))
     .collect::<std::collections::BTreeMap<_, _>>();
-    let metadata = serde_json::json!({"scope":"Actual production Host and Store; modern protocol-qualified interrupted partial file write. No model, account, external action, or physical desktop acceptance.",
+    let metadata = serde_json::json!({"scope":"Actual production Host and Store; interrupted partial file write with transient activity only. No model, account, external action, or physical desktop acceptance.",
         "logical_size":[1380,880],"pixel_size":pixel_size,"file":"recovery.png","sha256":hex::encode(Sha256::digest(std::fs::read(&image).unwrap())),"compiled_sources_sha256":compiled_sources});
     std::fs::write(
         output.join("recovery.json"),

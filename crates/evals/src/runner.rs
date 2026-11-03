@@ -86,7 +86,7 @@ pub struct Trial {
     pub approvals: Vec<ApprovalDecision>,
     /// Active memory records of the project after the turn, as JSON.
     pub memories: Vec<Value>,
-    /// Journal actions still pending, running or of unknown outcome.
+    /// Live actions still pending, running or of unknown outcome.
     pub unresolved_actions: usize,
     /// The trial hit its deadline and was cancelled.
     pub timed_out: bool,
@@ -122,7 +122,7 @@ impl Trial {
         std::fs::read_to_string(self.workspace.join(relative)).ok()
     }
 
-    /// Journal records of the actions named `tool`.
+    /// Live activity records of the actions named `tool`.
     pub fn actions<'a>(&'a self, tool: &'a str) -> impl Iterator<Item = &'a RecordedAction> {
         self.trace
             .actions
@@ -375,7 +375,7 @@ pub(crate) async fn run_trial_with(
     let checkpoint = store
         .checkpoint(session)?
         .map(|checkpoint| checkpoint.messages);
-    let unresolved_actions = store.unresolved_actions(session)?.len();
+    let unresolved_actions = store.unfinished_actions(session)?.len();
     let exchanges = std::mem::take(&mut *log.lock());
     let trace = places.portable_json(&Trace {
         version: TRACE_VERSION,

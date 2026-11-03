@@ -15,7 +15,10 @@ use std::{
     collections::BTreeMap,
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{io::AsyncReadExt, sync::Mutex};
@@ -24,6 +27,44 @@ use xylo_core::{ToolDefinition, ToolObservation};
 
 const DOWNLOAD_UNSUPPORTED: &str = "browser_download is unavailable with Obscura v0.2.6: its CDP download controls do not enforce byte limits or cancellation. Use a bounded HTTP download tool instead; no browser download was started.";
 const MAX_SCREENSHOT_BYTES: usize = 8 * 1024 * 1024;
+
+/// The requested browser operation never reached the native browser. This is
+/// stronger evidence than an error returned after navigation/click dispatch.
+#[derive(Debug)]
+pub struct BrowserNotDispatched(anyhow::Error);
+
+impl std::fmt::Display for BrowserNotDispatched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+impl std::error::Error for BrowserNotDispatched {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn validate_operation(name: &str, args: &Value) -> Result<()> {
+    match name {
+        "browser_navigate" => {
+            validate_url(required_str(args, "url")?)?;
+        }
+        "browser_click" | "browser_wait" => {
+            required_str(args, "selector")?;
+        }
+        "browser_type" => {
+            required_str(args, "selector")?;
+            ensure!(
+                required_str(args, "text")?.len() <= 100_000,
+                "Input text exceeds limit"
+            );
+        }
+        "browser_snapshot" | "browser_screenshot" | "browser_close" => {}
+        "browser_download" => anyhow::bail!(DOWNLOAD_UNSUPPORTED),
+        _ => anyhow::bail!("Unknown browser tool: {name}"),
+    }
+    Ok(())
+}
 
 fn sibling_runtime(current_executable: &Path) -> Result<PathBuf> {
     let directory = current_executable
@@ -319,25 +360,40 @@ impl BrowserService {
         args: &Value,
         cancel: CancellationToken,
     ) -> Result<ToolObservation> {
-        // Legacy compatibility only: not advertised, and rejected before any
-        // lock, launch, validation or destruction of a healthy session.
-        ensure!(name != "browser_download", "{DOWNLOAD_UNSUPPORTED}");
+        // Reject invalid operations before locking or launching a browser.
+        validate_operation(name, args).map_err(BrowserNotDispatched)?;
         // In-flight operations own their session and drop its process on failure.
         // A cancelled request still waiting for the mutex must not tear down a
         // different request's healthy session or wait for that request to finish.
-        tokio::select! {
+        let dispatched = AtomicBool::new(false);
+        let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(anyhow::anyhow!("Browser operation cancelled")),
             _ = tokio::time::sleep(Duration::from_secs(self.config.operation_timeout_seconds)) => {
                 Err(anyhow::anyhow!("Browser operation timed out"))
             }
-            result = self.inner(name, args) => result,
-        }
+            result = self.inner(name, args, &dispatched) => result,
+        };
+        result.map_err(|error| {
+            if dispatched.load(Ordering::Acquire) {
+                error
+            } else {
+                BrowserNotDispatched(error).into()
+            }
+        })
     }
 
-    async fn inner(&self, name: &str, args: &Value) -> Result<ToolObservation> {
+    async fn inner(
+        &self,
+        name: &str,
+        args: &Value,
+        dispatched: &AtomicBool,
+    ) -> Result<ToolObservation> {
         if name == "browser_close" {
-            self.shutdown().await?;
+            if let Some(session) = self.state.lock().await.take() {
+                dispatched.store(true, Ordering::Release);
+                session.close().await;
+            }
             return Ok(observation(json!({"closed":true}), vec![]));
         }
         ensure!(
@@ -364,6 +420,10 @@ impl BrowserService {
             "Bundled Obscura process has exited"
         );
         let cdp = &mut session.cdp;
+        // From this point a CDP request can reach a page. Even a TLS error may
+        // follow a redirect or unload script, so error text cannot prove that
+        // no side effects occurred. Keep those errors uncertain.
+        dispatched.store(true, Ordering::Release);
         let value = match name {
             "browser_navigate" => {
                 let url = validate_url(required_str(args, "url")?)?;

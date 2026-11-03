@@ -1,4 +1,4 @@
-//! Actual permission/journal boundary with isolated credentials and loopback HTTP.
+//! Actual permission/conversation_state boundary with isolated credentials and loopback HTTP.
 use super::super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::{
@@ -7,7 +7,7 @@ use tokio::{
 };
 use xylo_services::{ConnectorNotDispatched, CredentialVault, VaultKey};
 
-const SECRET: &str = "offline-native-journal-token";
+const SECRET: &str = "offline-native-conversation_state-token";
 
 fn install(
     broker: &mut Arc<ToolBroker>,
@@ -21,7 +21,7 @@ fn install(
         .store
         .save_connector(&ConnectorConfig {
             id,
-            name: "Offline native journal fixture".into(),
+            name: "Offline native conversation_state fixture".into(),
             transport: "gmail".into(),
             endpoint,
             command: None,
@@ -84,7 +84,7 @@ fn vault(directory: &std::path::Path) -> CredentialVault {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_native_write_rejections_fail_the_journal_and_cached_retries_never_dispatch() {
+async fn local_native_write_rejections_fail_live_tracking_and_cached_retries_never_dispatch() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     for (index, secret, reference) in [
@@ -111,13 +111,13 @@ async fn local_native_write_rejections_fail_the_journal_and_cached_retries_never
             approvals, 1,
             "The write still uses the actual permission boundary"
         );
-        let action = broker.journaled(&key).unwrap().unwrap();
+        let action = broker.active_action(&key).unwrap().unwrap();
         assert_eq!(action.state, "failed");
         assert!(!action.error.as_ref().unwrap().contains(SECRET));
         assert!(
             broker
                 .store
-                .unresolved_actions(broker.request.session_id)
+                .unfinished_actions(broker.request.session_id)
                 .unwrap()
                 .is_empty()
         );
@@ -127,7 +127,7 @@ async fn local_native_write_rejections_fail_the_journal_and_cached_retries_never
             approvals, 0,
             "A failed identity cannot authorize a fresh attempt"
         );
-        let cached = broker.journaled(&key).unwrap().unwrap();
+        let cached = broker.active_action(&key).unwrap().unwrap();
         assert_eq!(cached.intent.id, action.intent.id);
         assert_eq!(cached.updated_at, action.updated_at);
         assert_eq!(cached.state, "failed");
@@ -216,14 +216,14 @@ async fn sent_native_write_failures_are_unknown_and_cached_retries_never_send_ag
         let (error, approvals) = execute(&broker, &mut incoming, &key, arguments.clone()).await;
         assert!(error.downcast_ref::<ConnectorNotDispatched>().is_none());
         assert_eq!(approvals, 1);
-        let action = broker.journaled(&key).unwrap().unwrap();
+        let action = broker.active_action(&key).unwrap().unwrap();
         assert_eq!(action.state, "outcome_unknown");
         assert_eq!(sends.load(Ordering::SeqCst), 1);
         assert!(!action.error.unwrap().contains(SECRET));
         let (_, approvals) = execute(&broker, &mut incoming, &key, arguments).await;
         assert_eq!(approvals, 0);
         assert_eq!(
-            broker.journaled(&key).unwrap().unwrap().intent.id,
+            broker.active_action(&key).unwrap().unwrap().intent.id,
             action.intent.id
         );
         assert_eq!(sends.load(Ordering::SeqCst), 1);

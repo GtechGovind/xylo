@@ -1,4 +1,5 @@
 use super::*;
+use crate::ActionIntent;
 use xylo_core::{PermissionMode, ProviderConfig, TurnRequest, Usage};
 
 fn setup() -> (tempfile::TempDir, Store, LearningService, Uuid, String) {
@@ -410,7 +411,7 @@ async fn evidence_keeps_relative_paths_and_hashes_without_copying_auth_or_extern
     assert_eq!(skill.provenance[0].result_digests[0].len(), 64);
 }
 #[tokio::test]
-async fn expired_job_lease_recovers_without_duplicate_version_or_promotion() {
+async fn expired_job_after_reopen_cannot_promote_without_live_evidence() {
     let (directory, store, service, session, scope) = setup();
     command(&store, session, &scope, json!(["check", "--offline"]));
     store
@@ -426,9 +427,9 @@ async fn expired_job_lease_recovers_without_duplicate_version_or_promotion() {
     drop(store);
     let reopened = Store::open(directory.path().join("learning.db")).unwrap();
     let service = LearningService::new(reopened);
-    assert_eq!(drain(&service).await.candidates, 1);
+    assert_eq!(drain(&service).await.candidates, 0);
     assert_eq!(drain(&service).await.processed, 0);
-    assert_eq!(service.skills(&scope, 10).unwrap().len(), 1);
+    assert!(service.skills(&scope, 10).unwrap().is_empty());
 }
 #[tokio::test]
 async fn queued_completion_is_atomic_and_repeated_receipt_does_not_requeue_learning() {
@@ -440,83 +441,6 @@ async fn queued_completion_is_atomic_and_repeated_receipt_does_not_requeue_learn
     assert_eq!(drain(&service).await.processed, 0);
 }
 
-#[tokio::test]
-async fn reaped_session_recovery_atomically_queues_unknown_counterevidence_and_keeps_other_session_live()
- {
-    let (_directory, store, service, session, scope) = setup();
-    for _ in 0..2 {
-        command(&store, session, &scope, json!(["test", "--offline"]));
-        drain(&service).await;
-    }
-    let turn = user_turn(&store, session, &scope, "Verify Rust project tests offline");
-    let crashed = action(
-        &store,
-        session,
-        turn,
-        "run_command",
-        json!({"program":"cargo","args":["test","--offline"]}),
-        true,
-        "running",
-    );
-    let other = Uuid::new_v4();
-    store
-        .upsert_conversation(&Conversation {
-            id: other,
-            title: "Live worker".into(),
-            workspace: scope.clone().into(),
-            updated_at: now_ms(),
-            title_source: Default::default(),
-            pinned: false,
-            archived: false,
-        })
-        .unwrap();
-    let other_turn = user_turn(&store, other, &scope, "Verify Rust project tests offline");
-    let live = action(
-        &store,
-        other,
-        other_turn,
-        "run_command",
-        json!({"program":"cargo","args":["test","--offline"]}),
-        true,
-        "running",
-    );
-    assert_eq!(store.recover_session_interrupted(session).unwrap(), 1);
-    assert_eq!(
-        store.action(crashed).unwrap().unwrap().state,
-        "outcome_unknown"
-    );
-    assert_eq!(store.action(live).unwrap().unwrap().state, "running");
-    assert_eq!(service.status(&scope).unwrap().pending_jobs, 1);
-    assert_eq!(drain(&service).await.suspended, 1);
-    assert!(
-        service
-            .relevant_skills(&scope, "Rust tests", 2)
-            .unwrap()
-            .is_empty()
-    );
-}
-#[tokio::test]
-async fn startup_recovery_captures_terminal_failure_when_worker_died_before_enqueue() {
-    let (_directory, store, service, session, scope) = setup();
-    for _ in 0..2 {
-        command(&store, session, &scope, json!(["check", "--offline"]));
-        drain(&service).await;
-    }
-    let turn = user_turn(&store, session, &scope, "Verify Rust project tests offline");
-    action(
-        &store,
-        session,
-        turn,
-        "run_command",
-        json!({"program":"cargo","args":["check","--offline"]}),
-        true,
-        "failed",
-    );
-    assert_eq!(service.status(&scope).unwrap().pending_jobs, 0);
-    assert_eq!(store.recover_interrupted().unwrap(), 0);
-    assert_eq!(service.status(&scope).unwrap().pending_jobs, 1);
-    assert_eq!(drain(&service).await.suspended, 1);
-}
 #[tokio::test]
 async fn cancelled_background_pass_leaves_durable_job_available_for_resume() {
     let (_directory, store, service, session, scope) = setup();

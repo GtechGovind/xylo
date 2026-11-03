@@ -981,14 +981,6 @@ impl Xylo {
                 self.invalidate_live_history();
                 self.sync_history_list(cx);
             }
-            // Action records remain available through the runtime API. The desktop
-            // no longer opens a review workflow or blocks chats on their outcomes.
-            HostEvent::ActionReviews { .. }
-            | HostEvent::ActionReview { .. }
-            | HostEvent::ActionResolved { .. }
-            | HostEvent::ActionResolution { .. }
-            | HostEvent::ActionReviewForm { .. }
-            | HostEvent::ActionReviewFormSaved { .. } => {}
             HostEvent::DocumentDraftRelinked { request_id, result } => {
                 self.document_relinked(request_id, *result, window, cx)
             }

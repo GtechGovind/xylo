@@ -1,5 +1,5 @@
-//! Lazy metadata from the existing action journal; no schema or output duplication.
-use crate::{JournalAction, Store};
+//! Live activity detail with compact summaries stored in chat messages.
+use crate::{ActiveAction, Store};
 use anyhow::{Result, ensure};
 use rusqlite::params;
 use uuid::Uuid;
@@ -18,89 +18,81 @@ pub struct TurnActivityPage {
     pub items: Vec<TurnActivityItem>,
     pub next: Option<i64>,
 }
-/// Hydrate older JSON without rewriting history or guessing from answer text.
-/// A legacy reply is associated only through its durable completion receipt.
 pub(crate) fn hydrate_activity(
     connection: &rusqlite::Connection,
     message: &mut xylo_core::ChatMessage,
 ) -> Result<()> {
     use rusqlite::OptionalExtension;
-    if message.role != "assistant" {
-        return Ok(());
-    }
-    if message.turn_id.is_none() {
+    if message.role == "assistant" && message.turn_id.is_none() {
         let turn: Option<String> = connection.query_row(
             "SELECT turn_id FROM completed_turns WHERE session_id=?1 AND json_extract(json,'$.reply_id')=?2 LIMIT 1",
             params![message.session_id.to_string(), message.id.to_string()], |row| row.get(0),
         ).optional()?;
         message.turn_id = turn.map(|turn| Uuid::parse_str(&turn)).transpose()?;
     }
-    let Some(turn) = message.turn_id else {
-        return Ok(());
-    };
-    let mut statement = connection.prepare(
-        "SELECT CASE
-            WHEN state='succeeded' AND json_extract(intent,'$.name')='file_read' THEN 'read'
-            WHEN (state='succeeded' OR (state='failed' AND (json_extract(result,'$.exit_code') IS NOT NULL OR json_extract(result,'$.summary.exit_code') IS NOT NULL))) AND json_extract(intent,'$.name') IN ('run_command','shell_command') THEN 'run'
-            WHEN state='succeeded' AND json_extract(intent,'$.name') IN ('file_edit','file_write','notebook_edit') THEN 'edit'
-            ELSE 'other' END AS kind,
-            COUNT(*),COUNT(DISTINCT COALESCE(json_extract(intent,'$.arguments.path'),id))
-            FROM actions WHERE session_id=?1 AND turn_id=?2 GROUP BY kind",
-    )?;
-    let groups = statement
-        .query_map(
-            params![message.session_id.to_string(), turn.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, u32>(2)?,
-                ))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    message.activity_count = groups.iter().map(|(_, count, _)| count).copied().sum();
-    let (mut read, mut ran, mut edited, mut other) = (0, 0, 0, 0);
-    for (name, count, files) in groups {
-        match name.as_str() {
-            "read" => read += files,
-            "run" => ran += count,
-            "edit" => edited += files,
-            _ => other += count,
-        }
-    }
-    let mut parts = Vec::new();
-    for (count, verb, noun) in [
-        (read, "Read", "file"),
-        (ran, "Ran", "command"),
-        (edited, "Edited", "file"),
-        (other, "Recorded", "action"),
-    ] {
-        if count > 0 {
-            parts.push(format!(
-                "{verb} {count} {noun}{}",
-                if count == 1 { "" } else { "s" }
-            ));
-        }
-    }
-    message.activity_summary = (!parts.is_empty()).then(|| parts.join(" · "));
     Ok(())
 }
+pub(crate) fn summarize_activity(actions: &[ActiveAction], message: &mut xylo_core::ChatMessage) {
+    use std::collections::HashSet;
+    let mut read = HashSet::new();
+    let mut edited = HashSet::new();
+    let (mut ran, mut other) = (0, 0);
+    message.activity_count = 0;
+    for action in actions.iter().filter(|a| {
+        a.intent.session_id == message.session_id && Some(a.intent.turn_id) == message.turn_id
+    }) {
+        message.activity_count += 1;
+        let path = action
+            .intent
+            .arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| action.intent.id.to_string());
+        match (action.intent.name.as_str(), action.state.as_str()) {
+            ("file_read", "succeeded") => {
+                read.insert(path);
+            }
+            ("file_edit" | "file_write" | "notebook_edit", "succeeded") => {
+                edited.insert(path);
+            }
+            ("run_command" | "shell_command", state)
+                if state == "succeeded"
+                    || (state == "failed"
+                        && action.result.as_ref().is_some_and(|r| {
+                            r.get("exit_code").is_some()
+                                || r.pointer("/summary/exit_code").is_some()
+                        })) =>
+            {
+                ran += 1
+            }
+            _ => other += 1,
+        }
+    }
+    let parts: Vec<_> = [
+        (read.len(), "Read", "file"),
+        (ran, "Ran", "command"),
+        (edited.len(), "Edited", "file"),
+        (other, "Recorded", "action"),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .map(|(n, v, o)| format!("{v} {n} {o}{}", if n == 1 { "" } else { "s" }))
+    .collect();
+    message.activity_summary = (!parts.is_empty()).then(|| parts.join(" · "));
+}
 impl Store {
-    /// Recent helper results from the existing journal, scoped to one chat.
-    pub fn subagent_actions(&self, session: Uuid) -> Result<Vec<JournalAction>> {
-        self.call(move |connection| {
-            let mut query = connection.prepare("SELECT intent,state,result,error,updated_at FROM actions WHERE session_id=?1 AND json_extract(intent,'$.name')='agent_delegate' ORDER BY updated_at DESC,rowid DESC LIMIT 64")?;
-            let rows = query.query_map([session.to_string()], |row| Ok((
-                row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?, row.get::<_, i64>(4)?,
-            )))?;
-            rows.map(|row| {
-                let (intent, state, result, error, updated_at) = row?;
-                Ok(JournalAction { intent: serde_json::from_str(&intent)?, state,
-                    result: result.map(|json| serde_json::from_str(&json)).transpose()?, error, updated_at })
-            }).collect()
-        })
+    pub fn subagent_actions(&self, session: Uuid) -> Result<Vec<ActiveAction>> {
+        Ok(self
+            .active_actions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Action tracking unavailable"))?
+            .iter()
+            .rev()
+            .filter(|a| a.intent.session_id == session && a.intent.name == "agent_delegate")
+            .take(64)
+            .cloned()
+            .collect())
     }
     pub fn turn_activity_page(
         &self,
@@ -109,16 +101,35 @@ impl Store {
         after: Option<i64>,
         limit: usize,
     ) -> Result<TurnActivityPage> {
-        self.call(move |connection| {
-            let limit = limit.clamp(1, 50);
-            let mut query = connection.prepare("SELECT rowid,id,json_extract(intent,'$.name'),state,substr(error,1,512) FROM actions WHERE session_id=?1 AND turn_id=?2 AND rowid>?3 ORDER BY rowid LIMIT ?4")?;
-            let rows = query.query_map(params![session_id.to_string(), turn_id.to_string(), after.unwrap_or(0), limit as i64 + 1], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?, row.get::<_,String>(3)?, row.get::<_,Option<String>>(4)?)))?;
-            let mut items = Vec::new();
-            for row in rows { let (cursor,id,name,state,error) = row?; items.push(TurnActivityItem { id: Uuid::parse_str(&id)?, name, state, error, cursor }); }
-            let more = items.len() > limit;
-            items.truncate(limit);
-            let next = more.then(|| items.last().unwrap().cursor);
-            Ok(TurnActivityPage { session_id, turn_id, items, next })
+        let limit = limit.clamp(1, 50);
+        let held = self
+            .active_actions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Action tracking unavailable"))?;
+        let mut items: Vec<_> = held
+            .iter()
+            .filter(|a| {
+                a.intent.session_id == session_id
+                    && a.intent.turn_id == turn_id
+                    && a.cursor > after.unwrap_or(0)
+            })
+            .take(limit + 1)
+            .map(|a| TurnActivityItem {
+                id: a.intent.id,
+                name: a.intent.name.clone(),
+                state: a.state.clone(),
+                error: a.error.as_ref().map(|e| e.chars().take(512).collect()),
+                cursor: a.cursor,
+            })
+            .collect();
+        let more = items.len() > limit;
+        items.truncate(limit);
+        let next = more.then(|| items.last().unwrap().cursor);
+        Ok(TurnActivityPage {
+            session_id,
+            turn_id,
+            items,
+            next,
         })
     }
     pub fn turn_action(
@@ -126,16 +137,15 @@ impl Store {
         session: Uuid,
         turn: Uuid,
         action: Uuid,
-    ) -> Result<Option<JournalAction>> {
-        let owned = self.call(move |connection| {
-            Ok(connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM actions WHERE id=?1 AND session_id=?2 AND turn_id=?3)",
-                params![action.to_string(), session.to_string(), turn.to_string()],
-                |row| row.get::<_, bool>(0),
-            )?)
-        })?;
-        ensure!(owned, "This activity belongs to another chat or task");
-        self.action(action)
+    ) -> Result<Option<ActiveAction>> {
+        let action = self.action(action)?;
+        ensure!(
+            action
+                .as_ref()
+                .is_none_or(|a| a.intent.session_id == session && a.intent.turn_id == turn),
+            "This activity belongs to another chat or task"
+        );
+        Ok(action)
     }
 }
 #[cfg(test)]
@@ -144,7 +154,7 @@ mod tests {
     use crate::ActionIntent;
     use xylo_core::*;
     #[test]
-    fn saved_subagent_results_survive_reopen_and_stay_in_their_chat() {
+    fn live_subagent_results_stay_in_their_chat_and_disappear_on_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("agents.db");
         let store = Store::open(&path).unwrap();
@@ -185,15 +195,16 @@ mod tests {
                 saved = Some(action.id);
             }
         }
-        drop(store);
-        let reopened = Store::open(&path).unwrap();
-        let results = reopened.subagent_actions(session).unwrap();
+        let results = store.subagent_actions(session).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(Some(results[0].intent.id), saved);
         assert_eq!(
             results[0].result.as_ref().unwrap()["response"],
             "A saved report"
         );
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert!(reopened.subagent_actions(session).unwrap().is_empty());
         assert!(
             reopened
                 .subagent_actions(Uuid::new_v4())
@@ -332,6 +343,17 @@ mod tests {
                 &Usage::default(),
             )
             .unwrap();
+        let page = store.turn_activity_page(session, first, None, 50).unwrap();
+        assert_eq!(page.items.len(), 50);
+        let rest = store
+            .turn_activity_page(session, first, page.next, 50)
+            .unwrap();
+        assert_eq!(rest.items.len(), 5);
+        assert!(
+            store
+                .turn_action(session, second, page.items[0].id)
+                .is_err()
+        );
         drop(store);
         let store = Store::open(&path).unwrap();
         assert!(store.reset_notice().is_none());
@@ -370,7 +392,7 @@ mod tests {
             .unwrap();
         let raw: ChatMessage = serde_json::from_str(&raw).unwrap();
         assert_eq!(raw.activity_count, 55);
-        // Old JSON retains receipt-backed ownership and journal evidence.
+        // Legacy ownership can be hydrated; missing activity details cannot be reconstructed.
         store.call(move |connection| {
             connection.execute("UPDATE messages SET json=json_remove(json,'$.turn_id','$.activity_count','$.activity_summary') WHERE id=?1", [crate::store::assistant_reply_id(first).to_string()])?;
             Ok(())
@@ -382,33 +404,20 @@ mod tests {
             .find(|message| message.id == saved.id)
             .unwrap();
         assert_eq!(old.turn_id, Some(first));
-        assert_eq!(old.activity_count, 55);
-        assert_eq!(old.activity_summary.as_deref(), Some("Read 1 file"));
+        assert_eq!(old.activity_count, 0);
+        assert!(old.activity_summary.is_none());
         assert!(
             messages
                 .iter()
                 .any(|message| message.turn_id == Some(second)
                     && message.status == MessageStatus::Interrupted)
         );
-        let page = store
-            .turn_activity_page(session, first, None, 1000)
-            .unwrap();
-        assert_eq!(page.items.len(), 50);
-        let rest = store
-            .turn_activity_page(session, first, page.next, 50)
-            .unwrap();
-        assert_eq!(rest.items.len(), 5);
-        assert!(rest.next.is_none());
         assert!(
             store
-                .turn_action(session, second, page.items[0].id)
-                .is_err()
-        );
-        assert!(
-            store
-                .turn_action(session, first, page.items[0].id)
+                .turn_activity_page(session, first, None, 1000)
                 .unwrap()
-                .is_some()
+                .items
+                .is_empty()
         );
         let mut legacy = serde_json::to_value(&messages[0]).unwrap();
         legacy.as_object_mut().unwrap().remove("turn_id");

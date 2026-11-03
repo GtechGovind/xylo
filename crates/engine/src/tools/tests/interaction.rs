@@ -153,7 +153,7 @@ async fn interaction_cancellation_withdraws_question_and_leaves_no_uncertain_act
     assert!(
         broker
             .store
-            .unresolved_actions(broker.request.session_id)
+            .unfinished_actions(broker.request.session_id)
             .unwrap()
             .is_empty()
     );

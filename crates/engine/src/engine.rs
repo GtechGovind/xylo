@@ -10,7 +10,7 @@
 //! [`ErrorKind`] with an honest `retryable` flag.
 use crate::{
     AppPaths, ProviderCredentialResolver,
-    agent_loop::{AgentLoop, Journal, LoopFailure, MAX_MODEL_CALLS, error_result},
+    agent_loop::{AgentLoop, ConversationState, LoopFailure, MAX_MODEL_CALLS, error_result},
     attachments::{AttachmentProvider, user_message},
     broker_tools::BrokerTools,
     model::{Message, ModelError, ModelProvider, ModelRequest, Role},
@@ -42,7 +42,7 @@ const TITLE_REPLY_BYTES: usize = 2000;
 const TITLE_CHARS: usize = 80;
 
 /// Covers every error return, cancellation and future drop after turn admission.
-/// A process kill is covered by Store recovery's same-transaction evidence enqueue.
+/// Persisted conversations remain readable after a worker stops.
 struct LearningTurnGuard {
     service: LearningService,
     session: uuid::Uuid,
@@ -230,7 +230,7 @@ impl AgentEngine {
     }
 
     /// The conversation to continue: the checkpoint with every pending tool
-    /// call of an earlier turn settled from the journal, plus this turn's user
+    /// call of an earlier turn settled from the conversation_state, plus this turn's user
     /// message unless the same turn is resuming. Nothing is dispatched here;
     /// calls of a resuming turn that never ran are left for the loop.
     async fn restored_messages(
@@ -252,7 +252,7 @@ impl AgentEngine {
         let broker = Arc::new(self.broker(&previous, events, cancel)?);
         let settling = broker.clone();
         let (mut messages, settled) = tokio::task::spawn_blocking(move || {
-            let settled = settle_pending_tools(&mut messages, &settling, resuming);
+            let settled = settle_pending_tools(&mut messages, &settling);
             (messages, settled)
         })
         .await
@@ -511,27 +511,9 @@ impl AgentEngine {
             events.send(EngineEvent::Cancelled).await?;
             return Ok(());
         }
-        // Inspect exact native receipts before blocking resume on the journal.
-        // This pass never dispatches a tool or probes its target.
-        let (store, session) = (self.store.clone(), request.session_id);
-        for action in blocking(move || store.unresolved_actions(session)).await? {
-            if action.state == "outcome_unknown" && action.intent.name == "environment_execute" {
-                let broker = broker.clone();
-                tokio::task::spawn_blocking(move || broker.recover_native_action(action)).await??;
-            }
-        }
-        let store = self.store.clone();
-        let unresolved = blocking(move || store.unresolved_actions(session)).await?;
-        ensure!(
-            !unresolved
-                .iter()
-                .any(|a| matches!(a.state.as_str(), "outcome_unknown" | "running")),
-            "This task has an outcome-unknown action. Reconcile it before resuming"
-        );
-        // Budgets follow the context a local server actually serves. The
-        // probe runs only past the gate above, so a blocked turn never
-        // contacts the provider; the session's cache remembers each answer,
-        // so a session probes an endpoint and model once.
+        // Conversation continuation does not depend on persisted action records.
+        // The checkpoint supplies prior tool results; unanswered calls are
+        // reported as interrupted instead of being automatically executed.
         let mut request = request;
         request.provider.served_context_tokens = self
             .served_contexts
@@ -628,7 +610,7 @@ impl AgentEngine {
                 .min(MAX_MODEL_CALLS),
             events: events.clone(),
             permissions: Some((self.session.permissions().clone(), mode)),
-            journal: Some(Journal::new(
+            conversation_state: Some(ConversationState::new(
                 self.store.clone(),
                 request.session_id,
                 request.turn_id,
@@ -830,8 +812,8 @@ fn managed_endpoint(paths: &AppPaths, endpoint: &str) -> Result<bool> {
         == Some(true))
 }
 
-/// The journal operation of a call: `call_tool` is journaled under its target.
-fn journaled_operation(name: &str, arguments: &Value) -> Result<(String, Value)> {
+/// The operation behind a call: `call_tool` tracks its target.
+fn tool_operation(name: &str, arguments: &Value) -> Result<(String, Value)> {
     if name == "call_tool" {
         Ok((
             arguments
@@ -850,15 +832,11 @@ fn journaled_operation(name: &str, arguments: &Value) -> Result<(String, Value)>
 }
 
 /// Settles the unanswered calls of the newest assistant message from the
-/// journal. A call that already ran gets its recorded result; one that never
-/// ran stays pending for a resuming turn and is reported as not run for a new
-/// turn. Unknown outcomes block until the user reconciles them.
-fn settle_pending_tools(
-    messages: &mut Vec<Message>,
-    broker: &ToolBroker,
-    resuming: bool,
-) -> Result<()> {
-    refresh_operator_observations(messages, broker)?;
+/// live tracker. Available in-process results can be reused; a call without a
+/// result is reported as interrupted on both same-turn and new-turn resumes.
+/// Interrupted outcomes become tool results for the model; they never
+/// authorize replay or require a manual form before the chat can continue.
+fn settle_pending_tools(messages: &mut Vec<Message>, broker: &ToolBroker) -> Result<()> {
     let Some(index) = messages
         .iter()
         .rposition(|message| message.role == Role::Assistant && !message.tool_calls.is_empty())
@@ -875,30 +853,28 @@ fn settle_pending_tools(
         .filter(|call| !answered.contains(&call.id))
     {
         let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
-            if !resuming {
-                messages.push(Message::tool_result(
-                    call.id,
-                    error_result("Not run: the arguments were not valid JSON."),
-                ));
-            }
+            messages.push(Message::tool_result(
+                call.id,
+                error_result("Not run: the arguments were not valid JSON."),
+            ));
             continue;
         };
-        let (name, args) = journaled_operation(&call.name, &arguments)?;
-        let result = match tokio::task::block_in_place(|| broker.recover_journaled(&call.id))? {
+        let (name, args) = tool_operation(&call.name, &arguments)?;
+        let result = match tokio::task::block_in_place(|| broker.active_action(&call.id))? {
             Some(action) => {
                 ensure!(
-                    action.intent.name == name && action.intent.arguments == args,
-                    "Restored tool call does not match its durable intent"
+                    action.intent.name == name && action.matches_arguments(&args),
+                    "Restored tool call does not match its live invocation"
                 );
                 match action.state.as_str() {
-                    "succeeded" => serde_json::to_string(
-                        &broker.model_result(
-                            action.intent.id,
-                            action
-                                .result
-                                .context("Successful action has no stored result")?,
-                        ),
-                    )?,
+                    "succeeded" => serde_json::to_string(&match action.result {
+                        Some(result) => broker.model_result(action.intent.id, result),
+                        None => json!({
+                            "status": "success",
+                            "output_unavailable": true,
+                            "message": "The action completed, but its output was not retained in the bounded live cache. It was not repeated. Inspect the current state or retained output files if needed."
+                        }),
+                    })?,
                     "failed" => match action.result {
                         Some(result) => {
                             serde_json::to_string(&broker.model_result(action.intent.id, result))?
@@ -910,67 +886,24 @@ fn settle_pending_tools(
                     "denied" => {
                         error_result(action.error.unwrap_or_else(|| "Action denied".into()))
                     }
-                    "outcome_unknown" | "running" | "pending" => anyhow::bail!(
-                        "Interrupted action requires recovery/reconciliation before continuing"
-                    ),
-                    _ => anyhow::bail!("Invalid persisted action state"),
+                    "outcome_unknown" => serde_json::to_string(&json!({
+                        "status": "outcome_unknown",
+                        "error": action.error,
+                        "result": action.result.map(|result| broker.model_result(action.intent.id, result)),
+                        "message": "The action was interrupted and its effects are uncertain. It was not replayed. Inspect the current state before deciding what to do next; do not assume success or automatically repeat it."
+                    }))?,
+                    "running" => anyhow::bail!("An action is still running"),
+                    "pending" => {
+                        error_result("Not run: the earlier task stopped before this call started.")
+                    }
+                    _ => anyhow::bail!("Invalid live action state"),
                 }
             }
-            None if resuming => continue,
-            None => error_result("Not run: the earlier task stopped before this call started."),
+            None => error_result(
+                "Interrupted before a result was recorded. This call was not repeated; inspect the current state before deciding what to do next.",
+            ),
         };
         messages.push(Message::tool_result(call.id, result));
-    }
-    Ok(())
-}
-
-/// A tool's earlier unknown response can already exist in the checkpoint. Keep
-/// exact current-turn operator receipts visible without appending duplicate
-/// results or treating their manual observation as verified native output.
-fn refresh_operator_observations(messages: &mut [Message], broker: &ToolBroker) -> Result<()> {
-    for (expected_id, key) in broker.operator_reviewed_action_keys()? {
-        let Some(call_id) = key.strip_prefix("root:") else {
-            continue;
-        };
-        let Some((index, call)) = messages.iter().enumerate().rev().find_map(|(index, m)| {
-            (m.role == Role::Assistant)
-                .then(|| m.tool_calls.iter().find(|call| call.id == call_id))
-                .flatten()
-                .map(|call| (index, call.clone()))
-        }) else {
-            continue;
-        };
-        let arguments: Value = serde_json::from_str(&call.arguments)?;
-        let (name, args) = journaled_operation(&call.name, &arguments)?;
-        let action = broker
-            .journaled(call_id)?
-            .context("Reviewed tool action is unavailable")?;
-        ensure!(
-            action.intent.id == expected_id
-                && action.intent.name == name
-                && action.intent.arguments == args,
-            "Reviewed tool result does not match its durable intent"
-        );
-        let result = action
-            .result
-            .context("Reviewed action has no stored observation")?;
-        ensure!(
-            result
-                .pointer("/operator_observation/source")
-                .and_then(Value::as_str)
-                == Some("operator_review"),
-            "Reviewed action provenance is unavailable"
-        );
-        let presented = serde_json::to_string(&broker.model_result(expected_id, result))?;
-        for message in &mut messages[index + 1..] {
-            if message.role == Role::Assistant {
-                break;
-            }
-            if message.role == Role::Tool && message.tool_call_id.as_deref() == Some(call_id) {
-                message.content = presented.clone();
-                break;
-            }
-        }
     }
     Ok(())
 }

@@ -33,7 +33,7 @@ pub struct MemoryMutation {
     pub id: Uuid,
     pub deleted: bool,
 }
-/// One journaled action of a conversation, reduced to what decides the
+/// One live action of a conversation, reduced to what decides the
 /// origin of a fact written later in that conversation.
 #[derive(Clone, Debug)]
 pub struct ActionProvenance {
@@ -50,46 +50,51 @@ pub struct MemoryExport {
     pub records: usize,
 }
 impl Store {
-    /// Every action of `session` that may have run (pending and denied
-    /// actions never did), in the order they were journaled (insertion
-    /// order, which a millisecond timestamp cannot break ties in), with arguments only for the names in
-    /// `with_arguments` and results only for those in `with_results`, so
-    /// large file contents and outputs are not loaded.
+    /// Actions that may have run, in registration order, with only the requested
+    /// argument/result fields. Saved history without live proof contributes the
+    /// most conservative content origin.
     pub fn session_action_provenance(
         &self,
         session: Uuid,
         with_arguments: &[&str],
         with_results: &[&str],
     ) -> Result<Vec<ActionProvenance>> {
-        let arguments = serde_json::to_string(with_arguments)?;
-        let results = serde_json::to_string(with_results)?;
-        self.call(move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT json_extract(intent,'$.name'),
-                    CASE WHEN json_extract(intent,'$.name') IN(SELECT value FROM json_each(?2)) THEN json_extract(intent,'$.arguments') END,
-                    CASE WHEN json_extract(intent,'$.name') IN(SELECT value FROM json_each(?3)) THEN result END
-                 FROM actions WHERE session_id=?1 AND state NOT IN('pending','denied') ORDER BY rowid",
-            )?;
-            let rows = statement.query_map(
-                params![session.to_string(), arguments, results],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )?;
-            rows.map(|row| {
-                let (name, arguments, result) = row?;
-                Ok(ActionProvenance {
-                    name,
-                    arguments: arguments.map(|json| serde_json::from_str(&json)).transpose()?,
-                    result: result.map(|json| serde_json::from_str(&json)).transpose()?,
-                })
+        let live = self
+            .active_actions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Action tracking unavailable"))?;
+        let mut provenance: Vec<_> = live
+            .iter()
+            .filter(|a| {
+                a.intent.session_id == session && !matches!(a.state.as_str(), "pending" | "denied")
             })
-            .collect()
-        })
+            .map(|a| ActionProvenance {
+                name: a.intent.name.clone(),
+                arguments: with_arguments
+                    .contains(&a.intent.name.as_str())
+                    .then(|| a.intent.arguments.clone()),
+                result: with_results
+                    .contains(&a.intent.name.as_str())
+                    .then(|| a.result.clone())
+                    .flatten(),
+            })
+            .collect();
+        // Checkpoints can include compacted tool history whose original provenance
+        // is no longer available. Never upgrade that history to project-trusted text.
+        if self.restored_context_sessions.contains(&session)
+            || self
+                .forgotten_action_sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Action tracking unavailable"))?
+                .contains(&session)
+        {
+            provenance.push(ActionProvenance {
+                name: "web_fetch".into(),
+                arguments: None,
+                result: None,
+            });
+        }
+        Ok(provenance)
     }
     pub fn memory_page(
         &self,

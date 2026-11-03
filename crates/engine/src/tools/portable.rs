@@ -1,6 +1,6 @@
 //! Skills and plugin components. Built-in skills (compiled into the engine)
 //! resolve by name ahead of installed portable packages; installed skills and
-//! components use the same broker, journal and permissions as built-in tools.
+//! components use the same broker, conversation_state and permissions as built-in tools.
 use super::*;
 use xylo_services::extensions::{ExtensionService, LoadedSkill};
 

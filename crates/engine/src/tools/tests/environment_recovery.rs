@@ -1,4 +1,4 @@
-//! Exercises the two durable journals through their public execution boundaries.
+//! Exercises transient tool activity and explicit native-operation boundaries.
 //! The executable is a local fixture; no container daemon or network is involved.
 #![cfg(unix)]
 
@@ -60,7 +60,7 @@ esac
         };
         let profile = EnvironmentProfile {
             id: Uuid::new_v4(),
-            name: "Recovery fixture".into(),
+            name: "Interruption fixture".into(),
             target: EnvironmentTarget::Container {
                 executable,
                 runtime: ContainerRuntime::Docker,
@@ -90,7 +90,7 @@ esac
         store
             .upsert_conversation(&Conversation {
                 id: session_id,
-                title: "Environment recovery".into(),
+                title: "Environment interruption".into(),
                 workspace: root.clone(),
                 updated_at: now_ms(),
                 title_source: Default::default(),
@@ -148,13 +148,13 @@ esac
             name: "environment_execute".into(),
             arguments: arguments.clone(),
             writes: true,
-            idempotency_key: ToolBroker::journal_key(None, call_id),
+            idempotency_key: ToolBroker::call_key(None, call_id),
         };
         assert!(matches!(
             self.broker.store.begin_action(&intent).unwrap(),
             ActionDecision::Execute
         ));
-        // Represents the persisted approval and native dispatch before the lost ACK.
+        // Represents in-process approval and native dispatch before the lost ACK.
         self.broker.store.mark_action_running(intent.id).unwrap();
         intent.id
     }
@@ -222,7 +222,11 @@ esac
     }
 
     fn assert_single_execution(&self, argv: &[u8]) {
-        assert_eq!(self.argv(), argv, "Recovery must not launch even a probe");
+        assert_eq!(
+            self.argv(),
+            argv,
+            "A duplicate call must not launch even a probe"
+        );
         assert_eq!(
             fs::read_to_string(self.root.join("executions"))
                 .unwrap()
@@ -291,25 +295,13 @@ esac
         .unwrap_or_else(|_| panic!("Retained native output did not finish; last saved receipt: {last:?}"))
     }
 
-    fn assert_recovery_event(&mut self, id: Uuid, expected: &Value, success: bool) {
-        match self.events.try_recv().unwrap() {
-            EngineEvent::ToolFinished {
-                action_id,
-                name,
-                result,
-                success: actual,
-                ..
-            } => {
-                assert_eq!(action_id, id);
-                assert_eq!(name, "environment_execute");
-                assert_eq!(serde_json::from_str::<Value>(&result).unwrap(), *expected);
-                assert_eq!(actual, success);
-            }
-            event => panic!("Unexpected recovery event: {event:?}"),
-        }
+    fn assert_interrupted_without_dispatch(&mut self, id: Uuid) {
+        let action = self.broker.store.action(id).unwrap().unwrap();
+        assert_eq!(action.state, "outcome_unknown");
+        assert!(action.result.is_none());
         assert!(
             self.events.try_recv().is_err(),
-            "Recovery must not request approval or announce another dispatch"
+            "A duplicate interrupted call must not request approval or emit tool activity"
         );
     }
 }
@@ -328,7 +320,7 @@ fn receipt(observation: &Value) -> EnvironmentReceipt {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lost_outer_ack_recovers_exact_success_and_cached_retry_without_dispatch() {
+async fn lost_outer_ack_does_not_recover_native_success_or_repeat_dispatch() {
     let mut fixture = Fixture::new().await;
     let call_id = "lost-success";
     let arguments = fixture.arguments("__success__");
@@ -350,21 +342,22 @@ async fn lost_outer_ack_recovers_exact_success_and_cached_retry_without_dispatch
     let argv = fixture.argv();
 
     for _ in 0..3 {
-        let recovered: Value =
-            serde_json::from_str(&fixture.retry(call_id, &arguments).await.unwrap()).unwrap();
-        assert_eq!(recovered, observed);
+        let error = fixture.retry(call_id, &arguments).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("will not be repeated automatically")
+        );
         fixture.assert_single_execution(&argv);
     }
     let action = fixture.broker.store.action(id).unwrap().unwrap();
-    assert_eq!(action.state, "succeeded");
-    assert_eq!(action.result.as_ref(), Some(&observed));
     assert_eq!(action.intent.arguments, arguments);
-    fixture.assert_recovery_event(id, &observed, true);
+    fixture.assert_interrupted_without_dispatch(id);
     fixture.broker.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn known_native_failure_resolves_outer_unknown_without_dispatch() {
+async fn known_native_failure_does_not_resolve_transient_unknown_call() {
     let mut fixture = Fixture::new().await;
     let call_id = "lost-failure";
     let arguments = fixture.arguments("__fail__");
@@ -385,18 +378,19 @@ async fn known_native_failure_resolves_outer_unknown_without_dispatch() {
 
     for _ in 0..3 {
         let error = fixture.retry(call_id, &arguments).await.unwrap_err();
-        assert_eq!(error.downcast_ref::<ObservedFailure>().unwrap().0, observed);
+        assert!(
+            error
+                .to_string()
+                .contains("will not be repeated automatically")
+        );
         fixture.assert_single_execution(&argv);
     }
-    let action = fixture.broker.store.action(id).unwrap().unwrap();
-    assert_eq!(action.state, "failed");
-    assert_eq!(action.result.as_ref(), Some(&observed));
-    fixture.assert_recovery_event(id, &observed, false);
+    fixture.assert_interrupted_without_dispatch(id);
     fixture.broker.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelled_native_write_stays_unknown_until_observed_failure_is_recorded() {
+async fn cancelled_native_write_stays_unknown_after_explicit_native_resolution() {
     let mut fixture = Fixture::new().await;
     let call_id = "lost-cancelled-write";
     let arguments = fixture.arguments("__hang__");
@@ -475,19 +469,15 @@ async fn cancelled_native_write_stays_unknown_until_observed_failure_is_recorded
     )
     .await;
     assert_eq!(resolved.state, EnvironmentOperationState::Failed);
+    fixture.assert_retained_receipt(&resolved, false);
     let error = fixture.retry(call_id, &arguments).await.unwrap_err();
-    let observed = &error.downcast_ref::<ObservedFailure>().unwrap().0;
-    fixture.assert_retained_artifacts(observed, false);
-    assert_eq!(receipt(observed).state, EnvironmentOperationState::Failed);
-    assert_eq!(
-        serde_json::to_value(receipt(observed)).unwrap(),
-        serde_json::to_value(resolved).unwrap()
+    assert!(
+        error
+            .to_string()
+            .contains("will not be repeated automatically")
     );
-    let action = fixture.broker.store.action(id).unwrap().unwrap();
-    assert_eq!(action.state, "failed");
-    assert_eq!(action.result.as_ref(), Some(observed));
+    fixture.assert_interrupted_without_dispatch(id);
     fixture.assert_single_execution(&argv);
-    fixture.assert_recovery_event(id, observed, false);
     fixture.broker.shutdown().await.unwrap();
 }
 
@@ -535,7 +525,7 @@ pub(super) async fn provider_fixture() -> (String, tokio::task::JoinHandle<Value
             socket.read_exact(&mut body).await.unwrap();
             let response = format!(
                 "data: {}\n\ndata: [DONE]\n\n",
-                json!({"id":"resume-fixture","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Resumed from the saved command result."},"finish_reason":"stop"}]})
+                json!({"id":"resume-fixture","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Continued after the interrupted command."},"finish_reason":"stop"}]})
             );
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -546,7 +536,7 @@ pub(super) async fn provider_fixture() -> (String, tokio::task::JoinHandle<Value
             serde_json::from_slice(&body).unwrap()
         })
         .await
-        .expect("Engine must reach the bounded provider fixture after receipt recovery")
+        .expect("Engine must continue to the bounded provider fixture")
     });
     (endpoint, task)
 }
@@ -575,27 +565,24 @@ fn resumable_checkpoint(fixture: &Fixture, arguments: &Value, call_id: &str) {
         .unwrap();
 }
 
-async fn engine_resumes_terminal_receipt(command: &str, expected_state: &str) {
+async fn engine_continues_without_resolving_native_receipt(command: &str, reopen: bool) {
     let fixture = Fixture::new().await;
     let call_id = "engine-resume-old-turn";
     let arguments = fixture.arguments(command);
     let id = fixture.running_outer(call_id, &arguments);
-    let observed = serde_json::to_value(
-        fixture
-            .service
-            .execute("environment_execute", &arguments, CancellationToken::new())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    fixture
+        .service
+        .execute("environment_execute", &arguments, CancellationToken::new())
+        .await
+        .unwrap();
     fixture.lose_acknowledgement(id);
     resumable_checkpoint(&fixture, &arguments, call_id);
     let original = fixture.broker.store.action(id).unwrap().unwrap().intent;
     let argv = fixture.argv();
     let (endpoint, provider) = provider_fixture().await;
     let mut request = fixture.broker.request.clone();
-    // Receipt recovery must keep the old intent's turn, even when the user sends
-    // a new turn to resume the chat after the worker acknowledgement was lost.
+    // A new prompt can continue after an interrupted old turn. A fresh Store
+    // also models the loss of transient tool activity across a worker restart.
     request.turn_id = Uuid::new_v4();
     request.provider = ProviderConfig {
         endpoint,
@@ -606,8 +593,13 @@ async fn engine_resumes_terminal_receipt(command: &str, expected_state: &str) {
         ..Default::default()
     };
     let paths = crate::AppPaths::at(fixture.root.clone()).unwrap();
+    let store = if reopen {
+        Store::open(fixture.root.join("xylo.db")).unwrap()
+    } else {
+        fixture.broker.store.clone()
+    };
     let engine = crate::AgentEngine::new(
-        fixture.broker.store.clone(),
+        store,
         paths,
         ToolSession::for_tests(PermissionMode::AskForApproval),
     );
@@ -625,18 +617,30 @@ async fn engine_resumes_terminal_receipt(command: &str, expected_state: &str) {
         .unwrap()
         .iter()
         .find(|message| message["role"] == "tool")
-        .expect("The real provider request must contain the recovered old-turn result");
+        .expect("The real provider request must contain the interrupted old-turn result");
     assert_eq!(tool_result["tool_call_id"], call_id);
-    assert_eq!(
-        serde_json::from_str::<Value>(tool_result["content"].as_str().unwrap()).unwrap(),
-        observed
-    );
+    let result: Value = serde_json::from_str(tool_result["content"].as_str().unwrap()).unwrap();
+    if reopen {
+        assert!(
+            result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Interrupted before a result was recorded")
+        );
+    } else {
+        assert_eq!(result["status"], "outcome_unknown");
+        assert_eq!(
+            result["error"],
+            "Fixture lost the outer completion acknowledgement"
+        );
+        assert!(result["result"].is_null());
+    }
     let action = fixture.broker.store.action(id).unwrap().unwrap();
-    assert_eq!(action.state, expected_state);
+    assert_eq!(action.state, "outcome_unknown");
     assert_eq!(action.intent.id, original.id);
     assert_eq!(action.intent.turn_id, original.turn_id);
     assert_eq!(action.intent.idempotency_key, original.idempotency_key);
-    assert_eq!(action.result.as_ref(), Some(&observed));
+    assert!(action.result.is_none());
     assert!(
         fixture
             .broker
@@ -648,7 +652,7 @@ async fn engine_resumes_terminal_receipt(command: &str, expected_state: &str) {
             )
             .unwrap()
             .is_none(),
-        "Recovery must not create a replacement action in the new turn"
+        "Continuation must not create a replacement action in the new turn"
     );
     let mut completed = false;
     while let Ok(event) = received.try_recv() {
@@ -657,7 +661,7 @@ async fn engine_resumes_terminal_receipt(command: &str, expected_state: &str) {
                 event,
                 EngineEvent::ApprovalRequired { .. } | EngineEvent::ToolStarted { .. }
             ),
-            "Resume cannot approve or dispatch the recovered command again"
+            "Continuation cannot approve or dispatch the interrupted command again"
         );
         completed |= matches!(event, EngineEvent::Completed { .. });
     }
@@ -667,113 +671,70 @@ async fn engine_resumes_terminal_receipt(command: &str, expected_state: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn engine_entry_recovers_success_before_unresolved_gate_using_original_turn() {
-    engine_resumes_terminal_receipt("__success__", "succeeded").await;
+async fn engine_continues_with_interrupted_result_despite_native_success() {
+    engine_continues_without_resolving_native_receipt("__success__", false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn engine_entry_recovers_failure_before_unresolved_gate_using_original_turn() {
-    engine_resumes_terminal_receipt("__fail__", "failed").await;
+async fn engine_continues_with_interrupted_result_despite_native_failure() {
+    engine_continues_without_resolving_native_receipt("__fail__", false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn engine_entry_keeps_absent_or_unrelated_unknown_actions_blocked_without_dispatch() {
+async fn restarted_engine_reports_missing_result_without_native_reconciliation() {
+    engine_continues_without_resolving_native_receipt("__success__", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_continues_despite_unrelated_unknown_actions_without_dispatch() {
     use crate::model::{Message, ToolCall};
-    for unrelated in [false, true] {
-        let fixture = Fixture::new().await;
-        let arguments = fixture.arguments("__success__");
-        let id = fixture.running_outer("still-unknown", &arguments);
-        if unrelated {
-            // A terminal native receipt may be recovered, but an unrelated write
-            // still forbids both model requests and absent checkpoint dispatch.
-            fixture
-                .service
-                .execute("environment_execute", &arguments, CancellationToken::new())
-                .await
-                .unwrap();
-            let other = ActionIntent {
-                id: Uuid::new_v4(),
-                session_id: fixture.broker.request.session_id,
-                turn_id: fixture.broker.request.turn_id,
-                name: "run_command".into(),
-                arguments: json!({"program":"unrelated","args":[]}),
-                writes: true,
-                idempotency_key: ToolBroker::journal_key(None, "unrelated-unknown"),
-            };
-            fixture.broker.store.begin_action(&other).unwrap();
-            fixture.broker.store.mark_action_running(other.id).unwrap();
-            fixture.lose_acknowledgement(other.id);
-        }
-        fixture.lose_acknowledgement(id);
-        let checkpoint = vec![Message::assistant_with_tool_calls(
-            "",
-            vec![ToolCall::new(
-                "never-dispatched",
-                "file_write",
-                json!({"path":"must-not-write.txt","content":"not authorized"}).to_string(),
-            )],
-        )];
-        fixture
-            .broker
-            .store
-            .save_checkpoint(
-                fixture.broker.request.session_id,
-                fixture.broker.request.turn_id,
-                &serde_json::to_value(checkpoint).unwrap(),
-            )
-            .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut request = fixture.broker.request.clone();
-        request.provider.endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
-        request.provider.model = "fixture-model".into();
-        let argv = fixture.argv();
-        let engine = crate::AgentEngine::new(
-            fixture.broker.store.clone(),
-            crate::AppPaths::at(fixture.root.clone()).unwrap(),
-            ToolSession::for_tests(PermissionMode::AskForApproval),
-        );
-        let (events, mut received) = tokio::sync::mpsc::channel(256);
-        engine
-            .run(request, events, CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(fixture.argv(), argv);
-        assert!(!fixture.root.join("must-not-write.txt").exists());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), listener.accept())
-                .await
-                .is_err(),
-            "An unresolved action must block provider dispatch"
-        );
-        assert_eq!(
-            fixture.broker.store.action(id).unwrap().unwrap().state,
-            if unrelated {
-                "succeeded"
-            } else {
-                "outcome_unknown"
-            }
-        );
-        let mut blocked = false;
-        while let Ok(event) = received.try_recv() {
-            match event {
-                EngineEvent::Error { message, .. } => {
-                    blocked |= message.contains("outcome-unknown")
-                }
-                EngineEvent::ApprovalRequired { .. } | EngineEvent::ToolStarted { .. } => {
-                    panic!("An unresolved action must block dispatch: {event:?}")
-                }
-                _ => {}
-            }
-        }
-        assert!(
-            blocked,
-            "The engine must end with the unresolved-action error"
-        );
-        fixture.broker.shutdown().await.unwrap();
-    }
+    let fixture = Fixture::new().await;
+    let arguments = fixture.arguments("__success__");
+    let id = fixture.running_outer("unrelated-unknown", &arguments);
+    fixture.lose_acknowledgement(id);
+    let checkpoint = vec![Message::assistant_with_tool_calls(
+        "",
+        vec![ToolCall::new(
+            "never-dispatched",
+            "file_write",
+            json!({"path":"must-not-write.txt","content":"not authorized"}).to_string(),
+        )],
+    )];
+    fixture
+        .broker
+        .store
+        .save_checkpoint(
+            fixture.broker.request.session_id,
+            fixture.broker.request.turn_id,
+            &serde_json::to_value(checkpoint).unwrap(),
+        )
+        .unwrap();
+    let argv = fixture.argv();
+    let sent = assert_engine_can_continue(&fixture).await;
+    let tool = sent["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert_eq!(tool["tool_call_id"], "never-dispatched");
+    let result: Value = serde_json::from_str(tool["content"].as_str().unwrap()).unwrap();
+    assert!(
+        result["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Interrupted before a result was recorded")
+    );
+    assert_eq!(fixture.argv(), argv);
+    assert!(!fixture.root.join("must-not-write.txt").exists());
+    assert_eq!(
+        fixture.broker.store.action(id).unwrap().unwrap().state,
+        "outcome_unknown"
+    );
+    fixture.broker.shutdown().await.unwrap();
 }
 
-async fn assert_engine_can_continue(fixture: &Fixture) {
+async fn assert_engine_can_continue(fixture: &Fixture) -> Value {
     let (endpoint, provider) = provider_fixture().await;
     let mut request = fixture.broker.request.clone();
     request.turn_id = Uuid::new_v4();
@@ -798,7 +759,7 @@ async fn assert_engine_can_continue(fixture: &Fixture) {
     .await
     .unwrap()
     .unwrap();
-    provider.await.unwrap();
+    let sent = provider.await.unwrap();
     assert!(
         fixture
             .broker
@@ -806,7 +767,7 @@ async fn assert_engine_can_continue(fixture: &Fixture) {
             .completed_turn(request.session_id, request.turn_id)
             .unwrap()
             .is_some(),
-        "A locally rejected command must not permanently block the actual engine"
+        "Earlier tool activity must not block the actual engine"
     );
     while let Ok(event) = received.try_recv() {
         assert!(!matches!(
@@ -814,6 +775,7 @@ async fn assert_engine_can_continue(fixture: &Fixture) {
             EngineEvent::ApprovalRequired { .. } | EngineEvent::ToolStarted { .. }
         ));
     }
+    sent
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -848,13 +810,13 @@ async fn broker_preflight_rejections_are_failed_and_allow_actual_engine_to_conti
             error.downcast_ref::<CommandNotDispatched>().is_some(),
             "{case} must be a proven local validation rejection: {error:#}"
         );
-        let action = fixture.broker.journaled(case).unwrap().unwrap();
+        let action = fixture.broker.active_action(case).unwrap().unwrap();
         assert_eq!(action.state, "failed", "{case} must not become unknown");
         assert!(
             fixture
                 .broker
                 .store
-                .unresolved_actions(action.intent.session_id)
+                .unfinished_actions(action.intent.session_id)
                 .unwrap()
                 .is_empty()
         );
@@ -878,7 +840,7 @@ async fn broker_preflight_rejections_are_failed_and_allow_actual_engine_to_conti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn malformed_fresh_environment_requests_have_no_journal_approval_or_dispatch() {
+async fn malformed_fresh_environment_requests_have_no_activity_approval_or_dispatch() {
     let mut fixture = Fixture::new().await;
     let argv = fixture.argv();
     for case in ["malformed-uuid", "missing-command"] {
@@ -894,7 +856,7 @@ async fn malformed_fresh_environment_requests_have_no_journal_approval_or_dispat
                 .to_string()
                 .contains("Invalid environment command request")
         );
-        assert!(fixture.broker.journaled(case).unwrap().is_none());
+        assert!(fixture.broker.active_action(case).unwrap().is_none());
         assert!(fixture.events.try_recv().is_err());
         assert_eq!(fixture.argv(), argv);
         assert!(!fixture.root.join("executions").exists());
@@ -926,7 +888,7 @@ async fn existing_uncertain_receipt_is_not_classified_as_a_fresh_preflight_rejec
     assert!(error.downcast_ref::<CommandNotDispatched>().is_none());
     let action = fixture
         .broker
-        .journaled("existing-unknown")
+        .active_action("existing-unknown")
         .unwrap()
         .unwrap();
     assert_eq!(action.state, "outcome_unknown");
@@ -962,7 +924,7 @@ async fn pending_original_operation_lease_cancellation_remains_unknown_without_r
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if broker
-                    .journaled("existing-pending")
+                    .active_action("existing-pending")
                     .unwrap()
                     .is_some_and(|action| action.state == "running")
                 {
@@ -985,7 +947,7 @@ async fn pending_original_operation_lease_cancellation_remains_unknown_without_r
     assert_eq!(
         fixture
             .broker
-            .journaled("existing-pending")
+            .active_action("existing-pending")
             .unwrap()
             .unwrap()
             .state,

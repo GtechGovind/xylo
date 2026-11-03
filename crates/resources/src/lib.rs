@@ -1,9 +1,7 @@
 //! Automatic task admission based on current hardware, memory availability and
 //! task demand. There are no user-selected RAM tiers or fixed root-task counts.
 
-pub mod action_lease;
 pub mod shared;
-pub use action_lease::{ActionLeaseScope, current_action_lease, scope_action};
 
 #[cfg(target_os = "macos")]
 mod macos_memory;
@@ -42,10 +40,8 @@ where
     R: Send + 'static,
 {
     let lease = SHARED_LEASE.try_with(Arc::clone).ok();
-    let action = current_action_lease();
     tokio::task::spawn_blocking(move || {
         let _lease = lease;
-        let _action = action.map(ActionLeaseScope::enter);
         function()
     })
 }

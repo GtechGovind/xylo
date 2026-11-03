@@ -67,6 +67,8 @@ One lazily launched, **isolated** Obscura session shared behind a `Mutex`. Xylo 
 
 `browser_allow_private_network` defaults to `false`: loopback and private-network destinations are blocked. Setting it to `true` explicitly permits broad private-network access, including local development sites; it is not a per-host allowlist or a sandbox grant. Ordinary tool permissions still apply.
 
+The pinned browser source patch enables native OS certificate roots alongside bundled WebPKI roots, preserving certificate and hostname verification. Its digest is checked in the build cache and recorded in provenance. A TLS failure after dispatch remains uncertain: redirects or page scripts may already have produced effects. `BrowserNotDispatched` is reserved for argument validation, startup, or cancellation/timeouts before the requested operation starts. The engine records these as definitive failures, so they do not block the chat for reconciliation. Closing an existing browser counts as started before shutdown begins.
+
 | Tool | `writes` | Notes |
 | --- | --- | --- |
 | `browser_navigate` | yes | `url`; HTTP(S) with a host only, **no URL credentials** |

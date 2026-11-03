@@ -756,6 +756,12 @@ pub enum NoteKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EngineEvent {
+    /// Private worker-to-host live evidence, consumed before UI/event forwarding.
+    /// The payload is a services LiveActionUpdate; core has no services dependency.
+    LiveActivity {
+        turn_id: Uuid,
+        update: Value,
+    },
     /// Internal request intercepted by the host, never forwarded to the UI.
     ProviderCredentialRequested {
         request_id: Uuid,
@@ -974,7 +980,7 @@ pub struct ConversationPage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
-    /// Actual journaled actions, absent from older history and simple replies.
+    /// Observed tool activity, absent from older history and simple replies.
     #[serde(default, skip_serializing_if = "is_zero_activity")]
     pub activity_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]

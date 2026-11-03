@@ -64,7 +64,7 @@ impl Xylo {
         &mut self,
         id: Uuid,
         session: Uuid,
-        result: Result<Vec<xylo_runtime::host::JournalAction>, String>,
+        result: Result<Vec<xylo_runtime::host::ActiveAction>, String>,
         cx: &mut Context<Self>,
     ) {
         if self.turn_activity.subagent_request != Some((id, session)) {
@@ -125,7 +125,7 @@ impl Xylo {
                             "failed" => crate::state::SubagentState::Failed,
                             _ => crate::state::SubagentState::NotCompleted,
                         },
-                        // The journal has an update timestamp, not a start time. Do not invent duration.
+                        // The activity record has an update timestamp, not a start time. Do not invent duration.
                         started_at: 0,
                         finished_at: Some(record.updated_at),
                     });
@@ -244,7 +244,7 @@ impl Xylo {
         session: Uuid,
         turn: Uuid,
         action: Uuid,
-        result: Result<Option<xylo_runtime::host::JournalAction>, String>,
+        result: Result<Option<xylo_runtime::host::ActiveAction>, String>,
         cx: &mut Context<Self>,
     ) {
         if self.turn_activity.action_request != Some((id, session, turn, action)) {
@@ -314,7 +314,7 @@ impl Xylo {
     pub(super) fn saved_activity(&self, message: &ChatMessage, cx: &Context<Self>) -> AnyElement {
         let session = message.session_id;
         // A turn identity alone is not evidence of work: greetings and legacy
-        // replies without retained journal metadata have no disclosure.
+        // replies without retained activity metadata have no disclosure.
         let Some(turn) = message.turn_id.filter(|_| message.activity_count > 0) else {
             return div().into_any_element();
         };
@@ -491,7 +491,7 @@ mod subagent_restore_tests {
             let session = view.session;
             let id = Uuid::new_v4();
             let request = Uuid::new_v4();
-            let record: xylo_runtime::host::JournalAction = serde_json::from_value(serde_json::json!({
+            let record: xylo_runtime::host::ActiveAction = serde_json::from_value(serde_json::json!({
                 "intent": { "id": id, "session_id": session, "turn_id": Uuid::new_v4(), "name": "agent_delegate",
                     "arguments": {"task":"Review layout"}, "writes":false, "idempotency_key":"review" },
                 "state":"succeeded", "result":{"response":"A retained result"}, "error":null, "updated_at":1234

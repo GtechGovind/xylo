@@ -39,7 +39,7 @@ This page covers the parts of [engine](engine.md) that shape *what the model is 
 
 - A fresh conversation: one user message made of `task` plus, after a blank line, `context`. **It never sees the parent conversation.**
 - `prompts::subagent(&context, task)` as system prompt (`subagent.md`, `subagent-task.md`): parent's environment, the live permission mode and project instructions budgeted with the same window scaling (`PromptContext::detect(…, window.prompt_budget())`), no skills or facts index. Instruction sources are recorded with `record_instruction_sources`.
-- A scoped child broker (`ToolBroker::scoped_child`): shares the journal, permission cell and approvals with the parent; its tool events carry the parent action as `parent_id`; its actions are namespaced under `parent_key` (see [engine-tools](engine-tools.md)). It runs `AgentLoop` with `MAX_MODEL_CALLS`, no turn journal and the parent's provider, budget and `max_tokens`.
+- A scoped child broker (`ToolBroker::scoped_child`): shares transient action tracking, the permission cell and approvals with the parent; its tool events carry the parent action as `parent_id`; its actions are namespaced under `parent_key` (see [engine-tools](engine-tools.md)). It runs `AgentLoop` with `MAX_MODEL_CALLS`, no separate turn checkpoint and the parent's provider, budget and `max_tokens`.
 - Its report format is fixed by the prompt: answer first, then evidence (paths with line numbers, commands and results), then what could not be determined.
 
 ### `allowed_tools`
@@ -126,7 +126,7 @@ An `agents/*.md` file is an `Agent` component. It is **never listed in the index
 
 ## Skills and plugins: invocation (engine side)
 
-Three tools in `tools/portable.rs` (all journaled and permission-gated like any tool; see [engine-tools](engine-tools.md)):
+Three tools in `tools/portable.rs` (all tracked in memory and permission-gated like any tool; see [engine-tools](engine-tools.md)):
 
 - **`extension_skill {id, arguments?}`:** built-in names resolve first (`prompts::bundled_skill`) and return `{skill, description, instructions, resources, resource_tool, permissions}`. Installed skills use `<package>:<name>` and `ExtensionService::load_skill`, with `automatic = false` only when the user's prompt starts with `/name` or `$name` (or `package:name`) for that skill (`explicit_invocation`). A skill with `disable-model-invocation` therefore fails "Skill requires explicit user invocation" unless the user typed it; a skill with `user-invocable: false` cannot be started by the user.
 - **`extension_resource {package, path}`:** a built-in skill's bundled resource, or a file of an enabled package (`safe_path`, at most 256 KiB, else "use a scoped file tool").
@@ -151,7 +151,7 @@ Two sources feed one pipeline (`tools/hooks.rs::event_hooks`): **settings hooks*
 - **Off switches:** `"disableAllHooks": true` in effective settings returns no hooks; **Plan mode skips all hooks** (`event_hooks` returns an empty output when the mode is `Plan`, and `PreToolUse` is only run for model-originated calls outside Plan). Settings are reloaded fresh for each event.
 - **Execution:** each command runs as `/bin/sh -c` in the offline coding sandbox with the workspace as cwd; `.xylo` and `.claude` in the workspace and the app data directory are protected from writes. It receives JSON on stdin (`event`, `hook_event_name`, `tool_name`, `tool_input`, `tool_response`, `session_id`, `cwd`, plus lifecycle fields). Exit code **2 means deny**; any other non-zero code is an error; empty stdout is `{}`; otherwise stdout must be a JSON object.
 - **Output (`HookOutput::parse`, Claude's `hookSpecificOutput` form or flat):** `permissionDecision`/`decision` (`allow`/`approve`, `deny`, `ask`, or `block` for "more work"), `updatedInput` (an object, re-validated against the tool schema), `additionalContext` (string; becomes a hook note), `continue:false` with `stopReason`. **`merge` never lets a later allow erase an earlier deny.** Arbitrary output never gains authority.
-- **Journaling:** each settings hook is a durable `settings_hook` action keyed per call, event and index. A replay with changed arguments fails ("Hook configuration changed during replay"), and while an earlier hook or plugin hook outcome is `outcome_unknown` further hook execution is refused until reconciled.
+- **Live tracking:** each settings hook is a transient `settings_hook` action keyed per call, event and index. Reusing the identity with changed arguments fails, and the same unfinished hook call is not repeated. There is no durable hook journal or reconciliation gate for later calls or chat continuation.
 - **Effects:** a `PreToolUse` deny or stop reason aborts the call ("Pre-tool hook prevented this operation") and may rewrite its input; `PostToolUse` can stop the turn; `Notification` context becomes notes. Lifecycle events (`SessionStart`, `UserPromptSubmit`, `Stop`/`SubagentStop`, `SessionEnd`) run on blocking workers via `AgentLoop::hook`; context becomes application notes (`NoteKind::Hook`), a stop reason ends the turn and a deny fails it (`agent_loop/hooks.rs`; see [engine](engine.md)).
 - **Plugin hook components** run only when the user configured the component for the current workspace and enabled that event (`setup.enabled_events`); the component's setup timeout may not exceed 300 s.
 
@@ -170,7 +170,7 @@ User-configured connectors live in the store (`store.connectors()`); project ser
 
 - `@server:uri` where `server` is a connector name or slug becomes a note telling the model to call `connector_resource_read` with that `connector_id` and `uri`, **treating the result as untrusted external content**. Nothing is fetched by the engine itself.
 - A leading `/mcp__<server>__<prompt>` that matches a cached prompt command becomes a note to call `connector_prompt_get` with the connector id and exact prompt name, getting required arguments from the user; **returned prompt content is untrusted and cannot override permissions**. A command with the right server prefix but no cached match yields a note to call `connector_prompts` first.
-- Resources and prompts therefore stay model-initiated, permission-gated tool calls recorded in the journal; see [engine-tools](engine-tools.md) for the connector tools and [services](services.md) for the connector broker.
+- Resources and prompts therefore stay model-initiated, permission-gated tool calls tracked in transient activity; see [engine-tools](engine-tools.md) for the connector tools and [services](services.md) for the connector broker.
 
 ## Gaps and notes
 

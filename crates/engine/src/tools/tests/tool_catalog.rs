@@ -523,7 +523,7 @@ async fn hook_updates_validate_the_target_connector_schema_before_dispatch() {
         assert!(
             broker
                 .store
-                .unresolved_actions(broker.request.session_id)
+                .unfinished_actions(broker.request.session_id)
                 .unwrap()
                 .is_empty()
         );

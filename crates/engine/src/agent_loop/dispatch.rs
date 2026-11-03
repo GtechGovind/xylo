@@ -10,7 +10,7 @@
 //! exact alias table maps common foreign tool names to Xylo's.
 //!
 //! A repaired call is recorded in the assistant message as it will run
-//! ([`record`]), so the transcript, the journal and a resumed turn all see
+//! ([`record`]), so the transcript, the conversation_state and a resumed turn all see
 //! the same arguments.
 //!
 //! Read-only calls run concurrently (bounded); a writing call waits for every
@@ -37,7 +37,7 @@ pub(crate) enum Access {
 }
 
 /// The tools a loop may call. Execution is blocking and exactly-once per
-/// call id: the implementation journals every dispatch.
+/// call id: the implementation tracks live call identities.
 pub(crate) trait ToolExecutor: Send + Sync {
     /// Pending harness notes from work that outlives a tool call.
     fn take_notes(&self) -> Vec<(xylo_core::NoteKind, String)> {

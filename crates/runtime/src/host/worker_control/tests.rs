@@ -1,6 +1,32 @@
 use super::*;
 use crate::host::tests::{next_event, state, stop};
 
+#[test]
+fn live_activity_import_rejects_foreign_scope_and_malformed_updates() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path().join("test.db")).unwrap();
+    let (session, turn) = (Uuid::new_v4(), Uuid::new_v4());
+    for (foreign_session, foreign_turn) in [(Uuid::new_v4(), turn), (session, Uuid::new_v4())] {
+        let value = serde_json::to_value(xylo_services::LiveActionUpdate::Incomplete {
+            session_id: foreign_session,
+            turn_id: foreign_turn,
+        })
+        .unwrap();
+        assert!(import_live_activity(&store, session, turn, value).is_err());
+    }
+    assert!(
+        import_live_activity(&store, session, turn, serde_json::json!({"kind":"unknown"})).is_err()
+    );
+    assert!(store.live_action_evidence_complete(session, turn).unwrap());
+    let update = serde_json::to_value(xylo_services::LiveActionUpdate::Incomplete {
+        session_id: session,
+        turn_id: turn,
+    })
+    .unwrap();
+    assert!(!import_live_activity(&store, session, turn, update).unwrap());
+    assert!(!store.live_action_evidence_complete(session, turn).unwrap());
+}
+
 async fn mark_scheduled(host: &HostState, session: Uuid) {
     let task = host
         .default_scheduler()

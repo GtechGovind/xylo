@@ -29,7 +29,7 @@ async fn child_tool_constraints_cannot_widen_a_parent_allow_list() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sdk_callback_runs_only_after_approval_and_is_journaled() {
+async fn sdk_callback_runs_only_after_approval_and_is_active_action() {
     let (_root, broker, mut events) = fixture(PermissionMode::AskForApproval);
     let mut broker = Arc::try_unwrap(broker).ok().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));

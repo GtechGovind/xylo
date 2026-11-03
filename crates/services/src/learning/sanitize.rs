@@ -228,17 +228,17 @@ pub(super) fn verification_command(value: &Value, scope: &str) -> Option<Value> 
     }
     Some(json!({"program":"cargo","args":output}))
 }
-pub(super) fn build_steps(actions: &[JournalAction], scope: &str) -> (Vec<ProcedureStep>, bool) {
+pub(super) fn build_steps(actions: &[ActiveAction], scope: &str) -> (Vec<ProcedureStep>, bool) {
     let mut eligible = true;
     let steps=actions.iter().map(|action|{
         let known_verifier=(action.intent.name=="run_command").then(||verification_command(&action.intent.arguments,scope)).flatten();
         if (action.intent.writes || action.intent.name=="run_command") && known_verifier.is_none(){eligible=false;}
         if !valid_tool(&action.intent.name) {eligible=false;}
-        ProcedureStep{tool:action.intent.name.clone(),arguments:known_verifier.unwrap_or_else(||arguments(&action.intent.arguments,scope)),requires_approval:action.intent.writes,verification:if action.intent.name=="run_command"{"Require the approved verification command to exit zero; inspect its bounded output."}else{"Require a durable successful tool result; inspect the result before continuing."}.into()}
+        ProcedureStep{tool:action.intent.name.clone(),arguments:known_verifier.unwrap_or_else(||arguments(&action.intent.arguments,scope)),requires_approval:action.intent.writes,verification:if action.intent.name=="run_command"{"Require the approved verification command to exit zero; inspect its bounded output."}else{"Require a successful tool result; inspect the result before continuing."}.into()}
     }).collect();
     (steps, eligible)
 }
-pub(super) fn result_verified(action: &JournalAction) -> bool {
+pub(super) fn result_verified(action: &ActiveAction) -> bool {
     if action.state != "succeeded" {
         return false;
     }

@@ -268,7 +268,7 @@ impl CapabilityService {
         }
     }
 
-    /// Reconcile a previously journaled execution from an exact native receipt.
+    /// Read a previous command's result from its exact native receipt.
     /// This performs no command dispatch and never invents a successful result
     /// when a native operation is still pending or uncertain.
     pub async fn recover_execution(

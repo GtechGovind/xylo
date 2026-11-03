@@ -46,7 +46,7 @@ fn assistant_call(name: &str, args: Value) -> Message {
     )
 }
 
-fn journal(request: &TurnRequest, turn: Uuid, name: &str, args: &Value) -> ActionIntent {
+fn action_intent(request: &TurnRequest, turn: Uuid, name: &str, args: &Value) -> ActionIntent {
     ActionIntent {
         id: Uuid::new_v4(),
         session_id: request.session_id,
@@ -54,7 +54,7 @@ fn journal(request: &TurnRequest, turn: Uuid, name: &str, args: &Value) -> Actio
         name: name.into(),
         arguments: args.clone(),
         writes: true,
-        idempotency_key: ToolBroker::journal_key(None, "provider-call-1"),
+        idempotency_key: ToolBroker::call_key(None, "provider-call-1"),
     }
 }
 
@@ -108,7 +108,7 @@ async fn resume_restores_success_using_original_turn_before_new_prompt() {
     let (_directory, engine, mut request) = fixture();
     let old_turn = request.turn_id;
     let args = json!({"path":"already-written.txt","content":"original"});
-    let intent = journal(&request, old_turn, "file_write", &args);
+    let intent = action_intent(&request, old_turn, "file_write", &args);
     engine.store.begin_action(&intent).unwrap();
     engine.store.mark_action_running(intent.id).unwrap();
     engine
@@ -147,7 +147,7 @@ async fn resume_restores_success_using_original_turn_before_new_prompt() {
             .action_for_key(
                 request.session_id,
                 request.turn_id,
-                &ToolBroker::journal_key(None, "provider-call-1")
+                &ToolBroker::call_key(None, "provider-call-1")
             )
             .unwrap()
             .is_none()
@@ -158,7 +158,7 @@ async fn resume_restores_success_using_original_turn_before_new_prompt() {
 async fn denied_pending_result_is_restored_as_error_without_redispatch() {
     let (_directory, engine, request) = fixture();
     let args = json!({"path":"denied.txt","content":"never"});
-    let intent = journal(&request, request.turn_id, "file_write", &args);
+    let intent = action_intent(&request, request.turn_id, "file_write", &args);
     engine.store.begin_action(&intent).unwrap();
     engine.store.deny_action(intent.id).unwrap();
     engine
@@ -179,7 +179,170 @@ async fn denied_pending_result_is_restored_as_error_without_redispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn calls_that_never_ran_wait_for_the_resuming_turn_and_are_not_run_for_a_new_one() {
+async fn interrupted_action_allows_chat_to_continue_without_review_or_replay() {
+    for new_turn in [false, true] {
+        let (_directory, engine, mut request) = fixture();
+        let old_turn = request.turn_id;
+        let args = json!({"path":"partial.txt","content":"replacement must not be replayed"});
+        let action = action_intent(&request, old_turn, "file_write", &args);
+        std::fs::write(
+            request.workspace.join("partial.txt"),
+            "retained partial content",
+        )
+        .unwrap();
+        engine.store.begin_action(&action).unwrap();
+        engine.store.mark_action_running(action.id).unwrap();
+        engine
+            .store
+            .mark_action_unknown(action.id, "Interrupted during write")
+            .unwrap();
+        engine
+            .store
+            .save_checkpoint(
+                request.session_id,
+                old_turn,
+                &serde_json::to_value(vec![
+                    Message::user("Update the file"),
+                    assistant_call("file_write", args),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        if new_turn {
+            request.turn_id = Uuid::new_v4();
+        }
+        let (endpoint, seen) = serve(|_| message("We can continue with another task.")).await;
+        request.provider = responses(endpoint);
+        let (events, mut receiver) = mpsc::channel(256);
+        engine
+            .run(request.clone(), events, CancellationToken::new())
+            .await
+            .unwrap();
+        let events = drain(&mut receiver);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Completed { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::ToolStarted { .. }))
+        );
+        assert_eq!(
+            engine.store.action(action.id).unwrap().unwrap().state,
+            "outcome_unknown"
+        );
+        assert_eq!(
+            std::fs::read_to_string(request.workspace.join("partial.txt")).unwrap(),
+            "retained partial content"
+        );
+        let bodies = seen.lock();
+        let body = bodies
+            .iter()
+            .find(|body| !is_title(body))
+            .unwrap()
+            .to_string();
+        assert!(
+            body.contains("outcome_unknown"),
+            "The model must see the interrupted outcome: {body}"
+        );
+        assert!(body.contains("Interrupted during write"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_action_retained_output_is_bounded_when_restored() {
+    let (_directory, engine, request) = fixture();
+    let args = json!({"path":"partial.txt","content":"never replay"});
+    let action = action_intent(&request, request.turn_id, "file_write", &args);
+    engine.store.begin_action(&action).unwrap();
+    engine.store.mark_action_running(action.id).unwrap();
+    let output = json!({"status":"outcome_unknown","summary":"partial output".repeat(100_000)});
+    engine
+        .store
+        .mark_action_unknown_with_result(action.id, &output, "Interrupted")
+        .unwrap();
+    engine
+        .store
+        .save_checkpoint(
+            request.session_id,
+            request.turn_id,
+            &serde_json::to_value(vec![assistant_call("file_write", args)]).unwrap(),
+        )
+        .unwrap();
+    let restored = restore(&engine, &request).await.unwrap();
+    assert!(
+        restored[1].content.len() < 100_000,
+        "Retained output must respect the model result budget"
+    );
+    assert!(restored[1].content.contains("outcome_unknown"));
+    let retained = engine.store.action(action.id).unwrap().unwrap();
+    assert!(
+        retained.result.is_none(),
+        "Oversized outputs are not kept in the live cache"
+    );
+    assert!(!retained.evidence_complete);
+    assert!(
+        !engine
+            .store
+            .live_action_evidence_complete(request.session_id, request.turn_id)
+            .unwrap()
+    );
+    assert!(!request.workspace.join("partial.txt").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopened_chat_continues_without_action_records_or_automatic_replay() {
+    let (_directory, old, mut request) = fixture();
+    let args = json!({"path":"must-not-repeat.txt","content":"should not be written"});
+    old.store
+        .save_checkpoint(
+            request.session_id,
+            request.turn_id,
+            &serde_json::to_value(vec![
+                Message::user("Update the file"),
+                assistant_call("file_write", args),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    let store = Store::open_existing(&old.paths.database).unwrap();
+    let engine = AgentEngine::new(
+        store,
+        old.paths.clone(),
+        ToolSession::for_tests(PermissionMode::ReadOnly),
+    );
+    let (endpoint, seen) = serve(|_| message("The chat can continue.")).await;
+    request.provider = responses(endpoint);
+    let (events, mut receiver) = mpsc::channel(256);
+    engine
+        .run(request.clone(), events, CancellationToken::new())
+        .await
+        .unwrap();
+    let events = drain(&mut receiver);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::Completed { .. })),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::ToolStarted { .. }))
+    );
+    assert!(!request.workspace.join("must-not-repeat.txt").exists());
+    assert!(
+        seen.lock()
+            .iter()
+            .any(|body| !is_title(body) && body.to_string().contains("not repeated"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unanswered_checkpoint_calls_are_not_replayed_on_same_or_new_turn() {
     let (_directory, engine, mut request) = fixture();
     let args = json!({"path":"pending.txt"});
     engine
@@ -195,11 +358,16 @@ async fn calls_that_never_ran_wait_for_the_resuming_turn_and_are_not_run_for_a_n
         )
         .unwrap();
     let resumed = restore(&engine, &request).await.unwrap();
-    assert_eq!(resumed.len(), 2, "the pending call is left for the loop");
+    assert_eq!(
+        resumed.len(),
+        3,
+        "an interrupted call must not be silently replayed"
+    );
+    assert!(resumed[2].content.contains("not repeated"));
     request.turn_id = Uuid::new_v4();
     let fresh = restore(&engine, &request).await.unwrap();
     assert_eq!(fresh.len(), 4);
-    assert!(fresh[2].content.contains("Not run"));
+    assert!(fresh[2].content.contains("not repeated"));
     assert_eq!(fresh[3].content, "Continue");
 }
 
@@ -278,21 +446,7 @@ async fn engine_error_after_admission_is_classified_and_queues_learning_evidence
     let (_directory, engine, mut request) = fixture();
     request.provider.model = "fixture-model".into();
     engine.store.register_user_turn(&request).unwrap();
-    let action = ActionIntent {
-        id: Uuid::new_v4(),
-        session_id: request.session_id,
-        turn_id: request.turn_id,
-        name: "run_command".into(),
-        arguments: json!({"program":"cargo","args":["test","--offline"]}),
-        writes: true,
-        idempotency_key: "interrupted-verifier".into(),
-    };
-    engine.store.begin_action(&action).unwrap();
-    engine.store.mark_action_running(action.id).unwrap();
-    engine
-        .store
-        .mark_action_unknown(action.id, "Worker interrupted")
-        .unwrap();
+    std::fs::write(engine.paths.data.join("capabilities.json"), "{").unwrap();
     let (events, mut receiver) = mpsc::channel(256);
     engine
         .run(request.clone(), events, CancellationToken::new())
@@ -308,7 +462,7 @@ async fn engine_error_after_admission_is_classified_and_queues_learning_evidence
             retryable,
             kind,
         } => {
-            assert!(message.contains("outcome-unknown"));
+            assert!(message.contains("Read native capability configuration"));
             assert!(!retryable);
             assert_eq!(kind, ErrorKind::Internal);
         }
@@ -975,7 +1129,7 @@ async fn child_timeout_cancels_its_stalled_process_without_cancelling_the_parent
     );
     assert!(request.workspace.join("child-started").is_file());
     broker.shutdown().await.unwrap();
-    let actions = engine.store.unresolved_actions(request.session_id).unwrap();
+    let actions = engine.store.unfinished_actions(request.session_id).unwrap();
     assert!(actions.iter().all(|action| action.state != "running"));
 }
 
@@ -1598,3 +1752,45 @@ mod provider_fallback;
 
 #[path = "child_instruction_provenance_tests.rs"]
 mod child_instruction_provenance_tests;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_oversized_output_does_not_block_checkpoint_restore() {
+    let (_directory, engine, mut request) = fixture();
+    let args = json!({"path":"must-not-repeat.txt","content":"unchanged"});
+    let action = action_intent(&request, request.turn_id, "file_write", &args);
+    engine.store.begin_action(&action).unwrap();
+    engine.store.mark_action_running(action.id).unwrap();
+    engine
+        .store
+        .finish_action(action.id, &json!({"body":"large output".repeat(100_000)}))
+        .unwrap();
+    assert!(
+        engine
+            .store
+            .action(action.id)
+            .unwrap()
+            .unwrap()
+            .result
+            .is_none()
+    );
+    engine
+        .store
+        .save_checkpoint(
+            request.session_id,
+            request.turn_id,
+            &serde_json::to_value(vec![assistant_call("file_write", args)]).unwrap(),
+        )
+        .unwrap();
+    for new_turn in [false, true] {
+        if new_turn {
+            request.turn_id = Uuid::new_v4();
+        }
+        let restored = restore(&engine, &request).await.unwrap();
+        assert!(
+            restored
+                .iter()
+                .any(|message| message.content.contains("output_unavailable"))
+        );
+        assert!(!request.workspace.join("must-not-repeat.txt").exists());
+    }
+}

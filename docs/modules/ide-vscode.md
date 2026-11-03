@@ -1,4 +1,6 @@
-# VS Code IDE bridge (`ide/vscode`)
+# Former VS Code IDE bridge
+
+The bundled `ide/vscode` extension has been removed. The following records its previous protocol and implementation; its build and launch commands no longer apply to this checkout.
 
 ## Purpose and boundaries
 

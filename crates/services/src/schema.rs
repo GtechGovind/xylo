@@ -1,23 +1,14 @@
 //! The one database schema, created whole when a database is first opened.
 //!
-//! There are no migrations. A database is accepted only when its
-//! `user_version` is [`VERSION`] and its schema objects are exactly the ones
-//! [`SCHEMA`] creates (plus the per-model vector tables that semantic memory
-//! adds at run time). Anything else, including a file that is not a database,
-//! is closed and deleted together with its WAL and shared-memory files, and a
-//! fresh database is created in its place. Old data is never kept or read.
-//!
-//! Only the owner of the database (the host) creates or resets it, through
-//! [`OpenMode::Owner`]. Every other opener (workers, tools) uses
-//! [`OpenMode::Existing`], which validates the same way but fails with an
-//! error instead of creating or deleting anything, because the owner may
-//! have the file open.
+//! The exact previous schema is migrated by removing execution tracking only.
+//! A modified version-2 schema is left untouched; other mismatches retain the
+//! existing owner-only reset policy.
 use anyhow::{Context, Result};
 use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior};
 use std::{path::Path, sync::OnceLock, time::Duration};
 
 /// Schema generation stored in `PRAGMA user_version`.
-pub(crate) const VERSION: i64 = 2;
+pub(crate) const VERSION: i64 = 3;
 
 /// Every table, index and trigger of the application database.
 pub(crate) const SCHEMA: &str = "
@@ -38,22 +29,6 @@ CREATE TABLE turn_usage(session_id TEXT NOT NULL REFERENCES conversations(id) ON
 
 CREATE TABLE instruction_sources(session_id TEXT NOT NULL,workspace TEXT NOT NULL,path TEXT NOT NULL,outside INTEGER NOT NULL CHECK(outside IN(0,1)),PRIMARY KEY(session_id,workspace,path));
 
-CREATE TABLE actions(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES conversations(id),turn_id TEXT NOT NULL,action_key TEXT NOT NULL,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL,UNIQUE(session_id,turn_id,action_key));
-CREATE INDEX actions_state ON actions(state);
-CREATE INDEX actions_name_time ON actions(json_extract(intent,'$.name'),updated_at DESC);
-CREATE INDEX action_review_page ON actions(session_id,state,updated_at DESC,id DESC);
-CREATE TABLE action_review_clock(id INTEGER PRIMARY KEY CHECK(id=1),seq INTEGER NOT NULL);
-INSERT INTO action_review_clock VALUES(1,0);
-CREATE TABLE action_review_revisions(action_id TEXT PRIMARY KEY,seq INTEGER NOT NULL);
-CREATE TRIGGER action_review_insert AFTER INSERT ON actions BEGIN UPDATE action_review_clock SET seq=seq+1 WHERE id=1;INSERT OR REPLACE INTO action_review_revisions VALUES(new.id,(SELECT seq FROM action_review_clock WHERE id=1));END;
-CREATE TRIGGER action_review_update AFTER UPDATE ON actions BEGIN UPDATE action_review_clock SET seq=seq+1 WHERE id=1;INSERT OR REPLACE INTO action_review_revisions VALUES(new.id,(SELECT seq FROM action_review_clock WHERE id=1));END;
-CREATE TABLE action_execution_protocol(action_id TEXT PRIMARY KEY,version INTEGER NOT NULL);
-CREATE TABLE action_resolutions(operation_id TEXT PRIMARY KEY,action_id TEXT NOT NULL UNIQUE,request TEXT NOT NULL,receipt TEXT NOT NULL,original TEXT NOT NULL,original_sha256 TEXT NOT NULL);
-CREATE TRIGGER action_resolution_immutable_update BEFORE UPDATE ON action_resolutions BEGIN SELECT RAISE(ABORT,'Action resolution audit is immutable');END;
-CREATE TRIGGER action_resolution_immutable_delete BEFORE DELETE ON action_resolutions BEGIN SELECT RAISE(ABORT,'Action resolution audit is immutable');END;
-CREATE TABLE action_review_forms(session_id TEXT PRIMARY KEY,workspace TEXT NOT NULL,revision INTEGER NOT NULL,json TEXT NOT NULL CHECK(length(CAST(json AS BLOB))<=16384));
-CREATE TABLE extension_action_bindings(action_id TEXT PRIMARY KEY REFERENCES actions(id) ON DELETE CASCADE,binding TEXT NOT NULL);
-CREATE TABLE extension_execution_receipts(id TEXT PRIMARY KEY,intent TEXT NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,updated_at INTEGER NOT NULL);
 
 CREATE TABLE connectors(id TEXT PRIMARY KEY,name TEXT NOT NULL,json TEXT NOT NULL);
 CREATE TABLE project_mcp_consents(workspace TEXT NOT NULL,fingerprint TEXT NOT NULL,PRIMARY KEY(workspace,fingerprint));
@@ -154,8 +129,8 @@ impl std::fmt::Display for DatabaseReset {
 /// Who is opening the database, which decides what may happen to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenMode {
-    /// The host: creates the schema in a new file and replaces a database
-    /// with any other schema.
+    /// The host: creates a fresh schema or migrates the exact previous version.
+    /// Other unsupported generations retain the existing reset policy.
     Owner,
     /// Any other process: the file must exist with exactly this schema;
     /// anything else is an error and the file is left untouched.
@@ -225,6 +200,25 @@ fn prepare(mut conn: Connection, mode: OpenMode) -> Result<Opened> {
             return Ok(Opened::Unexpected("it has not been created yet".into()));
         }
         tx.execute_batch(SCHEMA)?;
+        tx.pragma_update(None, "user_version", VERSION)?;
+        tx.commit()?;
+    } else if version == 2 && mode == OpenMode::Owner {
+        let previous = Connection::open_in_memory()?;
+        previous.execute_batch(include_str!("schema_v2.sql"))?;
+        anyhow::ensure!(
+            objects == self::objects(&previous)?,
+            "Schema version 2 does not match the supported migration; database left untouched"
+        );
+        tx.execute_batch(
+            "DROP TABLE extension_action_bindings; DROP TABLE action_execution_protocol;
+            DROP TABLE action_resolutions; DROP TABLE action_review_forms;
+            DROP TABLE actions; DROP TABLE action_review_revisions; DROP TABLE action_review_clock;
+            DROP TABLE extension_execution_receipts;",
+        )?;
+        anyhow::ensure!(
+            self::objects(&tx)? == *reference()?,
+            "Migrated schema does not match this version"
+        );
         tx.pragma_update(None, "user_version", VERSION)?;
         tx.commit()?;
     } else if version != VERSION {

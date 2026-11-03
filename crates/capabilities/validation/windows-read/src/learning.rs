@@ -10,7 +10,7 @@ struct ActionIntent {
     writes: bool,
 }
 
-struct JournalAction {
+struct ActiveAction {
     intent: ActionIntent,
     state: String,
     result: Option<Value>,
@@ -29,7 +29,7 @@ mod sanitize;
 #[test]
 fn actual_learning_sanitizer_keeps_paths_and_approval_without_external_result_content() {
     let scope = r"C:\Users\private-person\project";
-    let mut action = JournalAction {
+    let mut action = ActiveAction {
         intent: ActionIntent {
             name: "file_read".into(),
             arguments: json!({
@@ -50,7 +50,7 @@ fn actual_learning_sanitizer_keeps_paths_and_approval_without_external_result_co
     assert!(
         steps[0]
             .verification
-            .contains("durable successful tool result")
+            .contains("successful tool result")
     );
     assert!(!steps[0].arguments.to_string().contains("private-person"));
     assert!(

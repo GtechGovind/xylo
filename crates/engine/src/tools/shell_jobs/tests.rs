@@ -908,7 +908,7 @@ async fn foreground_output_arrives_before_failure_with_action_identity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn interrupted_foreground_commands_keep_journaled_output_after_reopen() {
+async fn interrupted_foreground_commands_keep_output_without_persisting_action_records() {
     for cancelled in [false, true] {
         let (directory, broker, _events) =
             super::super::tests::fixture(xylo_core::PermissionMode::FullAccess);
@@ -941,22 +941,21 @@ async fn interrupted_foreground_commands_keep_journaled_output_after_reopen() {
             }
         }
         assert!(running.await.unwrap().is_err());
-        let action = broker.journaled("interrupted-output").unwrap().unwrap();
+        let action = broker.active_action("interrupted-output").unwrap().unwrap();
         let reopened =
             xylo_services::Store::open(directory.path().join("profile/xylo.db")).unwrap();
-        let record = reopened
-            .turn_action(
-                broker.request.session_id,
-                broker.request.turn_id,
-                action.intent.id,
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            record.state, "outcome_unknown",
-            "Interrupted writes must stay uncertain"
+        assert!(
+            reopened
+                .turn_action(
+                    broker.request.session_id,
+                    broker.request.turn_id,
+                    action.intent.id
+                )
+                .unwrap()
+                .is_none()
         );
-        let result = record.result.unwrap();
+        assert_eq!(action.state, "outcome_unknown");
+        let result = action.result.unwrap();
         let job = Uuid::parse_str(result["summary"]["job_id"].as_str().unwrap()).unwrap();
         assert_eq!(
             result["summary"]["job_turn_id"],

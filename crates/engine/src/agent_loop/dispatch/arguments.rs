@@ -14,7 +14,7 @@
 //!   schema forbids extra fields, a missing required field that declares a
 //!   default, and a top-level `arguments`/`input`/`parameters` wrapper the
 //!   schema does not declare. Repairing the same input twice gives the same
-//!   result, so a resumed call reproduces the journaled arguments.
+//!   result, so a resumed call reproduces the tracked arguments.
 //! - Validation never resolves remote references; a schema that does not
 //!   compile (a third-party server's mistake) is not enforced here, and the
 //!   tool or server reports its own error.

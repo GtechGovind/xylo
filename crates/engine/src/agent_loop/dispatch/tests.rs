@@ -207,7 +207,7 @@ fn stringified_json_enum_case_nulls_wrappers_and_defaults_are_repaired() {
 }
 
 #[test]
-fn repair_is_idempotent_so_resumed_calls_match_the_journal() {
+fn repair_is_idempotent_so_resumed_calls_match_live_tracking() {
     let fake = Fake::new();
     let raw = r#"{'todos': '[{"content":"a","status":"COMPLETED"}]',}"#;
     let first = ran(prepare(&ToolCall::new("c", "todo_write", raw), &fake)).1;

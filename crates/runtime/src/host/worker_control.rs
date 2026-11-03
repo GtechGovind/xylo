@@ -11,7 +11,7 @@
 //! - Replies to control commands (Approve, SetPermissions, Cancel…) are routed
 //!   by request id instead of being dropped.
 //! - A Stop the worker does not honor within [`STOP_GRACE`] kills the process;
-//!   the reaper then records interrupted actions and reports a cancellation.
+//!   the reaper marks live evidence incomplete and reports a cancellation.
 //! - Idle workers stay warm for [`IDLE_WORKER_TTL`], at most
 //!   [`MAX_IDLE_WORKERS`] of them, least recently used retired first.
 use super::*;
@@ -279,8 +279,7 @@ impl WorkerHandle {
         }
     }
 
-    /// Asks the process to exit and ends it. Idle workers have no turn to
-    /// lose; the reaper still reconciles the journal before reporting exit.
+    /// Asks the process to exit and ends it. Idle workers have no turn to lose.
     pub(super) fn retire(&self, session: Uuid) {
         let _ = self.commands.try_send(Envelope::new(
             Uuid::new_v4(),
@@ -794,6 +793,18 @@ struct WorkerReader {
     renewal_capacity: Arc<tokio::sync::Semaphore>,
 }
 
+/// Imports observations only after the caller validated the active worker envelope.
+fn import_live_activity(store: &Store, session: Uuid, turn: Uuid, value: Value) -> Result<bool> {
+    let update: xylo_services::LiveActionUpdate = serde_json::from_value(value)?;
+    ensure!(
+        update.scope() == (session, turn),
+        "Live activity scope mismatch"
+    );
+    let complete = matches!(update, xylo_services::LiveActionUpdate::TurnComplete { .. });
+    store.import_live_action(update)?;
+    Ok(complete)
+}
+
 impl WorkerReader {
     async fn run(
         self,
@@ -841,6 +852,44 @@ impl WorkerReader {
 
     /// Returns false when the UI channel closed.
     async fn handle(&self, mut envelope: Envelope<EngineEvent>) -> bool {
+        if let EngineEvent::LiveActivity { turn_id, update } = &envelope.payload {
+            let active_turn = *self.worker.run_turn.lock();
+            if envelope.session_id != Some(self.session)
+                || *self.worker.run_request.lock() != Some(envelope.request_id)
+                || active_turn != Some(*turn_id)
+            {
+                // Stale or foreign transport evidence never becomes host activity.
+                return true;
+            }
+            let imported =
+                import_live_activity(&self.store, self.session, *turn_id, update.clone());
+            match imported {
+                Ok(true) => {
+                    // Completion may have enqueued learning before this process
+                    // received all evidence. Requeue after the final marker.
+                    let store = self.store.clone();
+                    let session = self.session;
+                    let turn = *turn_id;
+                    if !matches!(
+                        tokio::task::spawn_blocking(move || {
+                            xylo_services::LearningService::new(store).queue_turn(session, turn)
+                        })
+                        .await,
+                        Ok(Ok(()))
+                    ) {
+                        tracing::warn!(%session, %turn, "Queue live learning evidence");
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    let _ = self
+                        .store
+                        .mark_live_action_incomplete(self.session, *turn_id);
+                    tracing::warn!(session = %self.session, turn = %turn_id, "Live activity was omitted");
+                }
+            }
+            return true;
+        }
         envelope.session_id = Some(self.session);
         match &envelope.payload {
             EngineEvent::Steering { receipt } => {
@@ -1187,8 +1236,8 @@ impl WorkerReader {
         });
     }
 
-    /// Ends the process, reconciles its journal and reports a run that never
-    /// reached a terminal event. Only such a run settles the queue as failed:
+    /// Ends the process and reports a run that never reached a terminal event.
+    /// Only such a run settles the queue as failed:
     /// retiring an idle worker ran nothing, and a finished run already
     /// settled the queue at its terminal event.
     async fn reap(&self, child: &mut tokio::process::Child) {
@@ -1197,17 +1246,14 @@ impl WorkerReader {
         let unfinished = self.worker.active.swap(false, Ordering::AcqRel);
         let session = self.session;
         let ended_turn = *self.worker.run_turn.lock();
+        if unfinished && let Some(turn) = ended_turn {
+            let _ = self.store.mark_live_action_incomplete(session, turn);
+        }
         if let Err(error) =
             steering_control::finish_turn(self.store.clone(), &self.events, session, ended_turn)
                 .await
         {
             tracing::warn!(%error, "Recover reaped task guidance");
-        }
-        let store = self.store.clone();
-        let recovered =
-            tokio::task::spawn_blocking(move || store.recover_session_interrupted(session)).await;
-        if !matches!(recovered, Ok(Ok(_))) {
-            tracing::error!(?recovered, %session, "Recover reaped task journal");
         }
         if unfinished && let Some(host) = self.host.upgrade() {
             tokio::spawn(host.settle_turn_queue(

@@ -184,6 +184,7 @@ async fn precancelled_operation_never_launches() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("cancelled"));
+    assert!(error.downcast_ref::<BrowserNotDispatched>().is_some());
     assert!(service.state.lock().await.is_none());
     service.shutdown().await.unwrap();
 }
@@ -206,6 +207,7 @@ async fn queued_cancellation_does_not_wait_for_another_operations_lock() {
     .expect("Queued cancellation must not try to acquire the session lock again")
     .unwrap_err();
     assert!(error.to_string().contains("cancelled"));
+    assert!(error.downcast_ref::<BrowserNotDispatched>().is_some());
     assert!(guard.is_none());
 }
 
@@ -224,6 +226,7 @@ async fn queued_timeout_does_not_wait_for_another_operations_lock() {
     .expect("Queued timeout must not try to acquire the session lock again")
     .unwrap_err();
     assert!(error.to_string().contains("timed out"));
+    assert!(error.downcast_ref::<BrowserNotDispatched>().is_some());
     assert!(guard.is_none());
 }
 
@@ -454,6 +457,7 @@ async fn bundled_cancellation_stops_process_and_removes_profile() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("cancelled"));
+    assert!(error.downcast_ref::<BrowserNotDispatched>().is_none());
     assert!(service.state.lock().await.is_none());
     // Cancellation kills synchronously; reaping/profile deletion is scheduled.
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -463,4 +467,82 @@ async fn bundled_cancellation_stops_process_and_removes_profile() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn invalid_navigation_is_rejected_before_runtime_startup() {
+    let service = BrowserService::new(CapabilityConfig::default());
+    let error = service
+        .execute(
+            "browser_navigate",
+            &json!({"url":"file:///private/fixture"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("HTTP(S)"), "{error:#}");
+    assert!(service.state.lock().await.is_none());
+}
+
+#[test]
+fn browser_sidecar_fixture() {
+    if std::env::var_os("XYLO_TEST_BROWSER_SIDECAR").is_some() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+#[tokio::test]
+async fn dispatched_tls_error_remains_uncertain() {
+    use async_tungstenite::tungstenite::Message;
+    use futures_util::StreamExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/devtools/browser", listener.local_addr().unwrap());
+    let server =
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = async_tungstenite::tokio::accept_async(stream)
+                .await
+                .unwrap();
+            let message = socket.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "Page.navigate");
+            socket.send(Message::Text(json!({
+            "id": request["id"],
+            "error": {"code": -32000, "message": "invalid peer certificate: UnknownIssuer"}
+        }).to_string().into())).await.unwrap();
+        });
+    let profile = tempfile::tempdir().unwrap();
+    let child = ManagedProcess::spawn(&ProcessSpec {
+        executable: std::env::current_exe().unwrap(),
+        args: vec![
+            "--exact".into(),
+            "browser::tests::browser_sidecar_fixture".into(),
+        ],
+        cwd: profile.path().to_owned(),
+        env: BTreeMap::from([("XYLO_TEST_BROWSER_SIDECAR".into(), "1".into())]),
+        timeout: Duration::from_secs(30),
+        output_limit: 1024,
+    })
+    .unwrap();
+    let service = BrowserService::new(CapabilityConfig::default());
+    *service.state.lock().await = Some(Session {
+        process: Sidecar {
+            child: Some(child),
+            profile: Some(profile),
+        },
+        cdp: Cdp::connect(&endpoint, "test-secret").await.unwrap(),
+        used: Instant::now(),
+    });
+    let error = service
+        .execute(
+            "browser_navigate",
+            &json!({"url":"https://example.com/"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("UnknownIssuer"), "{error:#}");
+    assert!(error.downcast_ref::<BrowserNotDispatched>().is_none());
+    assert!(service.state.lock().await.is_none());
+    server.await.unwrap();
 }

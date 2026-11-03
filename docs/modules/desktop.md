@@ -42,7 +42,7 @@ If the main window cannot open, the error is logged and `cx.quit()` runs.
 
 ### Root view (`xylo.rs`)
 
-`Xylo` is the single root `Entity` and owns all UI state: the `HostClient` (an `Option`, `None` when the host failed to start), `AppSettings`, the current `Page`, workspace path, the active chat `session: Uuid`, conversation list and paging, loaded `messages`, `turns: BTreeMap<Uuid, TurnState>`, the composer (`TextareaState`), the file editor (`EditorState`) and many feature sub-structs (`DraftUi`, `DocumentUi`, `RecoveryUi`, `UpdateUi`, ...). Each feature file adds an `impl Xylo` block and its own `*Ui` struct held as a field.
+`Xylo` is the single root `Entity` and owns all UI state: the `HostClient` (an `Option`, `None` when the host failed to start), `AppSettings`, the current `Page`, workspace path, the active chat `session: Uuid`, conversation list and paging, loaded `messages`, `turns: BTreeMap<Uuid, TurnState>`, the composer (`TextareaState`), the file editor (`EditorState`) and many feature sub-structs (`DraftUi`, `DocumentUi`, `UpdateUi`, ...). Each feature file adds an `impl Xylo` block and its own `*Ui` struct held as a field.
 
 `Page` variants: `Chat`, `Permissions`, `Skills`, `Files`, `Search`, `Drafts`, `Voice`, `Images`, `Notifications`, `Changes`, `Artifacts`, `Memory`, `Connectors`, `Plugins`, `Environments`, `Providers`, `Schedules`, `Appearance`, `Assets`. `Page::is_settings` marks the pages that replace the sidebar with settings navigation. `Page::key`/`from_key` persist the active page in `UiPreferences::active_page`; transient pages (drafts, voice, images, notifications, artifacts, schedules) **reopen as the chat**.
 
@@ -95,7 +95,7 @@ The work panel opens only on request or when a file or diff is opened, and never
 
 ### Documents and recovery
 
-Document parsing and writing run in the supervised helper via host capabilities, never the render thread; reads carry `epoch`/`generation` so stale replies are ignored, and explicit actions use `confirm_explicit_action` (no second confirmation in Full access), while unsaved-edit and conflict choices use `window.prompt`. Interrupted actions retain their uncertain outcomes in the runtime journal. They do not open a review UI or block chat submission, navigation, or shutdown. Ordinary document autosaves continue across project switches; oversized uncaptured edits, conflicts, and pending copy/relink operations still require a decision or completion.
+Document parsing and writing run in the supervised helper via host capabilities, never the render thread; reads carry `epoch`/`generation` so stale replies are ignored, and explicit actions use `confirm_explicit_action` (no second confirmation in Full access), while unsaved-edit and conflict choices use `window.prompt`. Tool activity is transient; interrupted actions have no durable action journal, review UI or recovery gate. Saved chat checkpoints can retain tool errors, while unanswered calls are reported as interrupted without automatic replay. Live activity and saved command output do not block chat submission, navigation, or shutdown. Ordinary document autosaves continue across project switches; oversized uncaptured edits, conflicts, and pending copy/relink operations still require a decision or completion.
 
 ## Icons, theme and motion
 

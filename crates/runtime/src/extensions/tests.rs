@@ -259,7 +259,7 @@ async fn cancelled_native_component_has_unknown_receipt_and_same_attempt_never_r
     )
     .await
     .unwrap_err();
-    assert!(retry.to_string().contains("outcome is unknown"));
+    assert!(retry.to_string().contains("did not finish successfully"));
     assert_eq!(
         std::fs::read_to_string(workspace.join("receipt-marker")).unwrap(),
         "once"

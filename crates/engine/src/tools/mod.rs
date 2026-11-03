@@ -1,19 +1,19 @@
-//! Application-owned durable tool and permission boundary.
+//! Application-owned tool and permission boundary.
 //!
-//! Every tool call is a journaled action with an idempotency key. Before an
+//! Every live tool call has an in-process identity for duplicate protection. Before an
 //! intent exists the broker classifies the call (external metadata cannot
 //! supply its own permission flag), reads the live permission mode and asks
 //! [`permissions::decide`] whether it runs, needs the user's decision or is
 //! refused. Writes to one file are serialized process-wide from preview to
 //! write, so concurrent edits of one file in a batch both land and each
 //! approval shows the change against current content. Child brokers created
-//! for delegated work share the journal, the mode and the turn's approved
+//! for delegated work share live action tracking, the mode and the turn's approved
 //! rules, and stamp their events with the parent `agent_delegate` action.
 //!
 //! The offered tool list does not depend on the permission mode (calls are
 //! gated at dispatch), so it stays byte-identical for provider caching. A
 //! memory write's origin is assigned here, never by the model: the
-//! least-trusted content any journaled action of the conversation may have
+//! least-trusted content any tracked action of the conversation may have
 //! shown it, or the user's authority when they approved the write.
 mod builtin;
 pub(crate) mod catalog;
@@ -55,13 +55,13 @@ use xylo_core::{
     TurnRequest,
 };
 use xylo_services::{
-    ActionDecision, ActionIntent, ConnectorBroker, ConnectorLaunchScope, JournalAction,
+    ActionDecision, ActionIntent, ActiveAction, ConnectorBroker, ConnectorLaunchScope,
     LearningService, NativeConnectors, SqliteMemory, Store,
 };
 
 /// A request to run a delegated task in a child agent.
 pub struct DelegateCall {
-    /// Durable journal key of the parent `agent_delegate` call; namespaces the child's actions.
+    /// Live call key of the parent `agent_delegate` call; namespaces the child's actions.
     pub parent_key: String,
     /// The parent `agent_delegate` action; child tool events carry it as `parent_id`.
     pub parent_action_id: Uuid,
@@ -474,7 +474,7 @@ impl ToolBroker {
     /// [`RECALLED_FACTS`]. Only facts the user stated or approved, or that
     /// the agent wrote before reading anything from outside the project, are
     /// recalled automatically; facts derived from tool output or web content
-    /// reach the model only through `memory_search`, whose journaled results
+    /// reach the model only through `memory_search`, whose live results
     /// count toward the conversation's exposure. Initial context and memory
     /// tools share one lazy resident embedding model.
     pub(crate) fn project_facts(&self) -> Result<Vec<xylo_services::RecalledFact>> {
@@ -600,64 +600,18 @@ impl ToolBroker {
             .collect()
     }
 
-    pub(crate) fn journal_key(namespace: Option<&str>, call_id: &str) -> String {
+    pub(crate) fn call_key(namespace: Option<&str>, call_id: &str) -> String {
         match namespace {
             None => format!("root:{call_id}"),
             Some(ns) => format!("child:{}:{ns}:{call_id}", ns.len()),
         }
     }
-    pub(crate) fn journaled(&self, call_id: &str) -> Result<Option<JournalAction>> {
+    pub(crate) fn active_action(&self, call_id: &str) -> Result<Option<ActiveAction>> {
         self.store.action_for_key(
             self.request.session_id,
             self.request.turn_id,
-            &Self::journal_key(None, call_id),
+            &Self::call_key(None, call_id),
         )
-    }
-    pub(crate) fn operator_reviewed_action_keys(&self) -> Result<Vec<(Uuid, String)>> {
-        self.store
-            .operator_reviewed_action_keys(self.request.session_id, self.request.turn_id)
-    }
-    /// Called from a blocking tool/restore context. Native receipt lookup only
-    /// observes an exact previous execution; it cannot dispatch a new command.
-    pub(crate) fn recover_journaled(&self, call_id: &str) -> Result<Option<JournalAction>> {
-        self.journaled(call_id)?
-            .map(|action| self.recover_native_action(action))
-            .transpose()
-    }
-    pub(crate) fn recover_native_action(&self, action: JournalAction) -> Result<JournalAction> {
-        if action.state != "outcome_unknown" || action.intent.name != "environment_execute" {
-            return Ok(action);
-        }
-        let _lease = self.store.lock_action_execution(action.intent.id)?;
-        let Some(observation) = self.runtime.block_on(self.capabilities.recover_execution(
-            &action.intent.name,
-            &action.intent.arguments,
-            self.cancel.child_token(),
-        ))?
-        else {
-            return Ok(action);
-        };
-        let result = serde_json::to_value(observation)?;
-        let success = !observation_failed(&result);
-        let evidence = "Exact native environment operation identity, arguments and terminal receipt verified without command dispatch";
-        if success {
-            self.store
-                .reconcile_action(action.intent.id, Some(&result), evidence)?;
-        } else {
-            self.store
-                .reconcile_action_failure_with_result(action.intent.id, &result, evidence)?;
-        }
-        let presented = self.bound_result(action.intent.id, result);
-        self.emit(EngineEvent::ToolFinished {
-            action_id: action.intent.id,
-            name: action.intent.name,
-            result: serde_json::to_string(&presented)?,
-            success,
-            parent_id: self.parent_id,
-        })?;
-        self.store
-            .action(action.intent.id)?
-            .context("Recovered action disappeared")
     }
     /// Drains newly encountered path-scoped instructions at a model boundary.
     fn record_instruction_touch(&self, path: &std::path::Path) {
@@ -692,7 +646,7 @@ impl ToolBroker {
         self.execute_scoped(None, call_id, name, arguments, Origin::Model)
     }
     /// A child has a unique stable parent-call namespace and no delegation entry,
-    /// including through call_tool. It still shares policy and the durable journal.
+    /// including through call_tool. It still shares policy and live call tracking.
     pub(crate) fn execute_child(
         &self,
         namespace: &str,
@@ -855,7 +809,7 @@ impl ToolBroker {
             }
             bail!(reason);
         }
-        let key = Self::journal_key(namespace, call_id);
+        let key = Self::call_key(namespace, call_id);
         if let Some(action) =
             self.store
                 .action_for_key(self.request.session_id, self.request.turn_id, &key)?
@@ -906,7 +860,7 @@ impl ToolBroker {
         } else {
             xylo_services::hooks::HookOutput::default()
         };
-        let key = Self::journal_key(namespace, call_id);
+        let key = Self::call_key(namespace, call_id);
         if let Some(action) =
             self.store
                 .action_for_key(self.request.session_id, self.request.turn_id, &key)?
@@ -971,7 +925,7 @@ impl ToolBroker {
         };
         let mode = self.mode();
         // A memory write's origin is the least-trusted content the
-        // conversation has read, recomputed from the journal.
+        // conversation has read, derived from available provenance.
         let exposure = (name == "memory_remember")
             .then(|| self.exposure())
             .transpose()?;
@@ -1143,25 +1097,13 @@ impl ToolBroker {
             presentation = json!({"request": presentation, "source": entry.workspace.join(".mcp.json"), "server": entry.config.name, "transport": entry.config.transport, "command": entry.config.command, "args": entry.config.args, "endpoint": entry.config.endpoint, "environment_names": entry.environment.keys().collect::<Vec<_>>()});
         }
         let id = Uuid::new_v4();
-        // Native clients can close inherited descriptors and outlive a crashed
-        // worker. Only proven in-process writes qualify for generic review.
-        let qualified = matches!(
-            name,
-            "file_write" | "file_edit" | "memory_remember" | "skill_propose"
-        );
-        let execution_lease = qualified
-            .then(|| self.store.action_execution_lease(id, true))
-            .transpose()?;
-        let _action_scope = execution_lease
-            .as_ref()
-            .map(|lease| xylo_resources::ActionLeaseScope::enter(lease.file()));
         let intent = ActionIntent {
             id,
             session_id: self.request.session_id,
             turn_id: self.request.turn_id,
             name: name.into(),
             arguments: arguments.clone(),
-            // Interactions serialize with writes but have no external effect to reconcile after a crash.
+            // Interactions serialize with writes but do not change external state.
             writes: definition.writes && !matches!(name, "ask_user" | "exit_plan_mode"),
             idempotency_key: key.clone(),
         };
@@ -1171,7 +1113,7 @@ impl ToolBroker {
                 let previous = self
                     .store
                     .action_for_key(self.request.session_id, self.request.turn_id, &key)?
-                    .context("Reused action has no journal record")?;
+                    .context("Reused call has no live result")?;
                 return Ok(serde_json::to_string(
                     &self.model_result(previous.intent.id, result),
                 )?);
@@ -1340,12 +1282,7 @@ impl ToolBroker {
                         .execute(name, &arguments, self.cancel.child_token())
                         .await
                 };
-                let result = match &execution_lease {
-                    Some(lease) => self
-                        .runtime
-                        .block_on(xylo_resources::scope_action(lease.file(), operation)),
-                    None => self.runtime.block_on(operation),
-                }?;
+                let result = self.runtime.block_on(operation)?;
                 serde_json::to_value(result)?
             };
             ensure_observation_success(&result)?;
@@ -1353,17 +1290,16 @@ impl ToolBroker {
         })();
         match execution {
             Ok(result) => {
-                // Record the actual operation result BEFORE fallible artifact/UI work.
-                // If persistence fails after a write, retain uncertainty, never replay it.
+                // Keep the live result before fallible artifact/UI work.
                 if let Err(error) = self.store.finish_action(id, &result) {
                     if definition.writes {
                         let _ = self.store.mark_action_unknown(
                             id,
-                            "Operation returned a result but result persistence failed",
+                            "Operation returned a result but live tracking failed",
                         );
                     }
                     return Err(error)
-                        .context("Tool completed but durable result could not be confirmed");
+                        .context("Tool completed but live result could not be retained");
                 }
                 if let Some(path) = arguments.get("path").and_then(Value::as_str) {
                     self.record_instruction_touch(std::path::Path::new(path));
@@ -1440,6 +1376,10 @@ impl ToolBroker {
                     || error
                         .downcast_ref::<image_generation::DefinitiveFailure>()
                         .is_some()
+                    || (name.starts_with("browser_")
+                        && error
+                            .downcast_ref::<xylo_capabilities::browser::BrowserNotDispatched>()
+                            .is_some())
                     || (name == "connector_call"
                         && error
                             .downcast_ref::<xylo_services::ConnectorNotDispatched>()
@@ -1464,13 +1404,12 @@ impl ToolBroker {
             }
         }
     }
-    /// The model's answer for a call identity that already has a journal entry.
-    fn replay(&self, action: JournalAction, name: &str, arguments: &Value) -> Result<String> {
+    /// Reuse only an in-process result for an already-seen call identity.
+    fn replay(&self, action: ActiveAction, name: &str, arguments: &Value) -> Result<String> {
         ensure!(
-            action.intent.name == name && &action.intent.arguments == arguments,
+            action.intent.name == name && action.matches_arguments(arguments),
             "Tool call identity was reused with different arguments"
         );
-        let action = self.recover_native_action(action)?;
         match action.state.as_str() {
             "succeeded" => Ok(serde_json::to_string(
                 &self.model_result(
@@ -1481,7 +1420,7 @@ impl ToolBroker {
                 ),
             )?),
             "outcome_unknown" => {
-                bail!("Previous outcome is unknown. Reconcile the action before continuing")
+                bail!("This call was interrupted and will not be repeated automatically")
             }
             "pending" | "running" => {
                 bail!("Action is already pending or executing; it will not be dispatched twice")
@@ -1503,12 +1442,12 @@ impl ToolBroker {
     /// exposed content any action of this conversation (every turn, every
     /// child agent) may have shown the model, or
     /// [`MemoryOrigin::AgentInferred`] when it read only the project.
-    /// Derived from the durable action journal and instruction-source records,
+    /// Derived from live tool provenance, saved conversation context and instruction sources,
     /// so it survives restarts. Recalled facts count with their own origins.
     fn exposure(&self) -> Result<MemoryOrigin> {
         self.session_exposure(self.request.session_id, true)
     }
-    /// The most exposed content any journaled action of `session` may have
+    /// The most exposed content any tracked action of `session` may have
     /// shown the model. With `follow_procedures`, reading a learned procedure
     /// counts with the exposure of the conversations it was learned from (one
     /// level deep; a procedure read inside those counts as tool output).
@@ -1534,7 +1473,7 @@ impl ToolBroker {
             |least, action| Ok(least.max(self.action_exposure(action, follow_procedures)?)),
         )
     }
-    /// What one journaled action may have shown the model.
+    /// What one tracked action may have shown the model.
     fn action_exposure(
         &self,
         action: &xylo_services::ActionProvenance,
@@ -2132,7 +2071,7 @@ impl ToolBroker {
         let encoded = match serde_json::to_vec(&result) {
             Ok(v) => v,
             Err(error) => {
-                return json!({"status":status,"summary":"Tool result is stored in the action journal","action_id":id,"presentation_error":error.to_string()});
+                return json!({"status":status,"summary":"Tool result is available in this turn","action_id":id,"presentation_error":error.to_string()});
             }
         };
         if encoded.len() <= PRESENTATION_BYTES {
@@ -2143,7 +2082,7 @@ impl ToolBroker {
         if let Ok(path) = &write {
             references.push(serde_json::to_value(path).unwrap_or(Value::Null));
         }
-        let mut presented = json!({"status":status,"summary":"Tool result recorded. Open the attached result or action journal for details.",
+        let mut presented = json!({"status":status,"summary":"Tool result recorded. Open the attached result for details.",
             "action_id":id,"next_actions":["Inspect the full result before retrying an unsuccessful or uncertain action"],
             "artifacts":[],"truncated":true});
         if let Err(error) = write {
@@ -2198,7 +2137,7 @@ impl ToolBroker {
                     && !metadata.file_type().is_symlink()
                     && metadata.len() == encoded.len() as u64
                     && std::fs::read(&path)? == encoded,
-                "Stored tool presentation differs from the action journal"
+                "Stored tool presentation differs from the live result"
             );
             return Ok(path);
         }
@@ -2315,7 +2254,7 @@ impl ToolBroker {
     }
 }
 /// Keeps start and approval events far below the protocol line limit; the
-/// journal and the tool itself always receive the complete arguments.
+/// live tracker and the tool itself always receive the complete arguments.
 fn bound_presentation(value: Value) -> Value {
     match serde_json::to_vec(&value) {
         Ok(encoded) if encoded.len() > PRESENTATION_EVENT_BYTES => {
@@ -2556,7 +2495,7 @@ const FETCHING_GIT: &[&str] = &["fetch", "pull", "clone", "ls-remote", "submodul
 /// the project.
 fn command_stays_in_project(name: &str, arguments: &Value, workspace: &std::path::Path) -> bool {
     // Directory overrides can grant outside access. Keep their output untrusted
-    // in the durable journal, including later calls inheriting that directory.
+    // in live tracking, including later calls inheriting that directory.
     if arguments.get("cwd").is_some() {
         return false;
     }

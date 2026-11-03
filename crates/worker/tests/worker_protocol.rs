@@ -1,5 +1,5 @@
 //! End-to-end checks use the real worker process, streaming provider,
-//! native broker and SQLite journal against a local deterministic HTTP fixture.
+//! native broker and saved chat checkpoints against a local deterministic HTTP fixture.
 
 use serde_json::{Value, json};
 use std::{
@@ -203,7 +203,7 @@ async fn real_worker_streams_executes_and_checkpoints() {
             },
         )
         .await;
-    let mut tool_finished = false;
+    let mut finished_action = None;
     let mut streamed = false;
     let mut last_sequence = 0;
     loop {
@@ -213,11 +213,14 @@ async fn real_worker_streams_executes_and_checkpoints() {
         match event.payload {
             EngineEvent::Delta { text } => streamed |= !text.is_empty(),
             EngineEvent::ToolFinished {
-                success, result, ..
+                action_id,
+                success,
+                result,
+                ..
             } => {
                 assert!(success);
                 assert!(result.contains("durable fixture contents"));
-                tool_finished = true;
+                finished_action = Some(action_id);
             }
             EngineEvent::Completed { text, .. } => {
                 assert!(text.contains("durable fixture contents"));
@@ -227,7 +230,21 @@ async fn real_worker_streams_executes_and_checkpoints() {
             _ => {}
         }
     }
-    assert!(tool_finished && streamed);
+    assert!(streamed);
+    let action = finished_action.expect("The worker must publish live tool completion");
+    let store =
+        xylo_services::Store::open_existing(worker._profile.path().join("xylo.db")).unwrap();
+    assert!(
+        store.action(action).unwrap().is_none(),
+        "Live worker activity must not become a durable action record"
+    );
+    let checkpoint = store.checkpoint(session).unwrap().unwrap();
+    assert!(
+        checkpoint
+            .messages
+            .to_string()
+            .contains("durable fixture contents")
+    );
     {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);

@@ -47,7 +47,13 @@ Xylo keeps conversations, project files and practical tools together. Bring a lo
 
 Browser actions, images, voice and local model tools extend the workspace through services that start when used. Xylo's sole managed browser is the source-built, render-enabled **Obscura v0.2.6** component, packaged as the sibling `xylo-obscura` executable (`.exe` on Windows) and supervised through private local IPC. It is not a browser URL, cloud service, MCP connection, optional asset download or custom executable setting; there is no installed Chrome/Chromium/Edge fallback. Seven browser tools support navigation, snapshots, click, type, wait, screenshots and close; browser downloads are unsupported. Private-network access is blocked by default; `browser_allow_private_network: true` explicitly enables broad loopback/private-network access, not a per-host allowlist.
 
+Obscura loads native operating-system certificate authorities alongside its bundled roots, including locally trusted enterprise certificates. Certificate and hostname verification remain enabled. The pinned [source patch](crates/patches/README.md) is verified and included in build provenance.
+
 Other features may need an explicit asset download, configured service or operating system permission. Browser implementation is integrated into the build/package, but real-browser and cross-platform runtime qualification remain separate release gates; see [the integration record](docs/obscura-integration-plan.md).
+
+Tool activity is tracked in memory while the app runs. There is no durable action journal or interrupted-action review form. Saved conversations and diagnostic logs remain available; an unanswered call in a restored chat is reported as interrupted instead of automatically repeated.
+
+This is a maintained product constraint: do not add persistent tool-action journals, manual reconciliation forms, or an unresolved-action gate that blocks continuing a chat. Keep transient tracking bounded and report failed or interrupted calls honestly. Preserve normal permissions, chat checkpoints, saved drafts and rotating diagnostic logs. Contributor and coding-agent requirements are in [AGENTS.md](AGENTS.md).
 
 Xylo uses a native interface, background execution and automatic local resource scheduling. Responsiveness is a design priority; performance measurements are still being qualified.
 
@@ -81,16 +87,16 @@ npm ci --prefix crates/services/sandbox-helper --ignore-scripts --no-audit --no-
 cargo run --locked --bin xylo
 ```
 
-On macOS, `cargo bundle-macos` builds a complete release app at `dist/Xylo.app` using Rust build tooling.
+On macOS, `cargo run --locked -p xylo-build -- bundle-macos` builds a complete release app at `dist/Xylo.app` using Rust build tooling.
 The bundle includes its worker, helper, CLI and Obscura browser component, and remains usable after cleaning the Cargo cache.
 
 Windows builds embed the application icon in `xylo.exe` for Explorer, the title bar and taskbar, including builds with `--no-default-features`. Rebuild and restart to update an already-running executable. On Linux, X11 receives window-icon pixels directly; Wayland resolves the icon through `xylo.desktop` and the installed `xylo` hicolor icon. Install the DEB or integrate the AppImage with your desktop for Wayland launcher icons; a source-only `cargo run` without a desktop entry may show a generic icon. Linux release verification checks the launcher identity, hicolor PNG and AppImage root icon entries.
 
-The pinned Rust toolchain is selected by `rust-toolchain.toml`. Standard `cargo build --locked` builds the application binaries and bundled browser through the desktop crate's default `bundled-browser` feature; evaluation tools are opt-in. Use `cargo build --locked --release` for an optimized build. `cargo app` and `cargo app-release` remain convenience aliases, not required build wrappers. The browser builder is Rust, invoked by Cargo's `build.rs`; a browser build failure stops the build rather than silently omitting it. Builds require Git, Rust/Cargo and native C/C++ build tools, with build-time network access for pinned upstream source, locked crates and the versioned upstream V8 static-library archive. Rust downloads that archive and supplies its local path to upstream Cargo, bypassing upstream's interpreter-based download/source-build paths. No Python installation is required. Obscura's Rust code is compiled from source; V8 itself remains a prebuilt native dependency, not pure Rust.
+The pinned Rust toolchain is selected by `rust-toolchain.toml`. Standard `cargo build --locked` builds the application binaries and bundled browser through the desktop crate's default `bundled-browser` feature; evaluation tools are opt-in. Use `cargo build --locked --release` for an optimized build. The browser builder is Rust, invoked by Cargo's `build.rs`; a browser build failure stops the build rather than silently omitting it. Builds require Git, Rust/Cargo and native C/C++ build tools, with build-time network access for pinned upstream source, locked crates and the versioned upstream V8 static-library archive. Rust downloads that archive and supplies its local path to upstream Cargo, bypassing upstream's interpreter-based download/source-build paths. No Python installation is required. Obscura's Rust code is compiled from source; V8 itself remains a prebuilt native dependency, not pure Rust.
 
 For a fast application compile check without building the browser, use `cargo check -p xylo --locked --no-default-features`; ordinary `cargo check` retains the default browser feature. `cargo test --locked -p xylo-build` tests build planning offline without fetching browser sources. Browser outputs are cached with revision, target, profile and binary-hash validation; initial native builds can be lengthy. Application builds otherwise use the checked-in assets and do not require a packager or updater configuration. Automatic updates are disabled until a trusted release feed is configured.
 
-Native UI checks share the root build cache and should be run by target, for example `cargo native-test --test composer-interactions`. See [Native validation](crates/desktop/validation/README.md) for focused checks and cache cleanup.
+Native UI checks can share the root build cache and should be run by target, for example `cargo test --locked --manifest-path crates/desktop/validation/Cargo.toml --target-dir target --test composer-interactions`. See [Native validation](crates/desktop/validation/README.md) for focused checks and cache cleanup.
 
 Local executable tools use a pinned OS sandbox helper and require Node.js 22.12 or later. Xylo uses a bundled runtime first, then `XYLO_SANDBOX_NODE` if set, then `node` from `PATH` (including nvm, volta, fnm or asdf installs under your home directory) as long as the binary and its parent directories are owned by you or root and are not writable by other users; otherwise sandboxed tools report which Node.js was rejected and why. Install its locked dependencies with the command above. Missing sandbox dependencies fail closed; Xylo does not fall back to unrestricted execution. The native UI and Rust backend do not run in Node.js. macOS sandbox execution has local regression coverage; Linux packaging and Windows execution remain unqualified.
 
@@ -136,7 +142,7 @@ Every push and pull request runs the same gates on **macOS 15 and Ubuntu 24.04**
 | Release signing policy      | `cargo test --locked --manifest-path crates/release-tool/Cargo.toml` |
 | Dependency advisories       | `cargo audit` (pinned `cargo-audit` version)                        |
 
-Native UI behavior and rendering are checked separately per target, for example `cargo native-test --test composer-interactions`; see [Native validation](crates/desktop/validation/README.md).
+Native UI behavior and rendering are checked separately per target, for example `cargo test --locked --manifest-path crates/desktop/validation/Cargo.toml --target-dir target --test composer-interactions`; see [Native validation](crates/desktop/validation/README.md).
 
 ## Project layout
 
@@ -169,7 +175,6 @@ flowchart LR
 | `crates/evals`        | Deterministic evaluation and trace harness                                     |
 | `crates/core`         | Application-owned contracts                                                    |
 | `sdk/`                | Rust SDK, plugin SDK and [protocol-v1](sdk/protocol-v1.md)                     |
-| `ide/vscode`          | Development VS Code bridge exposing selection and diagnostics over local MCP   |
 | `examples/plugins`    | Minimal example plugins                                                        |
 | `docs/`               | [Documentation index](docs/README.md) and [Agents in Xylo](docs/modules/engine-agents-and-skills.md)     |
 

@@ -116,7 +116,7 @@ impl Delegation {
             max_tokens: self.max_tokens,
             max_model_calls: MAX_MODEL_CALLS,
             events: self.events.clone(),
-            journal: None,
+            conversation_state: None,
             permissions: Some((self.permissions.clone(), mode)),
             cancel: cancel.clone(),
         };

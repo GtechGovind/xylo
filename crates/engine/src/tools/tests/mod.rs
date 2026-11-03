@@ -64,7 +64,7 @@ async fn malformed_native_connector_writes_do_not_create_uncertain_actions_or_ap
                 "{error}"
             );
             assert!(
-                execution.journaled(&key).unwrap().is_none(),
+                execution.active_action(&key).unwrap().is_none(),
                 "Rejected input must not leave an uncertain action"
             );
         }
@@ -74,7 +74,7 @@ async fn malformed_native_connector_writes_do_not_create_uncertain_actions_or_ap
     assert!(
         broker
             .store
-            .unresolved_actions(broker.request.session_id)
+            .unfinished_actions(broker.request.session_id)
             .unwrap()
             .is_empty()
     );
@@ -166,7 +166,7 @@ async fn agent_dispatch_cannot_invoke_application_management_controls() {
                     broker.execute(&key, name, json!({}))
                 };
                 assert!(result.unwrap_err().to_string().contains("Unknown tool"));
-                assert!(broker.journaled(&key).unwrap().is_none());
+                assert!(broker.active_action(&key).unwrap().is_none());
             }
         }
     })
@@ -190,7 +190,7 @@ async fn installed_extension_and_environment_execution_obey_read_only_tasks() {
             let key = format!("read-only-{name}");
             let error = broker.execute(&key, name, json!({})).unwrap_err();
             assert!(error.to_string().contains("requires write permission"));
-            assert!(broker.journaled(&key).unwrap().is_none());
+            assert!(broker.active_action(&key).unwrap().is_none());
         }
     })
     .await
@@ -199,12 +199,12 @@ async fn installed_extension_and_environment_execution_obey_read_only_tasks() {
 #[test]
 fn keys_are_namespaced_and_unambiguous() {
     assert_ne!(
-        ToolBroker::journal_key(None, "child:1:x:y"),
-        ToolBroker::journal_key(Some("x"), "y")
+        ToolBroker::call_key(None, "child:1:x:y"),
+        ToolBroker::call_key(Some("x"), "y")
     );
     assert_ne!(
-        ToolBroker::journal_key(Some("a:b"), "c"),
-        ToolBroker::journal_key(Some("a"), "b:c")
+        ToolBroker::call_key(Some("a:b"), "c"),
+        ToolBroker::call_key(Some("a"), "b:c")
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -233,7 +233,7 @@ async fn children_cannot_delegate_directly_or_through_dispatch_alias() {
         );
         broker
             .store
-            .unresolved_actions(broker.request.session_id)
+            .unfinished_actions(broker.request.session_id)
             .unwrap()
     })
     .await
@@ -275,7 +275,7 @@ async fn child_call_identity_does_not_reuse_sibling_result() {
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn execution_error_after_running_always_finishes_the_journal_state() {
+async fn execution_error_after_running_always_finishes_the_live_action_state() {
     let (_directory, broker, _events) = fixture(PermissionMode::AskForApproval);
     let task = broker.clone();
     assert!(
@@ -288,12 +288,15 @@ async fn execution_error_after_running_always_finishes_the_journal_state() {
         .unwrap()
         .is_err()
     );
-    let action = broker.journaled("delegate-no-handler").unwrap().unwrap();
+    let action = broker
+        .active_action("delegate-no-handler")
+        .unwrap()
+        .unwrap();
     assert_eq!(action.state, "failed");
     assert!(
         broker
             .store
-            .unresolved_actions(broker.request.session_id)
+            .unfinished_actions(broker.request.session_id)
             .unwrap()
             .is_empty()
     );
@@ -317,7 +320,7 @@ pub(super) async fn run(
         .unwrap()
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn presentation_failure_does_not_erase_a_completed_result() {
+async fn presentation_failure_does_not_erase_the_model_result() {
     let (directory, broker, _events) = fixture(PermissionMode::ReadOnly);
     needles(directory.path());
     std::fs::remove_dir_all(&broker.artifacts).unwrap();
@@ -340,9 +343,14 @@ async fn presentation_failure_does_not_erase_a_completed_result() {
             .unwrap()
             .contains("needle 0 ")
     );
-    let action = broker.journaled("search-big").unwrap().unwrap();
+    let action = broker.active_action("search-big").unwrap().unwrap();
     assert_eq!(action.state, "succeeded");
-    assert_eq!(action.result.unwrap()["summary"]["matches"], 2000);
+    assert_eq!(value["summary"]["matches"], 2000);
+    assert!(
+        action.result.is_none(),
+        "Oversized output stays out of the live cache"
+    );
+    assert!(!action.evidence_complete);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_results_reach_the_model_while_events_stay_small() {
@@ -431,7 +439,10 @@ async fn failing_commands_are_definitive_observations_with_their_output() {
     let text = format!("{error:#}");
     assert!(text.contains("\"exit_code\":1"), "{text}");
     assert!(text.contains("definitely-not-a-subcommand"), "{text}");
-    assert_eq!(broker.journaled("fails").unwrap().unwrap().state, "failed");
+    assert_eq!(
+        broker.active_action("fails").unwrap().unwrap().state,
+        "failed"
+    );
     let missing = run(
         &broker,
         "missing",
@@ -442,7 +453,7 @@ async fn failing_commands_are_definitive_observations_with_their_output() {
     .unwrap_err();
     assert!(format!("{missing:#}").contains("was not found"));
     assert_eq!(
-        broker.journaled("missing").unwrap().unwrap().state,
+        broker.active_action("missing").unwrap().unwrap().state,
         "failed"
     );
     let ok = run(
@@ -457,7 +468,7 @@ async fn failing_commands_are_definitive_observations_with_their_output() {
     assert!(
         broker
             .store
-            .unresolved_actions(broker.request.session_id)
+            .unfinished_actions(broker.request.session_id)
             .unwrap()
             .is_empty()
     );
@@ -500,7 +511,7 @@ async fn accepted_edits_apply_without_prompts_and_inapplicable_edits_leave_no_in
         .await
         .is_err()
     );
-    assert!(broker.journaled("edit-missing").unwrap().is_none());
+    assert!(broker.active_action("edit-missing").unwrap().is_none());
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn always_allow_uses_the_saved_file_rule_and_revocation_is_immediate() {
@@ -602,7 +613,7 @@ async fn native_connector_write_classification_cannot_be_overridden_by_arguments
     let task = broker.clone();
     let error=tokio::task::spawn_blocking(move||task.execute("write","connector_call",json!({"connector_id":id,"tool":"github_create_issue","arguments":{"owner":"o","repo":"r","title":"t"},"writes":false}))).await.unwrap().unwrap_err();
     assert!(error.to_string().contains("read-only"));
-    assert!(broker.journaled("write").unwrap().is_none());
+    assert!(broker.active_action("write").unwrap().is_none());
     // Every connector call asks in Read only, even one classified as a read.
     let task = broker.clone();
     let read = tokio::task::spawn_blocking(move || {
@@ -624,10 +635,13 @@ async fn native_connector_write_classification_cannot_be_overridden_by_arguments
     }
     let error = read.await.unwrap().unwrap_err();
     assert!(error.to_string().contains("credential"));
-    assert_eq!(broker.journaled("read").unwrap().unwrap().state, "failed");
+    assert_eq!(
+        broker.active_action("read").unwrap().unwrap().state,
+        "failed"
+    );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_observation_is_not_journaled_as_success() {
+async fn failed_observation_is_not_tracked_as_success() {
     let (_directory, broker, _events) = fixture(PermissionMode::AskForApproval);
     broker.set_delegate(Arc::new(|_call: &DelegateCall| {
         Ok(json!({"status":"failed","error":"fixture provider failure"}))
@@ -644,7 +658,11 @@ async fn failed_observation_is_not_journaled_as_success() {
         .is_err()
     );
     assert_eq!(
-        broker.journaled("delegate-failure").unwrap().unwrap().state,
+        broker
+            .active_action("delegate-failure")
+            .unwrap()
+            .unwrap()
+            .state,
         "failed"
     );
 }
@@ -664,7 +682,7 @@ async fn incomplete_delegate_is_failed_with_partial_result_preserved() {
         .unwrap()
         .is_err()
     );
-    let action = broker.journaled("incomplete-child").unwrap().unwrap();
+    let action = broker.active_action("incomplete-child").unwrap().unwrap();
     assert_eq!(action.state, "failed");
     assert_eq!(action.result.unwrap()["result"], "partial findings");
 }
@@ -695,7 +713,7 @@ async fn uncertain_observation_is_retained_and_never_replayed_as_success() {
     .await
     .unwrap();
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-    let action = broker.journaled("uncertain").unwrap().unwrap();
+    let action = broker.active_action("uncertain").unwrap().unwrap();
     assert_eq!(action.state, "outcome_unknown");
     assert_eq!(action.result, Some(observation));
     let mut finished = None;
@@ -732,7 +750,7 @@ async fn model_supplied_plugin_capabilities_are_refused_before_any_intent() {
     .await
     .unwrap_err();
     assert!(error.to_string().contains("reviewed"), "{error}");
-    assert!(broker.journaled("self-granted").unwrap().is_none());
+    assert!(broker.active_action("self-granted").unwrap().is_none());
     assert!(events.try_recv().is_err());
 }
 #[tokio::test]
@@ -792,7 +810,7 @@ async fn denied_write_never_touches_the_file() {
     assert!(running.await.unwrap().is_err());
     assert!(!never.exists());
     assert_eq!(
-        broker.journaled("write-denied").unwrap().unwrap().state,
+        broker.active_action("write-denied").unwrap().unwrap().state,
         "denied"
     );
     while let Ok(event) = events.try_recv() {
@@ -908,7 +926,7 @@ async fn retrieved_verified_command_remains_advisory_and_cannot_bypass_read_only
             .action_for_key(
                 broker.request.session_id,
                 broker.request.turn_id,
-                &ToolBroker::journal_key(None, "attempt-reuse")
+                &ToolBroker::call_key(None, "attempt-reuse")
             )
             .unwrap()
             .is_none()
@@ -1009,7 +1027,7 @@ async fn connector_discovery_snapshot_never_grants_execution_after_removal() {
             )
             .is_err()
         );
-        assert!(next.journaled("removed-connector").unwrap().is_none());
+        assert!(next.active_action("removed-connector").unwrap().is_none());
     })
     .await
     .unwrap();
@@ -1142,7 +1160,7 @@ async fn portable_dynamic_context_is_denied_in_read_only_tasks_while_plain_skill
             error.to_string().contains("requires write permission"),
             "{error}"
         );
-        assert!(task.journaled("dynamic").unwrap().is_none());
+        assert!(task.active_action("dynamic").unwrap().is_none());
     })
     .await
     .unwrap();
@@ -1186,7 +1204,11 @@ async fn portable_dynamic_context_waits_for_broker_approval_and_denial_never_exe
     );
     assert!(!directory.path().join("dynamic-marker").exists());
     assert_eq!(
-        broker.journaled("dynamic-approval").unwrap().unwrap().state,
+        broker
+            .active_action("dynamic-approval")
+            .unwrap()
+            .unwrap()
+            .state,
         "denied"
     );
 }
@@ -1283,7 +1305,7 @@ fn installed_tool_hooks(broker: &ToolBroker, pre: &str, post: &str) {
         .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn enabled_hooks_run_journaled_without_prompts_and_never_recurse_or_replay() {
+async fn enabled_hooks_run_tracked_without_prompts_and_never_recurse_or_replay() {
     let (directory, broker, mut events) = fixture(PermissionMode::AskForApproval);
     installed_tool_hooks(
         &broker,
@@ -1361,7 +1383,7 @@ async fn hook_denial_blocks_original_mutation_and_read_only_tasks_still_run_hook
     .unwrap_err();
     assert!(error.to_string().contains("Pre-tool hook prevented"));
     assert!(!directory.path().join("should-not-exist.txt").exists());
-    assert!(broker.journaled("blocked-write").unwrap().is_none());
+    assert!(broker.active_action("blocked-write").unwrap().is_none());
     let (directory, broker, mut events) = fixture(PermissionMode::ReadOnly);
     std::fs::write(directory.path().join("sample.txt"), "readable").unwrap();
     installed_tool_hooks(&broker, "printf ran > hook-marker; printf '{}'", "");
@@ -1380,7 +1402,7 @@ async fn hook_denial_blocks_original_mutation_and_read_only_tasks_still_run_hook
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn post_hook_failure_preserves_completed_tool_receipt_and_blocks_uncertain_hook_replay() {
+async fn post_hook_failure_keeps_live_duplicate_guard_without_blocking_new_calls() {
     let (directory, broker, _events) = fixture(PermissionMode::ApproveForMe);
     installed_tool_hooks(&broker, "", "printf once >> post-marker; exit 1");
     let task = broker.clone();
@@ -1399,7 +1421,7 @@ async fn post_hook_failure_preserves_completed_tool_receipt_and_blocks_uncertain
             .contains("Tool completed")
     );
     assert_eq!(
-        broker.journaled("post-write").unwrap().unwrap().state,
+        broker.active_action("post-write").unwrap().unwrap().state,
         "succeeded"
     );
     assert_eq!(
@@ -1435,11 +1457,11 @@ async fn post_hook_failure_preserves_completed_tool_receipt_and_blocks_uncertain
         next["post_tool_hook_error"]
             .as_str()
             .unwrap()
-            .contains("previous hook outcome is unknown")
+            .contains("Tool completed")
     );
     assert_eq!(
         std::fs::read_to_string(directory.path().join("post-marker")).unwrap(),
-        "once"
+        "onceonce"
     );
 }
 
@@ -1720,7 +1742,7 @@ async fn permission_changes_apply_to_the_next_call_of_a_running_task() {
     .await
     .unwrap_err();
     assert!(refused.to_string().contains("read-only"), "{refused}");
-    assert!(broker.journaled("read-only-write").unwrap().is_none());
+    assert!(broker.active_action("read-only-write").unwrap().is_none());
     broker.session.permissions().set(PermissionMode::FullAccess);
     let outside = tempfile::tempdir().unwrap();
     run(
@@ -1886,7 +1908,7 @@ async fn network_requests_are_validated_approved_and_sandbox_denials_suggest_the
     .await
     .unwrap_err();
     assert!(missing.to_string().contains("justification"), "{missing}");
-    assert!(broker.journaled("no-justification").unwrap().is_none());
+    assert!(broker.active_action("no-justification").unwrap().is_none());
     // Offline: the sandbox refuses the connection and the model is told how
     // to ask for the network. The denied destination never resolves.
     // The command may still exit successfully (the sandbox proxy answers
@@ -1961,8 +1983,6 @@ async fn network_requests_are_validated_approved_and_sandbox_denials_suggest_the
 }
 
 #[cfg(unix)]
-mod action_review;
-
 mod memory_provenance;
 
 mod environment_recovery;
@@ -2080,3 +2100,56 @@ mod settings;
 
 mod catalog_revocation;
 mod interaction;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_browser_url_does_not_leave_unfinished_actions() {
+    let (_directory, broker, _events) = fixture(PermissionMode::FullAccess);
+    let execution = broker.clone();
+    let error = tokio::task::spawn_blocking(move || {
+        execution.execute(
+            "invalid-browser-url",
+            "browser_navigate",
+            json!({"url":"file:///private/fixture"}),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.to_string().contains("HTTP(S)"), "{error:#}");
+    let action = broker
+        .active_action("invalid-browser-url")
+        .unwrap()
+        .unwrap();
+    assert_eq!(action.state, "failed");
+    assert!(
+        broker
+            .store
+            .unfinished_actions(broker.request.session_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_file_write_executes_with_bounded_tracking_and_cannot_replay() {
+    let (directory, broker, _events) = fixture(PermissionMode::FullAccess);
+    let content = "large input\n".repeat(10_000);
+    let args = json!({"path":"large-write.txt","content":content});
+    let first = run(&broker, "large-write", "file_write", args.clone())
+        .await
+        .unwrap();
+    let path = directory.path().join("large-write.txt");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    let action = broker.active_action("large-write").unwrap().unwrap();
+    assert!(action.matches_arguments(&args));
+    assert!(!action.evidence_complete);
+    std::fs::write(&path, "subsequent external change").unwrap();
+    let duplicate = run(&broker, "large-write", "file_write", args)
+        .await
+        .unwrap();
+    assert_eq!(duplicate, first);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "subsequent external change"
+    );
+}

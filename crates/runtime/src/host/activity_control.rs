@@ -1,4 +1,4 @@
-//! Activity queries use the existing journal, off the UI thread.
+//! Activity queries read transient tool activity off the UI thread.
 use super::*;
 impl HostClient {
     pub fn subagent_activity(&self, id: Uuid, session: Uuid) -> Result<()> {
@@ -85,10 +85,10 @@ impl HostState {
     }
 }
 
-/// Old journal entries lack job_turn_id. Resolve it from retained app-owned
+/// Activity entries may lack job_turn_id. Resolve it from retained app-owned
 /// metadata only after the caller's session, turn and action were validated.
 fn resolve_command_origin(
-    record: &mut xylo_services::JournalAction,
+    record: &mut xylo_services::ActiveAction,
     artifacts: &std::path::Path,
     session: Uuid,
 ) -> Result<()> {

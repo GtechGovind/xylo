@@ -256,3 +256,53 @@ fn session_provenance_lists_actions_that_ran_with_requested_details_only() {
         "web_content"
     );
 }
+
+#[test]
+fn restored_history_keeps_conservative_provenance_without_an_execution_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+    let store = Store::open(&path).unwrap();
+    let session = Uuid::new_v4();
+    let turn = Uuid::new_v4();
+    store
+        .upsert_conversation(&xylo_core::Conversation {
+            id: session,
+            title: "Saved history".into(),
+            workspace: dir.path().into(),
+            updated_at: 1,
+            title_source: Default::default(),
+            pinned: false,
+            archived: false,
+        })
+        .unwrap();
+    store
+        .save_checkpoint(
+            session,
+            turn,
+            &serde_json::json!([{"role":"assistant","content":"Earlier outside content"}]),
+        )
+        .unwrap();
+    assert!(
+        store
+            .session_action_provenance(session, &[], &[])
+            .unwrap()
+            .is_empty(),
+        "Current-process provenance uses live evidence"
+    );
+    drop(store);
+    let reopened = Store::open(&path).unwrap();
+    let provenance = reopened
+        .session_action_provenance(session, &[], &[])
+        .unwrap();
+    assert_eq!(provenance.len(), 1);
+    assert_eq!(
+        provenance[0].name, "web_fetch",
+        "Missing historical proof cannot imply project-only trust"
+    );
+    assert!(
+        reopened
+            .session_action_provenance(Uuid::new_v4(), &[], &[])
+            .unwrap()
+            .is_empty()
+    );
+}

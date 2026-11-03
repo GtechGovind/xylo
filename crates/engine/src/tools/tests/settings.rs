@@ -180,7 +180,7 @@ async fn real_user_prompt_hook_receives_json_and_context_reaches_the_model() {
         max_tokens: 256,
         max_model_calls: 4,
         events,
-        journal: None,
+        conversation_state: None,
         permissions: None,
         cancel: CancellationToken::new(),
     };
@@ -399,7 +399,7 @@ async fn tool_boundary_stop_prevents_remaining_batch_and_model(event: &str) {
         max_tokens: 256,
         max_model_calls: 4,
         events,
-        journal: None,
+        conversation_state: None,
         permissions: None,
         cancel: CancellationToken::new(),
     };

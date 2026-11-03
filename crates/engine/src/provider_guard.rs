@@ -786,7 +786,7 @@ impl ContextBudget {
         }
         // Tool outputs can overflow even a short conversation. Keep both ends
         // (including artifact references) and the call/result pairing; the full
-        // observation remains in the action journal.
+        // observation remains in the action conversation_state.
         for limit in [4096, 2048, 1024, 512] {
             if costs.iter().sum::<usize>() <= proactive {
                 break;

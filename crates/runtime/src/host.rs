@@ -35,9 +35,8 @@ use xylo_core::*;
 use xylo_helper_client::HelperClient;
 use xylo_resources::{ResourceLease, ResourceManager, TaskDemand};
 use xylo_services::settings_files::{PermissionDecision, PermissionRule, SettingsFiles};
+pub use xylo_services::{ActiveAction, McpPromptCommand, TurnActivityPage};
 use xylo_services::{ConnectorBroker, CredentialVault, SqliteMemory, Store};
-pub use xylo_services::{JournalAction, McpPromptCommand, TurnActivityPage};
-mod action_control;
 mod activity_control;
 mod credential_control;
 mod document_control;
@@ -71,7 +70,7 @@ pub enum HostEvent {
     SubagentActivity {
         request_id: Uuid,
         session: Uuid,
-        result: std::result::Result<Vec<JournalAction>, String>,
+        result: std::result::Result<Vec<ActiveAction>, String>,
     },
     TurnActivity {
         request_id: Uuid,
@@ -84,7 +83,7 @@ pub enum HostEvent {
         session: Uuid,
         turn: Uuid,
         action: Uuid,
-        result: std::result::Result<Option<xylo_services::JournalAction>, String>,
+        result: std::result::Result<Option<xylo_services::ActiveAction>, String>,
     },
     CommandOutput {
         request_id: Uuid,
@@ -128,30 +127,6 @@ pub enum HostEvent {
         action_id: Uuid,
         modes: Vec<PermissionMode>,
         scheduled: bool,
-    },
-    ActionReviews {
-        request_id: Uuid,
-        result: std::result::Result<crate::ActionReviewPage, String>,
-    },
-    ActionReview {
-        request_id: Uuid,
-        result: Box<std::result::Result<crate::ActionReviewDetail, String>>,
-    },
-    ActionResolved {
-        request_id: Uuid,
-        result: std::result::Result<crate::ActionResolutionReceipt, String>,
-    },
-    ActionResolution {
-        request_id: Uuid,
-        result: std::result::Result<Option<crate::ActionResolutionReceipt>, String>,
-    },
-    ActionReviewForm {
-        request_id: Uuid,
-        result: std::result::Result<crate::ActionReviewFormSnapshot, String>,
-    },
-    ActionReviewFormSaved {
-        request_id: Uuid,
-        result: std::result::Result<crate::ActionReviewFormSave, String>,
     },
     DocumentDraftRelinked {
         request_id: Uuid,
@@ -415,7 +390,6 @@ enum HostCommand {
     StopWakeups(Uuid),
     PreparedCancel(Vec<turn_queue_control::PreparedStop>),
     RefusedCancel,
-    Action(action_control::ActionCommand),
     Document(document_control::DocumentCommand),
     Fact(fact_control::FactCommand),
     Image(image_control::ImageCommand),
@@ -539,8 +513,6 @@ impl HostClient {
                 let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
                 let store = Store::open(&paths.database)?;
                 let database_reset = store.reset_notice();
-                let recovered = store.recover_interrupted()?;
-                if recovered > 0 { tracing::debug!(recovered, "Retained interrupted action outcomes"); }
                 store.recover_steering()?;
                 store.recover_turn_queue()?;
                 let (mut settings, settings_reset) = startup_settings(&store)?;
@@ -1335,12 +1307,6 @@ impl HostState {
                         .await?;
                     return Ok(false);
                 }
-                HostCommand::Action(command) => {
-                    self.events
-                        .send(command.refused("Wait for the update installation to finish"))
-                        .await?;
-                    return Ok(false);
-                }
                 HostCommand::Image(command) => {
                     self.events
                         .send(command.refused("Wait for the update installation to finish"))
@@ -1460,7 +1426,6 @@ impl HostState {
         }
         let control_id = match command {
             HostCommand::Document(command) => command.cancellable_id(),
-            HostCommand::Action(command) => command.cancellable_id(),
             HostCommand::Fact(command) => command.cancellable_id(),
             HostCommand::Image(command) => command.cancellable_id(),
             _ => None,
@@ -1471,9 +1436,6 @@ impl HostState {
                 drop(requests);
                 let event = match command {
                     HostCommand::Document(command) => {
-                        command.refused("Wait for the current actions to finish")
-                    }
-                    HostCommand::Action(command) => {
                         command.refused("Wait for the current actions to finish")
                     }
                     HostCommand::Fact(command) => {
@@ -1639,7 +1601,6 @@ impl HostState {
         let _operation = self.operations.read().await;
         match command {
             HostCommand::Document(command) => self.handle_document(command).await?,
-            HostCommand::Action(command) => self.handle_action(command).await?,
             HostCommand::Fact(command) => self.handle_fact(command).await?,
             HostCommand::Image(command) => self.handle_image(command).await?,
             HostCommand::QueueDraft(id, turn, submission) => {
@@ -3143,7 +3104,7 @@ impl HostState {
         Ok(Admission::Dispatched(receipt))
     }
 
-    /// A retried turn that already completed is answered from the journal.
+    /// A retried turn that already completed is answered from chat history.
     async fn replay_completed(
         &self,
         turn: &TurnRequest,

@@ -176,7 +176,7 @@ async fn approved_image_tool_uses_frozen_saved_provider_actual_output_and_durabl
         ImageGenerationState::Succeeded
     );
     assert_eq!(
-        broker.journaled("image-call").unwrap().unwrap().state,
+        broker.active_action("image-call").unwrap().unwrap().state,
         "succeeded"
     );
     let task = broker.clone();
@@ -210,7 +210,7 @@ async fn image_tool_read_only_denial_and_arbitrary_provider_override_never_dispa
         .to_string()
         .contains("read-only")
     );
-    assert!(broker.journaled("readonly-image").unwrap().is_none());
+    assert!(broker.active_action("readonly-image").unwrap().is_none());
     let (_directory, broker, mut events) = fixture(PermissionMode::AskForApproval, endpoint);
     let task = broker.clone();
     assert!(
@@ -223,7 +223,7 @@ async fn image_tool_read_only_denial_and_arbitrary_provider_override_never_dispa
         .unwrap()
         .is_err()
     );
-    assert!(broker.journaled("override-image").unwrap().is_none());
+    assert!(broker.active_action("override-image").unwrap().is_none());
     let task = broker.clone();
     let running = tokio::task::spawn_blocking(move || {
         task.execute("denied-image", "image_generate", json!({"prompt":"image"}))
@@ -231,7 +231,7 @@ async fn image_tool_read_only_denial_and_arbitrary_provider_override_never_dispa
     approve(&broker, &mut events, false).await;
     assert!(running.await.unwrap().is_err());
     assert_eq!(
-        broker.journaled("denied-image").unwrap().unwrap().state,
+        broker.active_action("denied-image").unwrap().unwrap().state,
         "denied"
     );
     assert!(
@@ -266,7 +266,7 @@ async fn image_tool_transport_loss_retains_uncertainty_and_blocks_action_replay(
         .unwrap()
         .unwrap();
     assert_eq!(
-        broker.journaled("lost-image").unwrap().unwrap().state,
+        broker.active_action("lost-image").unwrap().unwrap().state,
         "outcome_unknown"
     );
     let task = broker.clone();
@@ -280,6 +280,6 @@ async fn image_tool_transport_loss_retains_uncertainty_and_blocks_action_replay(
         .unwrap()
         .unwrap_err()
         .to_string()
-        .contains("Reconcile")
+        .contains("will not be repeated")
     );
 }

@@ -68,7 +68,7 @@ Strikes escalate: **note**, then **warning** that the task stops, then **stop** 
 
 - `MAX_RETRIES = 5` after the first failed attempt, only for `ModelError::retryable()` (`RateLimited`, `Unavailable`, `Timeout`, `EmptyResponse`, and `Provider` when flagged). `Authentication`, `InvalidRequest`, `ContextOverflow`, `Interrupted`, `Io` and `Stalled` are never retried.
 - Backoff: base 1 s doubling per attempt (exponent capped at 6), capped at 32 s, with ±25 % jitter. A provider `Retry-After` is honored instead, but **a wait above 120 s (`MAX_RETRY_AFTER`) fails the request** so the user decides. Each wait emits `TurnPhase::Retrying { attempt, delay_ms }` and is cancellable.
-- **Only `ModelError::Unavailable` permits the configured fallback model**, and only once per run, after retries are exhausted. The selection is written to the journal (`select_checkpoint_fallback`) before the first alternative request, so a resumed turn restores it from trusted checkpoint metadata (`checkpoint_fallback`), never from prompt content. The user sees `NoteKind::Fallback`.
+- **Only `ModelError::Unavailable` permits the configured fallback model**, and only once per run, after retries are exhausted. The selection is written to conversation metadata (`select_checkpoint_fallback`) before the first alternative request, so a resumed turn restores it from trusted checkpoint metadata (`checkpoint_fallback`), never from prompt content. The user sees `NoteKind::Fallback`.
 - Context overflow is recovered **once**: either detected while fitting or reported by the provider (`ModelError::ContextOverflow`, which also calls `ContextBudget::penalize_overflow`), the request is refitted under `Pressure::Overflow` and sent again.
 
 ### Lifecycle hooks and guidance
@@ -116,21 +116,22 @@ All model-facing instruction text lives in Markdown under `crates/engine/prompts
 - **Skills index** (`skills.rs`): one `name: description` line per skill the model may use on its own, at most `SKILLS_INDEX_BYTES = 8 KiB` (scaled by window). Bodies load only through `extension_skill` and resources through `extension_resource`; see [engine-agents-and-skills](engine-agents-and-skills.md).
 - **Titles**: only while the conversation's `title_source` is still `Prompt`, after `Completed`: output limit `TITLE_TOKENS = 64`, deadline 10 s, reply text sent capped at 2,000 bytes, stored title at most `TITLE_CHARS = 80`. A title failure is logged and **can neither delay nor fail the turn**.
 
-## Journaling, checkpoints and turn lifecycle (`engine.rs`, `agent_loop/mod.rs`)
+## Conversation checkpoints and turn lifecycle (`engine.rs`, `agent_loop/mod.rs`)
 
 `AgentEngine::run_turn` admits a turn and settles it with **exactly one terminal event**:
 
 1. **Replay.** If the store already holds a receipt for `(session, turn)` (`completed_turn`), `Completed` is re-sent with the stored text and usage and **no model call is made**. A cancelled token before start yields `Cancelled`.
 2. **Admission.** `TurnPhase::Preparing`; the provider config, attachments and absolute existing workspace directory are validated; a `LearningTurnGuard` guarantees terminal procedural evidence is queued on any error, cancellation or drop.
-3. **Recovery gate.** Unresolved actions are read from the store; an `outcome_unknown` `environment_execute` action is checked against its native receipt (never re-dispatched or probed). **A turn is refused while any action is still `outcome_unknown` or `running`**: "Reconcile it before resuming". Only then is the served context probed, so a blocked turn never contacts the provider.
-4. **Restore** (`restored_messages`). With no checkpoint the conversation is the new user message. Otherwise the saved messages are loaded and `settle_pending_tools` answers any call without a result from its journaled action (`succeeded`, `failed`, `denied` replay the recorded result; `outcome_unknown`, `running` or `pending` abort). On a new turn an unjournaled call gets "Not run: the earlier task stopped before this call started."; on a resume of the same turn it is left to run. The settled history is checkpointed before the new user message is appended.
+3. **Live activity.** Tool execution has bounded in-memory tracking for current work; no durable action journal, reconciliation gate, or manual review form is consulted. Ordinary permission checks and in-process duplicate-call guards still apply.
+4. **Restore** (`restored_messages`). Saved conversation messages remain the source of chat context. Available live results can settle unanswered calls; when no live result is available, the call becomes an interrupted tool result on both same-turn and new-turn resumes. It is never automatically executed from an old checkpoint. The model is told to inspect current state before deciding on another action. The settled conversation is checkpointed before a new user message is appended.
 5. **Run** the loop (system prompt and recalled-context note built on blocking workers).
 6. **Settle.**
    - *Completed*: checkpoint, reply, usage and receipt commit **atomically** (`complete_turn_with_reasoning`), then `Completed` is sent, then the best-effort title. Status is `Truncated` if the answer was cut off at the output limit, else `Complete`.
    - *Cancelled*: the streamed text is stored as an `Interrupted` reply, then `Cancelled`.
    - *Failed*: the streamed text is stored as a `Failed` reply and the error returns; `classify` maps `ModelError` to `ErrorKind` and a retryable flag (anything else is `Internal`, not retryable).
 
-**Checkpoints.** The root loop writes the full conversation (`Message` is the durable format, including provider-native thinking/signature content) through `Journal::checkpoint`, which sends only the changed suffix relative to its previous revision. Writes occur **before every tool batch and after its results**, after masking or summarising, and when a fallback model is chosen. A crash between them resumes by executing only the calls that have no result. Tools run **exactly once**: the broker journals each call by id, and a resumed call returns its recorded result ([engine-tools](engine-tools.md)). Child loops have no journal; they report through tool events with a `parent_id`.
+**Checkpoints.** The root loop writes the conversation (`Message` is the durable format, including provider-native thinking/signature content) through `ConversationState::checkpoint`, which sends only the changed suffix relative to its previous revision. Writes occur before every tool batch and after its results, after masking or summarising, and when a fallback model is chosen. A crash between them leaves unanswered calls recorded as interrupted on resume. The broker deduplicates calls only within live in-memory tracking; no action journal is saved. Child loops report through tool events with a `parent_id`.
+
 
 ## Tests
 

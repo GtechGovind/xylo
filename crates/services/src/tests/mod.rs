@@ -302,181 +302,7 @@ fn successful_action_is_reused_and_changed_arguments_rejected() {
     changed.arguments = json!({"amount":43});
     assert!(store.begin_action(&changed).is_err());
 }
-#[test]
-fn interrupted_write_is_unknown_until_evidence_is_recorded() {
-    let (directory, store, session) = database();
-    let action = intent(session, true);
-    store.begin_action(&action).unwrap();
-    store.mark_action_running(action.id).unwrap();
-    let restarted = Store::open(directory.path().join("xylo.db")).unwrap();
-    assert_eq!(restarted.recover_interrupted().unwrap(), 1);
-    assert_eq!(
-        restarted.begin_action(&action).unwrap(),
-        ActionDecision::OutcomeUnknown
-    );
-    assert!(
-        restarted
-            .reconcile_action(action.id, Some(&json!({"id":"confirmed"})), "")
-            .is_err()
-    );
-    restarted
-        .reconcile_action(
-            action.id,
-            Some(&json!({"id":"confirmed"})),
-            "Provider lookup confirmed id",
-        )
-        .unwrap();
-    assert_eq!(
-        store.begin_action(&action).unwrap(),
-        ActionDecision::Reuse(json!({"id":"confirmed"}))
-    );
-    assert!(store.unresolved_actions(session).unwrap().is_empty());
-}
 
-#[test]
-fn unsuccessful_observations_keep_artifacts_after_restart_and_reconciliation() {
-    let (directory, store, session) = database();
-    for unknown in [false, true] {
-        let mut action = intent(session, unknown);
-        action.idempotency_key = format!("partial-result-{unknown}");
-        store.begin_action(&action).unwrap();
-        store.mark_action_running(action.id).unwrap();
-        let observation = json!({"status":if unknown {"outcome_unknown"} else {"failed"},
-            "summary":"A partial file was committed", "artifacts":["partial.txt"]});
-        if unknown {
-            store
-                .mark_action_unknown_with_result(action.id, &observation, "Unconfirmed write")
-                .unwrap();
-        } else {
-            store
-                .fail_action_with_result(action.id, &observation, "Read failed")
-                .unwrap();
-        }
-        let reopened = Store::open(directory.path().join("xylo.db")).unwrap();
-        assert_eq!(
-            reopened.action(action.id).unwrap().unwrap().result,
-            Some(observation.clone())
-        );
-        if unknown {
-            assert_eq!(
-                reopened.begin_action(&action).unwrap(),
-                ActionDecision::OutcomeUnknown
-            );
-            reopened
-                .reconcile_action(
-                    action.id,
-                    None,
-                    "Inspected the actual target; command failed after writing partial.txt",
-                )
-                .unwrap();
-            assert_eq!(
-                reopened.action(action.id).unwrap().unwrap().result,
-                Some(observation)
-            );
-        }
-        assert!(reopened.begin_action(&action).is_err());
-    }
-}
-
-#[test]
-fn reaped_worker_recovery_is_session_scoped_and_preserves_confirmed_results() {
-    let (_directory, store, session) = database();
-    let running_write = intent(session, true);
-    let mut child_write = intent(session, true);
-    child_write.idempotency_key = "child:8:delegate:call-1".into();
-    let running_read = intent(session, false);
-    let pending_write = intent(session, true);
-    let pending_read = intent(session, false);
-    let succeeded = intent(session, true);
-    let denied = intent(session, true);
-    let foreign = intent(Uuid::new_v4(), true);
-    let mut foreign_conversation = store.conversations(1).unwrap().remove(0);
-    foreign_conversation.id = foreign.session_id;
-    store.upsert_conversation(&foreign_conversation).unwrap();
-    for action in [
-        &running_write,
-        &child_write,
-        &running_read,
-        &pending_write,
-        &pending_read,
-        &succeeded,
-        &denied,
-        &foreign,
-    ] {
-        store.begin_action(action).unwrap();
-    }
-    for action in [
-        &running_write,
-        &child_write,
-        &running_read,
-        &succeeded,
-        &foreign,
-    ] {
-        store.mark_action_running(action.id).unwrap();
-    }
-    store
-        .finish_action(succeeded.id, &json!({"remote_id":"confirmed"}))
-        .unwrap();
-    store.deny_action(denied.id).unwrap();
-    let foreign_before = serde_json::to_value(store.action(foreign.id).unwrap()).unwrap();
-    let denied_before = serde_json::to_value(store.action(denied.id).unwrap()).unwrap();
-    assert_eq!(store.recover_session_interrupted(session).unwrap(), 5);
-    for action in [&running_write, &child_write] {
-        assert_eq!(
-            store.begin_action(action).unwrap(),
-            ActionDecision::OutcomeUnknown
-        );
-    }
-    for action in [&running_read, &pending_write, &pending_read] {
-        assert_eq!(store.action(action.id).unwrap().unwrap().state, "failed");
-        assert!(
-            store.begin_action(action).is_err(),
-            "recovery must not redispatch"
-        );
-    }
-    assert_eq!(
-        store.begin_action(&succeeded).unwrap(),
-        ActionDecision::Reuse(json!({"remote_id":"confirmed"}))
-    );
-    assert_eq!(
-        serde_json::to_value(store.action(foreign.id).unwrap()).unwrap(),
-        foreign_before
-    );
-    assert_eq!(
-        serde_json::to_value(store.action(denied.id).unwrap()).unwrap(),
-        denied_before
-    );
-    assert_eq!(
-        store.begin_action(&foreign).unwrap(),
-        ActionDecision::InFlight
-    );
-    assert_eq!(store.recover_session_interrupted(session).unwrap(), 0);
-    store
-        .reconcile_action(
-            running_write.id,
-            None,
-            "Provider confirmed no external effect",
-        )
-        .unwrap();
-    assert_eq!(
-        store.action(running_write.id).unwrap().unwrap().state,
-        "failed"
-    );
-}
-
-#[test]
-fn denial_and_pending_recovery_never_execute_implicitly() {
-    let (_directory, store, session) = database();
-    let denied = intent(session, true);
-    store.begin_action(&denied).unwrap();
-    store.deny_action(denied.id).unwrap();
-    assert!(store.mark_action_running(denied.id).is_err());
-    assert!(store.begin_action(&denied).is_err());
-    let pending = intent(session, false);
-    store.begin_action(&pending).unwrap();
-    assert_eq!(store.recover_interrupted().unwrap(), 1);
-    assert!(store.begin_action(&pending).is_err());
-}
 #[test]
 fn memory_is_scoped_superseded_and_forgotten_atomically() {
     let (_directory, store, _) = database();
@@ -849,13 +675,13 @@ fn database_from_another_schema_version_is_replaced_not_migrated() {
     {
         let old = rusqlite::Connection::open(&path).unwrap();
         old.execute_batch(
-            "PRAGMA journal_mode=WAL; CREATE TABLE conversations(id TEXT PRIMARY KEY,json TEXT NOT NULL); INSERT INTO conversations VALUES('x','{}'); PRAGMA user_version=3;",
+            "PRAGMA journal_mode=WAL; CREATE TABLE conversations(id TEXT PRIMARY KEY,json TEXT NOT NULL); INSERT INTO conversations VALUES('x','{}'); PRAGMA user_version=99;",
         )
         .unwrap();
     }
     let store = Store::open(&path).unwrap();
     let reset = store.reset_notice().expect("the replacement is reported");
-    assert!(reset.reason.contains("version 3"));
+    assert!(reset.reason.contains("version 99"));
     assert!(reset.to_string().contains("replaced"), "{reset}");
     assert!(store.conversations(10).unwrap().is_empty());
     assert_eq!(user_version(&store), crate::schema::VERSION);
@@ -1315,4 +1141,190 @@ fn provider_reasoning_is_saved_separately_from_the_answer_and_reloaded() {
     let messages = store.messages(session, 10).unwrap();
     assert_eq!(messages[0].content, "Answer");
     assert_eq!(messages[0].reasoning.as_deref(), Some("Consider this"));
+}
+
+#[test]
+fn actions_are_shared_only_by_store_clones_and_never_saved() {
+    let (directory, store, session) = database();
+    let action = intent(session, true);
+    store.begin_action(&action).unwrap();
+    let clone = store.clone();
+    clone.mark_action_running(action.id).unwrap();
+    clone
+        .finish_action(action.id, &json!({"secret_output":"only in memory"}))
+        .unwrap();
+    assert_eq!(store.action(action.id).unwrap().unwrap().state, "succeeded");
+    let reopened = Store::open(directory.path().join("xylo.db")).unwrap();
+    assert!(reopened.action(action.id).unwrap().is_none());
+    assert_eq!(
+        reopened.begin_action(&action).unwrap(),
+        ActionDecision::Execute
+    );
+    let tables: i64 = reopened.call(|conn| Ok(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('actions','action_review_forms','action_resolutions','extension_execution_receipts')", [], |r| r.get(0))?)).unwrap();
+    assert_eq!(tables, 0);
+}
+
+#[test]
+fn exact_v2_migration_removes_execution_journals_and_preserves_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("xylo.db");
+    let session = Uuid::new_v4();
+    let turn = Uuid::new_v4();
+    let conversation = Conversation {
+        id: session,
+        title: "Keep my chat".into(),
+        workspace: directory.path().into(),
+        updated_at: 7,
+        title_source: Default::default(),
+        pinned: false,
+        archived: false,
+    };
+    {
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(include_str!("../schema_v2.sql")).unwrap();
+        old.pragma_update(None, "user_version", 2).unwrap();
+        old.execute(
+            "INSERT INTO conversations VALUES(?1,?2,7)",
+            rusqlite::params![
+                session.to_string(),
+                serde_json::to_string(&conversation).unwrap()
+            ],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO settings VALUES('retained','private preference')",
+            [],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO checkpoints VALUES(?1,?2,1,1,7,NULL)",
+            rusqlite::params![session.to_string(), turn.to_string()],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO checkpoint_messages VALUES(?1,0,?2)",
+            rusqlite::params![
+                session.to_string(),
+                r#"{"role":"user","content":"keep context"}"#
+            ],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO actions VALUES('action',?1,?2,'key','{}','running',NULL,NULL,7)",
+            rusqlite::params![session.to_string(), turn.to_string()],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO action_review_forms VALUES(?1,'workspace',1,'{}')",
+            [session.to_string()],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO action_resolutions VALUES('operation','action','{}','{}','{}','digest')",
+            [],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO extension_action_bindings VALUES('action','{}')",
+            [],
+        )
+        .unwrap();
+        old.execute("INSERT INTO extension_execution_receipts VALUES('extension','{}','running',NULL,NULL,7)", []).unwrap();
+    }
+    assert!(
+        Store::open_existing(&path).is_err(),
+        "Only the owner migrates"
+    );
+    let store = Store::open(&path).unwrap();
+    assert!(store.reset_notice().is_none());
+    assert_eq!(user_version(&store), 3);
+    assert_eq!(store.conversations(10).unwrap()[0].title, "Keep my chat");
+    assert_eq!(
+        store.checkpoint(session).unwrap().unwrap().messages[0]["content"],
+        "keep context"
+    );
+    let value: String = store
+        .call(|conn| {
+            Ok(
+                conn.query_row("SELECT value FROM settings WHERE key='retained'", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .unwrap();
+    assert_eq!(value, "private preference");
+    let removed: i64 = store.call(|conn| Ok(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE name='actions' OR name GLOB 'action_review*' OR name GLOB 'action_resolution*' OR name IN ('action_execution_protocol','extension_action_bindings','extension_execution_receipts')", [], |r| r.get(0))?)).unwrap();
+    assert_eq!(removed, 0);
+    drop(store);
+    assert!(Store::open(&path).unwrap().reset_notice().is_none());
+}
+
+#[test]
+fn unexpected_v2_schema_is_not_reset_or_partially_migrated() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("xylo.db");
+    let old = rusqlite::Connection::open(&path).unwrap();
+    old.execute_batch(include_str!("../schema_v2.sql")).unwrap();
+    old.execute_batch("PRAGMA user_version=2; CREATE TABLE unexpected(value TEXT); INSERT INTO settings VALUES('keep','yes');").unwrap();
+    drop(old);
+    assert!(Store::open(&path).is_err());
+    let old = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        old.query_row("SELECT value FROM settings WHERE key='keep'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+        "yes"
+    );
+    assert_eq!(
+        old.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    old.prepare("SELECT * FROM actions").unwrap();
+}
+
+#[test]
+fn live_action_capacity_preserves_current_turn_deduplication_and_stable_cursors() {
+    let (_directory, store, session) = database();
+    let first = intent(session, true);
+    for n in 0..1000 {
+        let mut action = first.clone();
+        action.id = if n == 0 { first.id } else { Uuid::new_v4() };
+        action.idempotency_key = if n == 0 {
+            first.idempotency_key.clone()
+        } else {
+            n.to_string()
+        };
+        store.begin_action(&action).unwrap();
+        store.mark_action_running(action.id).unwrap();
+        store
+            .finish_action(action.id, &json!({"done":true}))
+            .unwrap();
+    }
+    let mut extra = first.clone();
+    extra.id = Uuid::new_v4();
+    extra.idempotency_key = "capacity-overflow".into();
+    assert!(store.begin_action(&extra).is_err());
+    assert_eq!(
+        store.begin_action(&first).unwrap(),
+        ActionDecision::Reuse(json!({"done":true}))
+    );
+    let first_page = store
+        .turn_activity_page(session, first.turn_id, None, 50)
+        .unwrap();
+    extra.turn_id = Uuid::new_v4();
+    store.begin_action(&extra).unwrap();
+    let second_page = store
+        .turn_activity_page(session, first.turn_id, first_page.next, 50)
+        .unwrap();
+    assert_eq!(second_page.items[0].cursor, 51);
+    assert_eq!(store.active_actions().unwrap().len(), 1000);
+    assert!(
+        store
+            .session_action_provenance(session, &[], &[])
+            .unwrap()
+            .iter()
+            .any(|a| a.name == "web_fetch")
+    );
 }

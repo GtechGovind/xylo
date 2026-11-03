@@ -372,7 +372,8 @@ impl TurnState {
             EngineEvent::Ready { .. }
             | EngineEvent::TitleUpdated { .. }
             | EngineEvent::Steering { .. }
-            | EngineEvent::ProviderCredentialRequested { .. } => return,
+            | EngineEvent::ProviderCredentialRequested { .. }
+            | EngineEvent::LiveActivity { .. } => return,
             EngineEvent::ShellJobUpdated { mut job } => {
                 if !job.background
                     && job.running

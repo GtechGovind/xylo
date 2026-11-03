@@ -6,7 +6,7 @@ use xylo_services::ActionIntent;
 
 /// Journals a finished `name` call in the broker's conversation, as if the
 /// model had run it earlier.
-fn journal_read(broker: &ToolBroker, key: &str, name: &str, arguments: Value) {
+fn track_read(broker: &ToolBroker, key: &str, name: &str, arguments: Value) {
     let intent = ActionIntent {
         id: Uuid::new_v4(),
         session_id: broker.request.session_id,
@@ -14,7 +14,7 @@ fn journal_read(broker: &ToolBroker, key: &str, name: &str, arguments: Value) {
         name: name.into(),
         arguments,
         writes: false,
-        idempotency_key: ToolBroker::journal_key(None, key),
+        idempotency_key: ToolBroker::call_key(None, key),
     };
     broker.store.begin_action(&intent).unwrap();
     broker.store.mark_action_running(intent.id).unwrap();
@@ -51,7 +51,7 @@ async fn remember(broker: &Arc<ToolBroker>, key: &str, arguments: Value) -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_conversation_that_read_only_the_project_writes_agent_inferred_facts() {
     let (_directory, broker, mut events) = fixture(PermissionMode::AskForApproval);
-    journal_read(&broker, "read", "file_read", json!({"path":"README.md"}));
+    track_read(&broker, "read", "file_read", json!({"path":"README.md"}));
     let stored = remember(
         &broker,
         "remember",
@@ -71,7 +71,7 @@ async fn a_conversation_that_read_only_the_project_writes_agent_inferred_facts()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn after_untrusted_input_each_write_is_reviewed_and_approval_marks_it() {
     let (_directory, broker, mut events) = fixture(PermissionMode::ApproveForMe);
-    journal_read(
+    track_read(
         &broker,
         "web",
         "browser_navigate",
@@ -137,7 +137,7 @@ async fn full_access_writes_keep_the_least_trusted_origin_they_read() {
         .await
         .unwrap();
     assert_eq!(from_files["origin"], "tool_output");
-    journal_read(
+    track_read(
         &broker,
         "fetch",
         "run_command",
@@ -306,26 +306,26 @@ fn commands_count_as_project_output_only_when_they_stay_in_the_project() {
 async fn installed_skills_and_outside_commands_taint_but_built_in_skills_do_not() {
     let (_directory, broker, _events) = fixture(PermissionMode::FullAccess);
     let built_in = crate::prompts::bundled_skills()[0].name;
-    journal_read(
+    track_read(
         &broker,
         "built-in",
         "extension_skill",
         json!({"id":built_in}),
     );
-    journal_read(
+    track_read(
         &broker,
         "built-in-resource",
         "extension_resource",
         json!({"package":built_in,"path":"x.md"}),
     );
-    journal_read(
+    track_read(
         &broker,
         "tests",
         "run_command",
         json!({"program":"cargo","args":["test"]}),
     );
     assert_eq!(broker.exposure().unwrap(), MemoryOrigin::AgentInferred);
-    journal_read(
+    track_read(
         &broker,
         "plugin",
         "extension_skill",
@@ -333,7 +333,7 @@ async fn installed_skills_and_outside_commands_taint_but_built_in_skills_do_not(
     );
     assert_eq!(broker.exposure().unwrap(), MemoryOrigin::ToolOutput);
     let (_directory, broker, _events) = fixture(PermissionMode::FullAccess);
-    journal_read(
+    track_read(
         &broker,
         "outside",
         "shell_command",
@@ -341,7 +341,7 @@ async fn installed_skills_and_outside_commands_taint_but_built_in_skills_do_not(
     );
     assert_eq!(broker.exposure().unwrap(), MemoryOrigin::ToolOutput);
     let (_directory, broker, _events) = fixture(PermissionMode::FullAccess);
-    journal_read(&broker, "unknown", "skill_read", json!({"name":"missing"}));
-    journal_read(&broker, "list", "skill_list", json!({}));
+    track_read(&broker, "unknown", "skill_read", json!({"name":"missing"}));
+    track_read(&broker, "list", "skill_list", json!({}));
     assert_eq!(broker.exposure().unwrap(), MemoryOrigin::ToolOutput);
 }

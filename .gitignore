@@ -16,3 +16,4 @@ __pycache__/
 /.scratch/
 /rea-evidence/
 /crates/services/sandbox-helper/node_modules/
+/target-verify

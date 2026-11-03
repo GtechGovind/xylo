@@ -1,4 +1,4 @@
-//! Shared offline fixture: real Store/Host with interrupted writes, no model.
+//! Shared offline fixture: saved chat and partial files, transient activity, no model.
 use std::path::PathBuf;
 use uuid::Uuid;
 use xylo_core::{AppSettings, TurnRequest};
@@ -53,13 +53,12 @@ pub fn seeded(count: usize) -> Profile {
         store,
     };
     for index in 0..count {
-        seed_action(&mut profile, "file_write", true, index);
+        seed_action(&mut profile, "file_write", index);
     }
     profile
 }
-pub fn seed_action(profile: &mut Profile, name: &str, qualified: bool, index: usize) -> Uuid {
+pub fn seed_action(profile: &mut Profile, name: &str, index: usize) -> Uuid {
     let id = Uuid::new_v4();
-    let lease = profile.store.action_execution_lease(id, qualified).unwrap();
     let filename = format!("partial-{index}.txt");
     let artifact = profile
         .paths
@@ -99,7 +98,6 @@ pub fn seed_action(profile: &mut Profile, name: &str, qualified: bool, index: us
             "Interruption after a partial write",
         )
         .unwrap();
-    drop(lease);
     profile.actions.push(id);
     id
 }

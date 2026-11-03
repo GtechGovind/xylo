@@ -44,7 +44,7 @@ pub struct Trace {
     pub prompt: String,
     pub exchanges: Vec<Exchange>,
     pub events: Vec<EngineEvent>,
-    /// Journal records of every action the turn started, in event order.
+    /// Live activity records of every action the turn started, in event order.
     pub actions: Vec<RecordedAction>,
     /// The conversation checkpoint after the turn ended.
     pub checkpoint: Option<Value>,
@@ -387,7 +387,7 @@ pub struct RecordedAction {
     pub id: uuid::Uuid,
     pub name: String,
     pub arguments: Value,
-    /// Journal state (`succeeded`, `failed`, `denied`, ...), or `missing`
+    /// Live activity state (`succeeded`, `failed`, `denied`, ...), or `missing`
     /// when the event named an action the journal never recorded.
     pub state: String,
     pub result: Option<Value>,

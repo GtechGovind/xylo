@@ -178,7 +178,7 @@ fn harness(scripts: Vec<Vec<Step>>) -> Harness {
         max_tokens: 256,
         max_model_calls: MAX_MODEL_CALLS,
         events: sender,
-        journal: Some(Journal::new(store.clone(), session, turn, None)),
+        conversation_state: Some(ConversationState::new(store.clone(), session, turn, None)),
         permissions: None,
         cancel: CancellationToken::new(),
     };
@@ -517,8 +517,8 @@ async fn guidance_is_applied_after_a_complete_tool_round() {
         vec![text("adjusted"), finish(FinishReason::Stop)],
     ]);
     let steering = SteeringControl::new(h.store.clone());
-    if let Some(journal) = &mut h.agent.journal {
-        journal.steering = Some(steering.clone());
+    if let Some(conversation_state) = &mut h.agent.conversation_state {
+        conversation_state.steering = Some(steering.clone());
     }
     let workspace = h._directory.path().to_path_buf();
     let (store, session, turn) = (h.store.clone(), h.session, h.turn);
@@ -559,7 +559,7 @@ async fn guidance_is_applied_after_a_complete_tool_round() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_loops_report_nothing_but_their_answer() {
     let mut h = harness(vec![vec![text("child answer"), finish(FinishReason::Stop)]]);
-    h.agent.journal = None;
+    h.agent.conversation_state = None;
     let outcome = h.agent.run(vec![Message::user("task")]).await.unwrap();
     assert_eq!(outcome.text, "child answer");
     assert!(drain(&mut h.events).is_empty());
@@ -684,8 +684,8 @@ async fn guidance_during_the_final_answer_continues_the_task() {
         steering.clone(),
         h._directory.path().to_path_buf(),
     ));
-    if let Some(journal) = &mut h.agent.journal {
-        journal.steering = Some(steering);
+    if let Some(conversation_state) = &mut h.agent.conversation_state {
+        conversation_state.steering = Some(steering);
     }
     h.store
         .save_checkpoint(h.session, h.turn, &json!([{"role":"user","content":"go"}]))
@@ -808,7 +808,7 @@ async fn a_call_id_compacted_out_of_the_conversation_is_never_reused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_resumed_turn_never_reuses_an_id_only_its_journal_remembers() {
+async fn a_resumed_turn_never_reuses_an_id_only_its_live_tracker_remembers() {
     let h = harness(vec![
         vec![
             call(0, "call_0", "read_a", "{\"n\":2}"),
@@ -1265,14 +1265,14 @@ async fn each_message_is_tokenized_once_however_often_it_is_measured() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_checkpoints_store_exactly_the_latest_messages() {
     let h = harness(Vec::new());
-    let journal = h.agent.journal.as_ref().unwrap();
+    let conversation_state = h.agent.conversation_state.as_ref().unwrap();
     let mut messages = vec![Message::user("go"), Message::assistant("one")];
-    journal.checkpoint(&messages).await.unwrap();
+    conversation_state.checkpoint(&messages).await.unwrap();
     // An append, then a rewrite of an earlier message (as masking does).
     messages.push(Message::user("more"));
-    journal.checkpoint(&messages).await.unwrap();
+    conversation_state.checkpoint(&messages).await.unwrap();
     messages[1] = Message::assistant("one, masked");
-    journal.checkpoint(&messages).await.unwrap();
+    conversation_state.checkpoint(&messages).await.unwrap();
     assert_eq!(
         serde_json::to_value(checkpoint(&h)).unwrap(),
         serde_json::to_value(&messages).unwrap()
@@ -1288,7 +1288,7 @@ async fn incremental_checkpoints_store_exactly_the_latest_messages() {
         .unwrap();
     messages.truncate(1);
     messages.push(Message::assistant("compacted"));
-    journal.checkpoint(&messages).await.unwrap();
+    conversation_state.checkpoint(&messages).await.unwrap();
     assert_eq!(
         serde_json::to_value(checkpoint(&h)).unwrap(),
         serde_json::to_value(&messages).unwrap()

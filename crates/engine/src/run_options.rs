@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xylo_core::ToolDefinition;
 
-/// Executes a registered SDK tool after the broker has journaled and authorized it.
+/// Executes a registered SDK tool after the broker has tracked and authorized it.
 /// The implementation must honor cancellation and must not start work before called.
 pub type CustomToolHandler =
     Arc<dyn Fn(Uuid, &str, &Value, CancellationToken) -> Result<Value> + Send + Sync>;

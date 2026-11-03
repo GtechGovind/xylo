@@ -6,7 +6,7 @@
 
 Boundaries, from `crates/runtime/Cargo.toml` and the sources:
 
-- Depends on `xylo-core` ([core](core.md)), `xylo-services` ([services](services.md)), `xylo-resources`, `xylo-scheduler`, `xylo-helper-client`, `xylo-distribution` and `xylo-notifications`. It re-exports `xylo_scheduler` as `scheduler` and `xylo_notifications` as `notifications`, and re-exports `xylo_services::action_review::*` and a set of document-draft, memory-form, fact, usage and steering types (`crates/runtime/src/lib.rs`).
+- Depends on `xylo-core` ([core](core.md)), `xylo-services` ([services](services.md)), `xylo-resources`, `xylo-scheduler`, `xylo-helper-client`, `xylo-distribution` and `xylo-notifications`. It re-exports `xylo_scheduler` as `scheduler` and `xylo_notifications` as `notifications`, and re-exports a set of document-draft, memory-form, fact, usage and steering types (`crates/runtime/src/lib.rs`).
 - **The engine depends on runtime, not the reverse.** `crates/runtime/src/headless.rs` states that a headless frontend constructs its engine after opening the profile, so runtime never links `xylo-engine`. The host starts the agent as a separate `xylo-worker` process and a `xylo-helper` process, located as siblings of the current executable (`native_executable` in `host.rs`; a missing sibling fails with "A required application component is missing. Reinstall the complete application.").
 - It contains no UI toolkit code. Events leave through bounded channels (`HostEvent`), and the UI sends bounded commands through `HostClient`.
 - Platform-specific dependencies: `portable-pty` and `alacritty_terminal` (terminal), `notify` (file watching), `ignore` plus `grep-*` (project search), `rusqlite` (the private workspace catalogue), `fs2` (profile and activity locks), `libc` (Unix process groups) and `windows-sys` (Windows only).
@@ -23,7 +23,6 @@ Two small crates under `crates/runtime/validation/` (`terminal`, `windows-worksp
 | `host/turn_queue_control.rs` | Per-session queued next-turn intents; the single Stop implementation |
 | `host/steering_control.rs` | Durable mid-turn guidance |
 | `host/interaction_control.rs` | Wakeup admission (loops) and answers to questions and plans |
-| `host/action_control.rs` | Human review of recorded actions (no agent-facing resolver) |
 | `host/credential_control.rs` | Active-turn authorization of worker credential renewal |
 | `host/provider_control.rs`, `web_search_control.rs`, `image_control.rs` | Provider discovery, web-search settings and image operations that touch secrets |
 | `host/settings_control.rs` | Ordering of settings commits and project opens |
@@ -61,7 +60,7 @@ On a thread named `xylo-host` the host:
 
 1. Takes an exclusive `try_lock_exclusive` on `data/host.lock`; a second instance fails with "Xylo is already running for this profile".
 2. Builds a multi-thread Tokio runtime with **2** worker threads.
-3. Opens `Store` at `xylo.db`, then runs `recover_interrupted`, `recover_steering` and `recover_turn_queue`.
+3. Opens `Store` at `xylo.db`, then runs `recover_steering` and `recover_turn_queue` for saved drafts and queued turns. Action tracking is transient and is not recovered.
 4. Loads settings with `startup_settings`: if stored settings no longer decode, **defaults are saved** and a notice ("Your saved settings could not be read, so Xylo started with default settings.") is emitted. There is no compatibility parsing of older formats.
 5. Opens the secret vault (`open_secrets`) and aligns `settings.secret_storage` to the storage the vault actually records (`follow_vault_storage`). If the vault cannot be opened, the host keeps running with the error as state and emits "Saved keys are unavailable: ...".
 6. Creates the ChatGPT sign-in service, notifications service, updates service, semantic memory (`SqliteMemory::configured` with `data/embedding.json`; on failure it falls back to `SqliteMemory::new` and emits "Semantic search needs setup in Downloads. Your saved memories remain searchable."), the workspace service (cache in `data/workspace-index`) and the LSP service.
@@ -92,14 +91,15 @@ Each chat gets a `WorkerHandle` for a `xylo-worker` child process (stdin/stdout/
 - **Warm pool:** idle workers stay warm for `IDLE_WORKER_TTL` = **5 minutes**, at most `MAX_IDLE_WORKERS` = **4**, least recently used retired first. `retire_workers_for_new_key` retires workers when the vault key changes.
 - Credential renewal for an active turn (`host/credential_control.rs`, `WorkerReader::renew_credentials`) is bounded by a semaphore of 4 concurrent renewals; only the active turn may request one.
 
+The host exposes no manual action-review commands or events. Worker retirement ends the process and settles unfinished turns and queues without reconciling an action journal. Live tool cards use worker events. Private `LiveActivity` updates populate the host’s transient `ActiveAction` cache after matching the active request, session and turn; they never reach the UI event stream. The worker drains updates before terminal events, and a final marker enables complete imported evidence for learning. Lag, oversized payloads and worker crashes mark evidence incomplete. Command output logs and native command operation status remain separate.
+
 ### Other host controls (`host/*_control.rs`)
 
 Each file extends `HostState` for one concern; the module docs state the guarantees:
 
 - `turn_queue_control`: per-session ordered queue of next-turn intents. A queued intent does not touch the current worker; only durable admission may move it into the transcript. When a run ends the next queued message starts, or the queue pauses with a reason shown on each item ("You stopped the task. Resume the queue when ready.", "The task ended with an error. ...", "Paused while an update installs. ...").
-- `steering_control`: durable mid-turn guidance. Transport is reserved before the journal write; only the engine's durable application receipt may clear a captured draft. The worker never supplies draft content; the host rereads its own journal.
+- `steering_control`: durable mid-turn guidance. Transport is reserved before saving guidance; only the engine's durable application receipt may clear a captured draft. The worker never supplies draft content; the host rereads its saved guidance.
 - `interaction_control`: conversation-owned wakeup admission and explicit loop controls; explicit mode controls and plan answers obey unattended authority.
-- `action_control`: human review controls; "There is deliberately no agent-facing resolver tool."
 - `credential_control`: private worker credential renewal authorized only for the active turn.
 - `web_search_control`: saves the search credential before publishing non-secret references. SearXNG endpoints must be HTTPS with no credentials, query or fragment. Only this module can construct `AuthorizedSearchSettings`, the authority to replace vault-owned settings.
 - `image_control`: validates metadata, saves the secret in the vault, then publishes the connection; the UI receives only the credential reference. Receipts preserve uncertain outcomes rather than retrying an external write.

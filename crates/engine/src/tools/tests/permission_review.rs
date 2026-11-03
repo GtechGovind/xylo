@@ -248,7 +248,10 @@ async fn an_approval_never_outranks_a_mode_changed_while_waiting() {
     let error = write.await.unwrap().unwrap_err().to_string();
     assert_eq!(error, "Permission mode changed to Read only; not run");
     assert!(!target.exists());
-    assert_eq!(broker.journaled("late").unwrap().unwrap().state, "denied");
+    assert_eq!(
+        broker.active_action("late").unwrap().unwrap().state,
+        "denied"
+    );
 }
 
 #[test]

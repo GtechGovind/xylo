@@ -16,6 +16,7 @@ use std::{
 pub const VERSION: &str = "0.2.6";
 pub const REVISION: &str = "8534b401898ed17b62f69bdc3d5eb186bffb0d60";
 pub const REPOSITORY: &str = "https://github.com/h4ckf0r0day/obscura.git";
+const SOURCE_PATCH: &str = include_str!("patches/obscura-native-roots.patch");
 const V8_VERSION: &str = "150.4.0";
 pub const TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
@@ -153,6 +154,66 @@ fn verify_checkout(source: &Path) -> Result<()> {
     )
 }
 
+fn patch_digest() -> String {
+    hex::encode(Sha256::digest(SOURCE_PATCH.as_bytes()))
+}
+
+fn verify_source_patch(source: &Path, patch: &str) -> Result<()> {
+    ensure!(
+        git(
+            source,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--abbrev=7",
+                "--unified=3",
+                "--no-relative",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "--diff-algorithm=myers",
+                "--indent-heuristic",
+                "--binary",
+                "HEAD",
+                "--",
+            ]
+        )? == patch.trim(),
+        "Obscura source differs from the reviewed patch"
+    );
+    ensure!(
+        git(source, &["ls-files", "--others", "--exclude-standard"])?.is_empty(),
+        "Obscura checkout contains untracked source files"
+    );
+    Ok(())
+}
+
+fn apply_source_patch(source: &Path) -> Result<()> {
+    verify_checkout(source)?;
+    let mut patch = tempfile::NamedTempFile::new()?;
+    patch.write_all(SOURCE_PATCH.as_bytes())?;
+    patch.flush()?;
+    run(Command::new("git")
+        .arg("apply")
+        .arg("--check")
+        .arg(patch.path())
+        .current_dir(source))?;
+    run(Command::new("git")
+        .arg("apply")
+        .arg(patch.path())
+        .current_dir(source))?;
+    verify_patched_checkout(source)
+}
+
+fn verify_patched_checkout(source: &Path) -> Result<()> {
+    checkout_values(
+        &git(source, &["remote", "get-url", "origin"])?,
+        &git(source, &["rev-parse", "HEAD"])?,
+        "",
+    )?;
+    verify_source_patch(source, SOURCE_PATCH)
+}
+
 fn checkout(root: &Path) -> Result<PathBuf> {
     let parent = root.join("target/obscura-source");
     fs::create_dir_all(&parent)?;
@@ -258,7 +319,7 @@ fn licenses(cargo: &Path, source: &Path, destination: &Path, target: &str) -> Re
     fs::write(
         destination.join("BUILD.json"),
         serde_json::to_vec_pretty(
-            &json!({"project":"Obscura", "version": VERSION, "revision": REVISION, "repository": REPOSITORY, "features":["render"], "target":target, "packages":packages}),
+            &json!({"project":"Obscura", "version": VERSION, "revision": REVISION, "repository": REPOSITORY, "patch_sha256":patch_digest(), "features":["render"], "target":target, "packages":packages}),
         )?,
     )?;
     ensure!(
@@ -345,6 +406,7 @@ fn current(plan: &Plan, profile: Profile, target: &str) -> bool {
     };
     value["revision"] == REVISION
         && value["builder"] == 1
+        && value["patch_sha256"] == patch_digest()
         && value["profile"] == profile.name()
         && value["target"] == target
         && plan.licenses.join("upstream/LICENSE").is_file()
@@ -376,6 +438,7 @@ pub fn build(
         "BUILD-TIME NETWORK: fetching pinned Obscura v{VERSION} ({REVISION}) and locked dependencies"
     );
     let source = checkout(root)?;
+    apply_source_patch(&source)?;
     let archive = local_v8(root, target)?;
     let cargo = PathBuf::from(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     let mut command = Command::new(&cargo);
@@ -387,7 +450,7 @@ pub fn build(
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTFLAGS");
     run(&mut command)?;
-    verify_checkout(&source)?;
+    verify_patched_checkout(&source)?;
     fs::create_dir_all(destination)?;
     let stage = tempfile::Builder::new()
         .prefix("xylo-obscura-stage-")
@@ -416,7 +479,7 @@ pub fn build(
     fs::write(
         stage.path().join("licenses/XYLO-BUILD.json"),
         serde_json::to_vec_pretty(
-            &json!({"revision": REVISION, "builder":1, "profile":profile.name(), "target":target, "sha256":digest(&binary)?}),
+            &json!({"revision": REVISION, "builder":1, "patch_sha256":patch_digest(), "profile":profile.name(), "target":target, "sha256":digest(&binary)?}),
         )?,
     )?;
     // Only replace application-owned staged outputs, never source checkouts.
@@ -504,6 +567,49 @@ mod tests {
         checkout_values(REPOSITORY, REVISION, "").unwrap();
     }
     #[test]
+    fn patched_checkout_rejects_extra_changes_and_untracked_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "."]).unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "original\n").unwrap();
+        git(dir.path(), &["add", "Cargo.toml"]).unwrap();
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Xylo Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )
+        .unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "patched\n").unwrap();
+        let patch = git(dir.path(), &["diff", "--binary", "HEAD", "--"]).unwrap();
+        git(dir.path(), &["config", "core.abbrev", "12"]).unwrap();
+        git(dir.path(), &["config", "diff.noprefix", "true"]).unwrap();
+        git(dir.path(), &["config", "diff.context", "8"]).unwrap();
+        verify_source_patch(dir.path(), &patch).unwrap();
+        fs::write(dir.path().join("unexpected.rs"), "extra source").unwrap();
+        assert!(
+            verify_source_patch(dir.path(), &patch)
+                .unwrap_err()
+                .to_string()
+                .contains("untracked")
+        );
+        fs::remove_file(dir.path().join("unexpected.rs")).unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "unexpected modification\n").unwrap();
+        assert!(
+            verify_source_patch(dir.path(), &patch)
+                .unwrap_err()
+                .to_string()
+                .contains("reviewed patch")
+        );
+    }
+    #[test]
     fn collects_vendor_notices_not_build_caches() {
         let dir = tempfile::tempdir().unwrap();
         for path in [
@@ -558,6 +664,41 @@ mod tests {
         );
     }
     #[test]
+    fn cache_rejects_unpatched_and_wrong_patch_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = plan(
+            dir.path(),
+            dir.path(),
+            Profile::Debug,
+            TARGETS[0],
+            TARGETS[0],
+        )
+        .unwrap();
+        fs::create_dir_all(p.licenses.join("upstream")).unwrap();
+        fs::write(p.licenses.join("upstream/LICENSE"), "license").unwrap();
+        fs::write(&p.destination, "binary").unwrap();
+        let mut stamp = json!({"revision":REVISION,"builder":1,"profile":"debug","target":TARGETS[0],"sha256":digest(&p.destination).unwrap()});
+        fs::write(
+            p.licenses.join("XYLO-BUILD.json"),
+            serde_json::to_vec(&stamp).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !current(&p, Profile::Debug, TARGETS[0]),
+            "unpatched runtime must be rebuilt"
+        );
+        stamp["patch_sha256"] = json!("incorrect");
+        fs::write(
+            p.licenses.join("XYLO-BUILD.json"),
+            serde_json::to_vec(&stamp).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !current(&p, Profile::Debug, TARGETS[0]),
+            "changed patch must rebuild runtime"
+        );
+    }
+    #[test]
     fn cache_requires_matching_stamp_and_binary_hash() {
         let dir = tempfile::tempdir().unwrap();
         let p = plan(
@@ -572,7 +713,7 @@ mod tests {
         fs::write(p.licenses.join("upstream/LICENSE"), "license").unwrap();
         fs::write(&p.destination, "binary").unwrap();
         assert!(!current(&p, Profile::Debug, TARGETS[4]));
-        fs::write(p.licenses.join("XYLO-BUILD.json"), serde_json::to_vec(&json!({"revision":REVISION,"builder":1,"profile":"debug","target":TARGETS[4],"sha256":digest(&p.destination).unwrap()})).unwrap()).unwrap();
+        fs::write(p.licenses.join("XYLO-BUILD.json"), serde_json::to_vec(&json!({"revision":REVISION,"builder":1,"patch_sha256":patch_digest(),"profile":"debug","target":TARGETS[4],"sha256":digest(&p.destination).unwrap()})).unwrap()).unwrap();
         assert!(current(&p, Profile::Debug, TARGETS[4]));
         assert!(!current(&p, Profile::Release, TARGETS[4]));
         fs::write(&p.destination, "changed").unwrap();

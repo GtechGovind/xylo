@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -14,7 +14,6 @@ use xylo_core::{
     HistoryPage, MessageStatus, TitleSource, TurnRequest, Usage, now_ms,
 };
 
-type JournalRow = (String, String, Option<String>, Option<String>, i64);
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 /// Operations admitted to the database thread at once. Callers beyond this wait
 /// for a slot (up to [`QUEUE_WAIT`]) instead of failing a burst outright.
@@ -175,7 +174,14 @@ pub struct Store {
     sender: mpsc::Sender<Job>,
     slots: Arc<QueueSlots>,
     reset: Option<Arc<crate::schema::DatabaseReset>>,
-    pub(crate) action_lease_root: Arc<PathBuf>,
+    pub(crate) restored_context_sessions: Arc<std::collections::HashSet<Uuid>>,
+    pub(crate) forgotten_action_sessions: Arc<Mutex<std::collections::HashSet<Uuid>>>,
+    pub(crate) active_actions: Arc<Mutex<Vec<ActiveAction>>>,
+    pub(crate) completed_import_turns: Arc<Mutex<std::collections::HashSet<(Uuid, Uuid)>>>,
+    pub(crate) incomplete_action_turns: Arc<Mutex<std::collections::HashSet<(Uuid, Uuid)>>>,
+    pub(crate) live_action_updates: tokio::sync::broadcast::Sender<crate::LiveActionUpdate>,
+    pub(crate) extension_executions: Arc<Mutex<Vec<Value>>>,
+    pub(crate) extension_bindings: Arc<Mutex<std::collections::HashMap<Uuid, Value>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -212,12 +218,27 @@ pub enum ActionDecision {
     OutcomeUnknown,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JournalAction {
+pub struct ActiveAction {
     pub intent: ActionIntent,
     pub state: String,
     pub result: Option<Value>,
     pub error: Option<String>,
     pub updated_at: i64,
+    #[serde(skip)]
+    pub(crate) cursor: i64,
+    #[serde(default = "complete_evidence")]
+    pub evidence_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) key_fingerprint: Option<String>,
+    #[serde(skip)]
+    pub(crate) imported: bool,
+    #[serde(skip)]
+    pub(crate) retained_bytes: usize,
+}
+fn complete_evidence() -> bool {
+    true
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkillVersion {
@@ -228,11 +249,10 @@ pub struct SkillVersion {
 }
 
 impl Store {
-    /// Opens the database as its owner (the host): creates the schema in a new
-    /// file, and deletes a database with any other schema (or a file that is
-    /// not a database) and creates a fresh one; [`Store::reset_notice`] then
-    /// reports it. Call this from exactly one process. Does not create parent
-    /// folders.
+    /// Opens the database as its owner, creating a new schema or migrating the
+    /// exact previous version without execution journals. An unexpected previous
+    /// schema is left untouched; other unsupported schemas retain the reset policy.
+    /// Call this from exactly one process. Does not create parent folders.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::start(path.as_ref(), crate::schema::OpenMode::Owner)
     }
@@ -269,21 +289,29 @@ impl Store {
         let reset = ready_rx
             .recv()
             .context("Database worker stopped during startup")??;
-        let path = std::fs::canonicalize(path)?;
-        let name = path
-            .file_name()
-            .context("Database has no filename")?
-            .to_string_lossy();
-        let action_lease_root = Arc::new(path.with_file_name(format!("{name}.action-leases")));
-        Ok(Self {
+        let mut store = Self {
             sender,
             slots: Arc::new(QueueSlots {
                 free: Mutex::new(QUEUE_CAPACITY),
                 released: Condvar::new(),
             }),
             reset: reset.map(Arc::new),
-            action_lease_root,
-        })
+            restored_context_sessions: Arc::default(),
+            forgotten_action_sessions: Arc::default(),
+            active_actions: Arc::default(),
+            completed_import_turns: Arc::default(),
+            incomplete_action_turns: Arc::default(),
+            live_action_updates: tokio::sync::broadcast::channel(256).0,
+            extension_executions: Arc::default(),
+            extension_bindings: Arc::default(),
+        };
+        let restored = store.call(|conn| {
+            let mut statement = conn.prepare("SELECT DISTINCT session_id FROM checkpoint_messages UNION SELECT session_id FROM messages WHERE json_extract(json,'$.role')='assistant'")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.map(|row| Ok(Uuid::parse_str(&row?)?)).collect::<Result<std::collections::HashSet<_>>>()
+        })?;
+        store.restored_context_sessions = Arc::new(restored);
+        Ok(store)
     }
 
     /// Set when opening replaced an unusable database with an empty one; the
@@ -495,6 +523,7 @@ impl Store {
             attachments: Vec::new(),
             status,
         };
+        crate::turn_activity::summarize_activity(&self.active_actions()?, &mut message);
         self.call(move |conn| {
             let tx = write_transaction(conn)?;
             let completed: bool = tx.query_row(
@@ -707,13 +736,14 @@ impl Store {
             usage: usage.clone(),
         };
         let receipt_json = serde_json::to_string(&receipt)?;
+        let actions = self.active_actions()?;
         self.call(move|conn|{let tx=write_transaction(conn)?;
             let existing:Option<String>=tx.query_row("SELECT json FROM completed_turns WHERE session_id=?1 AND turn_id=?2",params![session_id.to_string(),turn_id.to_string()],|r|r.get(0)).optional()?;
             if let Some(existing)=existing{ensure!(serde_json::from_str::<Value>(&existing)?==serde_json::from_str::<Value>(&receipt_json)?,"Turn was already completed with a different result");return Ok(())}
             let timestamp=now_ms();
             crate::checkpoint::write_rows(&tx,session_id,turn_id,&messages,None,timestamp)?;
             let mut message=ChatMessage{ activity_count: 0, activity_summary: None, turn_id: Some(turn_id), reasoning,id:assistant_reply_id(turn_id),session_id,role:"assistant".into(),content:receipt.text,created_at:timestamp,attachments:Vec::new(), status,};
-            crate::turn_activity::hydrate_activity(&tx, &mut message)?;
+            crate::turn_activity::summarize_activity(&actions, &mut message);
             tx.execute("INSERT INTO messages(id,session_id,json,created_at) VALUES(?1,?2,?3,?4)",params![message.id.to_string(),session_id.to_string(),serde_json::to_string(&message)?,timestamp])?;
             tx.execute("DELETE FROM messages WHERE id=?1",[interrupted_reply_id(turn_id).to_string()])?;
             tx.execute("INSERT INTO completed_turns(session_id,turn_id,json,completed_at) VALUES(?1,?2,?3,?4)",params![session_id.to_string(),turn_id.to_string(),receipt_json,timestamp])?;
@@ -722,37 +752,126 @@ impl Store {
             tx.execute("INSERT OR IGNORE INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) VALUES(?1,?2,'pending',?3,?3)",params![session_id.to_string(),turn_id.to_string(),timestamp])?;
             tx.commit()?;Ok(())})
     }
-    pub fn actions_by_name(&self, name: &str, limit: usize) -> Result<Vec<JournalAction>> {
-        let name = name.to_owned();
-        self.call(move|conn|{let mut statement=conn.prepare("SELECT intent,state,result,error,updated_at FROM actions WHERE json_extract(intent,'$.name')=?1 ORDER BY updated_at DESC LIMIT ?2")?;let rows=statement.query_map(params![name,limit.min(MAX_PAGE) as i64],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?)))?;rows.map(|row|{let(intent,state,result,error,updated_at)=row?;Ok(JournalAction{intent:serde_json::from_str(&intent)?,state,result:result.map(|j|serde_json::from_str(&j)).transpose()?,error,updated_at})}).collect()})
+    pub(crate) fn active_actions(&self) -> Result<Vec<ActiveAction>> {
+        Ok(self
+            .active_actions
+            .lock()
+            .map_err(|_| anyhow!("Action tracking unavailable"))?
+            .clone())
     }
-    /// A key is scoped to its conversation and turn. Reusing a key with different
-    /// arguments is rejected; the caller must preserve stable keys across resume.
+    pub fn actions_by_name(&self, name: &str, limit: usize) -> Result<Vec<ActiveAction>> {
+        let held = self
+            .active_actions
+            .lock()
+            .map_err(|_| anyhow!("Action tracking unavailable"))?;
+        let mut actions: Vec<_> = held.iter().filter(|a| a.intent.name == name).collect();
+        actions.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+        actions.truncate(limit.min(MAX_PAGE));
+        Ok(actions.into_iter().cloned().collect())
+    }
+    /// Deduplicate only within this live Store. No execution state is saved to disk.
     pub fn begin_action(&self, intent: &ActionIntent) -> Result<ActionDecision> {
         ensure!(
             !intent.idempotency_key.trim().is_empty(),
             "Action key cannot be empty"
         );
-        let intent = intent.clone();
-        self.call(move |conn| {
-            let tx = write_transaction(conn)?;
-            let old: Option<(String,String,Option<String>)> = tx.query_row("SELECT intent,state,result FROM actions WHERE session_id=?1 AND turn_id=?2 AND action_key=?3",params![intent.session_id.to_string(),intent.turn_id.to_string(),intent.idempotency_key],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-            if let Some((old_json,state,result)) = old {
-                let old: ActionIntent = serde_json::from_str(&old_json)?;
-                ensure!(old.name==intent.name && old.arguments==intent.arguments && old.writes==intent.writes,"Action key was reused for a different operation");
-                let decision = match state.as_str() {
-                    "succeeded" => ActionDecision::Reuse(serde_json::from_str(&result.context("Successful action has no result")?)?),
-                    "outcome_unknown" => ActionDecision::OutcomeUnknown,
-                    "pending" | "running" => ActionDecision::InFlight,
-                    "denied" => bail!("Action was denied"),
-                    // Failed operations require a new explicit attempt, never an implicit replay.
-                    "failed" => bail!("Action failed; choose a new attempt key after reviewing the failure"),
-                    _ => bail!("Unknown journal state"),
-                }; return Ok(decision)
+        let oversized =
+            crate::live_actions::serialized_size(intent)? > crate::live_actions::MAX_INTENT_BYTES;
+        let mut actions = self
+            .active_actions
+            .lock()
+            .map_err(|_| anyhow!("Action tracking unavailable"))?;
+        if let Some(old) = actions.iter().find(|a| {
+            a.intent.session_id == intent.session_id
+                && a.intent.turn_id == intent.turn_id
+                && a.matches_key(&intent.idempotency_key)
+        }) {
+            ensure!(
+                !old.imported,
+                "Observed activity cannot authorize execution or result reuse"
+            );
+            ensure!(
+                old.intent.name == intent.name
+                    && old.matches_arguments(&intent.arguments)
+                    && old.intent.writes == intent.writes,
+                "Action key was reused for a different operation"
+            );
+            return match old.state.as_str() {
+                "succeeded" => Ok(ActionDecision::Reuse(
+                    old.result
+                        .clone()
+                        .context("Successful action has no result")?,
+                )),
+                "outcome_unknown" => Ok(ActionDecision::OutcomeUnknown),
+                "pending" | "running" => Ok(ActionDecision::InFlight),
+                "denied" => bail!("Action was denied"),
+                "failed" => {
+                    bail!("Action failed; choose a new attempt key after reviewing the failure")
+                }
+                _ => bail!("Unknown action state"),
+            };
+        }
+        ensure!(
+            !actions.iter().any(|a| a.intent.id == intent.id),
+            "Action ID already exists"
+        );
+        // Observability never rejects a legitimate large tool input. Retain its
+        // fingerprint and bounded metadata, while the caller executes the original.
+        let arguments_fingerprint = oversized
+            .then(|| crate::live_actions::fingerprint(&intent.arguments))
+            .transpose()?;
+        let key_fingerprint = (intent.idempotency_key.len() > 2048)
+            .then(|| crate::live_actions::fingerprint(&intent.idempotency_key))
+            .transpose()?;
+        let retained_intent = if oversized {
+            ActionIntent {
+                id: intent.id,
+                session_id: intent.session_id,
+                turn_id: intent.turn_id,
+                name: intent.name.chars().take(256).collect(),
+                arguments: Value::Null,
+                writes: intent.writes,
+                idempotency_key: if key_fingerprint.is_some() {
+                    String::new()
+                } else {
+                    intent.idempotency_key.clone()
+                },
             }
-            tx.execute("INSERT INTO actions(id,session_id,turn_id,action_key,intent,state,updated_at) VALUES(?1,?2,?3,?4,?5,'pending',?6)",params![intent.id.to_string(),intent.session_id.to_string(),intent.turn_id.to_string(),intent.idempotency_key,serde_json::to_string(&intent)?,now_ms()])?;
-            tx.commit()?; Ok(ActionDecision::Execute)
-        })
+        } else {
+            intent.clone()
+        };
+        let intent_bytes = crate::live_actions::serialized_size(&retained_intent)?;
+        self.make_live_action_room(
+            &mut actions,
+            intent.session_id,
+            intent.turn_id,
+            intent_bytes,
+            true,
+        )?;
+        let cursor = actions.last().map_or(1, |a| a.cursor + 1);
+        let action = ActiveAction {
+            cursor,
+            imported: false,
+            evidence_complete: !oversized,
+            arguments_fingerprint,
+            key_fingerprint,
+            retained_bytes: intent_bytes,
+            intent: retained_intent,
+            state: "pending".into(),
+            result: None,
+            error: None,
+            updated_at: now_ms(),
+        };
+        actions.push(action.clone());
+        if oversized {
+            self.mark_live_action_incomplete(intent.session_id, intent.turn_id)?;
+        }
+        let _ = self
+            .live_action_updates
+            .send(crate::LiveActionUpdate::Action {
+                action: Box::new(action),
+            });
+        Ok(ActionDecision::Execute)
     }
     pub fn mark_action_running(&self, id: Uuid) -> Result<()> {
         self.transition(id, "pending", "running", None, None)
@@ -811,120 +930,90 @@ impl Store {
         result: Option<String>,
         error: Option<String>,
     ) -> Result<()> {
-        self.call(move |conn| { let changed=conn.execute("UPDATE actions SET state=?1,result=?2,error=?3,updated_at=?4 WHERE id=?5 AND state=?6",params![to,result,error,now_ms(),id.to_string(),from])?; ensure!(changed==1,"Action is absent or has an incompatible state"); Ok(()) })
-    }
-    /// Startup recovery is explicit and should run once after obtaining the app's
-    /// single-instance lock. Pending intents never executed; running writes may have.
-    pub fn recover_interrupted(&self) -> Result<usize> {
-        self.call(|conn| { let tx=write_transaction(conn)?;
-            tx.execute("INSERT OR IGNORE INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) SELECT DISTINCT a.session_id,a.turn_id,'pending',?1,?1 FROM actions a WHERE NOT EXISTS(SELECT 1 FROM completed_turns c WHERE c.session_id=a.session_id AND c.turn_id=a.turn_id)",[now_ms()])?;
-            tx.execute("INSERT INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) SELECT DISTINCT session_id,turn_id,'pending',?1,?1 FROM actions WHERE state IN ('pending','running') ON CONFLICT(session_id,turn_id) DO UPDATE SET state=CASE WHEN learning_jobs.state='processing' THEN 'processing' ELSE 'pending' END,updated_at=excluded.updated_at",[now_ms()])?;
-            let writes=tx.execute("UPDATE actions SET state='outcome_unknown',error='Interrupted while executing; reconcile before retry',updated_at=?1 WHERE state='running' AND json_extract(intent,'$.writes')=1",[now_ms()])?;
-            let reads=tx.execute("UPDATE actions SET state='failed',error='Interrupted before a result was recorded',updated_at=?1 WHERE state IN ('pending','running')",[now_ms()])?;
-            let extensions = tx.execute("UPDATE extension_execution_receipts SET state='outcome_unknown',error='Application interrupted during component execution; effects require inspection',updated_at=?1 WHERE state='running'",[now_ms()])?;
-            tx.commit()?; Ok(writes+reads+extensions) })
-    }
-    /// Recover only a confirmed-dead worker's session, including its child tool
-    /// namespaces. Call after the process is reaped and before admitting a retry.
-    /// Live workers in other sessions must never be affected by this operation.
-    pub fn recover_session_interrupted(&self, session_id: Uuid) -> Result<usize> {
-        self.call(move |conn| {
-            let tx = write_transaction(conn)?;
-            let session = session_id.to_string();
-            let timestamp = now_ms();
-            tx.execute("INSERT INTO learning_jobs(session_id,turn_id,state,created_at,updated_at) SELECT DISTINCT a.session_id,a.turn_id,'pending',?1,?1 FROM actions a WHERE a.session_id=?2 AND NOT EXISTS(SELECT 1 FROM completed_turns c WHERE c.session_id=a.session_id AND c.turn_id=a.turn_id) ON CONFLICT(session_id,turn_id) DO UPDATE SET state=CASE WHEN learning_jobs.state='processing' THEN 'processing' ELSE 'pending' END,updated_at=excluded.updated_at",params![timestamp,session])?;
-            let writes = tx.execute(
-                "UPDATE actions SET state='outcome_unknown',error='Worker stopped while executing; reconcile before retry',updated_at=?1 WHERE session_id=?2 AND state='running' AND json_extract(intent,'$.writes')=1",
-                params![timestamp, session],
-            )?;
-            let unfinished = tx.execute(
-                "UPDATE actions SET state='failed',error='Worker stopped before a result was recorded',updated_at=?1 WHERE session_id=?2 AND state IN ('pending','running')",
-                params![timestamp, session],
-            )?;
-            tx.commit()?;
-            Ok(writes + unfinished)
-        })
-    }
-    /// Explicit reconciliation records evidence. None means confirmed no effect;
-    /// Some(result) means the external effect was confirmed successful.
-    pub fn reconcile_action(&self, id: Uuid, result: Option<&Value>, evidence: &str) -> Result<()> {
-        ensure!(
-            !evidence.trim().is_empty(),
-            "Reconciliation evidence is required"
-        );
-        let state = if result.is_some() {
-            "succeeded"
+        let mut actions = self
+            .active_actions
+            .lock()
+            .map_err(|_| anyhow!("Action tracking unavailable"))?;
+        let index = actions
+            .iter()
+            .position(|a| a.intent.id == id && a.state == from && !a.imported)
+            .context("Action is absent or has an incompatible state")?;
+        let total: usize = actions.iter().map(|a| a.retained_bytes).sum();
+        let intent_bytes = serde_json::to_vec(&actions[index].intent)?.len();
+        let result_bytes = result.as_ref().map_or(0, String::len);
+        let mut error = error.map(|e| e.chars().take(2048).collect::<String>());
+        if total - actions[index].retained_bytes
+            + intent_bytes
+            + error.as_ref().map_or(0, String::len)
+            > crate::live_actions::MAX_LIVE_BYTES
+        {
+            error = None;
+        }
+        let base_bytes = intent_bytes + error.as_ref().map_or(0, String::len);
+        let complete = result_bytes <= crate::live_actions::MAX_RESULT_BYTES
+            && total - actions[index].retained_bytes + base_bytes + result_bytes
+                <= crate::live_actions::MAX_LIVE_BYTES;
+        let action = &mut actions[index];
+        action.state = to.into();
+        action.result = if complete {
+            result.map(|r| serde_json::from_str(&r)).transpose()?
         } else {
-            "failed"
+            None
         };
-        let result = result.map(serde_json::to_string).transpose()?;
-        let evidence = evidence.to_owned();
-        self.call(move |conn| {
-            let changed = conn.execute(
-                "UPDATE actions SET state=?1,result=COALESCE(?2,result),error=?3,updated_at=?4 WHERE id=?5 AND state='outcome_unknown'",
-                params![state, result, evidence, now_ms(), id.to_string()],
-            )?;
-            ensure!(changed == 1, "Action is absent or has an incompatible state");
-            Ok(())
-        })
+        action.error = error;
+        action.updated_at = now_ms();
+        action.evidence_complete &= complete;
+        action.retained_bytes = base_bytes + if complete { result_bytes } else { 0 };
+        if !complete {
+            self.mark_live_action_incomplete(action.intent.session_id, action.intent.turn_id)?;
+        }
+        let _ = self
+            .live_action_updates
+            .send(crate::LiveActionUpdate::Action {
+                action: Box::new(action.clone()),
+            });
+        Ok(())
     }
-    /// Confirm a native receipt's failed/cancelled terminal result while keeping
-    /// its actual output and references. Unlike success this remains nonreplayable.
-    pub fn reconcile_action_failure_with_result(
-        &self,
-        id: Uuid,
-        result: &Value,
-        evidence: &str,
-    ) -> Result<()> {
-        ensure!(
-            !evidence.trim().is_empty(),
-            "Reconciliation evidence is required"
-        );
-        self.transition(
-            id,
-            "outcome_unknown",
-            "failed",
-            Some(serde_json::to_string(result)?),
-            Some(evidence.to_owned()),
-        )
-    }
-    pub fn action(&self, id: Uuid) -> Result<Option<JournalAction>> {
-        self.call(move |conn| {
-            let row: Option<JournalRow> = conn
-                .query_row(
-                    "SELECT intent,state,result,error,updated_at FROM actions WHERE id=?1",
-                    [id.to_string()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                )
-                .optional()?;
-            row.map(|(intent, state, result, error, updated_at)| {
-                Ok(JournalAction {
-                    intent: serde_json::from_str(&intent)?,
-                    state,
-                    result: result.map(|j| serde_json::from_str(&j)).transpose()?,
-                    error,
-                    updated_at,
-                })
-            })
-            .transpose()
-        })
+    pub fn action(&self, id: Uuid) -> Result<Option<ActiveAction>> {
+        Ok(self
+            .active_actions
+            .lock()
+            .map_err(|_| anyhow!("Action tracking unavailable"))?
+            .iter()
+            .find(|a| a.intent.id == id)
+            .cloned())
     }
     pub fn action_for_key(
         &self,
         session_id: Uuid,
         turn_id: Uuid,
         key: &str,
-    ) -> Result<Option<JournalAction>> {
-        let key = key.to_owned();
-        self.call(move|conn|{
-            let row:Option<JournalRow>=conn.query_row("SELECT intent,state,result,error,updated_at FROM actions WHERE session_id=?1 AND turn_id=?2 AND action_key=?3",params![session_id.to_string(),turn_id.to_string(),key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-            row.map(|(intent,state,result,error,updated_at)|Ok(JournalAction{intent:serde_json::from_str(&intent)?,state,result:result.map(|j|serde_json::from_str(&j)).transpose()?,error,updated_at})).transpose()
-        })
+    ) -> Result<Option<ActiveAction>> {
+        Ok(self
+            .active_actions
+            .lock()
+            .map_err(|_| anyhow!("Action tracking unavailable"))?
+            .iter()
+            .find(|a| {
+                !a.imported
+                    && a.intent.session_id == session_id
+                    && a.intent.turn_id == turn_id
+                    && a.matches_key(key)
+            })
+            .cloned())
     }
-    pub fn unresolved_actions(&self, session_id: Uuid) -> Result<Vec<JournalAction>> {
-        self.call(move |conn| { let mut stmt=conn.prepare("SELECT intent,state,result,error,updated_at FROM actions WHERE session_id=?1 AND state IN ('pending','running','outcome_unknown') ORDER BY updated_at")?;
-            let rows=stmt.query_map([session_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?)))?;
-            rows.map(|row| {let (intent,state,result,error,updated_at)=row?;Ok(JournalAction{intent:serde_json::from_str(&intent)?,state,result:result.map(|j|serde_json::from_str(&j)).transpose()?,error,updated_at})}).collect() })
+    pub fn unfinished_actions(&self, session_id: Uuid) -> Result<Vec<ActiveAction>> {
+        Ok(self
+            .active_actions
+            .lock()
+            .map_err(|_| anyhow!("Action tracking unavailable"))?
+            .iter()
+            .filter(|a| {
+                a.intent.session_id == session_id
+                    && matches!(a.state.as_str(), "pending" | "running" | "outcome_unknown")
+            })
+            .cloned()
+            .collect())
     }
     pub fn connectors(&self) -> Result<Vec<ConnectorConfig>> {
         self.call(|conn| json_rows(conn, "SELECT json FROM connectors ORDER BY name", []))

@@ -4,7 +4,7 @@ mod model;
 pub use model::*;
 mod persistence;
 mod sanitize;
-use crate::{ActionIntent, JournalAction, SkillVersion, Store};
+use crate::{ActiveAction, SkillVersion, Store};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};

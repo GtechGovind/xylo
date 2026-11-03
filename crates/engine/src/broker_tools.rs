@@ -12,7 +12,7 @@ use crate::{
 use serde_json::Value;
 use std::sync::Arc;
 
-/// A root broker, or a delegated child's broker with its journal namespace.
+/// A root broker, or a delegated child's broker with its conversation_state namespace.
 pub(crate) struct BrokerTools {
     broker: Arc<ToolBroker>,
     /// The parent `agent_delegate` call key; `None` for the root agent.

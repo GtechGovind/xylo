@@ -6,6 +6,7 @@
 //! updates the live permission mode every broker reads at each tool call.
 
 mod credentials;
+mod live_activity;
 mod shell_events;
 mod steering;
 use anyhow::{Context, Result, ensure};
@@ -252,6 +253,8 @@ async fn main() -> Result<()> {
                     request_id,
                     session_id,
                 };
+                let mut live_activity =
+                    live_activity::Forwarder::new(store.clone(), task_session, task_turn);
                 let handle = tokio::spawn(async move {
                     let registered_turn = turn.clone();
                     let registered = tokio::task::spawn_blocking(move || {
@@ -269,8 +272,13 @@ async fn main() -> Result<()> {
                     let forwarding = tokio::spawn(async move {
                         let mut ended = false;
                         while let Some(event) = incoming.recv().await {
+                            // Store transitions precede their engine events. Drain this
+                            // same task before forwarding completion so the host has
+                            // the full live evidence before observing the terminal event.
+                            live_activity.drain(&forward_ending).await?;
                             if is_terminal(&event) {
                                 if !ended {
+                                    live_activity.complete(&forward_ending).await?;
                                     forward_ending.end(event).await?;
                                     ended = true;
                                 }

@@ -26,10 +26,10 @@
 //! - **Checkpoint before and after every tool batch.** The assistant message
 //!   that requests tools is durable before any of them is dispatched, and the
 //!   results are durable before the next model call. A crash in between
-//!   resumes by executing only the calls that have no result yet.
-//! - **Exactly-once dispatch.** Tools run only through a [`ToolExecutor`],
-//!   whose broker journals each call by its id; a resumed call that already
-//!   ran returns its recorded result instead of running again.
+//!   resumes with interruption results for unanswered calls, without replay.
+//! - **Live duplicate protection.** Tools run through a [`ToolExecutor`] whose
+//!   broker tracks call identities in memory. It does not automatically replay
+//!   unanswered calls from a saved conversation.
 //! - **Guidance only at role-safe boundaries.** User guidance is inserted
 //!   after a complete tool round (or before the first model call), never
 //!   between a tool call and its result.
@@ -79,12 +79,12 @@ pub(crate) const MAX_MODEL_CALLS: u32 = 400;
 const DELTA_INTERVAL: Duration = Duration::from_millis(32);
 
 /// Where a root loop keeps its durable state.
-pub(crate) struct Journal {
+pub(crate) struct ConversationState {
     pub store: Store,
     pub session: Uuid,
     pub turn: Uuid,
     pub steering: Option<SteeringControl>,
-    /// The checkpoint this journal last wrote, so the next write sends only
+    /// The checkpoint this conversation_state last wrote, so the next write sends only
     /// the messages that changed since.
     written: tokio::sync::Mutex<Option<Written>>,
 }
@@ -95,7 +95,7 @@ struct Written {
     rows: Arc<[String]>,
 }
 
-impl Journal {
+impl ConversationState {
     pub(crate) fn new(
         store: Store,
         session: Uuid,
@@ -161,7 +161,7 @@ pub(crate) struct AgentLoop {
     pub events: mpsc::Sender<EngineEvent>,
     /// Root loops stream text, phases and context usage to the UI and
     /// checkpoint; child loops report only through their tool events.
-    pub journal: Option<Journal>,
+    pub conversation_state: Option<ConversationState>,
     /// The live permission mode and the mode the model was last told about
     /// (the one in the system prompt). A change is announced to the model
     /// with an appended note; the system prompt itself never changes.
@@ -212,7 +212,7 @@ struct Run {
 
 impl AgentLoop {
     fn root(&self) -> bool {
-        self.journal.is_some()
+        self.conversation_state.is_some()
     }
 
     async fn emit(&self, event: EngineEvent) -> anyhow::Result<()> {
@@ -230,14 +230,14 @@ impl AgentLoop {
     }
 
     async fn checkpoint(&self, messages: &[Message]) -> anyhow::Result<()> {
-        match &self.journal {
-            Some(journal) => journal.checkpoint(messages).await,
+        match &self.conversation_state {
+            Some(conversation_state) => conversation_state.checkpoint(messages).await,
             None => Ok(()),
         }
     }
 
     /// Makes the call ids of `assistant` unique within the turn; see
-    /// [`unique_call_ids`]. A root loop also treats ids its action journal
+    /// [`unique_call_ids`]. A root loop also treats ids its action conversation_state
     /// holds as taken: after a compaction and a resume, the calls that used
     /// them are in neither `messages` nor `issued`.
     async fn assign_call_ids(
@@ -248,14 +248,18 @@ impl AgentLoop {
         if assistant.tool_calls.is_empty() {
             return Ok(());
         }
-        let Some(journal) = &self.journal else {
+        let Some(conversation_state) = &self.conversation_state else {
             return unique_call_ids(assistant, issued, |_| Ok(false));
         };
-        let (store, session, turn) = (journal.store.clone(), journal.session, journal.turn);
+        let (store, session, turn) = (
+            conversation_state.store.clone(),
+            conversation_state.session,
+            conversation_state.turn,
+        );
         let (mut message, mut ids) = (assistant.clone(), std::mem::take(issued));
         let (message, ids) = tokio::task::spawn_blocking(move || {
             let recorded = |id: &str| {
-                let key = crate::tools::ToolBroker::journal_key(None, id);
+                let key = crate::tools::ToolBroker::call_key(None, id);
                 Ok(store.action_for_key(session, turn, &key)?.is_some())
             };
             unique_call_ids(&mut message, &mut ids, recorded).map(|()| (message, ids))
@@ -609,8 +613,8 @@ impl AgentLoop {
     /// Applies queued user guidance at a role-safe boundary; returns how many
     /// guidance messages were added.
     async fn apply_guidance(&self, messages: &mut Vec<Message>) -> anyhow::Result<usize> {
-        match &self.journal {
-            Some(Journal {
+        match &self.conversation_state {
+            Some(ConversationState {
                 steering: Some(steering),
                 session,
                 turn,
@@ -1056,12 +1060,12 @@ fn call_ids(messages: &[Message]) -> HashSet<String> {
         .collect()
 }
 
-/// Call ids key the action journal, so they must be unique within the turn,
+/// Call ids key the action conversation_state, so they must be unique within the turn,
 /// not only within the current conversation: a compaction removes earlier
-/// calls from it while their journal entries remain. Some servers restart
+/// calls from it while their conversation_state entries remain. Some servers restart
 /// ids like `call_0` in every response; an id that is `issued` already (or
-/// `recorded` in the journal) gets a `#n` suffix before it is checkpointed or
-/// dispatched, which keeps the journal key stable across a resume. Every id
+/// `recorded` in the conversation_state) gets a `#n` suffix before it is checkpointed or
+/// dispatched, which keeps the conversation_state key stable across a resume. Every id
 /// the response ends up with is added to `issued`.
 fn unique_call_ids(
     assistant: &mut Message,

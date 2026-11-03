@@ -30,7 +30,6 @@ impl Profile {
         lock.try_lock_exclusive()
             .context("Xylo is already running for this profile; choose another --data-dir")?;
         let store = Store::open(&paths.database)?;
-        store.recover_interrupted()?;
         let settings = store.settings()?;
         Ok(Self {
             paths,

@@ -1,4 +1,4 @@
-//! Interrupted actions retain their records without gating the native chat.
+//! Interrupted actions leave no durable records or native chat review workflow.
 #![allow(dead_code, unused_imports)]
 extern crate gpui_kit as gpui;
 #[path = "../src/icons.rs"]
@@ -197,7 +197,14 @@ mod xylo {
                         .update(cx, |input, cx| input.focus(window, cx));
                 });
                 window.render_frame(cx);
-                window.press(if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" }, cx);
+                window.press(
+                    if cfg!(target_os = "macos") {
+                        "cmd-a"
+                    } else {
+                        "ctrl-a"
+                    },
+                    cx,
+                );
                 window.input("Keep working", cx);
             })
             .unwrap();
@@ -374,6 +381,13 @@ mod xylo {
                 .unwrap()
                 .unwrap();
             assert_eq!(stored.state, "outcome_unknown");
+            let reopened = xylo_services::Store::open(&fixture.profile.paths.database).unwrap();
+            assert!(
+                reopened
+                    .action(fixture.profile.actions[0])
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(
                 std::fs::read_to_string(fixture.profile.workspace.join("partial-0.txt")).unwrap(),
                 "partial content remains"
@@ -407,7 +421,7 @@ mod xylo {
         }
         #[gpui_kit::test]
         fn interrupted_actions_allow_normal_submission_and_chat_switching(cx: &mut TestAppContext) {
-            // More than one page of old actions must not turn into a hidden gate.
+            // Previous tool activity must not survive reopening or gate the chat.
             let fixture = open(cx, 55);
             cx.update_window(fixture.window, |_, window, cx| {
                 fixture.view.update(cx, |view, cx| {
@@ -433,7 +447,9 @@ mod xylo {
                 });
             })
             .unwrap();
+            let reopened = xylo_services::Store::open(&fixture.profile.paths.database).unwrap();
             for action in &fixture.profile.actions {
+                assert!(reopened.action(*action).unwrap().is_none());
                 assert_eq!(
                     fixture
                         .profile

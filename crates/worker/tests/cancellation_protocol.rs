@@ -243,7 +243,7 @@ async fn repeated_active_stream_cancellation_emits_correlated_ack_and_cancelled_
                 .unwrap()
                 .is_none()
         );
-        assert!(store.unresolved_actions(session).unwrap().is_empty());
+        assert!(store.unfinished_actions(session).unwrap().is_empty());
         assert_eq!(
             store
                 .messages(session, 10)

@@ -1,4 +1,4 @@
-//! Lifecycle hooks share the action journal and pass structured controls to the loop.
+//! Lifecycle hooks share the action conversation_state and pass structured controls to the loop.
 use super::*;
 use sha2::Digest;
 use xylo_services::{
@@ -144,25 +144,9 @@ impl ToolBroker {
         if commands.is_empty() && plugin_hooks.is_empty() {
             return Ok(HookOutput::default());
         }
-        ensure!(
-            !self
-                .store
-                .unresolved_actions(self.request.session_id)?
-                .iter()
-                .any(|action| action.state == "outcome_unknown"
-                    && (action.intent.name == "settings_hook"
-                        || action.intent.name == "extension_component"
-                            && action
-                                .intent
-                                .arguments
-                                .get("operation")
-                                .and_then(Value::as_str)
-                                == Some("event"))),
-            "A previous hook outcome is unknown; reconcile its action before further hook execution"
-        );
         let mut output = HookOutput::default();
         for (index, command) in commands.into_iter().enumerate() {
-            let key = Self::journal_key(
+            let key = Self::call_key(
                 namespace,
                 &format!("{call_id}:settings-hook:{event}:{index}"),
             );
@@ -177,7 +161,7 @@ impl ToolBroker {
                 );
                 ensure!(
                     previous.state == "succeeded",
-                    "Previous hook did not complete; reconcile its outcome before retrying"
+                    "Previous hook did not complete; this call will not be repeated"
                 );
                 previous.result.context("Hook result missing")?
             } else {
@@ -246,7 +230,7 @@ impl ToolBroker {
                 .action_for_key(
                     self.request.session_id,
                     self.request.turn_id,
-                    &Self::journal_key(namespace, &hook_id),
+                    &Self::call_key(namespace, &hook_id),
                 )?
                 .and_then(|a| a.result)
                 .context("Hook outcome was not recorded")?;
